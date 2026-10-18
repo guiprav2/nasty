@@ -8,6 +8,7 @@ const native = require(join(fileURLToPath(new URL(".", import.meta.url)), "nativ
 
 export const LayoutTree = native.LayoutTree;
 export const Window = native.Window;
+export { FontRegistry } from "./font-registry.js";
 
 export class Element {
   constructor(document, name, style = {}) {

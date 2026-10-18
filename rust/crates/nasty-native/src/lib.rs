@@ -324,12 +324,22 @@ pub struct TextRunOptions {
     #[napi(js_name = "lineHeight")]
     pub line_height: f64,
     pub color: String,
+    #[napi(js_name = "fontFamily")]
+    pub font_family: Option<String>,
+}
+
+#[napi(object)]
+pub struct TextFontData {
+    pub family: String,
+    pub data: Buffer,
 }
 
 #[napi(object)]
 pub struct TextPreparationStats {
     #[napi(js_name = "systemFontInitMs")]
     pub system_font_init_ms: f64,
+    #[napi(js_name = "customFontLoadMs")]
+    pub custom_font_load_ms: f64,
     #[napi(js_name = "glyphCount")]
     pub glyph_count: u32,
     #[napi(js_name = "lineCount")]
@@ -385,6 +395,7 @@ struct PositionedText {
 struct TextRuntime {
     font_system: Option<FontSystem>,
     system_font_init_ms: f64,
+    loaded_custom_fonts: std::collections::HashSet<String>,
     swash_cache: SwashCache,
     text_viewport: Viewport,
     text_atlas: TextAtlas,
@@ -395,6 +406,7 @@ struct TextRuntime {
 struct TextWorkerMessage {
     request_id: u32,
     runs: Vec<TextRunOptions>,
+    custom_fonts: Vec<(String, Vec<u8>)>,
     runtime: TextRuntime,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -574,6 +586,7 @@ impl Renderer {
         let text_runtime = TextRuntime {
             font_system,
             system_font_init_ms: 0.0,
+            loaded_custom_fonts: std::collections::HashSet::new(),
             swash_cache,
             text_viewport,
             text_atlas,
@@ -588,6 +601,7 @@ impl Renderer {
                 while let Ok(mut job) = text_jobs.recv() {
                     let cold = job.runtime.set_text_runs(
                         job.runs.clone(),
+                        &job.custom_fonts,
                         &job.device,
                         &job.queue,
                         job.width,
@@ -596,6 +610,7 @@ impl Renderer {
                     let stats = cold.and_then(|mut stats| {
                         let warm = job.runtime.set_text_runs(
                             job.runs,
+                            &[],
                             &job.device,
                             &job.queue,
                             job.width,
@@ -786,7 +801,11 @@ impl Renderer {
         })
     }
 
-    fn request_text_runs(&mut self, runs: Vec<TextRunOptions>) -> std::result::Result<u32, String> {
+    fn request_text_runs(
+        &mut self,
+        runs: Vec<TextRunOptions>,
+        custom_fonts: Vec<TextFontData>,
+    ) -> std::result::Result<u32, String> {
         if self.pending_text_request.is_some() {
             return Err("a text preparation request is already pending".into());
         }
@@ -799,6 +818,10 @@ impl Renderer {
         let job = TextWorkerMessage {
             request_id,
             runs,
+            custom_fonts: custom_fonts
+                .into_iter()
+                .map(|font| (font.family, font.data.to_vec()))
+                .collect(),
             runtime,
             device: self.device.clone(),
             queue: self.queue.clone(),
@@ -850,6 +873,7 @@ impl TextRuntime {
     fn set_text_runs(
         &mut self,
         runs: Vec<TextRunOptions>,
+        custom_fonts: &[(String, Vec<u8>)],
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         width: u32,
@@ -862,6 +886,13 @@ impl TextRuntime {
             self.system_font_init_ms = font_init_started.elapsed().as_secs_f64() * 1000.0;
         }
         let font_system = self.font_system.as_mut().expect("font system initialized");
+        let font_load_started = Instant::now();
+        for (family, data) in custom_fonts {
+            if self.loaded_custom_fonts.insert(family.clone()) {
+                font_system.db_mut().load_font_data(data.clone());
+            }
+        }
+        let custom_font_load_ms = font_load_started.elapsed().as_secs_f64() * 1000.0;
         let shaping_started = Instant::now();
         let mut glyph_count = 0_u32;
         let mut line_count = 0_u32;
@@ -899,7 +930,12 @@ impl TextRuntime {
             buffer.set_text(
                 font_system,
                 &run.text,
-                Attrs::new().family(Family::SansSerif),
+                Attrs::new().family(
+                    run.font_family
+                        .as_deref()
+                        .map(Family::Name)
+                        .unwrap_or(Family::SansSerif),
+                ),
                 Shaping::Advanced,
             );
             buffer.shape_until_scroll(font_system, false);
@@ -958,6 +994,7 @@ impl TextRuntime {
 
         Ok(TextPreparationStats {
             system_font_init_ms: self.system_font_init_ms,
+            custom_font_load_ms,
             glyph_count,
             line_count,
             shaping_ms,
@@ -1228,7 +1265,11 @@ impl Window {
     }
 
     #[napi(js_name = "requestTextRuns")]
-    pub fn request_text_runs(&mut self, runs: Vec<TextRunOptions>) -> Result<u32> {
+    pub fn request_text_runs(
+        &mut self,
+        runs: Vec<TextRunOptions>,
+        custom_fonts: Option<Vec<TextFontData>>,
+    ) -> Result<u32> {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
@@ -1238,7 +1279,7 @@ impl Window {
             .as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
         renderer
-            .request_text_runs(runs)
+            .request_text_runs(runs, custom_fonts.unwrap_or_default())
             .map_err(|error| Error::new(Status::InvalidArg, error))
     }
 
