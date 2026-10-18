@@ -10,6 +10,7 @@ Build the debug native library and run an example from the repository root:
 npm --prefix node run build:debug
 node node/examples/layout.js
 node node/examples/window.js
+node node/examples/text.js
 ```
 
-The layout example checks positions, measures Taffy, and writes `node/examples/layout.svg`. The window example animates native GPU quads and reports timing data.
+The layout example checks positions, measures Taffy, and writes `node/examples/layout.svg`. The window example animates native GPU quads and reports timing data. The text example shapes and renders with installed system fonts, reports cold and repeated preparation costs, and measures frame pacing.

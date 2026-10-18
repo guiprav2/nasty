@@ -11,6 +11,7 @@ napi = { version = "3", default-features = false, features = ["napi4"] }
 napi-derive = "3"
 taffy = { version = "0.14", default-features = false, features = ["std", "flexbox", "block_layout", "taffy_tree"] }
 bytemuck = { version = "1", features = ["derive"] }
+glyphon = "0.8"
 pollster = "0.4"
 wgpu = { version = "24", default-features = false, features = ["wgsl"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }

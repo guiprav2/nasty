@@ -1,5 +1,10 @@
 //! Small Node binding for Taffy. The document and frame clock live in JavaScript.
 
+use glyphon::{
+    Attrs, Buffer as TextBuffer, Cache as TextCache, Color as TextColor, Family, FontSystem,
+    Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
+    Viewport,
+};
 use napi::bindgen_prelude::Buffer;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
@@ -303,6 +308,35 @@ pub struct PresentStats {
     pub present_ms: f64,
 }
 
+#[napi(object)]
+pub struct TextRunOptions {
+    pub text: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    #[napi(js_name = "fontSize")]
+    pub font_size: f64,
+    #[napi(js_name = "lineHeight")]
+    pub line_height: f64,
+    pub color: String,
+}
+
+#[napi(object)]
+pub struct TextPreparationStats {
+    #[napi(js_name = "systemFontInitMs")]
+    pub system_font_init_ms: f64,
+    #[napi(js_name = "glyphCount")]
+    pub glyph_count: u32,
+    #[napi(js_name = "lineCount")]
+    pub line_count: u32,
+    #[napi(js_name = "shapingMs")]
+    pub shaping_ms: f64,
+    #[napi(js_name = "atlasPrepareMs")]
+    pub atlas_prepare_ms: f64,
+    #[napi(js_name = "totalMs")]
+    pub total_ms: f64,
+}
+
 #[derive(Default, Clone, Copy)]
 struct RenderTimings {
     total_ms: f64,
@@ -320,9 +354,23 @@ struct Renderer {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
+    font_system: Option<FontSystem>,
+    system_font_init_ms: f64,
+    swash_cache: SwashCache,
+    text_viewport: Viewport,
+    text_atlas: TextAtlas,
+    text_renderer: TextRenderer,
+    text_buffers: Vec<PositionedText>,
     adapter_name: String,
     format_name: String,
     present_mode_name: String,
+}
+
+struct PositionedText {
+    buffer: TextBuffer,
+    x: f32,
+    y: f32,
+    color: TextColor,
 }
 
 impl Renderer {
@@ -468,6 +516,27 @@ impl Renderer {
         let warmup_data = vec![0_u8; vertex_capacity];
         queue.write_buffer(&vertex_buffer, 0, &warmup_data);
 
+        // Defer font discovery until text is requested so ordinary windows do
+        // not pay system-font startup cost.
+        let font_system = None;
+        let swash_cache = SwashCache::new();
+        let text_cache = TextCache::new(&device);
+        let mut text_viewport = Viewport::new(&device, &text_cache);
+        text_viewport.update(
+            &queue,
+            Resolution {
+                width: config.width,
+                height: config.height,
+            },
+        );
+        let mut text_atlas = TextAtlas::new(&device, &queue, &text_cache, format);
+        let text_renderer = TextRenderer::new(
+            &mut text_atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
+
         Ok(Self {
             surface,
             device,
@@ -476,6 +545,13 @@ impl Renderer {
             pipeline,
             vertex_buffer,
             vertex_capacity,
+            font_system,
+            system_font_init_ms: 0.0,
+            swash_cache,
+            text_viewport,
+            text_atlas,
+            text_renderer,
+            text_buffers: Vec::new(),
             adapter_name,
             format_name,
             present_mode_name,
@@ -489,6 +565,8 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.text_viewport
+            .update(&self.queue, Resolution { width, height });
     }
 
     fn render(
@@ -598,6 +676,11 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 pass.draw(0..vertices.len() as u32, 0..1);
             }
+            if !self.text_buffers.is_empty() {
+                self.text_renderer
+                    .render(&self.text_atlas, &self.text_viewport, &mut pass)
+                    .map_err(|error| format!("render text: {error}"))?;
+            }
         }
         let submit_started = Instant::now();
         self.queue.submit(Some(encoder.finish()));
@@ -613,6 +696,141 @@ impl Renderer {
             present_ms,
         })
     }
+
+    fn set_text_runs(
+        &mut self,
+        runs: Vec<TextRunOptions>,
+    ) -> std::result::Result<TextPreparationStats, String> {
+        let total_started = Instant::now();
+        if self.font_system.is_none() {
+            let font_init_started = Instant::now();
+            self.font_system = Some(FontSystem::new());
+            self.system_font_init_ms = font_init_started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let font_system = self.font_system.as_mut().expect("font system initialized");
+        let shaping_started = Instant::now();
+        let mut glyph_count = 0_u32;
+        let mut line_count = 0_u32;
+        let height = self.config.height as f32;
+        let mut positioned = Vec::with_capacity(runs.len());
+
+        for run in runs {
+            let [x, y, run_width, font_size, line_height] =
+                [run.x, run.y, run.width, run.font_size, run.line_height];
+            if [x, y, run_width, font_size, line_height]
+                .iter()
+                .any(|value| !value.is_finite())
+                || x < 0.0
+                || y < 0.0
+                || run_width < 0.0
+                || font_size <= 0.0
+                || line_height <= 0.0
+                || run_width > f32::MAX as f64
+                || font_size > f32::MAX as f64
+                || line_height > f32::MAX as f64
+            {
+                return Err("text run geometry and font metrics must be finite and nonnegative (font size and line height must be positive)".into());
+            }
+            let color = parse_text_color(&run.color)
+                .ok_or_else(|| format!("invalid text color: {}", run.color))?;
+            let mut buffer = TextBuffer::new(
+                font_system,
+                Metrics::new(font_size as f32, line_height as f32),
+            );
+            buffer.set_size(
+                font_system,
+                Some((run_width as f32).max(1.0)),
+                Some((height - y as f32).max(1.0)),
+            );
+            buffer.set_text(
+                font_system,
+                &run.text,
+                Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+            );
+            buffer.shape_until_scroll(font_system, false);
+            for layout_run in buffer.layout_runs() {
+                line_count += 1;
+                glyph_count += layout_run.glyphs.len() as u32;
+            }
+            positioned.push(PositionedText {
+                buffer,
+                x: x as f32,
+                y: y as f32,
+                color,
+            });
+        }
+        let shaping_ms = shaping_started.elapsed().as_secs_f64() * 1000.0;
+
+        self.text_viewport.update(
+            &self.queue,
+            Resolution {
+                width: self.config.width,
+                height: self.config.height,
+            },
+        );
+        let bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: self.config.width.min(i32::MAX as u32) as i32,
+            bottom: self.config.height.min(i32::MAX as u32) as i32,
+        };
+        let text_areas = positioned
+            .iter()
+            .map(|text| TextArea {
+                buffer: &text.buffer,
+                left: text.x,
+                top: text.y,
+                scale: 1.0,
+                bounds,
+                default_color: text.color,
+                custom_glyphs: &[],
+            })
+            .collect::<Vec<_>>();
+        let prepare_started = Instant::now();
+        self.text_renderer
+            .prepare(
+                &self.device,
+                &self.queue,
+                font_system,
+                &mut self.text_atlas,
+                &self.text_viewport,
+                text_areas,
+                &mut self.swash_cache,
+            )
+            .map_err(|error| error.to_string())?;
+        let atlas_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+        self.text_buffers = positioned;
+
+        Ok(TextPreparationStats {
+            system_font_init_ms: self.system_font_init_ms,
+            glyph_count,
+            line_count,
+            shaping_ms,
+            atlas_prepare_ms,
+            total_ms: total_started.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+
+    fn system_font_init_ms(&self) -> f64 {
+        self.system_font_init_ms
+    }
+}
+
+fn parse_text_color(value: &str) -> Option<TextColor> {
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() != 6 && hex.len() != 8 {
+        return None;
+    }
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    let alpha = if hex.len() == 8 {
+        u8::from_str_radix(&hex[6..8], 16).ok()?
+    } else {
+        255
+    };
+    Some(TextColor::rgba(red, green, blue, alpha))
 }
 
 #[derive(Default)]
@@ -836,6 +1054,30 @@ impl Window {
             .as_ref()
             .map(|renderer| renderer.present_mode_name.clone())
             .unwrap_or_default()
+    }
+
+    #[napi(js_name = "setTextRuns")]
+    pub fn set_text_runs(&mut self, runs: Vec<TextRunOptions>) -> Result<TextPreparationStats> {
+        if self.app.closed {
+            return Err(Error::new(Status::GenericFailure, "window is closed"));
+        }
+        let renderer = self
+            .app
+            .renderer
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        renderer
+            .set_text_runs(runs)
+            .map_err(|error| Error::new(Status::InvalidArg, error))
+    }
+
+    #[napi(js_name = "systemFontInitMs")]
+    pub fn system_font_init_ms(&self) -> f64 {
+        self.app
+            .renderer
+            .as_ref()
+            .map(Renderer::system_font_init_ms)
+            .unwrap_or(0.0)
     }
 
     #[napi]
