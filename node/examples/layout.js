@@ -31,6 +31,40 @@ assert.equal(byName("card-0").x, 24);
 assert.equal(byName("card-1").x, 92);
 assert.equal(byName("card-10").y, 126);
 
+const scrollDoc = new Document();
+const scroller = scrollDoc.createElement("scroller", {
+  display: "flex", direction: "column", width: 100, height: 40, overflow: "auto",
+});
+scrollDoc.body.appendChild(scroller);
+for (let index = 0; index < 4; index++) {
+  scroller.appendChild(scrollDoc.createElement(`item-${index}`, { width: 100, height: 30, flexShrink: 0 }));
+}
+let scrollBoxes = await scrollDoc.layout(100, 100);
+assert.equal(scroller.scrollTop, 0);
+assert.equal(scrollBoxes.find((box) => box.element === scroller).scrollHeight, 120);
+assert.equal(scrollDoc.scrollAt(10, 10, 0, 25), true);
+scrollBoxes = scrollDoc.boxes();
+assert.equal(scroller.scrollTop, 25);
+assert.equal(scrollBoxes.find((box) => box.element.name === "item-0").y, -25);
+assert.deepEqual(scrollBoxes.find((box) => box.element.name === "item-0").clip, {
+  x: 0, y: 0, width: 100, height: 40,
+});
+const inputDefaults = scrollDoc.createElement("input").style;
+const textareaDefaults = scrollDoc.createElement("textarea").style;
+assert.equal(inputDefaults.overflow, "hidden");
+assert.equal(inputDefaults.padding, 0);
+assert.equal(inputDefaults.backgroundColor, "transparent");
+assert.equal(inputDefaults.justifyContent, "start");
+assert.equal(inputDefaults.alignItems, "center");
+assert.equal(textareaDefaults.overflow, "hidden");
+assert.equal(textareaDefaults.padding, 0);
+assert.equal(textareaDefaults.backgroundColor, "transparent");
+assert.equal(textareaDefaults.justifyContent, "start");
+assert.equal(textareaDefaults.alignItems, "start");
+assert.equal(scrollDoc.handleEvent({ type: "wheel", x: 10, y: 10, deltaY: 15 }), true);
+assert.equal(scroller.scrollTop, 40);
+await scrollDoc.close();
+
 // Timings include JS mutation, Taffy layout, and reading every box. They do
 // not include GPU presentation, which arrives with the window feature.
 const samples = [];

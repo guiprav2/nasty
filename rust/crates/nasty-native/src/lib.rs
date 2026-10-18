@@ -2,9 +2,10 @@
 
 use glyphon::{
     Attrs, Buffer as TextBuffer, Cache as TextCache, Color as TextColor, Family, FontSystem,
-    Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
-    Viewport,
+    Edit, Editor, Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
+    TextRenderer, Viewport,
 };
+use glyphon::cosmic_text::Wrap;
 use napi::bindgen_prelude::Buffer;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
@@ -16,8 +17,9 @@ use taffy::prelude::*;
 use taffy::tree::TaffyError;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent as OsWindowEvent;
+use winit::event::{Ime, MouseScrollDelta, WindowEvent as OsWindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::ModifiersState;
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use winit::window::{Window as OsWindow, WindowId};
 
@@ -295,6 +297,82 @@ pub struct NativeEvent {
     pub x: f64,
     pub y: f64,
     pub key: Option<String>,
+    pub text: Option<String>,
+    pub modifiers: Option<String>,
+    #[napi(js_name = "deltaX")]
+    pub delta_x: Option<f64>,
+    #[napi(js_name = "deltaY")]
+    pub delta_y: Option<f64>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct TextAreaOptions {
+    pub id: String,
+    pub value: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    #[napi(js_name = "fontSize")]
+    pub font_size: f64,
+    #[napi(js_name = "lineHeight")]
+    pub line_height: Option<f64>,
+    pub multiline: Option<bool>,
+    pub focus: Option<bool>,
+    pub trace: Option<bool>,
+}
+
+#[napi(object)]
+pub struct TextSelectionRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[napi(object)]
+pub struct TextAreaState {
+    pub value: String,
+    #[napi(js_name = "displayText")]
+    pub display_text: String,
+    #[napi(js_name = "selectionStart")]
+    pub selection_start: u32,
+    #[napi(js_name = "selectionEnd")]
+    pub selection_end: u32,
+    #[napi(js_name = "caretIndex")]
+    pub caret_index: u32,
+    #[napi(js_name = "caretX")]
+    pub caret_x: f64,
+    #[napi(js_name = "caretY")]
+    pub caret_y: f64,
+    #[napi(js_name = "caretHeight")]
+    pub caret_height: f64,
+    #[napi(js_name = "editorCaretX")]
+    pub editor_caret_x: f64,
+    #[napi(js_name = "textOriginX")]
+    pub text_origin_x: f64,
+    #[napi(js_name = "textOriginY")]
+    pub text_origin_y: f64,
+    pub focused: bool,
+    #[napi(js_name = "systemFontReady")]
+    pub system_font_ready: bool,
+    #[napi(js_name = "systemFontLoadMs")]
+    pub system_font_load_ms: f64,
+    #[napi(js_name = "selectionRects")]
+    pub selection_rects: Vec<TextSelectionRect>,
+}
+
+#[napi(object)]
+pub struct TextAreaGeometry {
+    #[napi(js_name = "caretX")]
+    pub caret_x: f64,
+    #[napi(js_name = "caretY")]
+    pub caret_y: f64,
+    #[napi(js_name = "caretHeight")]
+    pub caret_height: f64,
+    #[napi(js_name = "selectionRects")]
+    pub selection_rects: Vec<TextSelectionRect>,
 }
 
 #[napi(object)]
@@ -326,6 +404,27 @@ pub struct TextRunOptions {
     pub color: String,
     #[napi(js_name = "fontFamily")]
     pub font_family: Option<String>,
+    #[napi(js_name = "clipX")]
+    pub clip_x: Option<f64>,
+    #[napi(js_name = "clipY")]
+    pub clip_y: Option<f64>,
+    #[napi(js_name = "clipWidth")]
+    pub clip_width: Option<f64>,
+    #[napi(js_name = "clipHeight")]
+    pub clip_height: Option<f64>,
+    pub wrap: Option<bool>,
+}
+
+fn text_bounds(run: &TextRunOptions, width: u32, height: u32) -> TextBounds {
+    let left = run.clip_x.unwrap_or(0.0).floor().clamp(0.0, i32::MAX as f64) as i32;
+    let top = run.clip_y.unwrap_or(0.0).floor().clamp(0.0, i32::MAX as f64) as i32;
+    let right = run.clip_x.zip(run.clip_width)
+        .map(|(x, w)| (x + w).ceil().clamp(0.0, i32::MAX as f64) as i32)
+        .unwrap_or(width.min(i32::MAX as u32) as i32);
+    let bottom = run.clip_y.zip(run.clip_height)
+        .map(|(y, h)| (y + h).ceil().clamp(0.0, i32::MAX as f64) as i32)
+        .unwrap_or(height.min(i32::MAX as u32) as i32);
+    TextBounds { left, top, right: right.max(left), bottom: bottom.max(top) }
 }
 
 #[napi(object)]
@@ -376,10 +475,12 @@ struct Renderer {
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
     text_runtime: Option<TextRuntime>,
+    worker_runtime: Option<TextRuntime>,
     text_worker: Sender<TextWorkerMessage>,
     text_results: Receiver<TextWorkerResult>,
     pending_text_request: Option<u32>,
     next_text_request: u32,
+    active_text_request: u32,
     adapter_name: String,
     format_name: String,
     present_mode_name: String,
@@ -399,8 +500,613 @@ struct TextRuntime {
     swash_cache: SwashCache,
     text_viewport: Viewport,
     text_atlas: TextAtlas,
-    text_renderer: TextRenderer,
+    text_renderers: Vec<TextRenderer>,
     text_buffers: Vec<PositionedText>,
+    text_run_options: Vec<TextRunOptions>,
+}
+
+struct TextEditor {
+    context: egui::Context,
+    winit: egui_winit::State,
+    system_fonts: Receiver<std::result::Result<SystemEditorFont, String>>,
+    system_font_ready: bool,
+    system_font_load_ms: f64,
+    system_font_bytes: Option<Vec<u8>>,
+    system_font_family: Option<String>,
+    caret_geometry_calibration: Option<CaretGeometryCalibration>,
+    word_drag: Option<WordDragState>,
+}
+
+struct WordDragState {
+    control_id: String,
+    start: usize,
+    end: usize,
+    anchor: Option<usize>,
+    dragging: bool,
+    armed_for_followup: bool,
+    tap_drag_active: bool,
+    tap_drag_origin: Option<egui::Pos2>,
+    tap_drag_last_pos: Option<egui::Pos2>,
+    tap_drag_armed_at: Option<Instant>,
+    tap_drag_last_motion: Option<Instant>,
+    text: String,
+}
+
+fn egui_word_range(text: &str, cursor_index: usize) -> (usize, usize) {
+    use egui::text_selection::text_cursor_state::{
+        ccursor_next_word, ccursor_previous_word, is_word_char,
+    };
+    use egui::text::CCursor;
+
+    let cursor = CCursor::new(cursor_index.min(text.chars().count()));
+    if cursor.index == 0 {
+        return (
+            cursor.index,
+            ccursor_next_word(text, cursor).index,
+        );
+    }
+
+    let mut chars = text.chars().skip(cursor.index - 1);
+    if let Some(before) = chars.next() {
+        if let Some(after) = chars.next() {
+            if is_word_char(before) && is_word_char(after) {
+                let start = ccursor_previous_word(text, cursor + 1);
+                let end = ccursor_next_word(text, start);
+                (start.index, end.index)
+            } else if is_word_char(before) {
+                let start = ccursor_previous_word(text, cursor);
+                let end = ccursor_next_word(text, start);
+                (start.index, end.index)
+            } else if is_word_char(after) {
+                (cursor.index, ccursor_next_word(text, cursor).index)
+            } else {
+                (
+                    ccursor_previous_word(text, cursor).index,
+                    ccursor_next_word(text, cursor).index,
+                )
+            }
+        } else {
+            (ccursor_previous_word(text, cursor).index, cursor.index)
+        }
+    } else {
+        (cursor.index, ccursor_next_word(text, cursor).index)
+    }
+}
+
+#[derive(Clone)]
+struct CaretGeometryCalibration {
+    control_id: String,
+    rendered_x: f64,
+    rendered_y: f64,
+    rendered_height: f64,
+}
+
+struct SystemEditorFont {
+    bytes: Vec<u8>,
+    face_index: u32,
+    family_name: String,
+    load_ms: f64,
+}
+
+const SYSTEM_EDITOR_FONT_KEY: &str = "nasty-system-sans";
+
+fn load_system_editor_font() -> std::result::Result<SystemEditorFont, String> {
+    let started = Instant::now();
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    let families = [fontdb::Family::SansSerif];
+    let id = database
+        .query(&fontdb::Query {
+            families: &families,
+            ..Default::default()
+        })
+        .ok_or_else(|| "no installed system sans-serif font was found".to_string())?;
+    let (bytes, face_index) = database
+        .with_face_data(id, |data, index| (data.to_vec(), index))
+        .ok_or_else(|| "the selected system font has no readable font data".to_string())?;
+    let family_name = database
+        .face(id)
+        .and_then(|face| face.families.first())
+        .map(|(name, _)| name.clone())
+        .ok_or_else(|| "the selected system font has no family name".to_string())?;
+    Ok(SystemEditorFont {
+        bytes,
+        face_index,
+        family_name,
+        load_ms: started.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+impl TextEditor {
+    fn new(window: &OsWindow) -> Self {
+        let context = egui::Context::default();
+        let winit = egui_winit::State::new(
+            context.clone(),
+            egui::ViewportId::ROOT,
+            window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        let (font_sender, system_fonts) = mpsc::channel();
+        let _ = thread::Builder::new()
+            .name("nasty-editor-system-font".into())
+            .spawn(move || {
+                let _ = font_sender.send(load_system_editor_font());
+            });
+        Self {
+            context,
+            winit,
+            system_fonts,
+            system_font_ready: false,
+            system_font_load_ms: 0.0,
+            system_font_bytes: None,
+            system_font_family: None,
+            caret_geometry_calibration: None,
+            word_drag: None,
+        }
+    }
+
+    fn on_window_event(&mut self, window: &OsWindow, event: &OsWindowEvent) {
+        let _ = self.winit.on_window_event(window, event);
+    }
+
+    fn update_many(
+        &mut self,
+        window: &OsWindow,
+        controls: Vec<TextAreaOptions>,
+        renderer: Option<&Renderer>,
+    ) -> Vec<TextAreaState> {
+        if let Ok(Ok(font)) = self.system_fonts.try_recv() {
+            self.system_font_bytes = Some(font.bytes.clone());
+            self.system_font_family = Some(font.family_name.clone());
+            let mut definitions = egui::FontDefinitions::default();
+            let mut system_font = egui::FontData::from_owned(font.bytes);
+            system_font.index = font.face_index;
+            definitions.font_data.insert(
+                SYSTEM_EDITOR_FONT_KEY.to_string(),
+                std::sync::Arc::new(system_font),
+            );
+            definitions
+                .families
+                .get_mut(&egui::FontFamily::Proportional)
+                .expect("proportional font family exists")
+                .insert(0, SYSTEM_EDITOR_FONT_KEY.to_string());
+            self.context.set_fonts(definitions);
+            self.system_font_ready = true;
+            self.system_font_load_ms = font.load_ms;
+        }
+        let input = self.winit.take_egui_input(window);
+        let pixels_per_point = window.scale_factor() as f32;
+        let mut edit_results = Vec::with_capacity(controls.len());
+        let mut output = self.context.run(input, |context| {
+            let mut visuals = egui::Visuals::dark();
+            visuals.selection.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.selection.stroke = egui::Stroke::NONE;
+            visuals.text_cursor.stroke = egui::Stroke::NONE;
+            context.set_visuals(visuals);
+            for options in &controls {
+                let id = egui::Id::new(("nasty-text-control", options.id.clone()));
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(options.x as f32, options.y as f32) / pixels_per_point,
+                    egui::vec2(options.width as f32, options.height as f32) / pixels_per_point,
+                );
+                let multiline = options.multiline.unwrap_or(true);
+                let font_size = options.font_size.clamp(1.0, 256.0) as f32 / pixels_per_point;
+                let line_height = options.line_height
+                    .filter(|height| height.is_finite() && *height > 0.0)
+                    .map(|height| height.clamp(1.0, 512.0) as f32 / pixels_per_point)
+                    .unwrap_or(font_size * 1.2);
+                if options.focus.unwrap_or(false) {
+                    context.memory_mut(|memory| memory.request_focus(id));
+                }
+                let mut value = options.value.clone();
+                let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                    let mut job = if multiline {
+                        egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(font_size), egui::Color32::TRANSPARENT, wrap_width)
+                    } else {
+                        egui::text::LayoutJob::simple_singleline(text.to_owned(), egui::FontId::proportional(font_size), egui::Color32::TRANSPARENT)
+                    };
+                    job.sections[0].format.line_height = Some(line_height);
+                    ui.fonts(|fonts| fonts.layout_job(job))
+                };
+                let edit = if multiline {
+                    egui::TextEdit::multiline(&mut value)
+                } else {
+                    egui::TextEdit::singleline(&mut value)
+                        .return_key(None)
+                        .clip_text(true)
+                        .vertical_align(egui::Align::Center)
+                };
+                let edit = egui::Area::new(egui::Id::new(("nasty-text-area", id)))
+                    .fixed_pos(rect.min)
+                    .order(egui::Order::Foreground)
+                    .show(context, |ui| {
+                        ui.set_clip_rect(rect);
+                        ui.set_min_size(rect.size());
+                        ui.set_max_size(rect.size());
+                        edit.id(id).frame(false).margin(egui::Margin::ZERO)
+                            .desired_width(rect.width()).min_size(rect.size())
+                            .font(egui::FontId::proportional(font_size))
+                            .layouter(&mut layouter).text_color(egui::Color32::TRANSPARENT).show(ui)
+                    }).inner;
+                edit_results.push((options.clone(), value, edit));
+            }
+        });
+        let mut states = Vec::with_capacity(edit_results.len());
+        for (options, value, mut edit) in edit_results {
+        let font_size = options.font_size.clamp(1.0, 256.0) as f32 / pixels_per_point;
+        if self
+            .word_drag
+            .as_ref()
+            .is_some_and(|state| state.control_id == options.id && state.text != edit.galley.text())
+        {
+            self.word_drag = None;
+        }
+        let pointer_button = egui::PointerButton::Primary;
+        let pointer_pressed = self
+            .context
+            .input(|input| input.pointer.button_pressed(pointer_button));
+        let pointer_down = self
+            .context
+            .input(|input| input.pointer.button_down(pointer_button));
+        let pointer_position = self
+            .context
+            .input(|input| input.pointer.latest_pos());
+        let pointer_released = self
+            .context
+            .input(|input| input.pointer.button_released(pointer_button));
+        // After a tap, egui only exposes interact_pointer_pos while a widget
+        // owns an active press/drag. For touchpad tap-drag, movement can arrive
+        // after that synthetic press has ended, so use the hover position while
+        // our short-lived word-drag gesture is armed.
+        let pointer_for_cursor = edit.response.interact_pointer_pos().or_else(|| {
+            self.word_drag
+                .as_ref()
+                .filter(|state| state.control_id == options.id && state.tap_drag_active)
+                .and_then(|_| pointer_position.filter(|position| edit.response.rect.contains(*position)))
+        });
+        let pointer_cursor = pointer_for_cursor.map(|pointer| {
+            edit.galley
+                .cursor_from_pos(pointer - edit.galley_pos)
+                .ccursor
+                .index
+        });
+        if options.trace.unwrap_or(false)
+            && (pointer_pressed
+                || pointer_released
+                || pointer_down
+                || edit.response.dragged_by(pointer_button)
+                || edit.response.double_clicked_by(pointer_button)
+                || edit.response.triple_clicked_by(pointer_button)
+                || self
+                    .word_drag
+                    .as_ref()
+                    .is_some_and(|state| state.control_id == options.id && state.tap_drag_active)
+                    && self
+                        .context
+                        .input(|input| input.pointer.delta().length_sq() > 0.0))
+        {
+            let (double, triple, pos, delta) = self.context.input(|input| {
+                (
+                    input.pointer.button_double_clicked(pointer_button),
+                    input.pointer.button_triple_clicked(pointer_button),
+                    input.pointer.latest_pos(),
+                    input.pointer.delta(),
+                )
+            });
+            eprintln!(
+                "[textarea pointer] pressed={pointer_pressed} released={pointer_released} down={pointer_down} double={double} triple={triple} dragged={} pos={pos:?} delta={delta:?} hit={pointer_cursor:?} range={:?} word_drag={:?}",
+                edit.response.dragged_by(pointer_button),
+                edit.cursor_range.map(|range| range.as_sorted_char_range()),
+                self.word_drag
+                    .as_ref()
+                    .map(|state| {
+                        (
+                            state.start,
+                            state.end,
+                            state.anchor,
+                            state.dragging,
+                            state.armed_for_followup,
+                            state.tap_drag_active,
+                        )
+                    }),
+            );
+        }
+        // A touchpad's tap-and-drag gesture starts with a third tap on the
+        // selected word. egui may classify that press as another multi-click
+        // and replace the selection before the drag threshold is crossed.
+        let continue_word_drag = pointer_pressed
+            && pointer_cursor.is_some_and(|index| {
+                self.word_drag
+                    .as_ref()
+                    .is_some_and(|state| {
+                        state.control_id == options.id
+                            &&
+                        state.armed_for_followup
+                            && state
+                                .tap_drag_armed_at
+                                .is_some_and(|armed| {
+                                    armed.elapsed() <= Duration::from_millis(650)
+                                })
+                            && (state.start..=state.end).contains(&index)
+                    })
+            });
+        if continue_word_drag {
+            if let Some(state) = self.word_drag.as_mut() {
+                state.armed_for_followup = false;
+                state.dragging = true;
+                state.anchor = None;
+                state.tap_drag_active = true;
+                state.tap_drag_origin = pointer_for_cursor;
+                state.tap_drag_last_pos = pointer_for_cursor;
+                state.tap_drag_armed_at = Some(Instant::now());
+                state.tap_drag_last_motion = None;
+                let range = egui::text::CursorRange::two(
+                    edit.galley
+                        .from_ccursor(egui::text::CCursor::new(state.start)),
+                    edit.galley
+                        .from_ccursor(egui::text::CCursor::new(state.end)),
+                );
+                edit.cursor_range = Some(range);
+                edit.state.cursor.set_range(Some(range));
+                edit.state.clone().store(&self.context, edit.response.id);
+            }
+        } else if pointer_pressed
+            && pointer_released
+            && pointer_down
+            && !edit.response.double_clicked_by(pointer_button)
+        {
+            // Some touchpad drivers coalesce the first tap's release and the
+            // second tap's press into one egui frame. If the second press is
+            // then held and moved, egui sees only a normal drag and never emits
+            // its double-click selection. Seed word selection before that drag.
+            if let Some(pointer_index) = pointer_cursor {
+                let (start, end) = egui_word_range(edit.galley.text(), pointer_index);
+                if start != end {
+                    self.word_drag = Some(WordDragState {
+                        control_id: options.id.clone(),
+                        start,
+                        end,
+                        anchor: None,
+                        dragging: true,
+                        armed_for_followup: false,
+                        tap_drag_active: true,
+                        tap_drag_origin: pointer_for_cursor,
+                        tap_drag_last_pos: pointer_for_cursor,
+                        tap_drag_armed_at: Some(Instant::now()),
+                        tap_drag_last_motion: None,
+                        text: edit.galley.text().to_owned(),
+                    });
+                    let range = egui::text::CursorRange::two(
+                        edit.galley.from_ccursor(egui::text::CCursor::new(start)),
+                        edit.galley.from_ccursor(egui::text::CCursor::new(end)),
+                    );
+                    edit.cursor_range = Some(range);
+                    edit.state.cursor.set_range(Some(range));
+                    edit.state.clone().store(&self.context, edit.response.id);
+                }
+            }
+        } else if edit.response.double_clicked_by(pointer_button) {
+            if let Some(range) = edit.cursor_range.filter(|range| !range.is_empty()) {
+                let selected = range.as_sorted_char_range();
+                self.word_drag = Some(WordDragState {
+                    control_id: options.id.clone(),
+                    start: selected.start,
+                    end: selected.end,
+                    anchor: None,
+                    dragging: pointer_down,
+                    armed_for_followup: !pointer_down,
+                    tap_drag_active: pointer_down,
+                    tap_drag_origin: pointer_for_cursor,
+                    tap_drag_last_pos: pointer_for_cursor,
+                    tap_drag_armed_at: Some(Instant::now()),
+                    tap_drag_last_motion: None,
+                    text: edit.galley.text().to_owned(),
+                });
+            }
+        } else if pointer_pressed && pointer_cursor.is_some() {
+            // A new press after a completed word drag starts a fresh selection
+            // at that point, even if it lies inside the previous word range.
+            self.word_drag = None;
+        }
+        if let (Some(state), Some(pointer_index)) = (self.word_drag.as_mut(), pointer_cursor) {
+            if state.control_id != options.id {
+                // Word drag belongs to whichever text control initiated it.
+            } else {
+            let now = Instant::now();
+            let mut tap_drag_motion = false;
+            if state.tap_drag_active {
+                if let Some(position) = pointer_position {
+                    let moved = state
+                        .tap_drag_last_pos
+                        .is_some_and(|previous| previous.distance(position) >= 1.5);
+                    let passed_drag_threshold = state
+                        .tap_drag_origin
+                        .is_some_and(|origin| origin.distance(position) >= 3.0);
+                    if moved && (passed_drag_threshold || state.tap_drag_last_motion.is_some()) {
+                        state.tap_drag_last_pos = Some(position);
+                        state.tap_drag_last_motion = Some(now);
+                        tap_drag_motion = !pointer_down;
+                    }
+                }
+                let started = state.tap_drag_armed_at.unwrap_or(now);
+                let expired_before_motion = state.tap_drag_last_motion.is_none()
+                    && now.duration_since(started) > Duration::from_millis(650);
+                let idle_after_motion = state.tap_drag_last_motion.is_some_and(|last_motion| {
+                    now.duration_since(last_motion) > Duration::from_millis(500)
+                });
+                if expired_before_motion || idle_after_motion {
+                    state.tap_drag_active = false;
+                    if !pointer_down {
+                        state.dragging = false;
+                    }
+                }
+            }
+            let native_drag = pointer_down && edit.response.dragged_by(pointer_button);
+            if state.dragging && (native_drag || tap_drag_motion) {
+                if native_drag {
+                    state.tap_drag_active = false;
+                }
+                if pointer_index < state.start {
+                    state.anchor = Some(state.end);
+                } else if pointer_index > state.end {
+                    state.anchor = Some(state.start);
+                }
+                if let Some(anchor) = state.anchor {
+                    let (word_start, word_end) = egui_word_range(edit.galley.text(), pointer_index);
+                    let endpoint = if word_end <= anchor {
+                        word_start
+                    } else if word_start >= anchor {
+                        word_end
+                    } else {
+                        anchor
+                    };
+                    let primary = edit.galley.from_ccursor(egui::text::CCursor::new(endpoint));
+                    let secondary = edit.galley.from_ccursor(egui::text::CCursor::new(anchor));
+                    let range = egui::text::CursorRange { primary, secondary };
+                    edit.cursor_range = Some(range);
+                    edit.state.cursor.set_range(Some(range));
+                    edit.state.store(&self.context, edit.response.id);
+                } else {
+                    let range = egui::text::CursorRange::two(
+                        edit.galley
+                            .from_ccursor(egui::text::CCursor::new(state.start)),
+                        edit.galley.from_ccursor(egui::text::CCursor::new(state.end)),
+                    );
+                    edit.cursor_range = Some(range);
+                    edit.state.cursor.set_range(Some(range));
+                    edit.state.store(&self.context, edit.response.id);
+                }
+            } else if !pointer_down && !state.tap_drag_active {
+                if state.anchor.is_some() {
+                    if let Some(range) = edit.cursor_range.filter(|range| !range.is_empty()) {
+                        let selected = range.as_sorted_char_range();
+                        state.start = selected.start;
+                        state.end = selected.end;
+                        state.anchor = None;
+                    }
+                }
+                state.dragging = false;
+            }
+            }
+        }
+        let range = edit.cursor_range;
+        let (selection_start, selection_end) = range
+            .map(|range| {
+                let selected = range.as_sorted_char_range();
+                (selected.start, selected.end)
+            })
+            .unwrap_or((0, 0));
+        let caret_index = range
+            .map(|range| range.primary.ccursor.index)
+            .unwrap_or(selection_end);
+        let mut selection_rects = Vec::new();
+        let mut caret_x = edit.galley_pos.x as f64;
+        let mut caret_y = edit.galley_pos.y as f64;
+        let mut caret_height = font_size as f64;
+        if let Some(range) = range {
+            let cursor = edit.galley.pos_from_cursor(&range.primary);
+            caret_x = (edit.galley_pos.x + cursor.left()) as f64;
+            caret_y = (edit.galley_pos.y + cursor.top()) as f64;
+            caret_height = cursor.height() as f64;
+            if !range.is_empty() {
+                let [start, end] = range.sorted_cursors();
+                for row_index in start.rcursor.row..=end.rcursor.row {
+                    let Some(row) = edit.galley.rows.get(row_index) else {
+                        continue;
+                    };
+                    let left = if row_index == start.rcursor.row {
+                        row.x_offset(start.rcursor.column)
+                    } else {
+                        row.rect.left()
+                    };
+                    let right = if row_index == end.rcursor.row {
+                        row.x_offset(end.rcursor.column)
+                    } else {
+                        row.rect.right()
+                            + if row.ends_with_newline {
+                                row.height() * 0.5
+                            } else {
+                                0.0
+                            }
+                    };
+                    if right > left {
+                        selection_rects.push(TextSelectionRect {
+                            x: (edit.galley_pos.x + left) as f64 * pixels_per_point as f64,
+                            y: (edit.galley_pos.y + row.min_y()) as f64 * pixels_per_point as f64,
+                            width: (right - left) as f64 * pixels_per_point as f64,
+                            height: row.height() as f64 * pixels_per_point as f64,
+                        });
+                    }
+                }
+            }
+        }
+        let mut state = TextAreaState {
+            value,
+            display_text: edit.galley.job.text.to_string(),
+            selection_start: selection_start.min(u32::MAX as usize) as u32,
+            selection_end: selection_end.min(u32::MAX as usize) as u32,
+            caret_index: caret_index.min(u32::MAX as usize) as u32,
+            caret_x: caret_x * pixels_per_point as f64,
+            caret_y: caret_y * pixels_per_point as f64,
+            caret_height: caret_height * pixels_per_point as f64,
+            editor_caret_x: caret_x * pixels_per_point as f64,
+            text_origin_x: edit.galley_pos.x as f64 * pixels_per_point as f64,
+            text_origin_y: edit.galley_pos.y as f64 * pixels_per_point as f64,
+            focused: edit.response.has_focus(),
+            system_font_ready: self.system_font_ready,
+            system_font_load_ms: self.system_font_load_ms,
+            selection_rects,
+        };
+        let exact_geometry = renderer.and_then(|renderer| {
+            renderer.textarea_geometry(
+                &state.display_text,
+                state.selection_start,
+                state.selection_end,
+                state.caret_index,
+            )
+        });
+        if let Some((x, y, height, rects)) = exact_geometry {
+            state.caret_x = x;
+            state.caret_y = y;
+            state.caret_height = height;
+            state.selection_rects = rects;
+            self.caret_geometry_calibration = Some(CaretGeometryCalibration {
+                control_id: options.id.clone(),
+                rendered_x: x,
+                rendered_y: y,
+                rendered_height: height,
+            });
+        } else if let Some(calibration) = self
+            .caret_geometry_calibration
+            .as_ref()
+            .filter(|calibration| calibration.control_id == options.id)
+        {
+            state.caret_x = calibration.rendered_x;
+            state.caret_y = calibration.rendered_y;
+            state.caret_height = calibration.rendered_height;
+        }
+        if state.focused
+            && self
+                .caret_geometry_calibration
+                .as_ref()
+                .is_some_and(|calibration| calibration.control_id == options.id)
+        {
+            if let Some(ime) = output.platform_output.ime.as_mut() {
+                let caret_rect = egui::Rect::from_min_size(
+                    egui::pos2(state.caret_x as f32, state.caret_y as f32) / pixels_per_point,
+                    egui::vec2(1.0, state.caret_height as f32) / pixels_per_point,
+                );
+                ime.rect = caret_rect;
+                ime.cursor_rect = caret_rect;
+            }
+        }
+        states.push(state);
+        }
+        self.winit.handle_platform_output(window, output.platform_output);
+        states
+    }
 }
 
 struct TextWorkerMessage {
@@ -418,6 +1124,30 @@ struct TextWorkerResult {
     request_id: u32,
     runtime: TextRuntime,
     stats: std::result::Result<TextPreparationStats, String>,
+}
+
+fn create_text_runtime(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> TextRuntime {
+    let cache = TextCache::new(device);
+    let mut viewport = Viewport::new(device, &cache);
+    viewport.update(queue, Resolution { width, height });
+    let atlas = TextAtlas::new(device, queue, &cache, format);
+    TextRuntime {
+        font_system: None,
+        system_font_init_ms: 0.0,
+        loaded_custom_fonts: std::collections::HashSet::new(),
+        swash_cache: SwashCache::new(),
+        text_viewport: viewport,
+        text_atlas: atlas,
+        text_renderers: Vec::new(),
+        text_buffers: Vec::new(),
+        text_run_options: Vec::new(),
+    }
 }
 
 impl Renderer {
@@ -563,64 +1293,26 @@ impl Renderer {
         let warmup_data = vec![0_u8; vertex_capacity];
         queue.write_buffer(&vertex_buffer, 0, &warmup_data);
 
-        // Keep font discovery and GPU atlas preparation off the render thread.
-        let font_system = None;
-        let swash_cache = SwashCache::new();
-        let text_cache = TextCache::new(&device);
-        let mut text_viewport = Viewport::new(&device, &text_cache);
-        text_viewport.update(
-            &queue,
-            Resolution {
-                width: config.width,
-                height: config.height,
-            },
-        );
-        let mut text_atlas = TextAtlas::new(&device, &queue, &text_cache, format);
-        let text_renderer = TextRenderer::new(
-            &mut text_atlas,
-            &device,
-            wgpu::MultisampleState::default(),
-            None,
-        );
-
-        let text_runtime = TextRuntime {
-            font_system,
-            system_font_init_ms: 0.0,
-            loaded_custom_fonts: std::collections::HashSet::new(),
-            swash_cache,
-            text_viewport,
-            text_atlas,
-            text_renderer,
-            text_buffers: Vec::new(),
-        };
+        // Keep the active atlas on the render thread while the spare runtime
+        // shapes and uploads the next text version on the worker.
+        let text_runtime =
+            create_text_runtime(&device, &queue, format, config.width, config.height);
+        let worker_runtime =
+            create_text_runtime(&device, &queue, format, config.width, config.height);
         let (text_worker, text_jobs) = mpsc::channel::<TextWorkerMessage>();
         let (text_result_sender, text_results) = mpsc::channel::<TextWorkerResult>();
         thread::Builder::new()
             .name("nasty-text-preparation".into())
             .spawn(move || {
                 while let Ok(mut job) = text_jobs.recv() {
-                    let cold = job.runtime.set_text_runs(
-                        job.runs.clone(),
+                    let stats = job.runtime.set_text_runs(
+                        job.runs,
                         &job.custom_fonts,
                         &job.device,
                         &job.queue,
                         job.width,
                         job.height,
                     );
-                    let stats = cold.and_then(|mut stats| {
-                        let warm = job.runtime.set_text_runs(
-                            job.runs,
-                            &[],
-                            &job.device,
-                            &job.queue,
-                            job.width,
-                            job.height,
-                        )?;
-                        stats.warm_shaping_ms = warm.shaping_ms;
-                        stats.warm_atlas_prepare_ms = warm.atlas_prepare_ms;
-                        stats.warm_total_ms = warm.total_ms;
-                        Ok(stats)
-                    });
                     if text_result_sender
                         .send(TextWorkerResult {
                             request_id: job.request_id,
@@ -644,10 +1336,12 @@ impl Renderer {
             vertex_buffer,
             vertex_capacity,
             text_runtime: Some(text_runtime),
+            worker_runtime: Some(worker_runtime),
             text_worker,
             text_results,
             pending_text_request: None,
             next_text_request: 1,
+            active_text_request: 0,
             adapter_name,
             format_name,
             present_mode_name,
@@ -780,10 +1474,11 @@ impl Renderer {
                 .as_ref()
                 .filter(|runtime| !runtime.text_buffers.is_empty())
             {
-                runtime
-                    .text_renderer
-                    .render(&runtime.text_atlas, &runtime.text_viewport, &mut pass)
-                    .map_err(|error| format!("render text: {error}"))?;
+                for text_renderer in &runtime.text_renderers {
+                    text_renderer
+                        .render(&runtime.text_atlas, &runtime.text_viewport, &mut pass)
+                        .map_err(|error| format!("render text: {error}"))?;
+                }
             }
         }
         let submit_started = Instant::now();
@@ -803,25 +1498,40 @@ impl Renderer {
 
     fn request_text_runs(
         &mut self,
-        runs: Vec<TextRunOptions>,
+        mut runs: Vec<TextRunOptions>,
         custom_fonts: Vec<TextFontData>,
+        system_font: Option<(String, Vec<u8>)>,
     ) -> std::result::Result<u32, String> {
         if self.pending_text_request.is_some() {
             return Err("a text preparation request is already pending".into());
         }
         let runtime = self
-            .text_runtime
+            .worker_runtime
             .take()
             .ok_or_else(|| "text resources are busy".to_string())?;
         let request_id = self.next_text_request;
         self.next_text_request = self.next_text_request.wrapping_add(1).max(1);
+        let mut custom_fonts = custom_fonts
+            .into_iter()
+            .map(|font| (font.family, font.data.to_vec()))
+            .collect::<Vec<_>>();
+        if let Some((family_name, data)) = system_font {
+            for run in &mut runs {
+                if run.font_family.is_none() {
+                    run.font_family = Some(family_name.clone());
+                }
+            }
+            if !custom_fonts
+                .iter()
+                .any(|(family, _)| family == &family_name)
+            {
+                custom_fonts.push((family_name, data));
+            }
+        }
         let job = TextWorkerMessage {
             request_id,
             runs,
-            custom_fonts: custom_fonts
-                .into_iter()
-                .map(|font| (font.family, font.data.to_vec()))
-                .collect(),
+            custom_fonts,
             runtime,
             device: self.device.clone(),
             queue: self.queue.clone(),
@@ -829,22 +1539,100 @@ impl Renderer {
             height: self.config.height,
         };
         if let Err(error) = self.text_worker.send(job) {
-            self.text_runtime = Some(error.0.runtime);
+            self.worker_runtime = Some(error.0.runtime);
             return Err("text worker is unavailable".into());
         }
         self.pending_text_request = Some(request_id);
+        self.active_text_request = request_id;
         Ok(request_id)
+    }
+
+    fn set_text_runs_now(
+        &mut self,
+        mut runs: Vec<TextRunOptions>,
+        custom_fonts: Vec<TextFontData>,
+        system_font: Option<(String, Vec<u8>)>,
+        update_run_index: Option<usize>,
+    ) -> std::result::Result<TextPreparationStats, String> {
+        let mut custom_fonts = custom_fonts
+            .into_iter()
+            .map(|font| (font.family, font.data.to_vec()))
+            .collect::<Vec<_>>();
+        if let Some((family_name, data)) = system_font {
+            for run in &mut runs {
+                if run.font_family.is_none() {
+                    run.font_family = Some(family_name.clone());
+                }
+            }
+            if !custom_fonts
+                .iter()
+                .any(|(family, _)| family == &family_name)
+            {
+                custom_fonts.push((family_name, data));
+            }
+        }
+        let request_id = self.next_text_request;
+        self.next_text_request = self.next_text_request.wrapping_add(1).max(1);
+        let runtime = self
+            .text_runtime
+            .as_mut()
+            .ok_or_else(|| "active text resources are unavailable".to_string())?;
+        let stats = if let Some(index) = update_run_index.filter(|index| {
+            *index < runs.len() && runtime.text_buffers.len() == runs.len()
+        }) {
+            runtime.set_text_run(
+                index,
+                runs.swap_remove(index),
+                &custom_fonts,
+                &self.device,
+                &self.queue,
+                self.config.width,
+                self.config.height,
+            )?
+        } else {
+            runtime.set_text_runs(
+                runs,
+                &custom_fonts,
+                &self.device,
+                &self.queue,
+                self.config.width,
+                self.config.height,
+            )?
+        };
+        self.active_text_request = request_id;
+        Ok(stats)
+    }
+
+    fn textarea_geometry_for_api(
+        &self,
+        text: &str,
+        selection_start: u32,
+        selection_end: u32,
+        caret_index: u32,
+    ) -> Option<TextAreaGeometry> {
+        let (caret_x, caret_y, caret_height, selection_rects) =
+            Renderer::textarea_geometry(self, text, selection_start, selection_end, caret_index)?;
+        Some(TextAreaGeometry {
+            caret_x,
+            caret_y,
+            caret_height,
+            selection_rects,
+        })
     }
 
     fn poll_text_runs(&mut self) -> std::result::Result<Option<TextPreparationStats>, String> {
         match self.text_results.try_recv() {
             Ok(result) => {
                 if self.pending_text_request != Some(result.request_id) {
-                    self.text_runtime = Some(result.runtime);
-                    return Err("received a stale text preparation result".into());
+                    self.worker_runtime = Some(result.runtime);
+                    return Ok(None);
                 }
-                self.text_runtime = Some(result.runtime);
                 self.pending_text_request = None;
+                if result.request_id != self.active_text_request {
+                    self.worker_runtime = Some(result.runtime);
+                    return Ok(None);
+                }
+                self.worker_runtime = self.text_runtime.replace(result.runtime);
                 if let Some(runtime) = self.text_runtime.as_mut() {
                     runtime.text_viewport.update(
                         &self.queue,
@@ -870,6 +1658,170 @@ impl Renderer {
 }
 
 impl TextRuntime {
+    fn set_text_run(
+        &mut self,
+        index: usize,
+        run: TextRunOptions,
+        custom_fonts: &[(String, Vec<u8>)],
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) -> std::result::Result<TextPreparationStats, String> {
+        if index >= self.text_buffers.len() || index >= self.text_renderers.len() {
+            return Err("text run index is outside the active text list".into());
+        }
+        let total_started = Instant::now();
+        if self.font_system.is_none() {
+            let font_init_started = Instant::now();
+            self.font_system = Some(FontSystem::new());
+            self.system_font_init_ms = font_init_started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let font_system = self.font_system.as_mut().expect("font system initialized");
+        let font_load_started = Instant::now();
+        for (family, data) in custom_fonts {
+            if self.loaded_custom_fonts.insert(family.clone()) {
+                font_system.db_mut().load_font_data(data.clone());
+            }
+        }
+        let custom_font_load_ms = font_load_started.elapsed().as_secs_f64() * 1000.0;
+        let [x, y, run_width, font_size, line_height] =
+            [run.x, run.y, run.width, run.font_size, run.line_height];
+        if [x, y, run_width, font_size, line_height]
+            .iter()
+            .any(|value| !value.is_finite())
+            || run_width < 0.0
+            || font_size <= 0.0
+            || line_height <= 0.0
+            || run_width > f32::MAX as f64
+            || font_size > f32::MAX as f64
+            || line_height > f32::MAX as f64
+        {
+            return Err("text run geometry and font metrics must be finite; width must be nonnegative and font size/line height positive".into());
+        }
+        let color = parse_text_color(&run.color)
+            .ok_or_else(|| format!("invalid text color: {}", run.color))?;
+        let shaping_started = Instant::now();
+        let previous_options = self.text_run_options.get(index);
+        let same_style = previous_options.is_some_and(|previous| {
+            previous.width == run.width
+                && previous.font_size == run.font_size
+                && previous.line_height == run.line_height
+                && previous.color == run.color
+                && previous.font_family == run.font_family
+                && previous.clip_x == run.clip_x
+                && previous.clip_y == run.clip_y
+                && previous.clip_width == run.clip_width
+                && previous.clip_height == run.clip_height
+                && previous.wrap == run.wrap
+        });
+        if same_style {
+            let old_text = self.text_buffers[index]
+                .buffer
+                .lines
+                .iter()
+                .map(|line| line.text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if old_text == run.text {
+                self.text_buffers[index].x = x as f32;
+                self.text_buffers[index].y = y as f32;
+                self.text_run_options[index] = run.clone();
+            } else {
+                let old_chars = old_text.chars().collect::<Vec<_>>();
+                let new_chars = run.text.chars().collect::<Vec<_>>();
+                let prefix = old_chars.iter().zip(&new_chars).take_while(|(old, new)| old == new).count();
+                let suffix = old_chars[prefix..].iter().rev().zip(new_chars[prefix..].iter().rev()).take_while(|(old, new)| old == new).count();
+                let inserted = new_chars[prefix..new_chars.len() - suffix].iter().collect::<String>();
+                let start = cosmic_cursor_at_char(&self.text_buffers[index].buffer, prefix);
+                let end = cosmic_cursor_at_char(&self.text_buffers[index].buffer, old_chars.len() - suffix);
+                let mut editor = Editor::new(&mut self.text_buffers[index].buffer);
+                editor.set_cursor(start);
+                editor.set_selection(glyphon::cosmic_text::Selection::Normal(end));
+                editor.insert_string(&inserted, None);
+                editor.shape_as_needed(font_system, false);
+                self.text_buffers[index].x = x as f32;
+                self.text_buffers[index].y = y as f32;
+                self.text_run_options[index] = run.clone();
+            }
+        } else {
+            let mut buffer = TextBuffer::new_empty(Metrics::new(
+                font_size as f32,
+                line_height as f32,
+            ));
+            buffer.set_wrap(font_system, if run.wrap == Some(false) { Wrap::None } else { Wrap::Word });
+            buffer.set_size(
+                font_system,
+                Some((run_width as f32).max(1.0)),
+                Some((height as f32 - y as f32).max(1.0)),
+            );
+            buffer.set_text(
+                font_system,
+                &run.text,
+                Attrs::new().family(
+                    run.font_family
+                        .as_deref()
+                        .map(Family::Name)
+                        .unwrap_or(Family::SansSerif),
+                ),
+                Shaping::Advanced,
+            );
+            self.text_buffers[index] = PositionedText {
+                buffer,
+                x: x as f32,
+                y: y as f32,
+                color,
+            };
+            if self.text_run_options.len() <= index {
+                self.text_run_options.resize_with(index + 1, || run.clone());
+            }
+            self.text_run_options[index] = run;
+        }
+        let mut glyph_count = 0_u32;
+        let mut line_count = 0_u32;
+        for layout_run in self.text_buffers[index].buffer.layout_runs() {
+            line_count += 1;
+            glyph_count += layout_run.glyphs.len() as u32;
+        }
+        let shaping_ms = shaping_started.elapsed().as_secs_f64() * 1000.0;
+        self.text_viewport.update(queue, Resolution { width, height });
+        let bounds = text_bounds(&self.text_run_options[index], width, height);
+        let text = &self.text_buffers[index];
+        let prepare_started = Instant::now();
+        self.text_renderers[index]
+            .prepare(
+                device,
+                queue,
+                font_system,
+                &mut self.text_atlas,
+                &self.text_viewport,
+                [TextArea {
+                    buffer: &text.buffer,
+                    left: text.x,
+                    top: text.y,
+                    scale: 1.0,
+                    bounds,
+                    default_color: text.color,
+                    custom_glyphs: &[],
+                }],
+                &mut self.swash_cache,
+            )
+            .map_err(|error| error.to_string())?;
+        let atlas_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+        Ok(TextPreparationStats {
+            system_font_init_ms: self.system_font_init_ms,
+            custom_font_load_ms,
+            glyph_count,
+            line_count,
+            shaping_ms,
+            atlas_prepare_ms,
+            total_ms: total_started.elapsed().as_secs_f64() * 1000.0,
+            warm_shaping_ms: 0.0,
+            warm_atlas_prepare_ms: 0.0,
+            warm_total_ms: 0.0,
+        })
+    }
+
     fn set_text_runs(
         &mut self,
         runs: Vec<TextRunOptions>,
@@ -880,6 +1832,7 @@ impl TextRuntime {
         height: u32,
     ) -> std::result::Result<TextPreparationStats, String> {
         let total_started = Instant::now();
+        let text_run_options = runs.clone();
         if self.font_system.is_none() {
             let font_init_started = Instant::now();
             self.font_system = Some(FontSystem::new());
@@ -905,8 +1858,6 @@ impl TextRuntime {
             if [x, y, run_width, font_size, line_height]
                 .iter()
                 .any(|value| !value.is_finite())
-                || x < 0.0
-                || y < 0.0
                 || run_width < 0.0
                 || font_size <= 0.0
                 || line_height <= 0.0
@@ -914,14 +1865,15 @@ impl TextRuntime {
                 || font_size > f32::MAX as f64
                 || line_height > f32::MAX as f64
             {
-                return Err("text run geometry and font metrics must be finite and nonnegative (font size and line height must be positive)".into());
+                return Err("text run geometry and font metrics must be finite; width must be nonnegative and font size/line height positive".into());
             }
             let color = parse_text_color(&run.color)
                 .ok_or_else(|| format!("invalid text color: {}", run.color))?;
-            let mut buffer = TextBuffer::new(
-                font_system,
-                Metrics::new(font_size as f32, line_height as f32),
-            );
+            let mut buffer = TextBuffer::new_empty(Metrics::new(
+                font_size as f32,
+                line_height as f32,
+            ));
+            buffer.set_wrap(font_system, if run.wrap == Some(false) { Wrap::None } else { Wrap::Word });
             buffer.set_size(
                 font_system,
                 Some((run_width as f32).max(1.0)),
@@ -938,7 +1890,6 @@ impl TextRuntime {
                 ),
                 Shaping::Advanced,
             );
-            buffer.shape_until_scroll(font_system, false);
             for layout_run in buffer.layout_runs() {
                 line_count += 1;
                 glyph_count += layout_run.glyphs.len() as u32;
@@ -959,38 +1910,44 @@ impl TextRuntime {
                 height: height as u32,
             },
         );
-        let bounds = TextBounds {
-            left: 0,
-            top: 0,
-            right: width.min(i32::MAX as u32) as i32,
-            bottom: height.min(i32::MAX as f32) as i32,
-        };
-        let text_areas = positioned
-            .iter()
-            .map(|text| TextArea {
-                buffer: &text.buffer,
-                left: text.x,
-                top: text.y,
-                scale: 1.0,
-                bounds,
-                default_color: text.color,
-                custom_glyphs: &[],
-            })
-            .collect::<Vec<_>>();
         let prepare_started = Instant::now();
-        self.text_renderer
+        self.text_renderers.resize_with(positioned.len(), || {
+            TextRenderer::new(
+                &mut self.text_atlas,
+                device,
+                wgpu::MultisampleState::default(),
+                None,
+            )
+        });
+        for ((text, options), text_renderer) in positioned
+            .iter()
+            .zip(text_run_options.iter())
+            .zip(self.text_renderers.iter_mut())
+        {
+            let bounds = text_bounds(options, width, height as u32);
+            text_renderer
             .prepare(
                 device,
                 queue,
                 font_system,
                 &mut self.text_atlas,
                 &self.text_viewport,
-                text_areas,
+                [TextArea {
+                    buffer: &text.buffer,
+                    left: text.x,
+                    top: text.y,
+                    scale: 1.0,
+                    bounds,
+                    default_color: text.color,
+                    custom_glyphs: &[],
+                }],
                 &mut self.swash_cache,
             )
             .map_err(|error| error.to_string())?;
+        }
         let atlas_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
         self.text_buffers = positioned;
+        self.text_run_options = text_run_options;
 
         Ok(TextPreparationStats {
             system_font_init_ms: self.system_font_init_ms,
@@ -1004,6 +1961,130 @@ impl TextRuntime {
             warm_atlas_prepare_ms: 0.0,
             warm_total_ms: 0.0,
         })
+    }
+}
+
+fn cosmic_cursor_at_char(buffer: &TextBuffer, char_index: usize) -> glyphon::Cursor {
+    let mut remaining = char_index;
+    for (line_index, line) in buffer.lines.iter().enumerate() {
+        let line_char_count = line.text().chars().count();
+        if remaining <= line_char_count {
+            let byte_index = line
+                .text()
+                .char_indices()
+                .nth(remaining)
+                .map(|(byte_index, _)| byte_index)
+                .unwrap_or(line.text().len());
+            return glyphon::Cursor::new(line_index, byte_index);
+        }
+        remaining = remaining.saturating_sub(line_char_count + 1);
+    }
+    glyphon::Cursor::new(
+        buffer.lines.len().saturating_sub(1),
+        buffer.lines.last().map(|line| line.text().len()).unwrap_or(0),
+    )
+}
+
+fn cosmic_cursor_x(cursor: glyphon::Cursor, run: &glyphon::LayoutRun<'_>) -> Option<f32> {
+    if cursor.line != run.line_i {
+        return None;
+    }
+    for glyph in run.glyphs {
+        if cursor.index == glyph.start {
+            return Some(if glyph.level.is_rtl() {
+                glyph.x + glyph.w
+            } else {
+                glyph.x
+            });
+        }
+        if cursor.index > glyph.start && cursor.index < glyph.end {
+            let cluster = run.text.get(glyph.start..glyph.end)?;
+            let mut before = 0;
+            let mut total = 0;
+            for (offset, _) in cluster.char_indices() {
+                if glyph.start + offset < cursor.index {
+                    before += 1;
+                }
+                total += 1;
+            }
+            let offset = glyph.w * before as f32 / total.max(1) as f32;
+            return Some(if glyph.level.is_rtl() {
+                glyph.x + glyph.w - offset
+            } else {
+                glyph.x + offset
+            });
+        }
+    }
+    Some(run.glyphs.last().map_or(0.0, |glyph| {
+        if glyph.level.is_rtl() {
+            glyph.x
+        } else {
+            glyph.x + glyph.w
+        }
+    }))
+}
+
+impl Renderer {
+    fn textarea_geometry(
+        &self,
+        text: &str,
+        selection_start: u32,
+        selection_end: u32,
+        caret_index: u32,
+    ) -> Option<(f64, f64, f64, Vec<TextSelectionRect>)> {
+        let runtime = self.text_runtime.as_ref()?;
+        let positioned = runtime.text_buffers.iter().find(|positioned| {
+            positioned
+                .buffer
+                .lines
+                .iter()
+                .map(|line| line.text())
+                .collect::<Vec<_>>()
+                .join("\n")
+                == text
+        })?;
+        let buffer = &positioned.buffer;
+        let start = cosmic_cursor_at_char(buffer, selection_start as usize);
+        let selection_end = cosmic_cursor_at_char(buffer, selection_end as usize);
+        let caret_cursor = cosmic_cursor_at_char(buffer, caret_index as usize);
+        let mut caret = None;
+        let mut selection_rects = Vec::new();
+        for run in buffer.layout_runs() {
+            if let Some(x) = cosmic_cursor_x(caret_cursor, &run) {
+                caret = Some((
+                    (positioned.x + x) as f64,
+                    (positioned.y + run.line_top) as f64,
+                    run.line_height as f64,
+                ));
+            }
+            if start < selection_end
+                && run.line_i >= start.line
+                && run.line_i <= selection_end.line
+            {
+                let run_start = if run.line_i == start.line {
+                    start
+                } else {
+                    glyphon::Cursor::new(run.line_i, 0)
+                };
+                let run_end = if run.line_i == selection_end.line {
+                    selection_end
+                } else {
+                    glyphon::Cursor::new(run.line_i, buffer.lines[run.line_i].text().len())
+                };
+                if let Some((x, width)) = run.highlight(run_start, run_end) {
+                    if width > 0.0 {
+                        selection_rects.push(TextSelectionRect {
+                            x: (positioned.x + x) as f64,
+                            y: (positioned.y + run.line_top) as f64,
+                            width: width as f64,
+                            height: run.line_height as f64,
+                        });
+                    }
+                }
+            }
+        }
+        let (caret_x, caret_y, caret_height) = caret?;
+        Some((caret_x, caret_y, caret_height, selection_rects))
     }
 }
 
@@ -1030,9 +2111,11 @@ struct WindowApp {
     height: f64,
     window: Option<Arc<OsWindow>>,
     renderer: Option<Renderer>,
+    text_editor: Option<TextEditor>,
     error: Option<String>,
     events: Vec<NativeEvent>,
     cursor: (f64, f64),
+    modifiers: ModifiersState,
     display_list: Vec<f32>,
     render_pending: bool,
     closed: bool,
@@ -1057,6 +2140,7 @@ impl ApplicationHandler for WindowApp {
                 let window = Arc::new(window);
                 match Renderer::new(window.clone()) {
                     Ok(renderer) => {
+                        self.text_editor = Some(TextEditor::new(window.as_ref()));
                         self.window = Some(window);
                         self.renderer = Some(renderer);
                     }
@@ -1076,11 +2160,15 @@ impl ApplicationHandler for WindowApp {
         if self.window.as_ref().map(|window| window.id()) != Some(window_id) {
             return;
         }
+        if let (Some(window), Some(editor)) = (self.window.as_ref(), self.text_editor.as_mut()) {
+            editor.on_window_event(window, &event);
+        }
         match event {
             OsWindowEvent::CloseRequested => {
                 self.closed = true;
                 self.window = None;
                 self.renderer = None;
+                self.text_editor = None;
                 event_loop.exit();
             }
             OsWindowEvent::Resized(size) => {
@@ -1092,6 +2180,10 @@ impl ApplicationHandler for WindowApp {
                     x: size.width as f64,
                     y: size.height as f64,
                     key: None,
+                    text: None,
+                    modifiers: None,
+                    delta_x: None,
+                    delta_y: None,
                 });
             }
             OsWindowEvent::Moved(_) => {
@@ -1107,6 +2199,10 @@ impl ApplicationHandler for WindowApp {
                         x: rate as f64 / 1000.0,
                         y: 0.0,
                         key: None,
+                        text: None,
+                        modifiers: None,
+                        delta_x: None,
+                        delta_y: None,
                     });
                 }
             }
@@ -1117,6 +2213,10 @@ impl ApplicationHandler for WindowApp {
                     x: position.x,
                     y: position.y,
                     key: None,
+                    text: None,
+                    modifiers: None,
+                    delta_x: None,
+                    delta_y: None,
                 });
             }
             OsWindowEvent::MouseInput { state, .. } => self.events.push(NativeEvent {
@@ -1129,7 +2229,28 @@ impl ApplicationHandler for WindowApp {
                 x: self.cursor.0,
                 y: self.cursor.1,
                 key: None,
+                text: None,
+                modifiers: None,
+                delta_x: None,
+                delta_y: None,
             }),
+            OsWindowEvent::MouseWheel { delta, .. } => {
+                let (delta_x, delta_y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x as f64 * 40.0, y as f64 * 40.0),
+                    MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
+                };
+                self.events.push(NativeEvent {
+                    kind: "wheel".into(),
+                    x: self.cursor.0,
+                    y: self.cursor.1,
+                    key: None,
+                    text: None,
+                    modifiers: None,
+                    delta_x: Some(delta_x),
+                    delta_y: Some(delta_y),
+                });
+            }
+            OsWindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             OsWindowEvent::KeyboardInput { event, .. } => self.events.push(NativeEvent {
                 kind: if event.state.is_pressed() {
                     "keydown"
@@ -1140,7 +2261,29 @@ impl ApplicationHandler for WindowApp {
                 x: self.cursor.0,
                 y: self.cursor.1,
                 key: Some(format!("{:?}", event.logical_key)),
+                text: event.text.map(|text| text.to_string()),
+                modifiers: Some(format!("{:?}", self.modifiers)),
+                delta_x: None,
+                delta_y: None,
             }),
+            OsWindowEvent::Ime(ime) => {
+                let (kind, text, cursor) = match ime {
+                    Ime::Enabled => ("imeEnabled", None, None),
+                    Ime::Preedit(text, cursor) => ("imePreedit", Some(text), cursor),
+                    Ime::Commit(text) => ("imeCommit", Some(text), None),
+                    Ime::Disabled => ("imeDisabled", None, None),
+                };
+                self.events.push(NativeEvent {
+                    kind: kind.into(),
+                    x: cursor.map(|range| range.0 as f64).unwrap_or(-1.0),
+                    y: cursor.map(|range| range.1 as f64).unwrap_or(-1.0),
+                    key: None,
+                    text,
+                    modifiers: None,
+                    delta_x: None,
+                    delta_y: None,
+                });
+            }
             OsWindowEvent::RedrawRequested if self.render_pending => {
                 self.render_pending = false;
                 let Some(window) = self.window.as_ref() else {
@@ -1273,14 +2416,69 @@ impl Window {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
+        let system_font = self
+            .app
+            .text_editor
+            .as_ref()
+            .and_then(|editor| {
+                Some((
+                    editor.system_font_family.clone()?,
+                    editor.system_font_bytes.clone()?,
+                ))
+            });
         let renderer = self
             .app
             .renderer
             .as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
         renderer
-            .request_text_runs(runs, custom_fonts.unwrap_or_default())
+            .request_text_runs(runs, custom_fonts.unwrap_or_default(), system_font)
             .map_err(|error| Error::new(Status::InvalidArg, error))
+    }
+
+    #[napi(js_name = "setTextRunsNow")]
+    pub fn set_text_runs_now(
+        &mut self,
+        runs: Vec<TextRunOptions>,
+        custom_fonts: Option<Vec<TextFontData>>,
+        update_run_index: Option<u32>,
+    ) -> Result<TextPreparationStats> {
+        if self.app.closed {
+            return Err(Error::new(Status::GenericFailure, "window is closed"));
+        }
+        let system_font = self.app.text_editor.as_ref().and_then(|editor| {
+            Some((
+                editor.system_font_family.clone()?,
+                editor.system_font_bytes.clone()?,
+            ))
+        });
+        self.app
+            .renderer
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?
+            .set_text_runs_now(
+                runs,
+                custom_fonts.unwrap_or_default(),
+                system_font,
+                update_run_index.map(|index| index as usize),
+            )
+            .map_err(|error| Error::new(Status::GenericFailure, error))
+    }
+
+    #[napi(js_name = "textAreaGeometry")]
+    pub fn text_area_geometry(
+        &self,
+        text: String,
+        selection_start: u32,
+        selection_end: u32,
+        caret_index: u32,
+    ) -> Option<TextAreaGeometry> {
+        self.app.renderer.as_ref()?.textarea_geometry_for_api(
+            &text,
+            selection_start,
+            selection_end,
+            caret_index,
+        )
     }
 
     #[napi(js_name = "pollTextRuns")]
@@ -1334,6 +2532,42 @@ impl Window {
     #[napi]
     pub fn drain_events(&mut self) -> Vec<NativeEvent> {
         std::mem::take(&mut self.app.events)
+    }
+
+    #[napi(js_name = "setImeAllowed")]
+    pub fn set_ime_allowed(&self, allowed: bool) -> Result<()> {
+        let window =
+            self.app.window.as_ref().ok_or_else(|| {
+                Error::new(Status::GenericFailure, "native window is unavailable")
+            })?;
+        window.set_ime_allowed(allowed);
+        Ok(())
+    }
+
+    #[napi(js_name = "updateTextArea")]
+    pub fn update_text_area(&mut self, options: TextAreaOptions) -> Result<TextAreaState> {
+        self.update_text_areas(vec![options])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "text editor returned no state"))
+    }
+
+    #[napi(js_name = "updateTextAreas")]
+    pub fn update_text_areas(&mut self, options: Vec<TextAreaOptions>) -> Result<Vec<TextAreaState>> {
+        if self.app.closed {
+            return Err(Error::new(Status::GenericFailure, "window is closed"));
+        }
+        let window =
+            self.app.window.as_ref().ok_or_else(|| {
+                Error::new(Status::GenericFailure, "native window is unavailable")
+            })?;
+        let renderer = self.app.renderer.as_ref();
+        let editor = self
+            .app
+            .text_editor
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "text editor is unavailable"))?;
+        Ok(editor.update_many(window, options, renderer))
     }
 
     #[napi]

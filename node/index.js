@@ -10,20 +10,39 @@ export const LayoutTree = native.LayoutTree;
 export const Window = native.Window;
 export { FontRegistry } from "./font-registry.js";
 
+function defaultElementStyle(name) {
+  if (name === "input") {
+    return { display: "flex", justifyContent: "start", alignItems: "center", padding: 0, overflow: "hidden", backgroundColor: "transparent" };
+  }
+  if (name === "textarea") {
+    return { display: "flex", justifyContent: "start", alignItems: "start", padding: 0, overflow: "hidden", backgroundColor: "transparent" };
+  }
+  return {};
+}
+
 export class Element {
   constructor(document, name, style = {}) {
     this.document = document;
     this.name = name;
     this.parent = null;
     this.children = [];
-    this.style = { ...style };
+    this.style = { ...defaultElementStyle(name), ...style };
+    this.scrollLeft = 0;
+    this.scrollTop = 0;
     this.handle = document.layoutTree.createNode(this.style);
   }
 
   setStyle(style) {
-    this.style = { ...style };
+    this.style = { ...defaultElementStyle(this.name), ...style };
     this.document.layoutTree.setStyle(this.handle, this.style);
     this.document.dirty = true;
+    return this;
+  }
+
+  scrollBy(x = 0, y = 0) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new TypeError("scroll offsets must be finite");
+    this.scrollLeft = Math.max(0, this.scrollLeft + x);
+    this.scrollTop = Math.max(0, this.scrollTop + y);
     return this;
   }
 
@@ -106,15 +125,80 @@ export class Document {
     };
     collect(this.body);
     const assemblyStart = timings && performance.now();
-    const boxes = elements.map((element) => {
+    const raw = elements.map((element) => {
       const box = this.layoutSnapshot?.[element.handle] ?? { x: 0, y: 0, width: 0, height: 0 };
       return { element, x: box.x, y: box.y, width: box.width, height: box.height };
+    });
+    const byElement = new Map(raw.map((box) => [box.element, box]));
+    const extents = new Map();
+    for (let i = raw.length - 1; i >= 0; i--) {
+      const box = raw[i];
+      let width = box.width;
+      let height = box.height;
+      for (const child of box.element.children) {
+        const childBox = byElement.get(child);
+        const childExtent = extents.get(child) ?? { width: childBox.width, height: childBox.height };
+        width = Math.max(width, childBox.x - box.x + childExtent.width);
+        height = Math.max(height, childBox.y - box.y + childExtent.height);
+      }
+      extents.set(box.element, { width, height });
+    }
+    const boxes = raw.map((box) => {
+      let x = box.x;
+      let y = box.y;
+      let clip = null;
+      for (let parent = box.element.parent; parent; parent = parent.parent) {
+        const parentBox = byElement.get(parent);
+        if (parent.style.overflow === "hidden" || parent.style.overflow === "auto" || parent.style.overflow === "scroll") {
+          x -= parent.scrollLeft;
+          y -= parent.scrollTop;
+          const next = { x: parentBox.x, y: parentBox.y, width: parentBox.width, height: parentBox.height };
+          clip = clip ? intersect(clip, next) : next;
+        }
+      }
+      const extent = extents.get(box.element);
+      box.element.scrollWidth = extent.width;
+      box.element.scrollHeight = extent.height;
+      box.element.scrollLeft = Math.min(box.element.scrollLeft, Math.max(0, box.element.scrollWidth - box.width));
+      box.element.scrollTop = Math.min(box.element.scrollTop, Math.max(0, box.element.scrollHeight - box.height));
+      return { ...box, x, y, clip, scrollWidth: box.element.scrollWidth, scrollHeight: box.element.scrollHeight };
     });
     if (timings) timings.assembly = performance.now() - assemblyStart;
     return boxes;
   }
 
+  scrollAt(x, y, deltaX = 0, deltaY = 0) {
+    if (![x, y, deltaX, deltaY].every(Number.isFinite)) return false;
+    const boxes = this.boxes();
+    for (let i = boxes.length - 1; i >= 0; i--) {
+      const box = boxes[i];
+      const overflow = box.element.style.overflow;
+      if (overflow !== "auto" && overflow !== "scroll") continue;
+      if (x < box.x || y < box.y || x >= box.x + box.width || y >= box.y + box.height) continue;
+      const maxX = Math.max(0, box.scrollWidth - box.width);
+      const maxY = Math.max(0, box.scrollHeight - box.height);
+      const nextX = Math.max(0, Math.min(maxX, box.element.scrollLeft + deltaX));
+      const nextY = Math.max(0, Math.min(maxY, box.element.scrollTop + deltaY));
+      if (nextX === box.element.scrollLeft && nextY === box.element.scrollTop) continue;
+      box.element.scrollLeft = nextX;
+      box.element.scrollTop = nextY;
+      return true;
+    }
+    return false;
+  }
+
+  handleEvent(event) {
+    if (event?.type !== "wheel") return false;
+    return this.scrollAt(event.x, event.y, event.deltaX ?? 0, event.deltaY ?? 0);
+  }
+
   close() {
     return this.layoutTree.close();
   }
+}
+
+function intersect(a, b) {
+  const x = Math.max(a.x, b.x);
+  const y = Math.max(a.y, b.y);
+  return { x, y, width: Math.max(0, Math.min(a.x + a.width, b.x + b.width) - x), height: Math.max(0, Math.min(a.y + a.height, b.y + b.height) - y) };
 }
