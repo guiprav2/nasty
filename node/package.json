@@ -1,0 +1,9 @@
+{
+  "name": "nasty",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:debug": "cargo build --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js"
+  }
+}

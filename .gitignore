@@ -1,0 +1,6 @@
+/native/
+/node/examples/*.svg
+/node/native/
+/rust/target/
+/target/
+plan.md
