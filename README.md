@@ -11,6 +11,10 @@ npm --prefix node run build:debug
 node node/examples/layout.js
 node node/examples/window.js
 node node/examples/text.js
+node node/examples/threaded_render.js
+node node/examples/threaded_layout.js
 ```
 
-The layout example checks positions, measures Taffy, and writes `node/examples/layout.svg`. The window example animates native GPU quads and reports timing data. The text example shapes and renders with installed system fonts, reports cold and repeated preparation costs, and measures frame pacing.
+The layout example checks positions, measures Taffy through the default persistent layout worker, and writes `node/examples/layout.svg`. The window example animates native GPU quads and reports timing data. The text example shapes and renders with installed system fonts, reports cold and repeated preparation costs, and measures frame pacing. The threaded-render example owns the native window and frame loop in a persistent Node worker while measuring worker frame pacing and main-thread event-loop delay. The threaded-layout example isolates a paced Taffy workload, returns versioned layout snapshots, and measures transfer cost and stale-result handling.
+
+`Document.layout(width, height)` is asynchronous and returns the latest completed box snapshot; styles changed while layout runs are applied on the next worker request. Call `document.close()` when the document is no longer needed to stop its persistent worker.

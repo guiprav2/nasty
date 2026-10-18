@@ -8,7 +8,9 @@ use glyphon::{
 use napi::bindgen_prelude::Buffer;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 use taffy::prelude::*;
 use taffy::tree::TaffyError;
@@ -276,6 +278,8 @@ pub struct WindowOptions {
     pub title: Option<String>,
     pub width: Option<f64>,
     pub height: Option<f64>,
+    #[napi(js_name = "allowAnyThread")]
+    pub allow_any_thread: Option<bool>,
 }
 
 #[napi(object)]
@@ -309,6 +313,7 @@ pub struct PresentStats {
 }
 
 #[napi(object)]
+#[derive(Clone)]
 pub struct TextRunOptions {
     pub text: String,
     pub x: f64,
@@ -335,6 +340,12 @@ pub struct TextPreparationStats {
     pub atlas_prepare_ms: f64,
     #[napi(js_name = "totalMs")]
     pub total_ms: f64,
+    #[napi(js_name = "warmShapingMs")]
+    pub warm_shaping_ms: f64,
+    #[napi(js_name = "warmAtlasPrepareMs")]
+    pub warm_atlas_prepare_ms: f64,
+    #[napi(js_name = "warmTotalMs")]
+    pub warm_total_ms: f64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -354,13 +365,11 @@ struct Renderer {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
-    font_system: Option<FontSystem>,
-    system_font_init_ms: f64,
-    swash_cache: SwashCache,
-    text_viewport: Viewport,
-    text_atlas: TextAtlas,
-    text_renderer: TextRenderer,
-    text_buffers: Vec<PositionedText>,
+    text_runtime: Option<TextRuntime>,
+    text_worker: Sender<TextWorkerMessage>,
+    text_results: Receiver<TextWorkerResult>,
+    pending_text_request: Option<u32>,
+    next_text_request: u32,
     adapter_name: String,
     format_name: String,
     present_mode_name: String,
@@ -371,6 +380,32 @@ struct PositionedText {
     x: f32,
     y: f32,
     color: TextColor,
+}
+
+struct TextRuntime {
+    font_system: Option<FontSystem>,
+    system_font_init_ms: f64,
+    swash_cache: SwashCache,
+    text_viewport: Viewport,
+    text_atlas: TextAtlas,
+    text_renderer: TextRenderer,
+    text_buffers: Vec<PositionedText>,
+}
+
+struct TextWorkerMessage {
+    request_id: u32,
+    runs: Vec<TextRunOptions>,
+    runtime: TextRuntime,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    width: u32,
+    height: u32,
+}
+
+struct TextWorkerResult {
+    request_id: u32,
+    runtime: TextRuntime,
+    stats: std::result::Result<TextPreparationStats, String>,
 }
 
 impl Renderer {
@@ -516,8 +551,7 @@ impl Renderer {
         let warmup_data = vec![0_u8; vertex_capacity];
         queue.write_buffer(&vertex_buffer, 0, &warmup_data);
 
-        // Defer font discovery until text is requested so ordinary windows do
-        // not pay system-font startup cost.
+        // Keep font discovery and GPU atlas preparation off the render thread.
         let font_system = None;
         let swash_cache = SwashCache::new();
         let text_cache = TextCache::new(&device);
@@ -537,6 +571,55 @@ impl Renderer {
             None,
         );
 
+        let text_runtime = TextRuntime {
+            font_system,
+            system_font_init_ms: 0.0,
+            swash_cache,
+            text_viewport,
+            text_atlas,
+            text_renderer,
+            text_buffers: Vec::new(),
+        };
+        let (text_worker, text_jobs) = mpsc::channel::<TextWorkerMessage>();
+        let (text_result_sender, text_results) = mpsc::channel::<TextWorkerResult>();
+        thread::Builder::new()
+            .name("nasty-text-preparation".into())
+            .spawn(move || {
+                while let Ok(mut job) = text_jobs.recv() {
+                    let cold = job.runtime.set_text_runs(
+                        job.runs.clone(),
+                        &job.device,
+                        &job.queue,
+                        job.width,
+                        job.height,
+                    );
+                    let stats = cold.and_then(|mut stats| {
+                        let warm = job.runtime.set_text_runs(
+                            job.runs,
+                            &job.device,
+                            &job.queue,
+                            job.width,
+                            job.height,
+                        )?;
+                        stats.warm_shaping_ms = warm.shaping_ms;
+                        stats.warm_atlas_prepare_ms = warm.atlas_prepare_ms;
+                        stats.warm_total_ms = warm.total_ms;
+                        Ok(stats)
+                    });
+                    if text_result_sender
+                        .send(TextWorkerResult {
+                            request_id: job.request_id,
+                            runtime: job.runtime,
+                            stats,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(|error| format!("start text worker: {error}"))?;
+
         Ok(Self {
             surface,
             device,
@@ -545,13 +628,11 @@ impl Renderer {
             pipeline,
             vertex_buffer,
             vertex_capacity,
-            font_system,
-            system_font_init_ms: 0.0,
-            swash_cache,
-            text_viewport,
-            text_atlas,
-            text_renderer,
-            text_buffers: Vec::new(),
+            text_runtime: Some(text_runtime),
+            text_worker,
+            text_results,
+            pending_text_request: None,
+            next_text_request: 1,
             adapter_name,
             format_name,
             present_mode_name,
@@ -565,8 +646,11 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.text_viewport
-            .update(&self.queue, Resolution { width, height });
+        if let Some(runtime) = self.text_runtime.as_mut() {
+            runtime
+                .text_viewport
+                .update(&self.queue, Resolution { width, height });
+        }
     }
 
     fn render(
@@ -676,9 +760,14 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 pass.draw(0..vertices.len() as u32, 0..1);
             }
-            if !self.text_buffers.is_empty() {
-                self.text_renderer
-                    .render(&self.text_atlas, &self.text_viewport, &mut pass)
+            if let Some(runtime) = self
+                .text_runtime
+                .as_ref()
+                .filter(|runtime| !runtime.text_buffers.is_empty())
+            {
+                runtime
+                    .text_renderer
+                    .render(&runtime.text_atlas, &runtime.text_viewport, &mut pass)
                     .map_err(|error| format!("render text: {error}"))?;
             }
         }
@@ -697,9 +786,74 @@ impl Renderer {
         })
     }
 
+    fn request_text_runs(&mut self, runs: Vec<TextRunOptions>) -> std::result::Result<u32, String> {
+        if self.pending_text_request.is_some() {
+            return Err("a text preparation request is already pending".into());
+        }
+        let runtime = self
+            .text_runtime
+            .take()
+            .ok_or_else(|| "text resources are busy".to_string())?;
+        let request_id = self.next_text_request;
+        self.next_text_request = self.next_text_request.wrapping_add(1).max(1);
+        let job = TextWorkerMessage {
+            request_id,
+            runs,
+            runtime,
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            width: self.config.width,
+            height: self.config.height,
+        };
+        if let Err(error) = self.text_worker.send(job) {
+            self.text_runtime = Some(error.0.runtime);
+            return Err("text worker is unavailable".into());
+        }
+        self.pending_text_request = Some(request_id);
+        Ok(request_id)
+    }
+
+    fn poll_text_runs(&mut self) -> std::result::Result<Option<TextPreparationStats>, String> {
+        match self.text_results.try_recv() {
+            Ok(result) => {
+                if self.pending_text_request != Some(result.request_id) {
+                    self.text_runtime = Some(result.runtime);
+                    return Err("received a stale text preparation result".into());
+                }
+                self.text_runtime = Some(result.runtime);
+                self.pending_text_request = None;
+                if let Some(runtime) = self.text_runtime.as_mut() {
+                    runtime.text_viewport.update(
+                        &self.queue,
+                        Resolution {
+                            width: self.config.width,
+                            height: self.config.height,
+                        },
+                    );
+                }
+                result.stats.map(Some)
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err("text worker stopped unexpectedly".into()),
+        }
+    }
+
+    fn system_font_init_ms(&self) -> f64 {
+        self.text_runtime
+            .as_ref()
+            .map(|runtime| runtime.system_font_init_ms)
+            .unwrap_or(0.0)
+    }
+}
+
+impl TextRuntime {
     fn set_text_runs(
         &mut self,
         runs: Vec<TextRunOptions>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
     ) -> std::result::Result<TextPreparationStats, String> {
         let total_started = Instant::now();
         if self.font_system.is_none() {
@@ -711,7 +865,7 @@ impl Renderer {
         let shaping_started = Instant::now();
         let mut glyph_count = 0_u32;
         let mut line_count = 0_u32;
-        let height = self.config.height as f32;
+        let height = height as f32;
         let mut positioned = Vec::with_capacity(runs.len());
 
         for run in runs {
@@ -763,17 +917,17 @@ impl Renderer {
         let shaping_ms = shaping_started.elapsed().as_secs_f64() * 1000.0;
 
         self.text_viewport.update(
-            &self.queue,
+            queue,
             Resolution {
-                width: self.config.width,
-                height: self.config.height,
+                width,
+                height: height as u32,
             },
         );
         let bounds = TextBounds {
             left: 0,
             top: 0,
-            right: self.config.width.min(i32::MAX as u32) as i32,
-            bottom: self.config.height.min(i32::MAX as u32) as i32,
+            right: width.min(i32::MAX as u32) as i32,
+            bottom: height.min(i32::MAX as f32) as i32,
         };
         let text_areas = positioned
             .iter()
@@ -790,8 +944,8 @@ impl Renderer {
         let prepare_started = Instant::now();
         self.text_renderer
             .prepare(
-                &self.device,
-                &self.queue,
+                device,
+                queue,
                 font_system,
                 &mut self.text_atlas,
                 &self.text_viewport,
@@ -809,11 +963,10 @@ impl Renderer {
             shaping_ms,
             atlas_prepare_ms,
             total_ms: total_started.elapsed().as_secs_f64() * 1000.0,
+            warm_shaping_ms: 0.0,
+            warm_atlas_prepare_ms: 0.0,
+            warm_total_ms: 0.0,
         })
-    }
-
-    fn system_font_init_ms(&self) -> f64 {
-        self.system_font_init_ms
     }
 }
 
@@ -990,7 +1143,25 @@ pub struct Window {
 impl Window {
     #[napi(constructor)]
     pub fn new(options: WindowOptions) -> Result<Self> {
-        let event_loop = EventLoop::new().map_err(|error| {
+        let mut builder = EventLoop::builder();
+        if options.allow_any_thread.unwrap_or(false) {
+            #[cfg(target_os = "linux")]
+            winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
+                &mut builder,
+                true,
+            );
+            #[cfg(target_os = "windows")]
+            winit::platform::windows::EventLoopBuilderExtWindows::with_any_thread(
+                &mut builder,
+                true,
+            );
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            return Err(Error::new(
+                Status::InvalidArg,
+                "worker-owned windows are unsupported on this platform",
+            ));
+        }
+        let event_loop = builder.build().map_err(|error| {
             Error::new(
                 Status::GenericFailure,
                 format!("create event loop: {error}"),
@@ -1056,8 +1227,8 @@ impl Window {
             .unwrap_or_default()
     }
 
-    #[napi(js_name = "setTextRuns")]
-    pub fn set_text_runs(&mut self, runs: Vec<TextRunOptions>) -> Result<TextPreparationStats> {
+    #[napi(js_name = "requestTextRuns")]
+    pub fn request_text_runs(&mut self, runs: Vec<TextRunOptions>) -> Result<u32> {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
@@ -1067,8 +1238,23 @@ impl Window {
             .as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
         renderer
-            .set_text_runs(runs)
+            .request_text_runs(runs)
             .map_err(|error| Error::new(Status::InvalidArg, error))
+    }
+
+    #[napi(js_name = "pollTextRuns")]
+    pub fn poll_text_runs(&mut self) -> Result<Option<TextPreparationStats>> {
+        if self.app.closed {
+            return Err(Error::new(Status::GenericFailure, "window is closed"));
+        }
+        let renderer = self
+            .app
+            .renderer
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        renderer
+            .poll_text_runs()
+            .map_err(|error| Error::new(Status::GenericFailure, error))
     }
 
     #[napi(js_name = "systemFontInitMs")]

@@ -14,16 +14,16 @@ const runs = [
   { text: "العربية — مرحبًا بالعالم", x: 38, y: 255, width: 650, fontSize: 28, lineHeight: 38, color: "#ffc875" },
   { text: "No font files are bundled. This uses system font fallback.", x: 38, y: 325, width: 650, fontSize: 17, lineHeight: 24, color: "#86e4c4" },
 ];
-const coldPrep = window.setTextRuns(runs);
-console.log(`cold system fonts: discovery ${coldPrep.systemFontInitMs.toFixed(3)} ms; ${coldPrep.glyphCount} glyphs, ${coldPrep.lineCount} lines; shaping ${coldPrep.shapingMs.toFixed(3)} ms, atlas ${coldPrep.atlasPrepareMs.toFixed(3)} ms, total ${coldPrep.totalMs.toFixed(3)} ms`);
-const warmPrep = window.setTextRuns(runs);
-console.log(`warm repeated shaping/atlas: ${warmPrep.glyphCount} glyphs, ${warmPrep.lineCount} lines; shaping ${warmPrep.shapingMs.toFixed(3)} ms, atlas ${warmPrep.atlasPrepareMs.toFixed(3)} ms, total ${warmPrep.totalMs.toFixed(3)} ms`);
 console.log("Move the pointer over the window; press Escape or close the window to exit.");
 
 const refreshRate = window.refreshRate() > 0 ? window.refreshRate() : 60;
 let budget = 1000 / refreshRate;
 console.log(`frame pacing: ${refreshRate.toFixed(3)} Hz (active display refresh)`);
 const started = performance.now();
+const textRequestStarted = started;
+const textRequestId = window.requestTextRuns(runs);
+let textPreparationReadyMs = null;
+console.log(`queued text preparation request ${textRequestId} on persistent font/GPU-text worker`);
 let previous = started;
 let next = started;
 let frame = 0;
@@ -35,6 +35,7 @@ const nativeTimes = [];
 const gpuTimes = [];
 const jsUpdateTimes = [];
 const listBuildTimes = [];
+const textPollTimes = [];
 const cpuStart = process.cpuUsage();
 let coldSkipped = 0;
 let steadySkipped = 0;
@@ -79,6 +80,14 @@ function draw() {
   const displayListStart = performance.now();
   const displayList = Buffer.from(values.buffer);
   const displayListMs = performance.now() - displayListStart;
+  const pollStart = performance.now();
+  const prep = window.pollTextRuns();
+  textPollTimes.push(performance.now() - pollStart);
+  if (prep) {
+    textPreparationReadyMs = performance.now() - textRequestStarted;
+    console.log(`worker text result ${prep.glyphCount} glyphs / ${prep.lineCount} lines became renderable in ${textPreparationReadyMs.toFixed(3)} ms; system-font discovery ${prep.systemFontInitMs.toFixed(3)} ms, cold shape ${prep.shapingMs.toFixed(3)} ms, cold atlas ${prep.atlasPrepareMs.toFixed(3)} ms, cold total ${prep.totalMs.toFixed(3)} ms`);
+    console.log(`same text warm reuse on worker: shape ${prep.warmShapingMs.toFixed(3)} ms, atlas ${prep.warmAtlasPrepareMs.toFixed(3)} ms, total ${prep.warmTotalMs.toFixed(3)} ms`);
+  }
   const before = performance.now();
   const result = window.present(displayList);
   presentTimes.push(performance.now() - before);
@@ -131,11 +140,13 @@ function finish() {
   const cpuMs = (cpu.user + cpu.system) / 1000;
   const mem = process.memoryUsage();
   console.log(`frames: ${frame} in ${(elapsed / 1000).toFixed(2)} s; average ${(frame / elapsed * 1000).toFixed(1)} FPS; process CPU ${(cpuMs / elapsed / os.cpus().length * 100).toFixed(1)}% machine / ${(cpuMs / elapsed).toFixed(2)} cores; RSS ${(mem.rss / 1048576).toFixed(1)} MB`);
+  console.log(`async text readiness: ${textPreparationReadyMs === null ? "not completed" : `${textPreparationReadyMs.toFixed(3)} ms from request, off the frame thread`}`);
   console.log(`expired refresh deadlines skipped: ${coldSkipped} in warmup, ${steadySkipped} after warmup`);
   reportIntervals("cold-start frame intervals", coldIntervals);
   reportIntervals("steady-state frame intervals", steadyIntervals);
   report("JS update", jsUpdateTimes);
   report("display-list build", listBuildTimes);
+  report("nonblocking text-result poll", textPollTimes);
   report("native present call", presentTimes);
   report("native render CPU", nativeTimes);
   report("GPU command submit", gpuTimes);

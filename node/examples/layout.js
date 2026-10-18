@@ -22,7 +22,7 @@ for (let rowIndex = 0; rowIndex < 8; rowIndex++) {
   }
 }
 
-let boxes = doc.layout(800, 300);
+let boxes = await doc.layout(800, 300);
 const byName = (name) => boxes.find((box) => box.element.name === name);
 assert.equal(byName("heading").x, 24);
 assert.equal(byName("heading").y, 24);
@@ -34,17 +34,17 @@ assert.equal(byName("card-10").y, 126);
 // Timings include JS mutation, Taffy layout, and reading every box. They do
 // not include GPU presentation, which arrives with the window feature.
 const samples = [];
-const phases = { style: [], compute: [], transfer: [], assembly: [] };
+const phases = { style: [], compute: [], workerAssembly: [], transfer: [], assembly: [] };
 for (let frame = 0; frame < 360; frame++) {
   const start = performance.now();
   cards[0].setStyle({ width: 60 + (frame % 2), height: 14, flexShrink: 0 });
   const styleEnd = performance.now();
   const timings = {};
-  boxes = doc.layout(800, 300, timings);
+  boxes = await doc.layout(800, 300, timings);
   if (frame >= 30) {
     samples.push(performance.now() - start);
     phases.style.push(styleEnd - start);
-    for (const phase of ["compute", "transfer", "assembly"]) phases[phase].push(timings[phase]);
+    for (const phase of ["compute", "workerAssembly", "transfer", "assembly"]) phases[phase].push(timings[phase]);
   }
 }
 samples.sort((a, b) => a - b);
@@ -64,3 +64,4 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="300" vi
 const output = fileURLToPath(new URL("./layout.svg", import.meta.url));
 writeFileSync(output, svg);
 console.log(`wrote ${output}`);
+await doc.close();

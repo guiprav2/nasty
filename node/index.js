@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { LayoutWorker } from "./layout-worker.js";
 
 const require = createRequire(import.meta.url);
 const native = require(join(fileURLToPath(new URL(".", import.meta.url)), "native/debug/nasty.node"));
@@ -61,7 +62,7 @@ export class Element {
 
 export class Document {
   constructor() {
-    this.layoutTree = new LayoutTree();
+    this.layoutTree = new LayoutWorker();
     this.body = new Element(this, "body", { display: "block" });
     this.dirty = true;
     this.viewport = { width: 0, height: 0 };
@@ -71,7 +72,7 @@ export class Document {
     return new Element(this, name, style);
   }
 
-  layout(width, height, timings) {
+  async layout(width, height, timings) {
     if (!Number.isFinite(width) || !Number.isFinite(height) || width < 0 || height < 0) {
       throw new RangeError("viewport must have finite nonnegative dimensions");
     }
@@ -79,42 +80,40 @@ export class Document {
       this.viewport = { width, height };
       this.body.setStyle({ ...this.body.style, width, height });
     }
-    if (this.dirty) {
-      const start = timings && performance.now();
-      this.layoutTree.compute(this.body.handle, width, height);
-      if (timings) timings.compute = performance.now() - start;
-      this.dirty = false;
+    if (this.dirty || !this.layoutSnapshot) {
+      const start = performance.now();
+      const result = await this.layoutTree.layout(width, height, this.body.handle);
+      const elapsed = performance.now() - start;
+      if (timings) {
+        timings.compute = result.computeMs;
+        timings.transfer = elapsed - result.workerMs;
+        timings.workerAssembly = result.workerMs - result.computeMs;
+      }
+      if (!result.stale) {
+        this.layoutSnapshot = result.boxes;
+        this.dirty = false;
+      }
     }
     return this.boxes(timings);
   }
 
   boxes(timings) {
     const elements = [];
-    const parentIndices = [];
-    const collect = (element, parentIndex) => {
-      const index = elements.length;
+    const collect = (element) => {
       elements.push(element);
-      parentIndices.push(parentIndex);
-      for (const child of element.children) collect(child, index);
+      for (const child of element.children) collect(child);
     };
-    collect(this.body, -1);
-    const transferStart = timings && performance.now();
-    const layouts = this.layoutTree.layouts(elements.map((element) => element.handle));
-    if (timings) timings.transfer = performance.now() - transferStart;
+    collect(this.body);
     const assemblyStart = timings && performance.now();
-    const boxes = [];
-    for (let index = 0; index < elements.length; index++) {
-      const parent = boxes[parentIndices[index]];
-      const box = layouts[index];
-      boxes.push({
-        element: elements[index],
-        x: (parent?.x ?? 0) + box.x,
-        y: (parent?.y ?? 0) + box.y,
-        width: box.width,
-        height: box.height,
-      });
-    }
+    const boxes = elements.map((element) => {
+      const box = this.layoutSnapshot?.[element.handle] ?? { x: 0, y: 0, width: 0, height: 0 };
+      return { element, x: box.x, y: box.y, width: box.width, height: box.height };
+    });
     if (timings) timings.assembly = performance.now() - assemblyStart;
     return boxes;
+  }
+
+  close() {
+    return this.layoutTree.close();
   }
 }
