@@ -454,13 +454,19 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
-        let vertex_capacity = 6 * std::mem::size_of::<Vertex>();
+        // Avoid a visible first-frame allocation for ordinary display lists.
+        // Larger lists still grow geometrically in `render`.
+        let vertex_capacity = 64 * 6 * std::mem::size_of::<Vertex>();
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Nasty display list vertices"),
             size: vertex_capacity as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Create the first staging upload before the animation loop without
+        // waiting for the GPU; the first real frame flushes this queued upload.
+        let warmup_data = vec![0_u8; vertex_capacity];
+        queue.write_buffer(&vertex_buffer, 0, &warmup_data);
 
         Ok(Self {
             surface,
