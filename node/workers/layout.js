@@ -62,6 +62,18 @@ parentPort.on("message", ({ id, type, payload }) => {
           y: (parent?.y ?? 0) + local.y,
           width: local.width,
           height: local.height,
+          marginTop: local.marginTop,
+          marginRight: local.marginRight,
+          marginBottom: local.marginBottom,
+          marginLeft: local.marginLeft,
+          borderTop: local.borderTop,
+          borderRight: local.borderRight,
+          borderBottom: local.borderBottom,
+          borderLeft: local.borderLeft,
+          paddingTop: local.paddingTop,
+          paddingRight: local.paddingRight,
+          paddingBottom: local.paddingBottom,
+          paddingLeft: local.paddingLeft,
         };
         return boxes[index];
       };

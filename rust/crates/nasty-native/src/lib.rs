@@ -35,6 +35,24 @@ pub struct LayoutStyle {
     pub min_width: Option<f64>,
     pub min_height: Option<f64>,
     pub padding: Option<f64>,
+    pub padding_top: Option<f64>,
+    pub padding_right: Option<f64>,
+    pub padding_bottom: Option<f64>,
+    pub padding_left: Option<f64>,
+    pub margin: Option<f64>,
+    pub margin_top: Option<f64>,
+    pub margin_right: Option<f64>,
+    pub margin_bottom: Option<f64>,
+    pub margin_left: Option<f64>,
+    pub margin_top_auto: Option<bool>,
+    pub margin_right_auto: Option<bool>,
+    pub margin_bottom_auto: Option<bool>,
+    pub margin_left_auto: Option<bool>,
+    pub border_width: Option<f64>,
+    pub border_top_width: Option<f64>,
+    pub border_right_width: Option<f64>,
+    pub border_bottom_width: Option<f64>,
+    pub border_left_width: Option<f64>,
     pub gap: Option<f64>,
     pub flex_grow: Option<f64>,
     pub flex_shrink: Option<f64>,
@@ -48,6 +66,18 @@ pub struct LayoutBox {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    pub margin_top: f64,
+    pub margin_right: f64,
+    pub margin_bottom: f64,
+    pub margin_left: f64,
+    pub border_top: f64,
+    pub border_right: f64,
+    pub border_bottom: f64,
+    pub border_left: f64,
+    pub padding_top: f64,
+    pub padding_right: f64,
+    pub padding_bottom: f64,
+    pub padding_left: f64,
 }
 
 fn finite_nonnegative(value: f64, name: &str) -> Result<f32> {
@@ -60,8 +90,20 @@ fn finite_nonnegative(value: f64, name: &str) -> Result<f32> {
     Ok(value as f32)
 }
 
+fn finite_signed(value: f64, name: &str) -> Result<f32> {
+    if !value.is_finite() || value.abs() > f32::MAX as f64 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{name} must be finite and within the supported numeric range"),
+        ));
+    }
+    Ok(value as f32)
+}
+
 fn convert_style(input: LayoutStyle) -> Result<Style> {
     let mut style = Style::default();
+    // Nasty uses reset-style border-box sizing. There is no public boxSizing option.
+    style.box_sizing = BoxSizing::BorderBox;
     if let Some(display) = input.display.as_deref() {
         style.display = match display {
             "block" => Display::Block,
@@ -123,15 +165,34 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
         style.min_size.height =
             LengthPercentageAuto::length(finite_nonnegative(value, "minHeight")?);
     }
-    if let Some(value) = input.padding {
-        let value = LengthPercentage::length(finite_nonnegative(value, "padding")?);
-        style.padding = Rect {
-            left: value,
-            right: value,
-            top: value,
-            bottom: value,
-        };
-    }
+    let padding = input.padding.unwrap_or(0.0);
+    style.padding = Rect {
+        top: LengthPercentage::length(finite_nonnegative(input.padding_top.unwrap_or(padding), "paddingTop")?),
+        right: LengthPercentage::length(finite_nonnegative(input.padding_right.unwrap_or(padding), "paddingRight")?),
+        bottom: LengthPercentage::length(finite_nonnegative(input.padding_bottom.unwrap_or(padding), "paddingBottom")?),
+        left: LengthPercentage::length(finite_nonnegative(input.padding_left.unwrap_or(padding), "paddingLeft")?),
+    };
+    let margin = input.margin.unwrap_or(0.0);
+    let margin_edge = |value: Option<f64>, auto: Option<bool>, name: &str| -> Result<LengthPercentageAuto> {
+        if auto.unwrap_or(false) {
+            Ok(LengthPercentageAuto::auto())
+        } else {
+            Ok(LengthPercentageAuto::length(finite_signed(value.unwrap_or(margin), name)?))
+        }
+    };
+    style.margin = Rect {
+        top: margin_edge(input.margin_top, input.margin_top_auto, "marginTop")?,
+        right: margin_edge(input.margin_right, input.margin_right_auto, "marginRight")?,
+        bottom: margin_edge(input.margin_bottom, input.margin_bottom_auto, "marginBottom")?,
+        left: margin_edge(input.margin_left, input.margin_left_auto, "marginLeft")?,
+    };
+    let border = input.border_width.unwrap_or(0.0);
+    style.border = Rect {
+        top: LengthPercentage::length(finite_nonnegative(input.border_top_width.unwrap_or(border), "borderTopWidth")?),
+        right: LengthPercentage::length(finite_nonnegative(input.border_right_width.unwrap_or(border), "borderRightWidth")?),
+        bottom: LengthPercentage::length(finite_nonnegative(input.border_bottom_width.unwrap_or(border), "borderBottomWidth")?),
+        left: LengthPercentage::length(finite_nonnegative(input.border_left_width.unwrap_or(border), "borderLeftWidth")?),
+    };
     if let Some(value) = input.gap {
         let value = LengthPercentage::length(finite_nonnegative(value, "gap")?);
         style.gap = Size {
@@ -254,6 +315,18 @@ impl LayoutTree {
             y: layout.location.y as f64,
             width: layout.size.width as f64,
             height: layout.size.height as f64,
+            margin_top: layout.margin.top as f64,
+            margin_right: layout.margin.right as f64,
+            margin_bottom: layout.margin.bottom as f64,
+            margin_left: layout.margin.left as f64,
+            border_top: layout.border.top as f64,
+            border_right: layout.border.right as f64,
+            border_bottom: layout.border.bottom as f64,
+            border_left: layout.border.left as f64,
+            padding_top: layout.padding.top as f64,
+            padding_right: layout.padding.right as f64,
+            padding_bottom: layout.padding.bottom as f64,
+            padding_left: layout.padding.left as f64,
         })
     }
 

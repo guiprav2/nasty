@@ -9,15 +9,44 @@ const native = require(join(fileURLToPath(new URL(".", import.meta.url)), "nativ
 export const LayoutTree = native.LayoutTree;
 export const Window = native.Window;
 export { FontRegistry } from "./font-registry.js";
+export { buildBoxDisplayList } from "./render.js";
+
+function styleForTaffy(style) {
+  const result = { ...style };
+  delete result.boxSizing;
+  const margin = style.margin;
+  if (margin === "auto") delete result.margin;
+  for (const side of ["marginTop", "marginRight", "marginBottom", "marginLeft"]) {
+    const value = style[side] ?? margin;
+    delete result[`${side}Auto`];
+    if (value === "auto") {
+      result[`${side}Auto`] = true;
+      delete result[side];
+    } else if (value !== undefined) {
+      result[side] = value;
+    }
+  }
+  const borderWidth = style.borderWidth ?? 0;
+  result.borderWidth = 0;
+  for (const side of ["Top", "Right", "Bottom", "Left"]) {
+    const edge = `border${side}Width`;
+    const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
+    result[edge] = borderStyle === "none" || borderStyle === "hidden"
+      ? 0
+      : (style[edge] ?? borderWidth);
+  }
+  return result;
+}
 
 function defaultElementStyle(name) {
+  const reset = { padding: 0, margin: 0, borderWidth: 0, borderStyle: "none", backgroundColor: "transparent" };
   if (name === "input") {
-    return { display: "flex", justifyContent: "start", alignItems: "center", padding: 0, overflow: "hidden", backgroundColor: "transparent" };
+    return { ...reset, display: "flex", justifyContent: "start", alignItems: "center", overflow: "hidden" };
   }
   if (name === "textarea") {
-    return { display: "flex", justifyContent: "start", alignItems: "start", padding: 0, overflow: "hidden", backgroundColor: "transparent" };
+    return { ...reset, display: "flex", justifyContent: "start", alignItems: "start", overflow: "hidden" };
   }
-  return {};
+  return reset;
 }
 
 export class Element {
@@ -29,12 +58,12 @@ export class Element {
     this.style = { ...defaultElementStyle(name), ...style };
     this.scrollLeft = 0;
     this.scrollTop = 0;
-    this.handle = document.layoutTree.createNode(this.style);
+    this.handle = document.layoutTree.createNode(styleForTaffy(this.style));
   }
 
   setStyle(style) {
     this.style = { ...defaultElementStyle(this.name), ...style };
-    this.document.layoutTree.setStyle(this.handle, this.style);
+    this.document.layoutTree.setStyle(this.handle, styleForTaffy(this.style));
     this.document.dirty = true;
     return this;
   }
@@ -127,19 +156,31 @@ export class Document {
     const assemblyStart = timings && performance.now();
     const raw = elements.map((element) => {
       const box = this.layoutSnapshot?.[element.handle] ?? { x: 0, y: 0, width: 0, height: 0 };
-      return { element, x: box.x, y: box.y, width: box.width, height: box.height };
+      const margin = { top: box.marginTop ?? 0, right: box.marginRight ?? 0, bottom: box.marginBottom ?? 0, left: box.marginLeft ?? 0 };
+      const border = { top: box.borderTop ?? 0, right: box.borderRight ?? 0, bottom: box.borderBottom ?? 0, left: box.borderLeft ?? 0 };
+      const padding = { top: box.paddingTop ?? 0, right: box.paddingRight ?? 0, bottom: box.paddingBottom ?? 0, left: box.paddingLeft ?? 0 };
+      const borderBox = { x: box.x, y: box.y, width: box.width, height: box.height };
+      const paddingBox = insetBox(borderBox, border);
+      const contentBox = insetBox(paddingBox, padding);
+      const marginBox = {
+        x: box.x - margin.left,
+        y: box.y - margin.top,
+        width: box.width + margin.left + margin.right,
+        height: box.height + margin.top + margin.bottom,
+      };
+      return { element, ...borderBox, margin, border, padding, marginBox, borderBox, paddingBox, contentBox };
     });
     const byElement = new Map(raw.map((box) => [box.element, box]));
     const extents = new Map();
     for (let i = raw.length - 1; i >= 0; i--) {
       const box = raw[i];
-      let width = box.width;
-      let height = box.height;
+      let width = box.paddingBox.width;
+      let height = box.paddingBox.height;
       for (const child of box.element.children) {
         const childBox = byElement.get(child);
         const childExtent = extents.get(child) ?? { width: childBox.width, height: childBox.height };
-        width = Math.max(width, childBox.x - box.x + childExtent.width);
-        height = Math.max(height, childBox.y - box.y + childExtent.height);
+        width = Math.max(width, childBox.x - box.paddingBox.x + childExtent.width + childBox.margin.right + box.padding.right);
+        height = Math.max(height, childBox.y - box.paddingBox.y + childExtent.height + childBox.margin.bottom + box.padding.bottom);
       }
       extents.set(box.element, { width, height });
     }
@@ -152,16 +193,28 @@ export class Document {
         if (parent.style.overflow === "hidden" || parent.style.overflow === "auto" || parent.style.overflow === "scroll") {
           x -= parent.scrollLeft;
           y -= parent.scrollTop;
-          const next = { x: parentBox.x, y: parentBox.y, width: parentBox.width, height: parentBox.height };
+          let clipX = parentBox.paddingBox.x;
+          let clipY = parentBox.paddingBox.y;
+          for (let ancestor = parent.parent; ancestor; ancestor = ancestor.parent) {
+            if (ancestor.style.overflow === "hidden" || ancestor.style.overflow === "auto" || ancestor.style.overflow === "scroll") {
+              clipX -= ancestor.scrollLeft;
+              clipY -= ancestor.scrollTop;
+            }
+          }
+          const next = { ...parentBox.paddingBox, x: clipX, y: clipY };
           clip = clip ? intersect(clip, next) : next;
         }
       }
       const extent = extents.get(box.element);
       box.element.scrollWidth = extent.width;
       box.element.scrollHeight = extent.height;
-      box.element.scrollLeft = Math.min(box.element.scrollLeft, Math.max(0, box.element.scrollWidth - box.width));
-      box.element.scrollTop = Math.min(box.element.scrollTop, Math.max(0, box.element.scrollHeight - box.height));
-      return { ...box, x, y, clip, scrollWidth: box.element.scrollWidth, scrollHeight: box.element.scrollHeight };
+      box.element.scrollLeft = Math.min(box.element.scrollLeft, Math.max(0, box.element.scrollWidth - box.paddingBox.width));
+      box.element.scrollTop = Math.min(box.element.scrollTop, Math.max(0, box.element.scrollHeight - box.paddingBox.height));
+      const translatedBorderBox = { ...box.borderBox, x, y };
+      const translatedPaddingBox = { ...box.paddingBox, x: box.paddingBox.x + (x - box.x), y: box.paddingBox.y + (y - box.y) };
+      const translatedContentBox = { ...box.contentBox, x: box.contentBox.x + (x - box.x), y: box.contentBox.y + (y - box.y) };
+      const translatedMarginBox = { ...box.marginBox, x: box.marginBox.x + (x - box.x), y: box.marginBox.y + (y - box.y) };
+      return { ...box, x, y, borderBox: translatedBorderBox, paddingBox: translatedPaddingBox, contentBox: translatedContentBox, marginBox: translatedMarginBox, clip, scrollWidth: box.element.scrollWidth, scrollHeight: box.element.scrollHeight };
     });
     if (timings) timings.assembly = performance.now() - assemblyStart;
     return boxes;
@@ -175,8 +228,8 @@ export class Document {
       const overflow = box.element.style.overflow;
       if (overflow !== "auto" && overflow !== "scroll") continue;
       if (x < box.x || y < box.y || x >= box.x + box.width || y >= box.y + box.height) continue;
-      const maxX = Math.max(0, box.scrollWidth - box.width);
-      const maxY = Math.max(0, box.scrollHeight - box.height);
+      const maxX = Math.max(0, box.scrollWidth - box.paddingBox.width);
+      const maxY = Math.max(0, box.scrollHeight - box.paddingBox.height);
       const nextX = Math.max(0, Math.min(maxX, box.element.scrollLeft + deltaX));
       const nextY = Math.max(0, Math.min(maxY, box.element.scrollTop + deltaY));
       if (nextX === box.element.scrollLeft && nextY === box.element.scrollTop) continue;
@@ -195,6 +248,16 @@ export class Document {
   close() {
     return this.layoutTree.close();
   }
+}
+
+function insetBox(box, edges) {
+  const x = box.x + edges.left;
+  const y = box.y + edges.top;
+  return {
+    x, y,
+    width: Math.max(0, box.width - edges.left - edges.right),
+    height: Math.max(0, box.height - edges.top - edges.bottom),
+  };
 }
 
 function intersect(a, b) {

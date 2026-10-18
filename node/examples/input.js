@@ -23,6 +23,8 @@ const titleBox = boxes.find((box) => box.element === titleElement);
 const subtitleBox = boxes.find((box) => box.element === subtitleElement);
 const inputBox = boxes.find((box) => box.element === inputElement);
 const textareaBox = boxes.find((box) => box.element === textareaElement);
+const inputContentBox = inputBox.contentBox;
+const textareaContentBox = textareaBox.contentBox;
 
 console.log(`GPU adapter: ${window.adapterName()}; active refresh: ${refreshRate.toFixed(3)} Hz`);
 console.log("Both controls are active: input is single-line; textarea supports multiline. Enter is ignored in the input. Double-click selects words; Ctrl/Cmd+A selects all.");
@@ -80,17 +82,17 @@ function textRuns() {
     { text: "Enter does nothing in the input. The textarea accepts newlines.", x: subtitleBox.x, y: subtitleBox.y, width: subtitleBox.width, fontSize: 17, lineHeight: 24, color: "#b9c7dc" },
     {
       text: inputState?.displayText ?? values.input,
-      x: inputState?.textOriginX ?? inputBox.x,
-      y: inputState?.textOriginY ?? inputBox.y + (inputBox.height - lineHeight) / 2,
-      width: inputBox.width, fontSize, lineHeight, color: "#ffffff", wrap: false,
-      clipX: inputBox.x, clipY: inputBox.y, clipWidth: inputBox.width, clipHeight: inputBox.height,
+      x: inputState?.textOriginX ?? inputContentBox.x,
+      y: inputState?.textOriginY ?? inputContentBox.y + (inputContentBox.height - lineHeight) / 2,
+      width: inputContentBox.width, fontSize, lineHeight, color: "#ffffff", wrap: false,
+      clipX: inputContentBox.x, clipY: inputContentBox.y, clipWidth: inputContentBox.width, clipHeight: inputContentBox.height,
     },
     {
       text: textareaState?.displayText ?? values.textarea,
-      x: textareaState?.textOriginX ?? textareaBox.x,
-      y: textareaState?.textOriginY ?? textareaBox.y,
-      width: textareaBox.width, fontSize, lineHeight, color: "#ffffff", wrap: true,
-      clipX: textareaBox.x, clipY: textareaBox.y, clipWidth: textareaBox.width, clipHeight: textareaBox.height,
+      x: textareaState?.textOriginX ?? textareaContentBox.x,
+      y: textareaState?.textOriginY ?? textareaContentBox.y,
+      width: textareaContentBox.width, fontSize, lineHeight, color: "#ffffff", wrap: true,
+      clipX: textareaContentBox.x, clipY: textareaContentBox.y, clipWidth: textareaContentBox.width, clipHeight: textareaContentBox.height,
     },
   ];
 }
@@ -182,8 +184,8 @@ function draw() {
 
   const editorStarted = performance.now();
   const nextStates = window.updateTextAreas([
-    { id: "main-input", value: values.input, x: inputBox.x, y: inputBox.y, width: inputBox.width, height: inputBox.height, fontSize, lineHeight, multiline: false, focus: (benchmark || fastBenchmark), trace: traceEditor },
-    { id: "main-textarea", value: values.textarea, x: textareaBox.x, y: textareaBox.y, width: textareaBox.width, height: textareaBox.height, fontSize, lineHeight, multiline: true, trace: traceEditor },
+    { id: "main-input", value: values.input, x: inputContentBox.x, y: inputContentBox.y, width: inputContentBox.width, height: inputContentBox.height, fontSize, lineHeight, multiline: false, focus: (benchmark || fastBenchmark), trace: traceEditor },
+    { id: "main-textarea", value: values.textarea, x: textareaContentBox.x, y: textareaContentBox.y, width: textareaContentBox.width, height: textareaContentBox.height, fontSize, lineHeight, multiline: true, trace: traceEditor },
   ]);
   states.input = nextStates[0];
   states.textarea = nextStates[1];
@@ -222,7 +224,8 @@ function draw() {
   for (const name of ["input", "textarea"]) {
     const state = states[name];
     const box = name === "input" ? inputBox : textareaBox;
-    const clip = { x: box.x, y: box.y, width: box.width, height: box.height };
+    const contentBox = name === "input" ? inputContentBox : textareaContentBox;
+    const clip = contentBox;
     for (const rect of state.selectionRects) {
       const clipped = clippedRect(rect, clip);
       if (clipped) quads.push(quad(clipped, [.20, .39, .64, .85]));
