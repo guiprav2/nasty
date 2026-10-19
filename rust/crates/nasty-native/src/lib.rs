@@ -382,6 +382,7 @@ struct GpuImage {
 
 enum DrawOrder {
     Solids(std::ops::Range<u32>),
+    Triangles(std::ops::Range<u32>),
     Image(usize),
 }
 
@@ -1619,6 +1620,7 @@ impl Renderer {
         &mut self,
         window: &OsWindow,
         list: &[f32],
+        triangles: &[f32],
         image_draws: &[ImageDraw],
         draw_order: &[DrawOrder],
     ) -> std::result::Result<RenderTimings, String> {
@@ -1662,6 +1664,12 @@ impl Renderer {
                     color,
                 },
             ]);
+        }
+        let triangle_vertex_offset = vertices.len() as u32;
+        for vertex in triangles.chunks_exact(6) {
+            let x = vertex[0] / width * 2.0 - 1.0;
+            let y = 1.0 - vertex[1] / height * 2.0;
+            vertices.push(Vertex { position: [x, y], color: [vertex[2], vertex[3], vertex[4], vertex[5]] });
         }
         let bytes = bytemuck::cast_slice(&vertices);
         if bytes.len() > self.vertex_capacity {
@@ -1795,6 +1803,12 @@ impl Renderer {
                             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                             pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                             pass.draw(range.clone(), 0..1);
+                        }
+                        DrawOrder::Triangles(range) => {
+                            pass.set_pipeline(&self.pipeline);
+                            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                            pass.draw((triangle_vertex_offset + range.start)..(triangle_vertex_offset + range.end), 0..1);
                         }
                         DrawOrder::Image(index) => {
                             let Some((texture_id, range, x, y, w, h)) = image_batches.get(*index).and_then(Option::as_ref) else { continue };
@@ -2457,6 +2471,7 @@ struct WindowApp {
     cursor: (f64, f64),
     modifiers: ModifiersState,
     display_list: Vec<f32>,
+    display_triangles: Vec<f32>,
     image_draws: Vec<ImageDraw>,
     draw_order: Vec<DrawOrder>,
     render_pending: bool,
@@ -2634,7 +2649,7 @@ impl ApplicationHandler for WindowApp {
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
-                match renderer.render(window, &self.display_list, &self.image_draws, &self.draw_order) {
+                match renderer.render(window, &self.display_list, &self.display_triangles, &self.image_draws, &self.draw_order) {
                     Ok(timings) => {
                         self.last_render_ms = timings.total_ms;
                         self.last_prepare_ms = timings.prepare_ms;
@@ -2941,7 +2956,16 @@ impl Window {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
         let (quads, images, order) = parse_ordered_display_list(display_list.as_ref())?;
-        self.present_parsed(quads, images, order)
+        self.present_parsed(quads, Vec::new(), images, order)
+    }
+
+    #[napi(js_name = "presentTransformed")]
+    pub fn present_transformed(&mut self, display_list: Buffer) -> Result<PresentStats> {
+        if self.app.closed {
+            return Err(Error::new(Status::GenericFailure, "window is closed"));
+        }
+        let (triangles, order) = parse_transformed_display_list(display_list.as_ref())?;
+        self.present_parsed(Vec::new(), triangles, Vec::new(), order)
     }
 }
 
@@ -2951,11 +2975,12 @@ impl Window {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
         let list = parse_display_list(display_list.as_ref())?;
-        self.present_parsed(list, images, Vec::new())
+        self.present_parsed(list, Vec::new(), images, Vec::new())
     }
 
-    fn present_parsed(&mut self, list: Vec<f32>, images: Vec<ImageDraw>, order: Vec<DrawOrder>) -> Result<PresentStats> {
+    fn present_parsed(&mut self, list: Vec<f32>, triangles: Vec<f32>, images: Vec<ImageDraw>, order: Vec<DrawOrder>) -> Result<PresentStats> {
         self.app.display_list = list;
+        self.app.display_triangles = triangles;
         self.app.image_draws = images;
         self.app.draw_order = order;
         self.app.render_pending = true;
@@ -3101,6 +3126,35 @@ fn parse_ordered_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<ImageDraw>,
         }
     }
     Ok((quads, images, order))
+}
+
+fn parse_transformed_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<DrawOrder>)> {
+    if bytes.len() < 8 || bytes.len() % 4 != 0 {
+        return Err(Error::new(Status::InvalidArg, "transformed display list must be a Float32Array"));
+    }
+    let values = bytes.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+    if values[0] != 3.0 || !values[1].is_finite() || values[1] < 0.0 || values[1].fract() != 0.0 {
+        return Err(Error::new(Status::InvalidArg, "unsupported transformed display-list header"));
+    }
+    let triangle_count = values[1] as usize;
+    if triangle_count > 1_000_000 || values.len() != 2 + triangle_count * 11 {
+        return Err(Error::new(Status::InvalidArg, "transformed display-list triangle count does not match its data"));
+    }
+    let mut vertices = Vec::with_capacity(triangle_count * 18);
+    for record in values[2..].chunks_exact(11) {
+        if record.iter().any(|value| !value.is_finite()) || record[0] != 0.0
+            || record[7..11].iter().any(|value| !(0.0..=1.0).contains(value))
+        {
+            return Err(Error::new(Status::InvalidArg, "transformed triangle contains invalid coordinates or color"));
+        }
+        for position in record[1..7].chunks_exact(2) {
+            vertices.extend_from_slice(&[position[0], position[1], record[7], record[8], record[9], record[10]]);
+        }
+    }
+    let order = if triangle_count == 0 { Vec::new() } else { vec![DrawOrder::Triangles(0..(triangle_count * 3) as u32)] };
+    Ok((vertices, order))
 }
 
 impl LayoutTree {

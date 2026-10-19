@@ -5,6 +5,7 @@ import { LayoutWorker } from "./layout-worker.js";
 import { loadImage, unloadImage } from "./image-decoder.js";
 import { documentBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
 import { DOMRect } from "./dom-rect.js";
+import { isPaintColorProperty, registerStyleTransitionState, startColorTransition } from "./internal/css-transitions.js";
 
 const require = createRequire(import.meta.url);
 const native = require(join(fileURLToPath(new URL(".", import.meta.url)), "native/debug/nasty.node"));
@@ -32,6 +33,7 @@ export { FontRegistry } from "./font-registry.js";
 export { buildBoxDisplayList } from "./render.js";
 export { buildImageDraws } from "./render.js";
 export { buildOrderedDisplayList } from "./render.js";
+export { buildTransformedDisplayList } from "./render.js";
 export { closeImageDecoder } from "./image-decoder.js";
 
 function styleForTaffy(style) {
@@ -75,18 +77,21 @@ function defaultElementStyle(name) {
 const styleData = new WeakMap();
 class CSSStyleDeclaration {
   constructor(element, initial) {
-    const state = { element, values: initial };
+    const state = { element, values: initial, transitions: new Map() };
     styleData.set(this, state);
     const proxy = new Proxy(this, {
       get: (target, property, receiver) => {
-        if (typeof property === "string" && property in state.values) return state.values[property];
+        if (typeof property === "string" && property in state.values) {
+          return state.values[property];
+        }
         return Reflect.get(target, property, receiver);
       },
       set: (target, property, value, receiver) => {
         if (typeof property !== "string" || property in target) return Reflect.set(target, property, value, receiver);
         if (state.values[property] === value) return true;
+        if (isPaintColorProperty(property)) startColorTransition(state, property, String(value));
         state.values[property] = value;
-        state.element._styleChanged();
+        state.element._styleChanged(property);
         return true;
       },
       ownKeys: () => Reflect.ownKeys(state.values),
@@ -95,6 +100,7 @@ class CSSStyleDeclaration {
         : Reflect.getOwnPropertyDescriptor(target, property),
     });
     styleData.set(proxy, state);
+    registerStyleTransitionState(proxy, state);
     return proxy;
   }
 
@@ -114,12 +120,14 @@ class CSSStyleDeclaration {
     const previous = this.getPropertyValue(property);
     const state = styleData.get(this);
     if (Object.hasOwn(state.values, name)) {
+      state.transitions.delete(name);
       delete state.values[name];
-      state.element._styleChanged();
+      state.element._styleChanged(name);
     }
     return previous;
   }
 }
+
 
 export class Element extends EventTarget {
   constructor(document, name) {
@@ -267,7 +275,8 @@ export class Element extends EventTarget {
     documentState(this.document).dirty = true;
   }
 
-  _styleChanged() {
+  _styleChanged(property) {
+    if (isPaintColorProperty(property) || property === "transition" || property === "transform" || property === "transformOrigin") return;
     const doc = documentState(this.document);
     doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
     doc.dirty = true;
