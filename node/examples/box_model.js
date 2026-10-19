@@ -93,11 +93,11 @@ const presented = window.present(displayList);
 assert.ok(presented.rendered, "box-model display list reaches the native GPU renderer");
 console.log(`box model passed: ${boxes.length} elements, ${(values.length - 1) / 8} GPU quads; adapter ${window.adapterName()}`);
 console.log("GPU preview is open; press Escape or close the window to exit.");
-while (!window.isClosed()) {
+while (!window.closed) {
   for (const event of window.drainEvents()) {
     if (event.type === "close" || (event.type === "key" && event.key === "Escape")) window.close();
   }
-  if (!window.isClosed()) await new Promise((resolve) => setTimeout(resolve, 20));
+  if (!window.closed) await new Promise((resolve) => setTimeout(resolve, 20));
 }
 
 console.log(`card border box ${cardBox.width}x${cardBox.height}, content box ${cardBox.contentBox.width}x${cardBox.contentBox.height}; auto-margin x ${box(right).x}; overflow clip ${box(overflowingChild).clip.width}x${box(overflowingChild).clip.height}`);

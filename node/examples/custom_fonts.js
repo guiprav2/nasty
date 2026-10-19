@@ -75,7 +75,7 @@ function spin(deadline) {
   draw();
 }
 function draw() {
-  if (window.isClosed()) return finish();
+  if (window.closed) return finish();
   const now = performance.now();
   if (frame) frameIntervals.push(now - previous);
   previous = now;
@@ -103,7 +103,7 @@ function draw() {
     if (event.type === "refreshRate" && event.x > 0) budget = 1000 / event.x;
     if (event.type === "keydown" && event.key === "Named(Escape)") window.close();
   }
-  if (frame < 720 && !window.isClosed()) {
+  if (frame < 720 && !window.closed) {
     next += budget;
     if (next <= performance.now()) {
       const count = Math.floor((performance.now() - next) / budget) + 1;

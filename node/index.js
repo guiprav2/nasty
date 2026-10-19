@@ -4,9 +4,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { LayoutWorker } from "./layout-worker.js";
 import { loadImage, unloadImage } from "./image-decoder.js";
 import { documentBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
-import { syncDocumentText } from "./internal/dom-text.js";
+import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
 import { isPaintColorProperty, registerStyleTransitionState, startColorTransition, TransitionEvent } from "./internal/css-transitions.js";
+import { displayListElements } from "./render.js";
 
 const require = createRequire(import.meta.url);
 const native = require(join(fileURLToPath(new URL(".", import.meta.url)), "native/debug/nasty.node"));
@@ -36,10 +37,10 @@ export class Window extends native.Window {
     this.#resizable = mode;
   }
 
-  present(list) { syncDocumentText(this, this.#document); return super.present(list); }
-  presentWithImages(list, images) { syncDocumentText(this, this.#document); return super.presentWithImages(list, images); }
-  presentOrdered(list) { syncDocumentText(this, this.#document); return super.presentOrdered(list); }
-  presentTransformed(list) { syncDocumentText(this, this.#document); return super.presentTransformed(list); }
+  present(list) { syncDocumentTextForPresent(this, this.#document); return super.present(list); }
+  presentWithImages(list, images) { syncDocumentTextForPresent(this, this.#document); return super.presentWithImages(list, images); }
+  presentOrdered(list) { syncDocumentTextForPresent(this, this.#document); return super.presentOrdered(list); }
+  presentTransformed(list) { syncDocumentTextForPresent(this, this.#document, displayListElements(list)); return super.presentTransformed(list); }
 
   get document() {
     return this.#document;
@@ -96,6 +97,11 @@ function defaultElementStyle(name) {
     return { ...reset, display: "flex", justifyContent: "start", alignItems: "start", overflow: "hidden" };
   }
   return reset;
+}
+
+function markGeometryDirty(document) {
+  document.geometryDirty = true;
+  document.geometryGeneration = (document.geometryGeneration ?? 0) + 1;
 }
 
 const styleData = new WeakMap();
@@ -309,11 +315,11 @@ export class Element extends EventTarget {
   }
 
   _styleChanged(property) {
-    if (isPaintColorProperty(property) || property === "transition" || property === "transform" || property === "transformOrigin") return;
+    if (isPaintColorProperty(property) || property === "opacity" || property === "transition" || property === "transform" || property === "transformOrigin") return;
     const doc = documentState(this.document);
     doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
     doc.dirty = true;
-    doc.geometryDirty = true;
+    markGeometryDirty(doc);
   }
 
   _taffyStyle() {
@@ -331,7 +337,7 @@ export class Element extends EventTarget {
     if (!Number.isFinite(x) || !Number.isFinite(y)) throw new TypeError("scroll offsets must be finite");
     this.scrollLeft = Math.max(0, this.scrollLeft + x);
     this.scrollTop = Math.max(0, this.scrollTop + y);
-    documentState(this.document).geometryDirty = true;
+    markGeometryDirty(documentState(this.document));
     return this;
   }
 
@@ -371,18 +377,22 @@ export class Element extends EventTarget {
     const doc = documentState(this.document);
     doc.layoutTree.setChildren(elementState(this).handle, this.children.map((child) => elementState(child).handle));
     doc.dirty = true;
-    doc.geometryDirty = true;
+    markGeometryDirty(doc);
   }
 }
 
 export class Document {
   constructor() {
-    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
+    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
     this.body = new Element(this, "body");
     this.body.style.display = "block";
     registerDocument(this, {
       layout: (width, height, timings) => this.#layout(width, height, timings),
       boxes: (timings) => this.#boxes(timings),
+      renderBoxes: (elements, timings) => {
+        this.#layoutSync();
+        return this.#boxes(timings, elements);
+      },
       rect: (element) => {
         this.#layoutSync();
         const box = this.#boxes().find((entry) => entry.element === element);
@@ -426,7 +436,7 @@ export class Document {
       if (!result.stale) {
         documentState(this).layoutSnapshot = result.boxes;
         documentState(this).dirty = false;
-        documentState(this).geometryDirty = true;
+        markGeometryDirty(documentState(this));
       }
     }
     return this.#boxes(timings);
@@ -447,21 +457,32 @@ export class Document {
       const result = documentState(this).layoutTree.layoutSync(width, height, elementState(this.body).handle);
       documentState(this).layoutSnapshot = result.boxes;
       documentState(this).dirty = false;
-      documentState(this).geometryDirty = true;
+      markGeometryDirty(documentState(this));
     }
   }
 
-  #boxes(timings) {
-    if (!documentState(this).geometryDirty && documentState(this).boxesSnapshot) {
+  #boxes(timings, selectedElements = null) {
+    const state = documentState(this);
+    if (selectedElements) {
+      const cached = state.renderBoxCache.get(selectedElements);
+      if (cached?.generation === state.geometryGeneration) {
+        if (timings) timings.assembly = 0;
+        return cached.boxes;
+      }
+    }
+    if (!selectedElements && !state.geometryDirty && state.boxesSnapshot) {
       if (timings) timings.assembly = 0;
-      return documentState(this).boxesSnapshot;
+      return state.boxesSnapshot;
     }
     const elements = [];
-    const collect = (element) => {
-      elements.push(element);
-      for (const child of element.children) collect(child);
-    };
-    collect(this.body);
+    if (selectedElements) elements.push(...selectedElements);
+    else {
+      const collect = (element) => {
+        elements.push(element);
+        for (const child of element.children) collect(child);
+      };
+      collect(this.body);
+    }
     const assemblyStart = timings && performance.now();
     const raw = elements.map((element) => {
       const box = documentState(this).layoutSnapshot?.[elementState(element).handle] ?? { x: 0, y: 0, width: 0, height: 0 };
@@ -486,6 +507,7 @@ export class Document {
       let width = box.paddingBox.width;
       let height = box.paddingBox.height;
       for (const child of box.element.children) {
+        if (selectedElements && !byElement.has(child)) continue;
         const childBox = byElement.get(child);
         const childExtent = extents.get(child) ?? { width: childBox.width, height: childBox.height };
         width = Math.max(width, childBox.x - box.paddingBox.x + childExtent.width + childBox.margin.right + box.padding.right);
@@ -526,8 +548,12 @@ export class Document {
       return { ...box, x, y, borderBox: translatedBorderBox, paddingBox: translatedPaddingBox, contentBox: translatedContentBox, marginBox: translatedMarginBox, clip, scrollWidth: box.element.scrollWidth, scrollHeight: box.element.scrollHeight };
     });
     if (timings) timings.assembly = performance.now() - assemblyStart;
-    documentState(this).boxesSnapshot = boxes;
-    documentState(this).geometryDirty = false;
+    if (!selectedElements) {
+      documentState(this).boxesSnapshot = boxes;
+      documentState(this).geometryDirty = false;
+    } else {
+      documentState(this).renderBoxCache.set(selectedElements, { generation: documentState(this).geometryGeneration, boxes });
+    }
     return boxes;
   }
 
@@ -546,7 +572,7 @@ export class Document {
       if (nextX === box.element.scrollLeft && nextY === box.element.scrollTop) continue;
       box.element.scrollLeft = nextX;
       box.element.scrollTop = nextY;
-      documentState(this).geometryDirty = true;
+      markGeometryDirty(documentState(this));
       return true;
     }
     return false;

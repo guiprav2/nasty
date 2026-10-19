@@ -13,10 +13,12 @@ h.style.color='#ffffff';assert.equal(documentState(d).dirty,false);
 let requests = 0;
 let ready = false;
 let placed = null;
+let placedIndices = null;
+let placementUpdates = 0;
 const window = {
   requestTextRuns() { requests++; },
   pollTextRuns() { return ready ? {} : null; },
-  updateTextPlacement(runs) { placed = runs; },
+  updateTextPlacement(runs, indices) { placed = runs; placedIndices = indices; placementUpdates++; },
 };
 syncDocumentText(window, d);
 assert.equal(requests, 1);
@@ -26,6 +28,12 @@ assert.equal(requests, 1);
 ready = true;
 syncDocumentText(window, d);
 assert.equal(placed[0].color, '#abcdefff');
+assert.deepEqual(placedIndices, [0]);
+syncDocumentText(window, d);
+assert.equal(placementUpdates, 1, 'unchanged paint placements should not be uploaded again');
+h.style.color = '#fedcba';
+syncDocumentText(window, d);
+assert.deepEqual(placedIndices, [0], 'paint-only updates should target changed text runs');
 Object.assign(h.style, { width: 400, flexShrink: 0 });
 await layoutDocument(d,400,300);
 syncDocumentText(window, d);

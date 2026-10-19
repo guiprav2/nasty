@@ -31,6 +31,14 @@ export function documentBoxes(document, timings) {
   return internals.boxes(timings);
 }
 
+// Internal rendering path for callers that already know which scene is visible.
+// It avoids assembling geometry for every offscreen DOM subtree each frame.
+export function documentBoxesFor(document, elements, timings) {
+  const internals = documents.get(document);
+  if (!internals) throw new TypeError("document is not managed by Nasty");
+  return internals.renderBoxes(elements, timings);
+}
+
 export function elementRect(element) {
   const internals = documents.get(element.document);
   if (!internals) throw new TypeError("element is not managed by Nasty");

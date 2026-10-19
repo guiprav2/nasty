@@ -157,7 +157,7 @@ function waitForFrameDeadline(deadline) {
 }
 
 function draw() {
-  if (window.isClosed()) return finish();
+  if (window.closed) return finish();
   const frameStart = performance.now();
   const dt = frameStart - previousFrame;
   previousFrame = frameStart;
@@ -236,7 +236,7 @@ function draw() {
     nextResourceSampleAt = frameStart + 1000;
   }
 
-  if (frame < 720 && !window.isClosed()) {
+  if (frame < 720 && !window.closed) {
     nextFrameAt += frameBudget;
     const now = performance.now();
     if (nextFrameAt <= now) {

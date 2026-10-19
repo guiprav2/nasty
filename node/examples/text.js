@@ -68,7 +68,7 @@ function spin(deadline) {
   draw();
 }
 function draw() {
-  if (window.isClosed()) return finish();
+  if (window.closed) return finish();
   const now = performance.now();
   if (frame) (frame < 30 ? coldIntervals : steadyIntervals).push(now - previous);
   previous = now;
@@ -122,7 +122,7 @@ function draw() {
     hostCpus = cpus;
     resourceAt = now + 1000;
   }
-  if (frame < 720 && !window.isClosed()) {
+  if (frame < 720 && !window.closed) {
     next += budget;
     const current = performance.now();
     if (next <= current) {

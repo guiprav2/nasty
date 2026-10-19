@@ -102,7 +102,7 @@ const hostIdleStart = hostCpusStart.reduce((sum, cpu) => sum + cpu.times.idle, 0
 console.log(`animating ${cards.length} 3D cards; ${refreshHz.toFixed(3)} Hz target; adapter ${window.adapterName()}`);
 
 function draw() {
-  if (window.isClosed() || frames >= frameLimit) return finish();
+  if (window.closed || frames >= frameLimit) return finish();
   const now = performance.now();
   const elapsed = (now - start) / 1000;
   if (frames) intervals.push(now - previous);

@@ -2,18 +2,37 @@ import { elementState } from "./internal/dom-state.js";
 import { computedStyleValue } from "./internal/css-transitions.js";
 
 const SIDES = ["Top", "Right", "Bottom", "Left"];
+const transformedListElements = new WeakMap();
+
+export function displayListElements(list) {
+  return transformedListElements.get(list) ?? null;
+}
 
 export function parseColor(value) {
   if (!value || value === "transparent") return null;
-  let match = /^#([\da-f]{3}|[\da-f]{6})$/i.exec(value);
+  let match = /^#([\da-f]{3}|[\da-f]{6}|[\da-f]{8})$/i.exec(value);
   if (match) {
     const hex = match[1].length === 3 ? [...match[1]].map((digit) => digit + digit).join("") : match[1];
-    return [0, 2, 4].map((index) => Number.parseInt(hex.slice(index, index + 2), 16) / 255).concat(1);
+    const channels = [0, 2, 4].map((index) => Number.parseInt(hex.slice(index, index + 2), 16) / 255);
+    return channels.concat(hex.length === 8 ? Number.parseInt(hex.slice(6, 8), 16) / 255 : 1);
   }
   match = /^rgba?\(\s*([\d.]+)[, ]+([\d.]+)[, ]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/i.exec(value);
   if (!match) throw new TypeError(`unsupported display-list color: ${value}`);
   const alpha = match[4] ? (match[4].endsWith("%") ? Number.parseFloat(match[4]) / 100 : Number.parseFloat(match[4])) : 1;
   return [Number(match[1]) / 255, Number(match[2]) / 255, Number(match[3]) / 255, alpha];
+}
+
+function opacityFor(element) {
+  let opacity = 1;
+  for (let current = element; current; current = current.parent) {
+    const value = Number(current.style.opacity);
+    if (current.style.opacity !== undefined && Number.isFinite(value)) opacity *= Math.max(0, Math.min(1, value));
+  }
+  return opacity;
+}
+function withOpacity(color, opacity) {
+  if (!color || opacity === 1) return color;
+  return [color[0], color[1], color[2], color[3] * opacity];
 }
 
 function intersection(a, b) {
@@ -347,11 +366,12 @@ export function buildTransformedDisplayList(boxes, width, height) {
   };
   for (const box of boxes) {
     const style = box.element.style;
+    const opacity = opacityFor(box.element);
     const project = (x, y) => {
       const point = projectPoint(box, box.x + x, box.y + y);
       return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
     };
-    push(box, box.borderBox, parseColor(computedStyleValue(style, "backgroundColor")), project);
+    push(box, box.borderBox, withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity), project);
     const { borderBox, border } = box;
     for (const side of SIDES) {
       const edge = side.toLowerCase();
@@ -367,9 +387,11 @@ export function buildTransformedDisplayList(boxes, width, height) {
             : { x: borderBox.x, y: borderBox.y, width: thickness, height: borderBox.height };
       const property = `border${side}Color`;
       const color = computedStyleValue(style, style[property] === undefined ? "borderColor" : property) ?? "#000000";
-      push(box, rect, parseColor(color), project);
+      push(box, rect, withOpacity(parseColor(color), opacity), project);
     }
   }
   values[1] = triangleCount;
-  return Buffer.from(new Float32Array(values).buffer);
+  const displayList = Buffer.from(new Float32Array(values).buffer);
+  transformedListElements.set(displayList, new Set(boxes.map(({ element }) => element)));
+  return displayList;
 }

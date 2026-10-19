@@ -2910,15 +2910,27 @@ impl Window {
 
     // Internal compositor transport: reuse shaped buffers for paint-only changes.
     #[napi(js_name = "updateTextPlacement")]
-    pub fn update_text_placement(&mut self, runs: Vec<TextRunOptions>) -> Result<()> {
+    pub fn update_text_placement(
+        &mut self,
+        runs: Vec<TextRunOptions>,
+        update_indices: Option<Vec<u32>>,
+    ) -> Result<()> {
         let renderer = self.app.renderer.as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
         let runtime = renderer.text_runtime.as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "text runtime unavailable"))?;
-        if runs.len() != runtime.text_buffers.len() {
+        if update_indices.is_none() && runs.len() != runtime.text_buffers.len() {
             return Err(Error::new(Status::InvalidArg, "text placement count mismatch"));
         }
-        for (run, old) in runs.iter().zip(&runtime.text_run_options) {
+        let indices = update_indices.unwrap_or_else(|| (0..runs.len() as u32).collect());
+        if runs.len() != indices.len() {
+            return Err(Error::new(Status::InvalidArg, "sparse text placement count mismatch"));
+        }
+        if indices.iter().any(|index| *index as usize >= runtime.text_buffers.len()) {
+            return Err(Error::new(Status::InvalidArg, "text placement index out of range"));
+        }
+        for (run, index) in runs.iter().zip(&indices) {
+            let old = &runtime.text_run_options[*index as usize];
             if run.text != old.text || run.width != old.width || run.font_size != old.font_size
                 || run.line_height != old.line_height || run.font_family != old.font_family || run.wrap != old.wrap
                 || !run.x.is_finite() || !run.y.is_finite() || parse_text_color(&run.color).is_none() {
@@ -2927,18 +2939,23 @@ impl Window {
         }
         let font_system = runtime.font_system.as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "font system unavailable"))?;
-        for ((text, run), painter) in runtime.text_buffers.iter_mut().zip(&runs).zip(runtime.text_renderers.iter_mut()) {
-            text.x = run.x as f32;
-            text.y = run.y as f32;
-            text.color = parse_text_color(&run.color).unwrap();
-            painter.prepare(&renderer.device, &renderer.queue, font_system,
-                &mut runtime.text_atlas, &runtime.text_viewport,
-                [TextArea { buffer: &text.buffer, left: text.x, top: text.y, scale: 1.0,
-                    bounds: text_bounds(run, renderer.config.width, renderer.config.height),
-                    default_color: text.color, custom_glyphs: &[] }], &mut runtime.swash_cache)
-                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))?;
+        for (run, index) in runs.iter().zip(indices) {
+            let index = index as usize;
+            {
+                let text = &mut runtime.text_buffers[index];
+                let painter = &mut runtime.text_renderers[index];
+                text.x = run.x as f32;
+                text.y = run.y as f32;
+                text.color = parse_text_color(&run.color).unwrap();
+                painter.prepare(&renderer.device, &renderer.queue, font_system,
+                    &mut runtime.text_atlas, &runtime.text_viewport,
+                    [TextArea { buffer: &text.buffer, left: text.x, top: text.y, scale: 1.0,
+                        bounds: text_bounds(run, renderer.config.width, renderer.config.height),
+                        default_color: text.color, custom_glyphs: &[] }], &mut runtime.swash_cache)
+                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))?;
+            }
+            runtime.text_run_options[index] = run.clone();
         }
-        runtime.text_run_options = runs;
         Ok(())
     }
 
@@ -2978,8 +2995,8 @@ impl Window {
             .unwrap_or(0.0)
     }
 
-    #[napi]
-    pub fn is_closed(&self) -> bool {
+    #[napi(getter)]
+    pub fn closed(&self) -> bool {
         self.app.closed
     }
 

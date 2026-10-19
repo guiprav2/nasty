@@ -85,7 +85,7 @@ function retarget(card, property, value) {
 console.log(`transition stress: background-color reversal/interruption + border-color steps(); ${refreshHz.toFixed(3)} Hz target; adapter ${window.adapterName()}`);
 
 function draw() {
-  if (window.isClosed() || frames >= frameLimit) return finish();
+  if (window.closed || frames >= frameLimit) return finish();
   const now = performance.now();
   const elapsed = now - start;
   if (frames) intervals.push(now - previous);

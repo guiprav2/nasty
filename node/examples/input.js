@@ -168,7 +168,7 @@ function quad(rect, color) {
 }
 
 function draw() {
-  if (window.isClosed()) return finish();
+  if (window.closed) return finish();
   const now = performance.now();
   if (frame) intervals.push(now - previous);
   previous = now;
@@ -252,7 +252,7 @@ function draw() {
     if (event.type === "refreshRate" && event.x > 0) budget = 1000 / event.x;
     if (event.type === "keydown" && event.key?.includes("Named(Escape)")) window.close();
   }
-  if (window.isClosed()) return finish();
+  if (window.closed) return finish();
   if (now - resourceWall >= 1000) {
     const cpus = os.cpus();
     const total = (list) => list.reduce((sum, cpu) => sum + Object.values(cpu.times).reduce((a, b) => a + b, 0), 0);

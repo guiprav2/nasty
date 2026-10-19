@@ -39,7 +39,7 @@ function spin(deadline) {
 }
 
 function draw() {
-  if (window.isClosed()) return finish();
+  if (window.closed) return finish();
   const now = performance.now();
   const prepared = window.pollTextRuns();
   if (prepared) {
@@ -60,7 +60,7 @@ function draw() {
     if (event.type === "resize") viewport = { width: event.x, height: event.y };
     if (event.type === "keydown" && event.key === "Named(Escape)") window.close();
   }
-  if (frame < 720 && !window.isClosed()) {
+  if (frame < 720 && !window.closed) {
     next += budget;
     const nowAfter = performance.now();
     if (next <= nowAfter) {

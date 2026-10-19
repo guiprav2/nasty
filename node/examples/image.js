@@ -175,7 +175,7 @@ const percentile = (values, p) => [...values].sort((a, b) => a - b)[Math.min(val
 function report(name, values) {
   console.log(`${name}: median ${percentile(values, .5).toFixed(3)} ms, p95 ${percentile(values, .95).toFixed(3)} ms, max ${percentile(values, 1).toFixed(3)} ms`);
 }
-while (!window.isClosed() && frame < frameLimit) {
+while (!window.closed && frame < frameLimit) {
   const frameStart = performance.now();
   if (frame) intervals.push(frameStart - previous);
   previous = frameStart;
