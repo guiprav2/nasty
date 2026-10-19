@@ -3,7 +3,7 @@ import { performance } from "node:perf_hooks";
 import { Document, Window } from "../index.js";
 import { layoutDocument } from "../internal/dom-state.js";
 
-const window = new Window({ title: "Nasty input and textarea", width: 960, height: 600 });
+const window = new Window({ resizable: "none", title: "Nasty input and textarea", width: 960, height: 600 });
 const refreshRate = window.refreshRate() > 0 ? window.refreshRate() : 60;
 let budget = 1000 / refreshRate;
 const viewport = window.size();

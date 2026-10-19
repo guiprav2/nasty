@@ -28,7 +28,7 @@ const width = 1280;
 const height = 720;
 const renderScale = height / layoutHeight;
 const sceneOffsetX = (width - layoutWidth * renderScale) / 2;
-const window = new Window({ title: "Nasty — JavaScript & DOM, full circle", width, height, visible: false });
+const window = new Window({ resizable: "none", title: "Nasty — JavaScript & DOM, full circle", width, height, visible: false });
 const document = new Document();
 window.document = document;
 

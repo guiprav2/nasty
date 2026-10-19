@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use taffy::prelude::*;
 use taffy::tree::TaffyError;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{Ime, MouseScrollDelta, WindowEvent as OsWindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
@@ -394,6 +394,7 @@ pub struct WindowOptions {
     #[napi(js_name = "allowAnyThread")]
     pub allow_any_thread: Option<bool>,
     pub visible: Option<bool>,
+    pub resizable: Option<String>,
 }
 
 #[napi(object)]
@@ -2465,6 +2466,7 @@ struct WindowApp {
     width: f64,
     height: f64,
     visible: bool,
+    resizable: String,
     window: Option<Arc<OsWindow>>,
     renderer: Option<Renderer>,
     text_editor: Option<TextEditor>,
@@ -2494,6 +2496,7 @@ impl ApplicationHandler for WindowApp {
         let attributes = OsWindow::default_attributes()
             .with_title(self.title.clone())
             .with_visible(self.visible)
+            .with_resizable(self.resizable != "none")
             .with_inner_size(LogicalSize::new(self.width, self.height));
         match event_loop.create_window(attributes) {
             Ok(window) => {
@@ -2501,6 +2504,7 @@ impl ApplicationHandler for WindowApp {
                 match Renderer::new(window.clone()) {
                     Ok(renderer) => {
                         self.text_editor = Some(TextEditor::new(window.as_ref()));
+                        self.apply_resizable(&window);
                         self.window = Some(window);
                         self.renderer = Some(renderer);
                     }
@@ -2673,6 +2677,30 @@ impl ApplicationHandler for WindowApp {
     }
 }
 
+impl WindowApp {
+    fn apply_resizable(&self, window: &OsWindow) {
+        window.set_min_inner_size::<LogicalSize<f64>>(None);
+        window.set_max_inner_size::<LogicalSize<f64>>(None);
+        match self.resizable.as_str() {
+            "none" => window.set_resizable(false),
+            "both" => window.set_resizable(true),
+            "horizontal" => {
+                let size = window.inner_size();
+                window.set_resizable(true);
+                window.set_min_inner_size(Some(PhysicalSize::new(1, size.height)));
+                window.set_max_inner_size(Some(PhysicalSize::new(i32::MAX as u32, size.height)));
+            }
+            "vertical" => {
+                let size = window.inner_size();
+                window.set_resizable(true);
+                window.set_min_inner_size(Some(PhysicalSize::new(size.width, 1)));
+                window.set_max_inner_size(Some(PhysicalSize::new(size.width, i32::MAX as u32)));
+            }
+            _ => unreachable!("resizable mode validated in constructor and setter"),
+        }
+    }
+}
+
 #[napi]
 pub struct Window {
     event_loop: EventLoop<()>,
@@ -2707,11 +2735,19 @@ impl Window {
                 format!("create event loop: {error}"),
             )
         })?;
+        let resizable = options.resizable.unwrap_or_else(|| "both".into());
+        if !matches!(resizable.as_str(), "horizontal" | "vertical" | "both" | "none") {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "resizable must be horizontal, vertical, both, or none",
+            ));
+        }
         let app = WindowApp {
             title: options.title.unwrap_or_else(|| "Nasty".into()),
             width: options.width.unwrap_or(960.0),
             height: options.height.unwrap_or(600.0),
             visible: options.visible.unwrap_or(true),
+            resizable,
             ..Default::default()
         };
         if !app.width.is_finite() || !app.height.is_finite() || app.width < 1.0 || app.height < 1.0
@@ -2735,6 +2771,26 @@ impl Window {
         window.set_visible(true);
         window.request_redraw();
         Ok(())
+    }
+
+    #[napi(js_name = "setResizableMode")]
+    pub fn set_resizable_mode(&mut self, mode: String) -> Result<()> {
+        if !matches!(mode.as_str(), "horizontal" | "vertical" | "both" | "none") {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "resizable must be horizontal, vertical, both, or none",
+            ));
+        }
+        self.app.resizable = mode;
+        if let Some(window) = self.app.window.as_ref() {
+            self.app.apply_resizable(window);
+        }
+        Ok(())
+    }
+
+    #[napi(js_name = "resizableMode")]
+    pub fn resizable_mode(&self) -> String {
+        self.app.resizable.clone()
     }
 
     #[napi]

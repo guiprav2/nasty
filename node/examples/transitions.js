@@ -14,7 +14,7 @@ assert.ok(Math.abs(timingProgress("cubic-bezier(.42, 0, .58, 1)", 0.5) - 0.5) < 
 assert.ok(Math.abs(timingProgress("ease", 0.5) - 0.8024) < 0.001);
 
 const frameLimit = Number(process.env.NASTY_TRANSITION_FRAMES ?? 180);
-const window = new Window({ title: "Nasty CSS transitions", width: 720, height: 480 });
+const window = new Window({ resizable: "none", title: "Nasty CSS transitions", width: 720, height: 480 });
 const document = new Document();
 window.document = document;
 document.body.style.display = "flex";

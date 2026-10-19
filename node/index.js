@@ -16,9 +16,24 @@ export { DOMRect };
 export { TransitionEvent };
 export class Window extends native.Window {
   #document = null;
-  constructor(options) {
-    super(options);
+  #resizable;
+  constructor(options = {}) {
+    const initialResizable = options.resizable ?? "both";
+    if (!RESIZABLE_MODES.has(initialResizable)) {
+      throw new TypeError('resizable must be "horizontal", "vertical", "both", or "none"');
+    }
+    super({ ...options, resizable: initialResizable });
+    this.#resizable = initialResizable;
     this.DOMRect = DOMRect;
+  }
+
+  get resizable() { return this.#resizable; }
+  set resizable(mode) {
+    if (!RESIZABLE_MODES.has(mode)) {
+      throw new TypeError('resizable must be "horizontal", "vertical", "both", or "none"');
+    }
+    super.setResizableMode(mode);
+    this.#resizable = mode;
   }
 
   present(list) { syncDocumentText(this, this.#document); return super.present(list); }
@@ -36,6 +51,8 @@ export class Window extends native.Window {
     if (document) document._attachWindow(this);
   }
 }
+
+const RESIZABLE_MODES = new Set(["horizontal", "vertical", "both", "none"]);
 export { FontRegistry } from "./font-registry.js";
 export { buildBoxDisplayList } from "./render.js";
 export { buildImageDraws } from "./render.js";

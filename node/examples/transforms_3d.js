@@ -37,7 +37,7 @@ assert.ok(Math.abs(scaledCorner.x - scaledOrigin.x - childBox.width * 2) < 0.01,
 assert.ok(Math.abs(scaledCorner.y - scaledOrigin.y - childBox.height * 2) < 0.01, "parent scale should scale the child's geometry vertically");
 nestedDocument.close();
 
-const window = new Window({ title: "Nasty CSS 3D transforms", ...viewport });
+const window = new Window({ resizable: "none", title: "Nasty CSS 3D transforms", ...viewport });
 const document = new Document();
 window.document = document;
 Object.assign(document.body.style, {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { Document, Window, buildBoxDisplayList } from "../index.js";
 import { documentBoxes, layoutDocument } from "../internal/dom-state.js";
 
-const window = new Window({ title: "Nasty box model", width: 720, height: 480 });
+const window = new Window({ resizable: "none", title: "Nasty box model", width: 720, height: 480 });
 const doc = new Document();
 const element = (id, style = {}) => {
   const result = doc.createElement("div");

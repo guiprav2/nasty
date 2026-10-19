@@ -2,7 +2,7 @@ import { parentPort } from "node:worker_threads";
 import { performance } from "node:perf_hooks";
 import { Window } from "../index.js";
 
-const window = new Window({ title: "Nasty render worker", width: 960, height: 600, allowAnyThread: true });
+const window = new Window({ resizable: "none", title: "Nasty render worker", width: 960, height: 600, allowAnyThread: true });
 const refreshRate = window.refreshRate() || 60;
 const budget = 1000 / refreshRate;
 const textRequestedAt = performance.now();
