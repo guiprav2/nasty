@@ -600,11 +600,17 @@ function framePacingArt(stage) {
 for (const groups of motionBySlide.values()) for (const group of groups) for (const { element } of group.entries) {
   element.style.transition = "none";
 }
-const floatingArtwork = slides.slice(0, 2).map((slide, index) => ({
+const floatingArtwork = slides.map((slide, index) => ({
   entry: motionBySlide.get(slide)?.find((group) => group.kind === "art")?.entries[0],
-  xAmplitude: index === 0 ? 3.75 : 3,
-  yAmplitude: index === 0 ? 4.8 : 5.25,
+  xAmplitude: 2.7 + (index * 1.13) % 2.3,
+  yAmplitude: 3.4 + (index * 1.71) % 2.4,
+  xPeriod: 17 + (index * 3.7) % 8,
+  yPeriod: 19 + (index * 2.9) % 7,
+  phase: (index * 1.37) % (2 * Math.PI),
 }));
+if (floatingArtwork.some((artwork) => !artwork.entry)) {
+  throw new Error("every tour slide must define a top-level artwork group");
+}
 await layoutDocument(document, width, height);
 setCamera(0, 0);
 const fontPrepareStarted = performance.now();
@@ -621,7 +627,7 @@ let pacedTicks = 0;
 let presentedFrames = 0;
 let slideIndex = 0;
 let phase = "hold";
-const floatingArtworkStart = [null, null];
+const floatingArtworkStart = slides.map(() => null);
 let springArtworkStartedAt = Number.POSITIVE_INFINITY;
 let springArtworkFinished = true;
 let nextSlideIndex = 0;
@@ -662,6 +668,7 @@ started = performance.now();
 deadline = started;
 previous = started;
 nextSlideAt = started + dwellMs;
+floatingArtworkStart[0] = started;
 const cpuStart = process.cpuUsage();
 const hostCpuStart = os.cpus();
 const hostTotalStart = hostCpuStart.reduce((sum, cpu) => sum + Object.values(cpu.times).reduce((a, b) => a + b, 0), 0);
@@ -679,15 +686,16 @@ function setThreeDCardPose(card, amount) {
     `${card.baseTransform} rotateX(${(direction * 11 * amount).toFixed(2)}deg) rotateY(${(direction * 19 * amount).toFixed(2)}deg) translateZ(${(15 * amount).toFixed(2)}px)`);
 }
 function animateFloatingArtwork(now) {
-  if (phase !== "hold" || slideIndex > 1) return;
+  if (phase !== "hold") return false;
   const artwork = floatingArtwork[slideIndex];
   const began = floatingArtworkStart[slideIndex];
-  if (!artwork?.entry || began === null) return;
+  if (!artwork?.entry || began === null) return false;
   const seconds = (now - began) / 1000;
-  const x = artwork.xAmplitude * Math.sin((2 * Math.PI * seconds) / (22 * timeMultiplier));
-  const y = artwork.yAmplitude * Math.sin((2 * Math.PI * seconds) / (19 * timeMultiplier));
+  const x = artwork.xAmplitude * Math.sin((2 * Math.PI * seconds) / (artwork.xPeriod * timeMultiplier) + artwork.phase);
+  const y = artwork.yAmplitude * Math.sin((2 * Math.PI * seconds) / (artwork.yPeriod * timeMultiplier) + artwork.phase * 0.73);
   const base = artwork.entry.transform && artwork.entry.transform !== "none" ? `${artwork.entry.transform} ` : "";
   setElementTransform(artwork.entry, `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0px) ${base}`);
+  return true;
 }
 function animateSpringArtwork(now) {
   if (slideIndex !== springSlideIndex || phase !== "hold" || springArtworkFinished) return false;
@@ -830,6 +838,8 @@ function draw() {
     if (phase !== "recordEnd") {
       const previousSlide = slideIndex;
       nextSlideIndex = loopToStart ? route[0] : route[++routeIndex];
+      const incomingArtwork = floatingArtwork[nextSlideIndex];
+      if (incomingArtwork?.entry) setElementTransform(incomingArtwork.entry, incomingArtwork.entry.transform);
       if (previousSlide === 2) {
         slideTwoSettledAt = Number.POSITIVE_INFINITY;
         for (const card of threeDCards) setElementTransform(card, card.baseTransform);
@@ -878,19 +888,19 @@ function draw() {
       }
       phase = "hold";
       nextSlideAt = now + dwellMs;
-      if (slideIndex < 2) floatingArtworkStart[slideIndex] = now;
+      if (floatingArtwork[slideIndex]?.entry) floatingArtworkStart[slideIndex] = now;
     }
   }
   const transitionForFrame = phase === "scroll" ? activeTransition : completedTransition;
   if (transitionForFrame) transitionForFrame.intervals.push(interval);
-  animateFloatingArtwork(now);
+  const floatingAnimating = animateFloatingArtwork(now);
   const springAnimating = animateSpringArtwork(now);
   if (slideIndex === 2 && (phase === "hold" || phase === "recordEnd")) animateThreeDCards(now);
   const threeDElapsed = now - slideTwoSettledAt - 1000;
   const threeDAnimating = slideIndex === 2 && Number.isFinite(slideTwoSettledAt)
     && threeDElapsed >= 0 && (!threeDAnimationFinished || threeDElapsed <= threeDSequenceSpan + frameBudget);
   const shouldPresent = sceneChanged || phaseAtStart !== "hold" || phase !== "hold"
-    || (phase === "hold" && slideIndex < 2)
+    || floatingAnimating
     || springAnimating
     || threeDAnimating;
   if (shouldPresent) {
