@@ -1,4 +1,4 @@
-import { documentBoxes, documentBoxesFor, elementState } from './dom-state.js';
+import { documentBoxes, documentBoxesFor, documentState, elementState } from './dom-state.js';
 import { computedStyleValue } from './css-transitions.js';
 import { createBoxProjector, parseColor } from '../render.js';
 
@@ -7,8 +7,8 @@ const placementProperties = ['x', 'y', 'color', 'clipX', 'clipY', 'clipWidth', '
 function placementChanged(previous, next) {
   return !previous || placementProperties.some((property) => previous[property] !== next[property]);
 }
-function sameShape(previous, next) {
-  return previous && previous.text === next.text && previous.width === next.width
+function sameShape(previous, next, allowProjectedWidthChange = false) {
+  return previous && previous.text === next.text && (allowProjectedWidthChange || previous.width === next.width)
     && previous.fontSize === next.fontSize && previous.lineHeight === next.lineHeight
     && previous.fontFamily === next.fontFamily && previous.wrap === next.wrap;
 }
@@ -69,9 +69,11 @@ export function syncDocumentText(window, document, selectedElements = null) {
     state.elementIndices = new Map(state.elements.map((element, index) => [element, index]));
     state.paintRuns = state.pending.runs;
     state.parked = state.pending.parked;
+    state.shapeGeneration = state.pending.shapeGeneration;
     state.pending = null;
   }
-  if (!state) windows.set(window, state = { shape: null, elements: [], elementIndices: new Map(), paintRuns: null, parked: new Set(), pending: null });
+  if (!state) windows.set(window, state = { shape: null, shapeGeneration: -1, elements: [], elementIndices: new Map(), paintRuns: null, parked: new Set(), pending: null });
+  const geometryGeneration = document ? documentState(document).geometryGeneration : -1;
   if (selectedElements && state.shape && state.paintRuns && !state.pending) {
     const entries = document ? textEntries(document, selectedElements) : [];
     const previousRuns = state.paintRuns;
@@ -79,13 +81,14 @@ export function syncDocumentText(window, document, selectedElements = null) {
     const parked = new Set(state.parked);
     const activeIndices = new Set();
     let needsReshape = false;
+    const allowProjectedWidthChange = state.shapeGeneration === geometryGeneration;
     for (const { element, run } of entries) {
       const index = state.elementIndices.get(element);
-      if (index === undefined || !sameShape(runs[index], run)) {
+      if (index === undefined || !sameShape(runs[index], run, allowProjectedWidthChange)) {
         needsReshape = true;
         break;
       }
-      runs[index] = run;
+      runs[index] = allowProjectedWidthChange ? { ...run, width: runs[index].width } : run;
       activeIndices.add(index);
       parked.delete(index);
     }
@@ -118,7 +121,7 @@ export function syncDocumentText(window, document, selectedElements = null) {
   if (shape !== state.shape) {
     if (!state.pending) {
       window.requestTextRuns(runs);
-      state.pending = { shape, elements: entries.map(({ element }) => element), runs, parked };
+      state.pending = { shape, elements: entries.map(({ element }) => element), runs, parked, shapeGeneration: geometryGeneration };
     }
     return;
   }
@@ -128,6 +131,7 @@ export function syncDocumentText(window, document, selectedElements = null) {
   if (changed.length) sendPlacements(window, runs, changed);
   state.paintRuns = runs;
   state.parked = parked;
+  state.shapeGeneration = geometryGeneration;
   state.elements = entries.map(({ element }) => element);
   state.elementIndices = new Map(state.elements.map((element, index) => [element, index]));
 }

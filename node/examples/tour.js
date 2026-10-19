@@ -807,7 +807,9 @@ function draw() {
   const phaseAtStart = phase;
   let finishAfterFrame = false;
   let sceneChanged = false;
-  if (pacedTicks) frameIntervals.push(now - previous);
+  let completedTransition = null;
+  const interval = pacedTicks ? now - previous : 0;
+  if (pacedTicks) frameIntervals.push(interval);
   previous = now;
   if (phase === "recordFinalWait" && now >= nextSlideAt) return finish();
   if (phase === "recordEnd" && now >= nextSlideAt) {
@@ -838,7 +840,7 @@ function draw() {
       }
       phase = "scroll";
       phaseStarted = now;
-      activeTransition = { from: slides[previousSlide], to: slides[nextSlideIndex], completedCycle: previousSlide === slides.length - 1 && nextSlideIndex === 0 };
+      activeTransition = { from: slides[previousSlide], to: slides[nextSlideIndex], intervals: [], presents: [], nativePrepare: [], acquire: [], submit: [], surface: [] };
       console.log(`scroll to slide ${String(nextSlideIndex).padStart(2, "0")}`);
     }
   }
@@ -848,6 +850,7 @@ function draw() {
     const { from, to } = activeTransition;
     setCamera(from.col + (to.col - from.col) * amount, from.row + (to.row - from.row) * amount);
     if (t === 1) {
+      completedTransition = activeTransition;
       slideIndex = nextSlideIndex;
       setCamera(to.col, to.row);
       completedTransitions++;
@@ -878,6 +881,8 @@ function draw() {
       if (slideIndex < 2) floatingArtworkStart[slideIndex] = now;
     }
   }
+  const transitionForFrame = phase === "scroll" ? activeTransition : completedTransition;
+  if (transitionForFrame) transitionForFrame.intervals.push(interval);
   animateFloatingArtwork(now);
   const springAnimating = animateSpringArtwork(now);
   if (slideIndex === 2 && (phase === "hold" || phase === "recordEnd")) animateThreeDCards(now);
@@ -899,12 +904,23 @@ function draw() {
     buildTimes.push(performance.now() - buildStart);
     const presentStart = performance.now();
     const nativeStats = window.presentTransformed(displayList);
-    presentTimes.push(performance.now() - presentStart);
+    const presentMs = performance.now() - presentStart;
+    presentTimes.push(presentMs);
+    if (transitionForFrame) {
+      transitionForFrame.presents.push(presentMs);
+      if (nativeStats.prepareMs !== undefined) transitionForFrame.nativePrepare.push(nativeStats.prepareMs);
+      if (nativeStats.acquireMs !== undefined) transitionForFrame.acquire.push(nativeStats.acquireMs);
+      if (nativeStats.submitMs !== undefined) transitionForFrame.submit.push(nativeStats.submitMs);
+      if (nativeStats.presentMs !== undefined) transitionForFrame.surface.push(nativeStats.presentMs);
+    }
     presentedFrames++;
     if (nativeStats.rendered) {
       nativeRenderTimes.push(nativeStats.nativeRenderMs);
       nativePrepareTimes.push(nativeStats.prepareMs);
     }
+  }
+  if (sceneChanged && completedTransitions > 0 && transitionForFrame) {
+    console.log(`pan ${String(slides.indexOf(transitionForFrame.from)).padStart(2, "0")}→${String(slides.indexOf(transitionForFrame.to)).padStart(2, "0")}: interval p95/max ${percentile(transitionForFrame.intervals, .95).toFixed(2)}/${percentile(transitionForFrame.intervals, 1).toFixed(2)} ms; present p95 ${percentile(transitionForFrame.presents, .95).toFixed(2)} ms; text prepare ${percentile(transitionForFrame.nativePrepare, .95).toFixed(2)} ms; GPU acquire/submit/surface ${percentile(transitionForFrame.acquire, .95).toFixed(2)}/${percentile(transitionForFrame.submit, .95).toFixed(2)}/${percentile(transitionForFrame.surface, .95).toFixed(2)} ms`);
   }
   pacedTicks++;
   if (phase === "recordFinalFrame") {

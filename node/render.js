@@ -3,6 +3,7 @@ import { computedStyleValue } from "./internal/css-transitions.js";
 
 const SIDES = ["Top", "Right", "Bottom", "Left"];
 const transformedListElements = new WeakMap();
+const elementsByBoxArray = new WeakMap();
 
 export function displayListElements(list) {
   return transformedListElements.get(list) ?? null;
@@ -392,6 +393,11 @@ export function buildTransformedDisplayList(boxes, width, height) {
   }
   values[1] = triangleCount;
   const displayList = Buffer.from(new Float32Array(values).buffer);
-  transformedListElements.set(displayList, new Set(boxes.map(({ element }) => element)));
+  let elements = elementsByBoxArray.get(boxes);
+  if (!elements) {
+    elements = new Set(boxes.map(({ element }) => element));
+    elementsByBoxArray.set(boxes, elements);
+  }
+  transformedListElements.set(displayList, elements);
   return displayList;
 }
