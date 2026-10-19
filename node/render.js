@@ -133,6 +133,7 @@ export function buildOrderedDisplayList(boxes, width, height) {
 const identity4 = () => [
   [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1],
 ];
+const IDENTITY_MATRIX = identity4();
 
 function multiply4(a, b) {
   const out = Array.from({ length: 4 }, () => [0, 0, 0, 0]);
@@ -219,16 +220,67 @@ function transformOrigin(source, width, height) {
 }
 
 export function projectBoxPoint(box, x, y) {
-  const matrix = parseTransform(box.element.style.transform, box.width, box.height);
+  return createBoxProjector([box])(box, x, y);
+}
+
+function boxTransformMatrix(box) {
+  const source = box.element.style.transform;
+  if (!source || source === "none") return IDENTITY_MATRIX;
   const origin = transformOrigin(box.element.style.transformOrigin, box.width, box.height);
-  const withOrigin = multiply4(multiply4(translation(...origin), matrix), translation(-origin[0], -origin[1], -origin[2]));
-  const localX = x - box.x;
-  const localY = y - box.y;
-  const qx = withOrigin[0][0] * localX + withOrigin[0][1] * localY + withOrigin[0][3];
-  const qy = withOrigin[1][0] * localX + withOrigin[1][1] * localY + withOrigin[1][3];
-  const qw = withOrigin[3][0] * localX + withOrigin[3][1] * localY + withOrigin[3][3];
-  if (qw <= 0.0001) return { x: Number.NaN, y: Number.NaN };
-  return { x: box.x + qx / qw, y: box.y + qy / qw };
+  const matrix = parseTransform(source, box.width, box.height);
+  return multiply4(
+    multiply4(
+      multiply4(
+        multiply4(translation(box.x, box.y, 0), translation(...origin)),
+        matrix,
+      ),
+      translation(-origin[0], -origin[1], -origin[2]),
+    ),
+    translation(-box.x, -box.y, 0),
+  );
+}
+
+// Layout boxes use document coordinates; compose local transforms from the
+// root down so a parent transform also moves and projects every descendant.
+export function createBoxProjector(boxes) {
+  const byElement = new Map(boxes.map((box) => [box.element, box]));
+  const worldMatrices = new Map();
+  const worldMatrix = (box) => {
+    const cached = worldMatrices.get(box.element);
+    if (cached) return cached;
+    const parent = byElement.get(box.element.parent);
+    const local = boxTransformMatrix(box);
+    const parentMatrix = parent ? worldMatrix(parent) : IDENTITY_MATRIX;
+    const matrix = local === IDENTITY_MATRIX ? parentMatrix
+      : parentMatrix === IDENTITY_MATRIX ? local
+        : multiply4(parentMatrix, local);
+    worldMatrices.set(box.element, matrix);
+    return matrix;
+  };
+  const project = (box, x, y) => {
+    const matrix = worldMatrix(box);
+    const qx = matrix[0][0] * x + matrix[0][1] * y + matrix[0][3];
+    const qy = matrix[1][0] * x + matrix[1][1] * y + matrix[1][3];
+    const qw = matrix[3][0] * x + matrix[3][1] * y + matrix[3][3];
+    if (qw <= 0.0001) return { x: Number.NaN, y: Number.NaN };
+    return { x: qx / qw, y: qy / qw };
+  };
+  project.widthScaleAt = (box, x, y) => {
+    const matrix = worldMatrix(box);
+    const w = matrix[3][0] * x + matrix[3][1] * y + matrix[3][3];
+    const qx = matrix[0][0] * x + matrix[0][1] * y + matrix[0][3];
+    const qy = matrix[1][0] * x + matrix[1][1] * y + matrix[1][3];
+    if (w <= 0.0001) return 1;
+    const w2 = w * w;
+    const xx = (matrix[0][0] * w - qx * matrix[3][0]) / w2;
+    const xy = (matrix[0][1] * w - qx * matrix[3][1]) / w2;
+    const yx = (matrix[1][0] * w - qy * matrix[3][0]) / w2;
+    const yy = (matrix[1][1] * w - qy * matrix[3][1]) / w2;
+    const scaleX = Math.hypot(xx, yx);
+    const scaleY = Math.hypot(xy, yy);
+    return Math.sqrt(scaleX * scaleY);
+  };
+  return project;
 }
 
 function clipPolygon(polygon, rect) {
@@ -276,6 +328,7 @@ export function buildTransformedDisplayList(boxes, width, height) {
   const values = [3, 0];
   let triangleCount = 0;
   const viewport = { x: 0, y: 0, width, height };
+  const projectPoint = createBoxProjector(boxes);
   const push = (box, rect, color, project) => {
     if (!color || rect.width <= 0 || rect.height <= 0) return;
     const polygon = [
@@ -294,15 +347,9 @@ export function buildTransformedDisplayList(boxes, width, height) {
   };
   for (const box of boxes) {
     const style = box.element.style;
-    const matrix = parseTransform(style.transform, box.width, box.height);
-    const origin = transformOrigin(style.transformOrigin, box.width, box.height);
-    const withOrigin = multiply4(multiply4(translation(...origin), matrix), translation(-origin[0], -origin[1], -origin[2]));
     const project = (x, y) => {
-      const qx = withOrigin[0][0] * x + withOrigin[0][1] * y + withOrigin[0][3];
-      const qy = withOrigin[1][0] * x + withOrigin[1][1] * y + withOrigin[1][3];
-      const qw = withOrigin[3][0] * x + withOrigin[3][1] * y + withOrigin[3][3];
-      if (qw <= 0.0001) return null;
-      return { x: box.x + qx / qw, y: box.y + qy / qw };
+      const point = projectPoint(box, box.x + x, box.y + y);
+      return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
     };
     push(box, box.borderBox, parseColor(computedStyleValue(style, "backgroundColor")), project);
     const { borderBox, border } = box;

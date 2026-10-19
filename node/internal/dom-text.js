@@ -1,6 +1,6 @@
 import { documentBoxes, elementState } from './dom-state.js';
 import { computedStyleValue } from './css-transitions.js';
-import { parseColor, projectBoxPoint } from '../render.js';
+import { createBoxProjector, parseColor } from '../render.js';
 
 const windows = new WeakMap();
 function inherited(element, property, fallback) {
@@ -12,15 +12,18 @@ function inherited(element, property, fallback) {
 }
 export function documentTextRuns(document) {
   const runs = [];
-  for (const box of documentBoxes(document)) {
+  const boxes = documentBoxes(document);
+  const projectPoint = createBoxProjector(boxes);
+  for (const box of boxes) {
     const { element, contentBox: bounds, clip } = box;
     const text = elementState(element).text;
     if (!text || !bounds.width || !bounds.height) continue;
     const rgba = parseColor(inherited(element, 'color', '#000000')) ?? [0, 0, 0, 0];
     const color = '#' + rgba.map((v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0')).join('');
     const fontSize = parseFloat(inherited(element, 'fontSize', 16));
-    const textOrigin = projectBoxPoint(box, bounds.x, bounds.y);
-    const run = { text, x: textOrigin.x, y: textOrigin.y, width: bounds.width, fontSize,
+    const textOrigin = projectPoint(box, bounds.x, bounds.y);
+    const transformedWidth = bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
+    const run = { text, x: textOrigin.x, y: textOrigin.y, width: transformedWidth, fontSize,
       lineHeight: parseFloat(inherited(element, 'lineHeight', fontSize * 1.2)),
       fontFamily: inherited(element, 'fontFamily', 'sans-serif'), color,
       wrap: inherited(element, 'whiteSpace', 'normal') !== 'nowrap' };

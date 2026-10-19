@@ -22,8 +22,12 @@ if (!Number.isFinite(timeMultiplier) || timeMultiplier <= 0) {
   throw new RangeError("NASTY_DEMO_TIME_MULTIPLIER must be a finite positive number");
 }
 const duration = (milliseconds) => milliseconds * 2 * timeMultiplier;
-const width = 900;
-const height = 560;
+const layoutWidth = 900;
+const layoutHeight = 560;
+const width = 1280;
+const height = 720;
+const renderScale = height / layoutHeight;
+const sceneOffsetX = (width - layoutWidth * renderScale) / 2;
 const window = new Window({ title: "Nasty — JavaScript & DOM, full circle", width, height, visible: false });
 const document = new Document();
 window.document = document;
@@ -39,7 +43,10 @@ const rows = 4;
 const viewport = document.body;
 Object.assign(viewport.style, { width, height, overflow: "hidden", backgroundColor: theme.ink });
 const canvas = document.createElement("div");
-Object.assign(canvas.style, { display: "flex", direction: "column", width: cols * width, height: rows * height });
+Object.assign(canvas.style, {
+  display: "flex", direction: "column", width: cols * layoutWidth, height: rows * layoutHeight,
+  transform: `translateX(${sceneOffsetX}px) scale(${renderScale})`, transformOrigin: "top left",
+});
 viewport.appendChild(canvas);
 
 const slides = [];
@@ -68,7 +75,10 @@ function vertical(parent, styles = {}) {
 function copy(parent, tag, text, styles) {
   const element = document.createElement(tag);
   element.textContent = text;
-  Object.assign(element.style, { flexShrink: 0, color: theme.white, fontFamily: "sans-serif", ...styles });
+  const sizedStyles = { ...styles };
+  if (typeof sizedStyles.fontSize === "number") sizedStyles.fontSize *= renderScale;
+  if (typeof sizedStyles.lineHeight === "number") sizedStyles.lineHeight *= renderScale;
+  Object.assign(element.style, { flexShrink: 0, color: theme.white, fontFamily: "sans-serif", ...sizedStyles });
   parent.appendChild(element);
   capturingSlide.elements.push(element);
   capturingGroup?.elements.push(element);
@@ -81,9 +91,9 @@ function beginMotionGroup(kind) {
 function endMotionGroup() { capturingGroup = null; }
 const cells = new Map();
 for (let r = 0; r < rows; r++) {
-  const row = horizontal(canvas, { width: cols * width, height, flexShrink: 0 });
+  const row = horizontal(canvas, { width: cols * layoutWidth, height: layoutHeight, flexShrink: 0 });
   for (let c = 0; c < cols; c++) {
-    cells.set(`${c},${r}`, vertical(row, { width, height, flexShrink: 0, padding: 60, backgroundColor: theme.ink }));
+    cells.set(`${c},${r}`, vertical(row, { width: layoutWidth, height: layoutHeight, flexShrink: 0, padding: 60, backgroundColor: theme.ink }));
   }
 }
 function beginSlide(col, row) {
@@ -238,6 +248,11 @@ function transformArt(stage) {
 for (const groups of motionBySlide.values()) for (const group of groups) for (const { element } of group.entries) {
   element.style.transition = "none";
 }
+const floatingArtwork = slides.slice(0, 2).map((slide, index) => ({
+  entry: motionBySlide.get(slide)?.find((group) => group.kind === "art")?.entries[0],
+  xAmplitude: index === 0 ? 3.75 : 3,
+  yAmplitude: index === 0 ? 4.8 : 5.25,
+}));
 await layoutDocument(document, width, height);
 viewport.scrollBy(0, 0);
 documentBoxes(document);
@@ -256,6 +271,7 @@ let frameCount = 0;
 let slideIndex = 0;
 let phase = "fadeIn";
 let phaseStarted = started;
+const floatingArtworkStart = [null, null];
 let nextSlideIndex = 0;
 let nextSlideAt = started + dwellMs;
 let slideTwoSettledAt = Number.POSITIVE_INFINITY;
@@ -312,6 +328,17 @@ function setThreeDCardPose(card, amount) {
   const direction = card.index === 0 ? -1 : card.index === 1 ? 1 : -0.7;
   setElementTransform(card,
     `${card.baseTransform} rotateX(${(direction * 11 * amount).toFixed(2)}deg) rotateY(${(direction * 19 * amount).toFixed(2)}deg) translateZ(${(15 * amount).toFixed(2)}px)`);
+}
+function animateFloatingArtwork(now) {
+  if (phase !== "hold" || slideIndex > 1) return;
+  const artwork = floatingArtwork[slideIndex];
+  const began = floatingArtworkStart[slideIndex];
+  if (!artwork?.entry || began === null) return;
+  const seconds = (now - began) / 1000;
+  const x = artwork.xAmplitude * Math.sin((2 * Math.PI * seconds) / (22 * timeMultiplier));
+  const y = artwork.yAmplitude * Math.sin((2 * Math.PI * seconds) / (19 * timeMultiplier));
+  const base = artwork.entry.transform && artwork.entry.transform !== "none" ? `${artwork.entry.transform} ` : "";
+  setElementTransform(artwork.entry, `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0px) ${base}`);
 }
 function animateSlideElements(slide, progress, direction, entering) {
   for (const group of motionBySlide.get(slide) ?? []) {
@@ -464,8 +491,8 @@ function draw() {
       animateSlideElements(activeScroll.from, t, activeScroll.direction, false);
       animateSlideElements(activeScroll.to, t, activeScroll.direction, true);
     }
-    viewport.scrollBy((from.col + (to.col - from.col) * amount) * width - viewport.scrollLeft,
-      (from.row + (to.row - from.row) * amount) * height - viewport.scrollTop);
+    viewport.scrollBy((from.col + (to.col - from.col) * amount) * layoutWidth * renderScale - viewport.scrollLeft,
+      (from.row + (to.row - from.row) * amount) * layoutHeight * renderScale - viewport.scrollTop);
     if (t === 1) {
       slideIndex = nextSlideIndex;
       for (const groups of [motionBySlide.get(slides[slideIndex]), motionBySlide.get(activeScroll.from)]) {
@@ -490,12 +517,15 @@ function draw() {
       if (phase !== "recordEnd") {
         phase = "hold";
         nextSlideAt = now + dwellMs;
+        if (slideIndex < 2) floatingArtworkStart[slideIndex] = now;
       }
     }
   } else if (phase === "fadeIn" && now - phaseStarted >= fadeMs) {
     phase = "hold";
     nextSlideAt = now + dwellMs;
+    if (slideIndex < 2) floatingArtworkStart[slideIndex] = now;
   }
+  animateFloatingArtwork(now);
   if (slideIndex === 2 && (phase === "hold" || phase === "recordEnd")) animateThreeDCards(now);
   const boxes = documentBoxes(document);
   const buildStart = performance.now();
