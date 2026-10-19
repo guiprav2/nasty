@@ -1,4 +1,5 @@
 import { Worker } from "node:worker_threads";
+import { elementState } from "./internal/dom-state.js";
 
 let nextId = 1;
 const pending = new Map();
@@ -62,8 +63,9 @@ export async function loadImage(path, window) {
 }
 
 export function unloadImage(element, window) {
-  if (!element.image) return false;
-  const released = window.deleteImageTexture(element.image.textureId);
-  element.image = null;
+  const state = elementState(element);
+  if (!state.image) return false;
+  const released = window.deleteImageTexture(state.image.textureId);
+  state.image = null;
   return released;
 }

@@ -46,7 +46,7 @@ parentPort.on("message", ({ id, type, payload }) => {
       rebuildParents();
       return;
     }
-    if (type === "layout") {
+    if (type === "layout" || type === "layoutSync") {
       const start = performance.now();
       const layoutRoot = handles[payload.root] ?? root;
       tree.compute(layoutRoot, payload.width, payload.height);
@@ -78,13 +78,36 @@ parentPort.on("message", ({ id, type, payload }) => {
         return boxes[index];
       };
       for (let index = 0; index < boxes.length; index++) resolve(index);
-      parentPort.postMessage({
-        id,
-        type: "result",
-        result: { version: payload.version, boxes, computeMs, workerMs: performance.now() - start },
-      });
+      const workerMs = performance.now() - start;
+      if (type === "layout") {
+        parentPort.postMessage({ id, type: "result", result: { version: payload.version, boxes, computeMs, workerMs } });
+      } else {
+        const header = new Int32Array(payload.shared, 0, 4);
+        const values = new Float64Array(payload.shared, 16, boxes.length * 16);
+        boxes.forEach((box, index) => {
+          const offset = index * 16;
+          values.set([
+            box.x, box.y, box.width, box.height,
+            box.marginTop, box.marginRight, box.marginBottom, box.marginLeft,
+            box.borderTop, box.borderRight, box.borderBottom, box.borderLeft,
+            box.paddingTop, box.paddingRight, box.paddingBottom, box.paddingLeft,
+          ], offset);
+        });
+        Atomics.store(header, 1, boxes.length);
+        Atomics.store(header, 2, Math.round(computeMs * 1000));
+        Atomics.store(header, 3, Math.round(workerMs * 1000));
+        Atomics.store(header, 0, 1);
+        Atomics.notify(header, 0);
+      }
+      return;
     }
   } catch (error) {
-    parentPort.postMessage({ id, type: "error", error: error.stack ?? String(error) });
+    if (type === "layoutSync") {
+      const header = new Int32Array(payload.shared, 0, 4);
+      Atomics.store(header, 0, -1);
+      Atomics.notify(header, 0);
+    } else {
+      parentPort.postMessage({ id, type: "error", error: error.stack ?? String(error) });
+    }
   }
 });

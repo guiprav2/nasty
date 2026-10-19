@@ -94,6 +94,17 @@ window.document = document;
 const [pngDecodeMs, jpegDecodeMs] = await Promise.all([pngDecoded, jpegDecoded]);
 await Promise.all([dataImage.decode(), httpImage.decode()]);
 await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+await layoutDocument(document, 720, 480);
+image.style.width = 450;
+const flushStart = performance.now();
+const flushedRect = image.getBoundingClientRect();
+const dirtyFlushMs = performance.now() - flushStart;
+assert.ok(flushedRect instanceof window.DOMRect);
+assert.equal(flushedRect.width, 450, "getBoundingClientRect flushes current style changes synchronously");
+const cacheStart = performance.now();
+image.getBoundingClientRect();
+const cachedReadMs = performance.now() - cacheStart;
+image.style.width = 440;
 await assert.rejects(failedImage.decode(), { name: "EncodingError" });
 await errorEvent;
 assert.equal(failedImage.complete, true, "a failed image request is complete");
@@ -143,6 +154,7 @@ assert.equal(tags.at(-1), 0, "last DOM element emits a solid quad after both ima
 assert.equal(tags.filter((tag) => tag === 1).length, 2, "ordered list contains PNG and JPEG draws");
 
 console.log(`img.decode() readiness: PNG ${pngDecodeMs.toFixed(2)} ms, JPEG ${jpegDecodeMs.toFixed(2)} ms (includes worker decode and GPU upload)`);
+console.log(`getBoundingClientRect: dirty flush ${dirtyFlushMs.toFixed(3)} ms; cached read ${cachedReadMs.toFixed(3)} ms`);
 console.log(`image content box ${imageBox.contentBox.width}x${imageBox.contentBox.height}, scroll clip ${imageBox.clip.width}x${imageBox.clip.height}; overlapping solid is ordered after the JPEG; adapter ${window.adapterName()}`);
 console.log("Rendering PNG and JPEG textures in a native window; press Escape to exit.");
 

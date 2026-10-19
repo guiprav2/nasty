@@ -3,25 +3,28 @@ import { join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { LayoutWorker } from "./layout-worker.js";
 import { loadImage, unloadImage } from "./image-decoder.js";
-import { documentBoxes, registerDocument } from "./internal/dom-state.js";
+import { documentBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
+import { DOMRect } from "./dom-rect.js";
 
 const require = createRequire(import.meta.url);
 const native = require(join(fileURLToPath(new URL(".", import.meta.url)), "native/debug/nasty.node"));
 
 export const LayoutTree = native.LayoutTree;
+export { DOMRect };
 export class Window extends native.Window {
+  #document = null;
   constructor(options) {
     super(options);
-    this._document = null;
+    this.DOMRect = DOMRect;
   }
 
   get document() {
-    return this._document;
+    return this.#document;
   }
 
   set document(document) {
-    if (this._document) this._document.defaultView = null;
-    this._document = document;
+    if (this.#document) documentState(this.#document).defaultView = null;
+    this.#document = document;
     if (document) document._attachWindow(this);
   }
 }
@@ -69,27 +72,30 @@ function defaultElementStyle(name) {
   return reset;
 }
 
+const styleData = new WeakMap();
 class CSSStyleDeclaration {
   constructor(element, initial) {
-    this.element = element;
-    this.values = initial;
-    return new Proxy(this, {
+    const state = { element, values: initial };
+    styleData.set(this, state);
+    const proxy = new Proxy(this, {
       get: (target, property, receiver) => {
-        if (typeof property === "string" && property in target.values) return target.values[property];
+        if (typeof property === "string" && property in state.values) return state.values[property];
         return Reflect.get(target, property, receiver);
       },
       set: (target, property, value, receiver) => {
         if (typeof property !== "string" || property in target) return Reflect.set(target, property, value, receiver);
-        if (target.values[property] === value) return true;
-        target.values[property] = value;
-        target.element._styleChanged();
+        if (state.values[property] === value) return true;
+        state.values[property] = value;
+        state.element._styleChanged();
         return true;
       },
-      ownKeys: (target) => Reflect.ownKeys(target.values),
-      getOwnPropertyDescriptor: (target, property) => Object.hasOwn(target.values, property)
-        ? { configurable: true, enumerable: true, writable: true, value: target.values[property] }
+      ownKeys: () => Reflect.ownKeys(state.values),
+      getOwnPropertyDescriptor: (target, property) => Object.hasOwn(state.values, property)
+        ? { configurable: true, enumerable: true, writable: true, value: state.values[property] }
         : Reflect.getOwnPropertyDescriptor(target, property),
     });
+    styleData.set(proxy, state);
+    return proxy;
   }
 
   setProperty(property, value) {
@@ -99,16 +105,17 @@ class CSSStyleDeclaration {
 
   getPropertyValue(property) {
     const name = property.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
-    const value = this.values[name];
+    const value = styleData.get(this).values[name];
     return value === undefined ? "" : String(value);
   }
 
   removeProperty(property) {
     const name = property.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
     const previous = this.getPropertyValue(property);
-    if (Object.hasOwn(this.values, name)) {
-      delete this.values[name];
-      this.element._styleChanged();
+    const state = styleData.get(this);
+    if (Object.hasOwn(state.values, name)) {
+      delete state.values[name];
+      state.element._styleChanged();
     }
     return previous;
   }
@@ -118,15 +125,18 @@ export class Element extends EventTarget {
   constructor(document, name) {
     super();
     this.document = document;
-    this.name = name;
+    this.localName = String(name).toLowerCase();
+    this.tagName = this.localName.toUpperCase();
     this.parent = null;
     this.children = [];
     this.attributes = new Map();
-    document.elements.add(this);
-    this.style = new CSSStyleDeclaration(this, { ...defaultElementStyle(name) });
+    const state = { image: null, imageLoad: null, imageLoadState: "empty", currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null };
+    registerElementState(this, state);
+    documentState(document).elements.add(this);
+    this.style = new CSSStyleDeclaration(this, { ...defaultElementStyle(this.localName) });
     this.scrollLeft = 0;
     this.scrollTop = 0;
-    this.handle = document.layoutTree.createNode(this._taffyStyle());
+    state.handle = documentState(document).layoutTree.createNode(this._taffyStyle());
   }
 
   getAttribute(name) {
@@ -149,16 +159,16 @@ export class Element extends EventTarget {
     name = String(name).toLowerCase();
     value = String(value);
     this.attributes.set(name, value);
-    if (name === "src" && this.name === "img") this._setImageSource(value === "" ? "" : this.src);
-    else if ((name === "width" || name === "height") && this.name === "img") this._styleChanged();
+    if (name === "src" && this.localName === "img") this._setImageSource(value === "" ? "" : this.src);
+    else if ((name === "width" || name === "height") && this.localName === "img") this._styleChanged();
   }
 
   removeAttribute(name) {
     name = String(name).toLowerCase();
     this.attributes.delete(name);
-    if (name === "src" && this.name === "img") {
+    if (name === "src" && this.localName === "img") {
       this._cancelImageRequest();
-    } else if ((name === "width" || name === "height") && this.name === "img") this._styleChanged();
+    } else if ((name === "width" || name === "height") && this.localName === "img") this._styleChanged();
   }
 
   get src() {
@@ -171,19 +181,19 @@ export class Element extends EventTarget {
   }
 
   get complete() {
-    return this.name !== "img" || !this.hasAttribute("src") || this.getAttribute("src") === "" || this.imageLoadState === "loaded" || this.imageLoadState === "error";
+    return this.localName !== "img" || !this.hasAttribute("src") || this.getAttribute("src") === "" || elementState(this).imageLoadState === "loaded" || elementState(this).imageLoadState === "error";
   }
 
   get currentSrc() {
-    return this._currentSrc ?? "";
+    return elementState(this).currentSrc ?? "";
   }
 
   get naturalWidth() {
-    return this.image?.width ?? 0;
+    return elementState(this).image?.width ?? 0;
   }
 
   get naturalHeight() {
-    return this.image?.height ?? 0;
+    return elementState(this).image?.height ?? 0;
   }
 
   get width() {
@@ -203,71 +213,73 @@ export class Element extends EventTarget {
   }
 
   decode() {
-    if (this.name !== "img") return Promise.reject(new TypeError("decode() is only available on img elements"));
+    if (this.localName !== "img") return Promise.reject(new TypeError("decode() is only available on img elements"));
     if (!this.hasAttribute("src") || this.getAttribute("src") === "") return Promise.reject(new DOMException("The image has no source", "EncodingError"));
-    return this.imageLoad.then(() => undefined);
+    return elementState(this).imageLoad.then(() => undefined);
   }
 
   _setImageSource(source) {
     this._cancelImageRequest();
     if (source === "") {
-      this.imageLoadState = "empty";
+      elementState(this).imageLoadState = "empty";
       return;
     }
-    this.imageLoadState = "pending";
-    this.imageLoad = new Promise((resolve, reject) => { this._resolveImageLoad = resolve; this._rejectImageLoad = reject; });
-    this.imageLoad.catch(() => {});
-    if (this.document.defaultView) this._beginImageLoad(source, this.document.defaultView, this._imageRequest);
+    elementState(this).imageLoadState = "pending";
+    elementState(this).imageLoad = new Promise((resolve, reject) => { elementState(this).resolveImageLoad = resolve; elementState(this).rejectImageLoad = reject; });
+    elementState(this).imageLoad.catch(() => {});
+    if (this.document.defaultView) this._beginImageLoad(source, this.document.defaultView, elementState(this).imageRequest);
   }
 
   _beginImageLoad(source, window, request) {
-    if (this.imageLoadState !== "pending" || request !== this._imageRequest) return;
-    this.imageLoadState = "loading";
-    this._currentSrc = source;
+    if (elementState(this).imageLoadState !== "pending" || request !== elementState(this).imageRequest) return;
+    elementState(this).imageLoadState = "loading";
+    elementState(this).currentSrc = source;
     loadImage(source, window).then((result) => {
-      if (request !== this._imageRequest) {
+      if (request !== elementState(this).imageRequest) {
         window.deleteImageTexture(result.textureId);
         return;
       }
-      this.image = { textureId: result.textureId, width: result.width, height: result.height };
+      elementState(this).image = { textureId: result.textureId, width: result.width, height: result.height };
       this._styleChanged();
-      this.imageLoadState = "loaded";
-      this._resolveImageLoad?.(result);
+      elementState(this).imageLoadState = "loaded";
+      elementState(this).resolveImageLoad?.(result);
       this.dispatchEvent(new Event("load"));
-      this._resolveImageLoad = this._rejectImageLoad = null;
+      elementState(this).resolveImageLoad = elementState(this).rejectImageLoad = null;
     }, (error) => {
-      if (request !== this._imageRequest) return;
-      this.imageLoadState = "error";
-      this._rejectImageLoad?.(new DOMException(error.message, "EncodingError"));
+      if (request !== elementState(this).imageRequest) return;
+      elementState(this).imageLoadState = "error";
+      elementState(this).rejectImageLoad?.(new DOMException(error.message, "EncodingError"));
       this.dispatchEvent(new Event("error"));
-      this._resolveImageLoad = this._rejectImageLoad = null;
+      elementState(this).resolveImageLoad = elementState(this).rejectImageLoad = null;
     });
   }
 
   _cancelImageRequest() {
-    this._imageRequest = (this._imageRequest ?? 0) + 1;
-    if (this.image && this.document.defaultView) unloadImage(this, this.document.defaultView);
-    this.image = null;
-    if (this.handle !== undefined) this._styleChanged();
-    if (this._rejectImageLoad) this._rejectImageLoad(new DOMException("The image source changed", "EncodingError"));
-    this._resolveImageLoad = this._rejectImageLoad = null;
-    this.imageLoad = null;
-    this.imageLoadState = "empty";
-    this._currentSrc = "";
-    this.document.dirty = true;
+    elementState(this).imageRequest = (elementState(this).imageRequest ?? 0) + 1;
+    if (elementState(this).image && this.document.defaultView) unloadImage(this, this.document.defaultView);
+    elementState(this).image = null;
+    if (elementState(this).handle !== undefined) this._styleChanged();
+    if (elementState(this).rejectImageLoad) elementState(this).rejectImageLoad(new DOMException("The image source changed", "EncodingError"));
+    elementState(this).resolveImageLoad = elementState(this).rejectImageLoad = null;
+    elementState(this).imageLoad = null;
+    elementState(this).imageLoadState = "empty";
+    elementState(this).currentSrc = "";
+    documentState(this.document).dirty = true;
   }
 
   _styleChanged() {
-    this.document.layoutTree.setStyle(this.handle, this._taffyStyle());
-    this.document.dirty = true;
+    const doc = documentState(this.document);
+    doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
+    doc.dirty = true;
+    doc.geometryDirty = true;
   }
 
   _taffyStyle() {
-    const style = this.style.values;
-    if (this.name === "img") {
+    const style = styleData.get(this.style).values;
+    if (this.localName === "img") {
       const imageStyle = { ...style };
-      if (imageStyle.width === undefined) imageStyle.width = parseDimension(this.getAttribute("width")) ?? this.image?.width;
-      if (imageStyle.height === undefined) imageStyle.height = parseDimension(this.getAttribute("height")) ?? this.image?.height;
+      if (imageStyle.width === undefined) imageStyle.width = parseDimension(this.getAttribute("width")) ?? elementState(this).image?.width;
+      if (imageStyle.height === undefined) imageStyle.height = parseDimension(this.getAttribute("height")) ?? elementState(this).image?.height;
       return styleForTaffy(imageStyle);
     }
     return styleForTaffy(style);
@@ -277,7 +289,12 @@ export class Element extends EventTarget {
     if (!Number.isFinite(x) || !Number.isFinite(y)) throw new TypeError("scroll offsets must be finite");
     this.scrollLeft = Math.max(0, this.scrollLeft + x);
     this.scrollTop = Math.max(0, this.scrollTop + y);
+    documentState(this.document).geometryDirty = true;
     return this;
+  }
+
+  getBoundingClientRect() {
+    return elementRect(this);
   }
 
   appendChild(child) {
@@ -309,35 +326,40 @@ export class Element extends EventTarget {
   }
 
   #syncChildren() {
-    this.document.layoutTree.setChildren(this.handle, this.children.map((child) => child.handle));
-    this.document.dirty = true;
+    const doc = documentState(this.document);
+    doc.layoutTree.setChildren(elementState(this).handle, this.children.map((child) => elementState(child).handle));
+    doc.dirty = true;
+    doc.geometryDirty = true;
   }
 }
 
 export class Document {
   constructor() {
-    this.layoutTree = new LayoutWorker();
-    this.elements = new Set();
+    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
     this.body = new Element(this, "body");
     this.body.style.display = "block";
-    this.dirty = true;
-    this.viewport = { width: 0, height: 0 };
-    this.defaultView = null;
-    this.baseURI = pathToFileURL(`${resolve(process.cwd())}${sep}`).href;
     registerDocument(this, {
       layout: (width, height, timings) => this.#layout(width, height, timings),
       boxes: (timings) => this.#boxes(timings),
+      rect: (element) => {
+        this.#layoutSync();
+        const box = this.#boxes().find((entry) => entry.element === element);
+        return box ? new DOMRect(box.x, box.y, box.width, box.height) : new DOMRect();
+      },
     });
   }
+
+  get baseURI() { return documentState(this).baseURI; }
+  get defaultView() { return documentState(this).defaultView; }
 
   createElement(name) {
     return new Element(this, name);
   }
 
   _attachWindow(window) {
-    this.defaultView = window;
-    for (const element of this.elements) if (element.name === "img" && element.imageLoadState === "pending") {
-      element._beginImageLoad(element.src, window, element._imageRequest);
+    documentState(this).defaultView = window;
+    for (const element of documentState(this).elements) if (element.localName === "img" && elementState(element).imageLoadState === "pending") {
+      element._beginImageLoad(element.src, window, elementState(element).imageRequest);
     }
   }
 
@@ -345,14 +367,14 @@ export class Document {
     if (!Number.isFinite(width) || !Number.isFinite(height) || width < 0 || height < 0) {
       throw new RangeError("viewport must have finite nonnegative dimensions");
     }
-    if (width !== this.viewport.width || height !== this.viewport.height) {
-      this.viewport = { width, height };
+    if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height) {
+      documentState(this).viewport = { width, height };
       this.body.style.width = width;
       this.body.style.height = height;
     }
-    if (this.dirty || !this.layoutSnapshot) {
+    if (documentState(this).dirty || !documentState(this).layoutSnapshot) {
       const start = performance.now();
-      const result = await this.layoutTree.layout(width, height, this.body.handle);
+      const result = await documentState(this).layoutTree.layout(width, height, elementState(this.body).handle);
       const elapsed = performance.now() - start;
       if (timings) {
         timings.compute = result.computeMs;
@@ -360,14 +382,38 @@ export class Document {
         timings.workerAssembly = result.workerMs - result.computeMs;
       }
       if (!result.stale) {
-        this.layoutSnapshot = result.boxes;
-        this.dirty = false;
+        documentState(this).layoutSnapshot = result.boxes;
+        documentState(this).dirty = false;
+        documentState(this).geometryDirty = true;
       }
     }
     return this.#boxes(timings);
   }
 
+  #layoutSync() {
+    const size = documentState(this).defaultView?.size();
+    const width = size?.width ?? documentState(this).viewport.width;
+    const height = size?.height ?? documentState(this).viewport.height;
+    if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height) {
+      documentState(this).viewport = { width, height };
+      if (documentState(this).defaultView) {
+        this.body.style.width = width;
+        this.body.style.height = height;
+      }
+    }
+    if (documentState(this).dirty || !documentState(this).layoutSnapshot) {
+      const result = documentState(this).layoutTree.layoutSync(width, height, elementState(this.body).handle);
+      documentState(this).layoutSnapshot = result.boxes;
+      documentState(this).dirty = false;
+      documentState(this).geometryDirty = true;
+    }
+  }
+
   #boxes(timings) {
+    if (!documentState(this).geometryDirty && documentState(this).boxesSnapshot) {
+      if (timings) timings.assembly = 0;
+      return documentState(this).boxesSnapshot;
+    }
     const elements = [];
     const collect = (element) => {
       elements.push(element);
@@ -376,7 +422,7 @@ export class Document {
     collect(this.body);
     const assemblyStart = timings && performance.now();
     const raw = elements.map((element) => {
-      const box = this.layoutSnapshot?.[element.handle] ?? { x: 0, y: 0, width: 0, height: 0 };
+      const box = documentState(this).layoutSnapshot?.[elementState(element).handle] ?? { x: 0, y: 0, width: 0, height: 0 };
       const margin = { top: box.marginTop ?? 0, right: box.marginRight ?? 0, bottom: box.marginBottom ?? 0, left: box.marginLeft ?? 0 };
       const border = { top: box.borderTop ?? 0, right: box.borderRight ?? 0, bottom: box.borderBottom ?? 0, left: box.borderLeft ?? 0 };
       const padding = { top: box.paddingTop ?? 0, right: box.paddingRight ?? 0, bottom: box.paddingBottom ?? 0, left: box.paddingLeft ?? 0 };
@@ -438,6 +484,8 @@ export class Document {
       return { ...box, x, y, borderBox: translatedBorderBox, paddingBox: translatedPaddingBox, contentBox: translatedContentBox, marginBox: translatedMarginBox, clip, scrollWidth: box.element.scrollWidth, scrollHeight: box.element.scrollHeight };
     });
     if (timings) timings.assembly = performance.now() - assemblyStart;
+    documentState(this).boxesSnapshot = boxes;
+    documentState(this).geometryDirty = false;
     return boxes;
   }
 
@@ -456,6 +504,7 @@ export class Document {
       if (nextX === box.element.scrollLeft && nextY === box.element.scrollTop) continue;
       box.element.scrollLeft = nextX;
       box.element.scrollTop = nextY;
+      documentState(this).geometryDirty = true;
       return true;
     }
     return false;
@@ -467,12 +516,12 @@ export class Document {
   }
 
   close() {
-    for (const element of this.elements) if (element.name === "img") element._cancelImageRequest();
-    if (this.defaultView) {
-      this.defaultView._document = null;
-      this.defaultView = null;
+    for (const element of documentState(this).elements) if (element.localName === "img") element._cancelImageRequest();
+    if (documentState(this).defaultView) {
+      documentState(this).defaultView.document = null;
+      documentState(this).defaultView = null;
     }
-    return this.layoutTree.close();
+    return documentState(this).layoutTree.close();
   }
 }
 

@@ -57,7 +57,7 @@ export function buildBoxDisplayList(boxes, width, height) {
 export function buildImageDraws(boxes) {
   const draws = [];
   for (const box of boxes) {
-    const image = box.element.image;
+    const image = elementState(box.element).image;
     const content = box.contentBox;
     if (!image || content.width <= 0 || content.height <= 0) continue;
     draws.push({
@@ -96,7 +96,7 @@ export function buildOrderedDisplayList(boxes, width, height) {
     const clip = box.clip;
     pushQuad(borderBox, parseColor(style.backgroundColor), clip);
 
-    const image = element.image;
+    const image = elementState(element).image;
     const content = box.contentBox;
     if (image && content.width > 0 && content.height > 0) {
       const imageClip = clip ? intersection(clip, viewport) : viewport;
@@ -124,3 +124,4 @@ export function buildOrderedDisplayList(boxes, width, height) {
   }
   return Buffer.from(new Float32Array([2, records.length, ...records.flat()]).buffer);
 }
+import { elementState } from "./internal/dom-state.js";
