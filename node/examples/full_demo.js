@@ -314,12 +314,14 @@ function easeInOut(t) {
 }
 
 const groupMotion = {
-  kicker: { delay: 0, span: 0.72, distance: 48, easing: "cubic-bezier(.3,.72,.38,1)" },
-  eyebrow: { delay: 0.08, span: 0.75, distance: 92, easing: "cubic-bezier(.18,.78,.28,1)" },
-  title: { delay: 0.16, span: 0.77, distance: 130, easing: "cubic-bezier(.2,1.48,.28,.9)" },
-  body: { delay: 0.24, span: 0.72, distance: 155, easing: "cubic-bezier(.3,.58,.35,1)" },
-  art: { delay: 0.04, span: 0.88, distance: 128, easing: "cubic-bezier(.16,1.85,.3,.78)" },
-  meta: { delay: 0.32, span: 0.66, distance: 64, easing: "cubic-bezier(.36,.62,.4,1)" },
+  // A compact reading-order cascade: every group starts within 100 ms and
+  // finishes at the same instant as the viewport scroll, so nothing drifts late.
+  kicker: { delay: 0, span: 1, distance: 22, easing: "cubic-bezier(.3,.72,.38,1)" },
+  eyebrow: { delay: 0.025, span: 0.975, distance: 28, easing: "cubic-bezier(.18,.78,.28,1)" },
+  title: { delay: 0.05, span: 0.95, distance: 36, easing: "cubic-bezier(.2,1.12,.3,1)" },
+  body: { delay: 0.075, span: 0.925, distance: 32, easing: "cubic-bezier(.3,.58,.35,1)" },
+  art: { delay: 0.015, span: 0.985, distance: 44, easing: "cubic-bezier(.2,1.2,.32,1)" },
+  meta: { delay: 0.1, span: 0.9, distance: 20, easing: "cubic-bezier(.36,.62,.4,1)" },
 };
 function setElementTransform(entry, transform) {
   entry.element.style.transform = transform || "none";
