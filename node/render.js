@@ -53,3 +53,74 @@ export function buildBoxDisplayList(boxes, width, height) {
   }
   return Buffer.from(new Float32Array(values).buffer);
 }
+
+export function buildImageDraws(boxes) {
+  const draws = [];
+  for (const box of boxes) {
+    const image = box.element.image;
+    const content = box.contentBox;
+    if (!image || content.width <= 0 || content.height <= 0) continue;
+    draws.push({
+      textureId: image.textureId,
+      x: content.x,
+      y: content.y,
+      width: content.width,
+      height: content.height,
+      ...(box.clip && {
+        clipX: box.clip.x,
+        clipY: box.clip.y,
+        clipWidth: box.clip.width,
+        clipHeight: box.clip.height,
+      }),
+    });
+  }
+  return draws;
+}
+
+// Display-list v2 is an ordered stream of fixed-size records. Solid commands
+// use [0, x, y, w, h, r, g, b, a, 0]; image commands use
+// [1, textureId, x, y, w, h, clipX, clipY, clipW, clipH].
+export function buildOrderedDisplayList(boxes, width, height) {
+  const records = [];
+  const viewport = { x: 0, y: 0, width, height };
+  const pushQuad = (rect, color, clip) => {
+    if (!color || rect.width <= 0 || rect.height <= 0) return;
+    const visible = intersection(rect, clip ? intersection(clip, viewport) : viewport);
+    if (visible.width <= 0 || visible.height <= 0) return;
+    records.push([0, visible.x, visible.y, visible.width, visible.height, ...color, 0]);
+  };
+
+  for (const box of boxes) {
+    const { element, borderBox, border } = box;
+    const style = element.style;
+    const clip = box.clip;
+    pushQuad(borderBox, parseColor(style.backgroundColor), clip);
+
+    const image = element.image;
+    const content = box.contentBox;
+    if (image && content.width > 0 && content.height > 0) {
+      const imageClip = clip ? intersection(clip, viewport) : viewport;
+      if (imageClip.width > 0 && imageClip.height > 0) {
+        records.push([1, image.textureId, content.x, content.y, content.width, content.height,
+          imageClip.x, imageClip.y, imageClip.width, imageClip.height]);
+      }
+    }
+
+    for (const side of SIDES) {
+      const edge = side.toLowerCase();
+      const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
+      if (borderStyle === "none" || borderStyle === "hidden") continue;
+      const thickness = border[edge];
+      const rect = side === "Top"
+        ? { x: borderBox.x, y: borderBox.y, width: borderBox.width, height: thickness }
+        : side === "Right"
+          ? { x: borderBox.x + borderBox.width - thickness, y: borderBox.y, width: thickness, height: borderBox.height }
+          : side === "Bottom"
+            ? { x: borderBox.x, y: borderBox.y + borderBox.height - thickness, width: borderBox.width, height: thickness }
+            : { x: borderBox.x, y: borderBox.y, width: thickness, height: borderBox.height };
+      const color = style[`border${side}Color`] ?? style.borderColor ?? "#000000";
+      pushQuad(rect, parseColor(color), clip);
+    }
+  }
+  return Buffer.from(new Float32Array([2, records.length, ...records.flat()]).buffer);
+}

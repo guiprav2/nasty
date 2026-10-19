@@ -348,6 +348,43 @@ struct Vertex {
     color: [f32; 4],
 }
 
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct ImageVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+}
+
+#[napi(object)]
+pub struct ImageDraw {
+    #[napi(js_name = "textureId")]
+    pub texture_id: u32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    #[napi(js_name = "clipX")]
+    pub clip_x: Option<f64>,
+    #[napi(js_name = "clipY")]
+    pub clip_y: Option<f64>,
+    #[napi(js_name = "clipWidth")]
+    pub clip_width: Option<f64>,
+    #[napi(js_name = "clipHeight")]
+    pub clip_height: Option<f64>,
+}
+
+struct GpuImage {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
+enum DrawOrder {
+    Solids(std::ops::Range<u32>),
+    Image(usize),
+}
+
 #[napi(object)]
 pub struct WindowOptions {
     pub title: Option<String>,
@@ -545,6 +582,12 @@ struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    image_pipeline: wgpu::RenderPipeline,
+    image_bind_group_layout: wgpu::BindGroupLayout,
+    images: std::collections::HashMap<u32, GpuImage>,
+    next_image_id: u32,
+    image_vertex_buffer: wgpu::Buffer,
+    image_vertex_capacity: usize,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
     text_runtime: Option<TextRuntime>,
@@ -1352,6 +1395,84 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+        let image_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Nasty image bindings"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let image_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Nasty image pipeline layout"),
+            bind_group_layouts: &[&image_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty image shader"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                struct VertexInput {
+                    @location(0) position: vec2<f32>,
+                    @location(1) uv: vec2<f32>,
+                };
+                struct VertexOutput {
+                    @builtin(position) position: vec4<f32>,
+                    @location(0) uv: vec2<f32>,
+                };
+                @vertex fn vs_main(input: VertexInput) -> VertexOutput {
+                    var output: VertexOutput;
+                    output.position = vec4<f32>(input.position, 0.0, 1.0);
+                    output.uv = input.uv;
+                    return output;
+                }
+                @group(0) @binding(0) var image_texture: texture_2d<f32>;
+                @group(0) @binding(1) var image_sampler: sampler;
+                @fragment fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+                    return textureSample(image_texture, image_sampler, input.uv);
+                }
+            "#.into()),
+        });
+        const IMAGE_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+        let image_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ImageVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &IMAGE_ATTRIBUTES,
+        };
+        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Nasty image pipeline"),
+            layout: Some(&image_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &image_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[image_vertex_layout],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview: None,
+            cache: None,
+        });
         // Avoid a visible first-frame allocation for ordinary display lists.
         // Larger lists still grow geometrically in `render`.
         let vertex_capacity = 64 * 6 * std::mem::size_of::<Vertex>();
@@ -1365,6 +1486,13 @@ impl Renderer {
         // waiting for the GPU; the first real frame flushes this queued upload.
         let warmup_data = vec![0_u8; vertex_capacity];
         queue.write_buffer(&vertex_buffer, 0, &warmup_data);
+        let image_vertex_capacity = 6 * std::mem::size_of::<ImageVertex>();
+        let image_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nasty image vertices"),
+            size: image_vertex_capacity as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // Keep the active atlas on the render thread while the spare runtime
         // shapes and uploads the next text version on the worker.
@@ -1406,6 +1534,12 @@ impl Renderer {
             queue,
             config,
             pipeline,
+            image_pipeline,
+            image_bind_group_layout,
+            images: std::collections::HashMap::new(),
+            next_image_id: 1,
+            image_vertex_buffer,
+            image_vertex_capacity,
             vertex_buffer,
             vertex_capacity,
             text_runtime: Some(text_runtime),
@@ -1419,6 +1553,52 @@ impl Renderer {
             format_name,
             present_mode_name,
         })
+    }
+
+    fn upload_image(&mut self, width: u32, height: u32, pixels: &[u8]) -> std::result::Result<u32, String> {
+        if width == 0 || height == 0 || width > 16384 || height > 16384 {
+            return Err("image dimensions must be between 1 and 16384 pixels".into());
+        }
+        if pixels.len() != width as usize * height as usize * 4 {
+            return Err("decoded image must contain width × height × 4 RGBA bytes".into());
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Nasty decoded image"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            pixels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Nasty image sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Nasty image bind group"),
+            layout: &self.image_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        let id = self.next_image_id;
+        self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        self.images.insert(id, GpuImage { _texture: texture, bind_group, width, height });
+        Ok(id)
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -1439,6 +1619,8 @@ impl Renderer {
         &mut self,
         window: &OsWindow,
         list: &[f32],
+        image_draws: &[ImageDraw],
+        draw_order: &[DrawOrder],
     ) -> std::result::Result<RenderTimings, String> {
         let started = Instant::now();
         let prepare_started = Instant::now();
@@ -1496,6 +1678,58 @@ impl Renderer {
         }
         let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
 
+        let mut image_vertices = Vec::with_capacity(image_draws.len() * 6);
+        let mut image_batches = Vec::with_capacity(image_draws.len());
+        for image in image_draws {
+            let gpu_image = self.images.get(&image.texture_id)
+                .ok_or_else(|| format!("unknown image texture {}", image.texture_id))?;
+            let x0 = image.x.max(0.0);
+            let y0 = image.y.max(0.0);
+            let x1 = (image.x + image.width).min(width as f64);
+            let y1 = (image.y + image.height).min(height as f64);
+            if image.width <= 0.0 || image.height <= 0.0 || x1 <= x0 || y1 <= y0 {
+                image_batches.push(None);
+                continue;
+            }
+            let u0 = ((x0 - image.x) / image.width) as f32;
+            let v0 = ((y0 - image.y) / image.height) as f32;
+            let u1 = ((x1 - image.x) / image.width) as f32;
+            let v1 = ((y1 - image.y) / image.height) as f32;
+            let px0 = x0 as f32 / width * 2.0 - 1.0;
+            let px1 = x1 as f32 / width * 2.0 - 1.0;
+            let py0 = 1.0 - y0 as f32 / height * 2.0;
+            let py1 = 1.0 - y1 as f32 / height * 2.0;
+            let start = image_vertices.len() as u32;
+            image_vertices.extend_from_slice(&[
+                ImageVertex { position: [px0, py0], uv: [u0, v0] },
+                ImageVertex { position: [px1, py0], uv: [u1, v0] },
+                ImageVertex { position: [px0, py1], uv: [u0, v1] },
+                ImageVertex { position: [px0, py1], uv: [u0, v1] },
+                ImageVertex { position: [px1, py0], uv: [u1, v0] },
+                ImageVertex { position: [px1, py1], uv: [u1, v1] },
+            ]);
+            let cx = image.clip_x.unwrap_or(0.0).floor().clamp(0.0, width as f64) as u32;
+            let cy = image.clip_y.unwrap_or(0.0).floor().clamp(0.0, height as f64) as u32;
+            let cr = image.clip_x.zip(image.clip_width).map(|(x, w)| (x + w).ceil().clamp(0.0, width as f64) as u32).unwrap_or(self.config.width);
+            let cb = image.clip_y.zip(image.clip_height).map(|(y, h)| (y + h).ceil().clamp(0.0, height as f64) as u32).unwrap_or(self.config.height);
+            if cr <= cx || cb <= cy {
+                image_vertices.truncate(start as usize);
+                image_batches.push(None);
+                continue;
+            }
+            image_batches.push(Some((image.texture_id, start..start + 6, cx, cy, cr - cx, cb - cy)));
+            let _intrinsic_size = (gpu_image.width, gpu_image.height);
+        }
+        let image_bytes = bytemuck::cast_slice(&image_vertices);
+        if image_bytes.len() > self.image_vertex_capacity {
+            self.image_vertex_capacity = image_bytes.len().next_power_of_two();
+            self.image_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Nasty image vertices"), size: self.image_vertex_capacity as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            });
+        }
+        if !image_bytes.is_empty() { self.queue.write_buffer(&self.image_vertex_buffer, 0, image_bytes); }
+
         let acquire_started = Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -1537,10 +1771,43 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if !vertices.is_empty() {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.draw(0..vertices.len() as u32, 0..1);
+            if draw_order.is_empty() {
+                if !vertices.is_empty() {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                    pass.draw(0..vertices.len() as u32, 0..1);
+                }
+                for batch in image_batches.iter().flatten() {
+                    let (texture_id, range, x, y, w, h) = batch;
+                    pass.set_pipeline(&self.image_pipeline);
+                    pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
+                    pass.set_scissor_rect(*x, *y, *w, *h);
+                    let image = &self.images[texture_id];
+                    pass.set_bind_group(0, &image.bind_group, &[]);
+                    pass.draw(range.clone(), 0..1);
+                }
+                pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+            } else {
+                for command in draw_order {
+                    match command {
+                        DrawOrder::Solids(range) => {
+                            pass.set_pipeline(&self.pipeline);
+                            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                            pass.draw(range.clone(), 0..1);
+                        }
+                        DrawOrder::Image(index) => {
+                            let Some((texture_id, range, x, y, w, h)) = image_batches.get(*index).and_then(Option::as_ref) else { continue };
+                            pass.set_pipeline(&self.image_pipeline);
+                            pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
+                            pass.set_scissor_rect(*x, *y, *w, *h);
+                            let image = &self.images[texture_id];
+                            pass.set_bind_group(0, &image.bind_group, &[]);
+                            pass.draw(range.clone(), 0..1);
+                        }
+                    }
+                }
+                pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
             }
             if let Some(runtime) = self
                 .text_runtime
@@ -2190,6 +2457,8 @@ struct WindowApp {
     cursor: (f64, f64),
     modifiers: ModifiersState,
     display_list: Vec<f32>,
+    image_draws: Vec<ImageDraw>,
+    draw_order: Vec<DrawOrder>,
     render_pending: bool,
     closed: bool,
     last_render_ms: f64,
@@ -2365,7 +2634,7 @@ impl ApplicationHandler for WindowApp {
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
-                match renderer.render(window, &self.display_list) {
+                match renderer.render(window, &self.display_list, &self.image_draws, &self.draw_order) {
                     Ok(timings) => {
                         self.last_render_ms = timings.total_ms;
                         self.last_prepare_ms = timings.prepare_ms;
@@ -2645,11 +2914,50 @@ impl Window {
 
     #[napi]
     pub fn present(&mut self, display_list: Buffer) -> Result<PresentStats> {
+        self.present_display_list(display_list, Vec::new())
+    }
+
+    #[napi(js_name = "createImageTexture")]
+    pub fn create_image_texture(&mut self, width: u32, height: u32, pixels: Buffer) -> Result<u32> {
+        let renderer = self.app.renderer.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        renderer.upload_image(width, height, pixels.as_ref())
+            .map_err(|error| Error::new(Status::InvalidArg, error))
+    }
+
+    #[napi(js_name = "deleteImageTexture")]
+    pub fn delete_image_texture(&mut self, texture_id: u32) -> bool {
+        self.app.renderer.as_mut().is_some_and(|renderer| renderer.images.remove(&texture_id).is_some())
+    }
+
+    #[napi(js_name = "presentWithImages")]
+    pub fn present_with_images(&mut self, display_list: Buffer, images: Vec<ImageDraw>) -> Result<PresentStats> {
+        self.present_display_list(display_list, images)
+    }
+
+    #[napi(js_name = "presentOrdered")]
+    pub fn present_ordered(&mut self, display_list: Buffer) -> Result<PresentStats> {
+        if self.app.closed {
+            return Err(Error::new(Status::GenericFailure, "window is closed"));
+        }
+        let (quads, images, order) = parse_ordered_display_list(display_list.as_ref())?;
+        self.present_parsed(quads, images, order)
+    }
+}
+
+impl Window {
+    fn present_display_list(&mut self, display_list: Buffer, images: Vec<ImageDraw>) -> Result<PresentStats> {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
         let list = parse_display_list(display_list.as_ref())?;
+        self.present_parsed(list, images, Vec::new())
+    }
+
+    fn present_parsed(&mut self, list: Vec<f32>, images: Vec<ImageDraw>, order: Vec<DrawOrder>) -> Result<PresentStats> {
         self.app.display_list = list;
+        self.app.image_draws = images;
+        self.app.draw_order = order;
         self.app.render_pending = true;
         let previous_count = self.app.last_render_count;
         if let Some(window) = self.app.window.as_ref() {
@@ -2729,6 +3037,70 @@ fn parse_display_list(bytes: &[u8]) -> Result<Vec<f32>> {
         }
     }
     Ok(values[1..].to_vec())
+}
+
+fn parse_ordered_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<ImageDraw>, Vec<DrawOrder>)> {
+    if bytes.len() < 8 || bytes.len() % 4 != 0 {
+        return Err(Error::new(Status::InvalidArg, "ordered display list must be a Float32Array"));
+    }
+    let values = bytes.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+    if values[0] != 2.0 || !values[1].is_finite() || values[1] < 0.0 || values[1].fract() != 0.0 {
+        return Err(Error::new(Status::InvalidArg, "unsupported ordered display-list header"));
+    }
+    let command_count = values[1] as usize;
+    if command_count > 1_000_000 || values.len() != 2 + command_count * 10 {
+        return Err(Error::new(Status::InvalidArg, "ordered display-list command count does not match its data"));
+    }
+
+    let mut quads = Vec::new();
+    let mut images = Vec::new();
+    let mut order = Vec::<DrawOrder>::new();
+    for record in values[2..].chunks_exact(10) {
+        if record.iter().any(|value| !value.is_finite()) {
+            return Err(Error::new(Status::InvalidArg, "display-list command values must be finite"));
+        }
+        match record[0] {
+            0.0 => {
+                let quad = &record[1..9];
+                if quad[2] < 0.0 || quad[3] < 0.0 || quad[4..].iter().any(|value| !(0.0..=1.0).contains(value)) {
+                    return Err(Error::new(Status::InvalidArg, "solid command has invalid dimensions or color"));
+                }
+                let first_vertex = (quads.len() / 8 * 6) as u32;
+                quads.extend_from_slice(quad);
+                let last_vertex = first_vertex + 6;
+                if let Some(DrawOrder::Solids(range)) = order.last_mut() {
+                    range.end = last_vertex;
+                } else {
+                    order.push(DrawOrder::Solids(first_vertex..last_vertex));
+                }
+            }
+            1.0 => {
+                let texture_id = record[1];
+                if texture_id < 1.0 || texture_id > u32::MAX as f32 || texture_id.fract() != 0.0
+                    || record[4] < 0.0 || record[5] < 0.0 || record[6] < 0.0 || record[7] < 0.0 || record[8] < 0.0 || record[9] < 0.0
+                {
+                    return Err(Error::new(Status::InvalidArg, "image command has an invalid texture or dimensions"));
+                }
+                let image_index = images.len();
+                images.push(ImageDraw {
+                    texture_id: texture_id as u32,
+                    x: record[2] as f64,
+                    y: record[3] as f64,
+                    width: record[4] as f64,
+                    height: record[5] as f64,
+                    clip_x: Some(record[6] as f64),
+                    clip_y: Some(record[7] as f64),
+                    clip_width: Some(record[8] as f64),
+                    clip_height: Some(record[9] as f64),
+                });
+                order.push(DrawOrder::Image(image_index));
+            }
+            _ => return Err(Error::new(Status::InvalidArg, "ordered display-list command type is unknown")),
+        }
+    }
+    Ok((quads, images, order))
 }
 
 impl LayoutTree {

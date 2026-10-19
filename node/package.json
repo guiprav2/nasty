@@ -5,5 +5,9 @@
   "type": "module",
   "scripts": {
     "build:debug": "cargo build --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js"
+  },
+  "dependencies": {
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0"
   }
 }
