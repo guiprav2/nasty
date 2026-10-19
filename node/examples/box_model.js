@@ -1,43 +1,50 @@
 import assert from "node:assert/strict";
 import { Document, Window, buildBoxDisplayList } from "../index.js";
+import { documentBoxes, layoutDocument } from "../internal/dom-state.js";
 
 const window = new Window({ title: "Nasty box model", width: 720, height: 480 });
 const doc = new Document();
-doc.body.setStyle({
+const element = (id, style = {}) => {
+  const result = doc.createElement("div");
+  result.id = id;
+  Object.assign(result.style, style);
+  return result;
+};
+Object.assign(doc.body.style, {
   display: "flex", direction: "column", width: 720, height: 480,
   padding: 20, gap: 16, backgroundColor: "#111827",
 });
-const card = doc.createElement("card", {
+const card = element("card", {
   width: 280, height: 150,
   padding: 12, paddingLeft: 18,
   borderWidth: 3, borderTopWidth: 5,
   margin: 8, marginLeft: 14,
   backgroundColor: "#1d3557", borderStyle: "solid", borderColor: "#60a5fa",
 });
-const cardContent = doc.createElement("card-content", {
+const cardContent = element("card-content", {
   width: 100, height: 36, backgroundColor: "#2a9d8f",
 });
 card.appendChild(cardContent);
-const row = doc.createElement("auto-margin-row", {
+const row = element("auto-margin-row", {
   display: "flex", direction: "row", width: 240, height: 44,
   padding: 6, borderWidth: 2, borderStyle: "solid", backgroundColor: "#202a44",
 });
-const left = doc.createElement("left", { width: 50, height: 24, backgroundColor: "#e9c46a" });
-const right = doc.createElement("right", { width: 50, height: 24, marginLeft: "auto", backgroundColor: "#f4a261" });
+const left = element("left", { width: 50, height: 24, backgroundColor: "#e9c46a" });
+const right = element("right", { width: 50, height: 24, marginLeft: "auto", backgroundColor: "#f4a261" });
 row.appendChild(left);
 row.appendChild(right);
-const scroller = doc.createElement("padded-overflow", {
+const scroller = element("padded-overflow", {
   width: 280, height: 96, padding: 10, borderWidth: 4, overflow: "auto",
   backgroundColor: "#252f47", borderColor: "#a78bfa", borderStyle: "solid",
 });
-const overflowingChild = doc.createElement("overflowing-child", {
+const overflowingChild = element("overflowing-child", {
   width: 360, height: 36, flexShrink: 0, backgroundColor: "#e76f51",
 });
 scroller.appendChild(overflowingChild);
-const negativeMargin = doc.createElement("negative-margin", {
+const negativeMargin = element("negative-margin", {
   width: 80, height: 24, marginLeft: -8, backgroundColor: "#c084fc",
 });
-const noBorderStyle = doc.createElement("border-width-with-none-style", {
+const noBorderStyle = element("border-width-with-none-style", {
   width: 80, height: 24, borderWidth: 5, backgroundColor: "#475569",
 });
 doc.body.appendChild(card);
@@ -46,7 +53,7 @@ doc.body.appendChild(scroller);
 doc.body.appendChild(negativeMargin);
 doc.body.appendChild(noBorderStyle);
 
-let boxes = await doc.layout(720, 480);
+let boxes = await layoutDocument(doc, 720, 480);
 const box = (element) => boxes.find((entry) => entry.element === element);
 const cardBox = box(card);
 assert.equal(cardBox.width, 280, "declared width includes padding and border (border-box reset)");
@@ -66,7 +73,7 @@ assert.deepEqual(box(overflowingChild).clip, box(scroller).paddingBox,
 assert.equal(box(scroller).scrollWidth, 380, "scroll width includes both padding edges and overflowing content");
 assert.equal(doc.scrollAt(box(scroller).x + 20, box(scroller).y + 20, 250, 0), true);
 assert.equal(scroller.scrollLeft, 108, "scroll range uses the padding-box scrollport rather than border-box width");
-boxes = doc.boxes();
+boxes = documentBoxes(doc);
 assert.equal(box(overflowingChild).x, box(scroller).contentBox.x - 108);
 assert.equal(box(overflowingChild).clip.x, box(scroller).paddingBox.x);
 assert.equal(box(negativeMargin).margin.left, -8);

@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 import { PNG } from "pngjs";
 import jpeg from "jpeg-js";
 import { closeImageDecoder, Document, Window, buildOrderedDisplayList } from "../index.js";
+import { documentBoxes, layoutDocument } from "../internal/dom-state.js";
 
 const width = 256;
 const height = 160;
@@ -27,7 +31,12 @@ await writeFile(jpegPath, jpeg.encode({ data: png.data, width, height }, 80).dat
 
 const window = new Window({ title: "Nasty image element", width: 720, height: 480 });
 const document = new Document();
-document.attachWindow(window);
+const sourceLessImage = document.createElement("img");
+assert.equal(sourceLessImage.complete, true, "an img with no src is complete");
+const emptySourceImage = document.createElement("img");
+emptySourceImage.src = "";
+assert.equal(emptySourceImage.complete, true, "an img with an empty src is complete");
+await assert.rejects(emptySourceImage.decode(), { name: "EncodingError" });
 Object.assign(document.body.style, {
   display: "flex", direction: "row", justifyContent: "center", alignItems: "center", gap: 20,
   width: 720, height: 480, backgroundColor: "#101827",
@@ -47,9 +56,11 @@ scroller.appendChild(image);
 document.body.appendChild(scroller);
 const secondImage = document.createElement("img");
 Object.assign(secondImage.style, {
-  width: 220, height: 180, padding: 8, borderWidth: 2,
+  padding: 8, borderWidth: 2,
   borderStyle: "solid", borderColor: "#34d399", overflow: "hidden",
 });
+secondImage.width = 220;
+secondImage.height = 180;
 document.body.appendChild(secondImage);
 const overlay = document.createElement("div");
 Object.assign(overlay.style, {
@@ -57,18 +68,54 @@ Object.assign(overlay.style, {
 });
 document.body.appendChild(overlay);
 
-image.src = fixturePath;
-secondImage.setAttribute("src", jpegPath);
-const decoded = await image.decode();
-const jpegDecoded = await secondImage.decode();
-assert.equal(image.getAttribute("src"), fixturePath);
-assert.equal(secondImage.src, jpegPath);
+image.src = relative(process.cwd(), fixturePath);
+secondImage.src = pathToFileURL(jpegPath).href;
+assert.equal(image.complete, false, "an image with a pending src is incomplete");
+const pngDecodeStart = performance.now();
+const pngDecoded = image.decode().then(() => performance.now() - pngDecodeStart);
+const jpegDecodeStart = performance.now();
+const jpegDecoded = secondImage.decode().then(() => performance.now() - jpegDecodeStart);
+const encodedPng = PNG.sync.write(png);
+const dataImage = document.createElement("img");
+dataImage.src = `data:image/png;base64,${encodedPng.toString("base64")}`;
+const server = createServer((_request, response) => {
+  response.writeHead(200, { "content-type": "image/png" });
+  response.end(encodedPng);
+});
+server.listen(0, "127.0.0.1");
+await once(server, "listening");
+const address = server.address();
+const httpImage = document.createElement("img");
+httpImage.src = `http://127.0.0.1:${address.port}/gradient.png`;
+const failedImage = document.createElement("img");
+failedImage.src = join(fixtureDir, "missing.png");
+const errorEvent = new Promise((resolve) => failedImage.addEventListener("error", resolve, { once: true }));
+window.document = document;
+const [pngDecodeMs, jpegDecodeMs] = await Promise.all([pngDecoded, jpegDecoded]);
+await Promise.all([dataImage.decode(), httpImage.decode()]);
+await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+await assert.rejects(failedImage.decode(), { name: "EncodingError" });
+await errorEvent;
+assert.equal(failedImage.complete, true, "a failed image request is complete");
+assert.equal(failedImage.naturalWidth, 0);
+failedImage.src = fixturePath;
+await failedImage.decode();
+assert.equal(failedImage.complete, true, "replacing a failed source starts a fresh request");
+assert.equal(failedImage.naturalWidth, width);
+assert.equal(document.baseURI, pathToFileURL(`${process.cwd()}${sep}`).href);
+assert.equal(image.getAttribute("src"), relative(process.cwd(), fixturePath), "relative image paths remain reflected in the src attribute");
+assert.equal(image.src, pathToFileURL(fixturePath).href, "the src property resolves against document.baseURI");
+assert.equal(image.currentSrc, pathToFileURL(fixturePath).href);
+assert.equal(secondImage.getAttribute("src"), pathToFileURL(jpegPath).href, "absolute file URIs remain reflected in the src attribute");
+assert.equal(secondImage.currentSrc, pathToFileURL(jpegPath).href);
 assert.equal(image.complete, true);
-assert.equal(decoded.width, width);
-assert.equal(decoded.height, height);
-assert.equal(jpegDecoded.width, width);
-assert.equal(jpegDecoded.height, height);
-let boxes = await document.layout(720, 480);
+assert.equal(image.naturalWidth, width);
+assert.equal(image.naturalHeight, height);
+assert.equal(secondImage.naturalWidth, width);
+assert.equal(secondImage.naturalHeight, height);
+assert.equal(secondImage.width, 220, "img width reflects its HTML dimension attribute");
+assert.equal(secondImage.height, 180, "img height reflects its HTML dimension attribute");
+let boxes = await layoutDocument(document, 720, 480);
 const initialImageBox = boxes.find((box) => box.element === image);
 const scrollerBox = boxes.find((box) => box.element === scroller);
 assert.ok(scrollerBox.scrollWidth > scrollerBox.paddingBox.width);
@@ -76,7 +123,7 @@ assert.ok(scrollerBox.scrollHeight > scrollerBox.paddingBox.height);
 assert.equal(document.scrollAt(scrollerBox.x + 20, scrollerBox.y + 20, 15, 10), true);
 assert.equal(scroller.scrollLeft, 15);
 assert.equal(scroller.scrollTop, 10);
-boxes = document.boxes();
+boxes = documentBoxes(document);
 const imageBox = boxes.find((box) => box.element === image);
 assert.deepEqual(imageBox.clip, scrollerBox.paddingBox, "image inherits the generic scrollport clip");
 assert.equal(imageBox.x, initialImageBox.x - 15, "image follows generic horizontal scrolling");
@@ -95,8 +142,7 @@ const tags = Array.from({ length: commandCount }, (_, index) => orderedValues[2 
 assert.equal(tags.at(-1), 0, "last DOM element emits a solid quad after both images");
 assert.equal(tags.filter((tag) => tag === 1).length, 2, "ordered list contains PNG and JPEG draws");
 
-console.log(`PNG decode: worker startup ${decoded.decoderStartupMs.toFixed(2)} ms, read ${decoded.readMs.toFixed(2)} ms, decode ${decoded.decodeMs.toFixed(2)} ms, request ${decoded.workerRoundTripMs.toFixed(2)} ms`);
-console.log(`JPEG decode ${jpegDecoded.decodeMs.toFixed(2)} ms / request ${jpegDecoded.workerRoundTripMs.toFixed(2)} ms; texture uploads ${decoded.uploadMs.toFixed(2)} / ${jpegDecoded.uploadMs.toFixed(2)} ms`);
+console.log(`img.decode() readiness: PNG ${pngDecodeMs.toFixed(2)} ms, JPEG ${jpegDecodeMs.toFixed(2)} ms (includes worker decode and GPU upload)`);
 console.log(`image content box ${imageBox.contentBox.width}x${imageBox.contentBox.height}, scroll clip ${imageBox.clip.width}x${imageBox.clip.height}; overlapping solid is ordered after the JPEG; adapter ${window.adapterName()}`);
 console.log("Rendering PNG and JPEG textures in a native window; press Escape to exit.");
 
