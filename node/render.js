@@ -218,6 +218,19 @@ function transformOrigin(source, width, height) {
   return [lengthValue(keyword(parts[0] ?? "50%", 0), width), lengthValue(keyword(parts[1] ?? "50%", 1), height), lengthValue(parts[2] ?? "0px")];
 }
 
+export function projectBoxPoint(box, x, y) {
+  const matrix = parseTransform(box.element.style.transform, box.width, box.height);
+  const origin = transformOrigin(box.element.style.transformOrigin, box.width, box.height);
+  const withOrigin = multiply4(multiply4(translation(...origin), matrix), translation(-origin[0], -origin[1], -origin[2]));
+  const localX = x - box.x;
+  const localY = y - box.y;
+  const qx = withOrigin[0][0] * localX + withOrigin[0][1] * localY + withOrigin[0][3];
+  const qy = withOrigin[1][0] * localX + withOrigin[1][1] * localY + withOrigin[1][3];
+  const qw = withOrigin[3][0] * localX + withOrigin[3][1] * localY + withOrigin[3][3];
+  if (qw <= 0.0001) return { x: Number.NaN, y: Number.NaN };
+  return { x: box.x + qx / qw, y: box.y + qy / qw };
+}
+
 function clipPolygon(polygon, rect) {
   if (!rect) return polygon;
   let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;

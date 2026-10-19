@@ -41,6 +41,10 @@ await layoutDocument(document, 720, 480);
 
 const original = "#1769aa";
 const target = "#ed6a35";
+const transitionEnds = [];
+cards.forEach((card, index) => card.addEventListener("transitionend", (event) => {
+  transitionEnds.push(`${index}:${event.propertyName}`);
+}));
 const start = performance.now();
 for (const card of cards) {
   card.style.backgroundColor = target;
@@ -141,6 +145,12 @@ function finish() {
   assert.ok(sawConcurrentInterpolation, "background color should pass through intermediate colors");
   assert.ok(reverseCompleted, "reversing should complete with a shortened duration");
   assert.ok(stepsCompleted, "steps() border-color transition should reach its endpoint");
+  for (let index = 0; index < cards.length; index++) {
+    for (const propertyName of ["background-color", "border-color"]) {
+      assert.equal(transitionEnds.filter((item) => item === `${index}:${propertyName}`).length, 1,
+        `${propertyName} should emit one transitionend event on card ${index}`);
+    }
+  }
   assert.equal(documentState(document).dirty, false, "paint-color transitions must not rerun layout");
   const cpu = process.cpuUsage(cpuStart);
   const cpuMs = (cpu.user + cpu.system) / 1000;

@@ -393,6 +393,7 @@ pub struct WindowOptions {
     pub height: Option<f64>,
     #[napi(js_name = "allowAnyThread")]
     pub allow_any_thread: Option<bool>,
+    pub visible: Option<bool>,
 }
 
 #[napi(object)]
@@ -2231,7 +2232,7 @@ impl TextRuntime {
             buffer.set_size(
                 font_system,
                 Some((run_width as f32).max(1.0)),
-                Some((height - y as f32).max(1.0)),
+                None,
             );
             buffer.set_text(
                 font_system,
@@ -2463,6 +2464,7 @@ struct WindowApp {
     title: String,
     width: f64,
     height: f64,
+    visible: bool,
     window: Option<Arc<OsWindow>>,
     renderer: Option<Renderer>,
     text_editor: Option<TextEditor>,
@@ -2491,6 +2493,7 @@ impl ApplicationHandler for WindowApp {
         }
         let attributes = OsWindow::default_attributes()
             .with_title(self.title.clone())
+            .with_visible(self.visible)
             .with_inner_size(LogicalSize::new(self.width, self.height));
         match event_loop.create_window(attributes) {
             Ok(window) => {
@@ -2708,6 +2711,7 @@ impl Window {
             title: options.title.unwrap_or_else(|| "Nasty".into()),
             width: options.width.unwrap_or(960.0),
             height: options.height.unwrap_or(600.0),
+            visible: options.visible.unwrap_or(true),
             ..Default::default()
         };
         if !app.width.is_finite() || !app.height.is_finite() || app.width < 1.0 || app.height < 1.0
@@ -2721,6 +2725,16 @@ impl Window {
         window.pump(Duration::ZERO)?;
         window.check_error()?;
         Ok(window)
+    }
+
+    #[napi]
+    pub fn show(&self) -> Result<()> {
+        let window = self.app.window.as_ref().ok_or_else(|| {
+            Error::new(Status::GenericFailure, "native window is unavailable")
+        })?;
+        window.set_visible(true);
+        window.request_redraw();
+        Ok(())
     }
 
     #[napi]
@@ -2836,6 +2850,40 @@ impl Window {
             selection_end,
             caret_index,
         )
+    }
+
+    // Internal compositor transport: reuse shaped buffers for paint-only changes.
+    #[napi(js_name = "updateTextPlacement")]
+    pub fn update_text_placement(&mut self, runs: Vec<TextRunOptions>) -> Result<()> {
+        let renderer = self.app.renderer.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        let runtime = renderer.text_runtime.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "text runtime unavailable"))?;
+        if runs.len() != runtime.text_buffers.len() {
+            return Err(Error::new(Status::InvalidArg, "text placement count mismatch"));
+        }
+        for (run, old) in runs.iter().zip(&runtime.text_run_options) {
+            if run.text != old.text || run.width != old.width || run.font_size != old.font_size
+                || run.line_height != old.line_height || run.font_family != old.font_family || run.wrap != old.wrap
+                || !run.x.is_finite() || !run.y.is_finite() || parse_text_color(&run.color).is_none() {
+                return Err(Error::new(Status::InvalidArg, "placement must preserve shaped text and use valid geometry/color"));
+            }
+        }
+        let font_system = runtime.font_system.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "font system unavailable"))?;
+        for ((text, run), painter) in runtime.text_buffers.iter_mut().zip(&runs).zip(runtime.text_renderers.iter_mut()) {
+            text.x = run.x as f32;
+            text.y = run.y as f32;
+            text.color = parse_text_color(&run.color).unwrap();
+            painter.prepare(&renderer.device, &renderer.queue, font_system,
+                &mut runtime.text_atlas, &runtime.text_viewport,
+                [TextArea { buffer: &text.buffer, left: text.x, top: text.y, scale: 1.0,
+                    bounds: text_bounds(run, renderer.config.width, renderer.config.height),
+                    default_color: text.color, custom_glyphs: &[] }], &mut runtime.swash_cache)
+                .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))?;
+        }
+        runtime.text_run_options = runs;
+        Ok(())
     }
 
     #[napi(js_name = "pollTextRuns")]

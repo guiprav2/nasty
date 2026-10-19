@@ -15,3 +15,10 @@ Track deferred engineering work that is known, measured, and intentionally not b
 - **Evidence:** The engines can report different advances for the same long string. Chasing the caret by moving the full glyph run caused per-character horizontal drift, so that correction was removed.
 - **Potential path:** Establish a shared font/advance metric source for hidden egui editing and glyphon rendering, then verify caret, selection, horizontal scroll, mixed-width text, and prepending at long input lengths.
 - **Revisit when:** physical testing shows a visible caret/hit-testing defect or before claiming exact platform-level input parity.
+
+## D-03: DOM block text integration and compositor updates
+
+- **Status:** DOM textContent/style now feeds the existing native text worker privately; block text currently requires layout dimensions. Full Text nodes, inline formatting, intrinsic text measurement, transformed glyphs, and interleaved text/solid paint ordering remain unimplemented.
+- **Placement correction:** Position/color/clip changes now reuse shaped buffers and update glyph preparation synchronously before presenting the same frame as solids. All DOM runs remain resident across viewport scrolling; worker results receive current placement immediately on installation. Static frames skip unchanged updates. Font/content/wrapping-width changes still shape on the worker.
+- **Next step:** Profile the remaining glyphon prepare/upload cost separately from software GPU rasterization; consider compositor uniforms for paint-only changes. Complete inline/intrinsic semantics and transformed glyph support separately.
+- **Evidence:** Three-slide DOM promo on Xvfb/llvmpipe: 601 frames/16.2 s, 37.2 FPS, 369 expired deadlines; JS list p95 5.634 ms, presentation including DOM text synchronization p95 36.395 ms; process 0.97 cores, RSS 193 MB; host CPU 91.4% across two CPUs. This does not establish physical GPU performance or isolate shaping as the cause.

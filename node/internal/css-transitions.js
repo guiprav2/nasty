@@ -1,9 +1,22 @@
 import { parseColor } from "../render.js";
 
 const COLOR_PROPERTIES = new Set([
-  "backgroundColor", "borderColor", "borderTopColor", "borderRightColor", "borderBottomColor", "borderLeftColor",
+  "color", "backgroundColor", "borderColor", "borderTopColor", "borderRightColor", "borderBottomColor", "borderLeftColor",
 ]);
 const styleTransitionStates = new WeakMap();
+
+export class TransitionEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, {
+      bubbles: init.bubbles ?? true,
+      cancelable: init.cancelable ?? false,
+      composed: init.composed ?? false,
+    });
+    this.propertyName = String(init.propertyName ?? "");
+    this.elapsedTime = Number(init.elapsedTime ?? 0);
+    this.pseudoElement = String(init.pseudoElement ?? "");
+  }
+}
 
 export function registerStyleTransitionState(style, state) {
   styleTransitionStates.set(style, state);
@@ -122,6 +135,9 @@ export function sampleColorTransition(state, property, now = performance.now()) 
   const t = timingProgress(transition.easing, progress);
   if (progress >= 1) {
     state.transitions.delete(property);
+    queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
+      propertyName: kebab(property), elapsedTime: transition.duration / 1000,
+    })));
     return state.values[property];
   }
   const rgba = transition.from.map((value, index) => value + (transition.to[index] - value) * t);

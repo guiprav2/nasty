@@ -4,20 +4,27 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { LayoutWorker } from "./layout-worker.js";
 import { loadImage, unloadImage } from "./image-decoder.js";
 import { documentBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
+import { syncDocumentText } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
-import { isPaintColorProperty, registerStyleTransitionState, startColorTransition } from "./internal/css-transitions.js";
+import { isPaintColorProperty, registerStyleTransitionState, startColorTransition, TransitionEvent } from "./internal/css-transitions.js";
 
 const require = createRequire(import.meta.url);
 const native = require(join(fileURLToPath(new URL(".", import.meta.url)), "native/debug/nasty.node"));
 
 export const LayoutTree = native.LayoutTree;
 export { DOMRect };
+export { TransitionEvent };
 export class Window extends native.Window {
   #document = null;
   constructor(options) {
     super(options);
     this.DOMRect = DOMRect;
   }
+
+  present(list) { syncDocumentText(this, this.#document); return super.present(list); }
+  presentWithImages(list, images) { syncDocumentText(this, this.#document); return super.presentWithImages(list, images); }
+  presentOrdered(list) { syncDocumentText(this, this.#document); return super.presentOrdered(list); }
+  presentTransformed(list) { syncDocumentText(this, this.#document); return super.presentTransformed(list); }
 
   get document() {
     return this.#document;
@@ -145,6 +152,15 @@ export class Element extends EventTarget {
     this.scrollLeft = 0;
     this.scrollTop = 0;
     state.handle = documentState(document).layoutTree.createNode(this._taffyStyle());
+  }
+
+  get textContent() {
+    return (elementState(this).text ?? "") + this.children.map((child) => child.textContent).join("");
+  }
+
+  set textContent(value) {
+    for (const child of [...this.children]) this.removeChild(child);
+    elementState(this).text = value == null ? "" : String(value);
   }
 
   getAttribute(name) {
