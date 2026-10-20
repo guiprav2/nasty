@@ -55,6 +55,11 @@ export class LayoutWorker {
     this.#worker.postMessage({ id: 0, type: "style", payload: { node, style } });
   }
 
+  setTextMetrics(node, metrics) {
+    this.#version++;
+    this.#worker.postMessage({ id: 0, type: "textMetrics", payload: { node, ...metrics } });
+  }
+
   setChildren(node, children) {
     this.#version++;
     this.#worker.postMessage({ id: 0, type: "children", payload: { node, children } });

@@ -7,14 +7,14 @@ import { FontRegistry } from "../font-registry.js";
 
 const family = process.argv[2] ?? "DejaVu Sans";
 const fontPath = process.argv[3] ?? execFileSync("fc-match", ["-f", "%{file}", family], { encoding: "utf8" }).trim();
-const fontUtility = `font-[${family.replaceAll(" ", "_")}]`;
+const fontLabel = `style.fontFamily = "${family}"`;
 const registry = new FontRegistry().register(family, async () => {
   sourceReadCount++;
   return readFile(fontPath);
 });
 const window = new Window({ resizable: "none", title: "Nasty lazy custom font", width: 960, height: 600 });
 console.log(`GPU adapter: ${window.adapterName()}; refresh: ${window.refreshRate().toFixed(3)} Hz`);
-console.log(`${fontUtility} source: ${fontPath} (host-installed, not bundled)`);
+console.log(`${fontLabel} source: ${fontPath} (host-installed, not bundled)`);
 console.log("Move the pointer over the window; press Escape or close the window to exit.");
 
 const refresh = window.refreshRate() > 0 ? window.refreshRate() : 60;
@@ -40,11 +40,11 @@ let skipped = 0;
 const baselineRuns = [
   { text: "Custom fonts load lazily on first use", x: 38, y: 34, width: 860, fontSize: 34, lineHeight: 44, color: "#f4f7ff" },
   { text: "The JavaScript frame loop keeps rendering while bytes are read and the native text worker registers and shapes the font.", x: 40, y: 100, width: 820, fontSize: 20, lineHeight: 30, color: "#b9c7dc" },
-  { text: fontUtility, x: 40, y: 180, width: 800, fontSize: 32, lineHeight: 40, color: "#ffc875" },
-  { text: "Tailwind family underscores map to spaces.", x: 40, y: 245, width: 800, fontSize: 20, lineHeight: 30, color: "#86e4c4" },
+  { text: fontLabel, x: 40, y: 180, width: 800, fontSize: 32, lineHeight: 40, color: "#ffc875" },
+  { text: "Family names resolve to lowercase ASCII filenames in fonts/.", x: 40, y: 245, width: 800, fontSize: 20, lineHeight: 30, color: "#86e4c4" },
 ];
 
-const customRuns = baselineRuns.map((run, index) => index >= 2 ? { ...run, fontClass: fontUtility } : run);
+const customRuns = baselineRuns.map((run, index) => index >= 2 ? { ...run, fontFamily: family } : run);
 window.requestTextRuns(baselineRuns);
 function queueCustomFontText() {
   if (!baselineReady || !customResolved || customRequested) return;

@@ -1,0 +1,23 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="28" />
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:hasCode="true"
+        android:label="Nasty Tour"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity
+            android:name="android.app.NativeActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:exported="true"
+            android:label="Nasty Tour"
+            android:screenOrientation="unspecified"
+            android:windowSoftInputMode="adjustResize|stateUnchanged">
+            <meta-data android:name="android.app.lib_name" android:value="nasty_native" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

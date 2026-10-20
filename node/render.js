@@ -1,9 +1,9 @@
 import { elementState } from "./internal/dom-state.js";
 import { computedStyleValue } from "./internal/css-transitions.js";
+import { canvasCommands, canvasSurface } from "./canvas-2d.js";
 
 const SIDES = ["Top", "Right", "Bottom", "Left"];
 const transformedListElements = new WeakMap();
-const elementsByBoxArray = new WeakMap();
 
 export function displayListElements(list) {
   return transformedListElements.get(list) ?? null;
@@ -25,7 +25,7 @@ export function parseColor(value) {
 
 function opacityFor(element) {
   let opacity = 1;
-  for (let current = element; current; current = current.parent) {
+  for (let current = element; current; current = current.parentElement ?? current.parentNode ?? current.parent) {
     const value = Number(current.style.opacity);
     if (current.style.opacity !== undefined && Number.isFinite(value)) opacity *= Math.max(0, Math.min(1, value));
   }
@@ -268,7 +268,8 @@ export function createBoxProjector(boxes) {
   const worldMatrix = (box) => {
     const cached = worldMatrices.get(box.element);
     if (cached) return cached;
-    const parent = byElement.get(box.element.parent);
+    const parentElement = box.element.parentElement ?? box.element.parentNode ?? box.element.parent;
+    const parent = byElement.get(parentElement);
     const local = boxTransformMatrix(box);
     const parentMatrix = parent ? worldMatrix(parent) : IDENTITY_MATRIX;
     const matrix = local === IDENTITY_MATRIX ? parentMatrix
@@ -282,9 +283,10 @@ export function createBoxProjector(boxes) {
     const qx = matrix[0][0] * x + matrix[0][1] * y + matrix[0][3];
     const qy = matrix[1][0] * x + matrix[1][1] * y + matrix[1][3];
     const qw = matrix[3][0] * x + matrix[3][1] * y + matrix[3][3];
-    if (qw <= 0.0001) return { x: Number.NaN, y: Number.NaN };
-    return { x: qx / qw, y: qy / qw };
+    if (qw <= 0.0001) return { x: Number.NaN, y: Number.NaN, reciprocalW: 0 };
+    return { x: qx / qw, y: qy / qw, reciprocalW: 1 / qw };
   };
+  project.matrixFor = worldMatrix;
   project.widthScaleAt = (box, x, y) => {
     const matrix = worldMatrix(box);
     const w = matrix[3][0] * x + matrix[3][1] * y + matrix[3][3];
@@ -342,19 +344,74 @@ function lineAtY(a, b, y) {
   return { x: a.x + (b.x - a.x) * t, y };
 }
 
+function clipTexturedPolygon(polygon, rect) {
+  const inside = [
+    (point) => point.x >= rect.x,
+    (point) => point.x <= rect.x + rect.width,
+    (point) => point.y >= rect.y,
+    (point) => point.y <= rect.y + rect.height,
+  ];
+  const intersectionAt = (a, b, edge) => {
+    const vertical = edge < 2;
+    const coordinate = edge === 0 ? rect.x : edge === 1 ? rect.x + rect.width : edge === 2 ? rect.y : rect.y + rect.height;
+    const t = vertical ? (coordinate - a.x) / (b.x - a.x) : (coordinate - a.y) / (b.y - a.y);
+    return {
+      x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t,
+      u: a.u + (b.u - a.u) * t, v: a.v + (b.v - a.v) * t,
+      reciprocalW: a.reciprocalW + (b.reciprocalW - a.reciprocalW) * t,
+    };
+  };
+  for (let edge = 0; edge < inside.length; edge++) {
+    const input = polygon;
+    polygon = [];
+    if (!input.length) break;
+    let previous = input.at(-1);
+    for (const current of input) {
+      const previousInside = inside[edge](previous);
+      const currentInside = inside[edge](current);
+      if (currentInside !== previousInside) polygon.push(intersectionAt(previous, current, edge));
+      if (currentInside) polygon.push(current);
+      previous = current;
+    }
+  }
+  return polygon;
+}
+
 // Display-list v3 stores screen-space triangles. JS performs the small per-box
 // CSS matrix/projection work; Rust only expands records and submits GPU geometry.
 export function buildTransformedDisplayList(boxes, width, height) {
-  const values = [3, 0];
-  let triangleCount = 0;
+  const values = [5, 0];
+  let commandCount = 0;
   const viewport = { x: 0, y: 0, width, height };
   const projectPoint = createBoxProjector(boxes);
-  const push = (box, rect, color, project) => {
+  const visibleElements = new Set();
+  const addVisibleAncestors = (element) => {
+    for (let current = element; current; current = current.parentElement ?? current.parentNode ?? current.parent) {
+      visibleElements.add(current);
+    }
+  };
+  const push = (box, rect, color, project, radius = 0) => {
     if (!color || rect.width <= 0 || rect.height <= 0) return;
-    const polygon = [
-      [rect.x - box.x, rect.y - box.y], [rect.x + rect.width - box.x, rect.y - box.y],
-      [rect.x + rect.width - box.x, rect.y + rect.height - box.y], [rect.x - box.x, rect.y + rect.height - box.y],
-    ].map(([x, y]) => project(x, y));
+    let localPoints;
+    const r = Math.min(radius, rect.width / 2, rect.height / 2);
+    if (r > 0 && rect.x === box.borderBox.x && rect.y === box.borderBox.y
+        && rect.width === box.borderBox.width && rect.height === box.borderBox.height) {
+      localPoints = [];
+      for (const [cx, cy, start] of [
+        [rect.x + rect.width - r, rect.y + r, -Math.PI / 2],
+        [rect.x + rect.width - r, rect.y + rect.height - r, 0],
+        [rect.x + r, rect.y + rect.height - r, Math.PI / 2],
+        [rect.x + r, rect.y + r, Math.PI],
+      ]) for (let step = 0; step <= 6; step++) {
+        const angle = start + step / 6 * Math.PI / 2;
+        localPoints.push([cx + Math.cos(angle) * r - box.x, cy + Math.sin(angle) * r - box.y]);
+      }
+    } else {
+      localPoints = [[rect.x, rect.y], [rect.x + rect.width, rect.y],
+        [rect.x + rect.width, rect.y + rect.height], [rect.x, rect.y + rect.height]]
+        .map(([x, y]) => [x - box.x, y - box.y]);
+    }
+    const polygon = localPoints.map(([x, y]) => project(x, y));
     if (polygon.some((point) => point === null)) return;
     const clip = box.clip ? intersection(box.clip, viewport) : viewport;
     const visible = clipPolygon(polygon, clip);
@@ -362,18 +419,117 @@ export function buildTransformedDisplayList(boxes, width, height) {
     for (let i = 1; i < visible.length - 1; i++) {
       const a = visible[0]; const b = visible[i]; const c = visible[i + 1];
       values.push(0, a.x, a.y, b.x, b.y, c.x, c.y, color[0], color[1], color[2], color[3]);
-      triangleCount++;
+      commandCount++;
     }
   };
   for (const box of boxes) {
     const style = box.element.style;
-    const opacity = opacityFor(box.element);
     const project = (x, y) => {
       const point = projectPoint(box, box.x + x, box.y + y);
       return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
     };
-    push(box, box.borderBox, withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity), project);
+    const corners = [
+      project(0, 0), project(box.width, 0),
+      project(box.width, box.height), project(0, box.height),
+    ];
+    if (corners.every(Boolean)) {
+      const minX = Math.min(...corners.map((point) => point.x));
+      const minY = Math.min(...corners.map((point) => point.y));
+      const maxX = Math.max(...corners.map((point) => point.x));
+      const maxY = Math.max(...corners.map((point) => point.y));
+      const clip = box.clip ? intersection(box.clip, viewport) : viewport;
+      const visible = clip.width > 0 && clip.height > 0
+        && maxX > clip.x && minX < clip.x + clip.width
+        && maxY > clip.y && minY < clip.y + clip.height;
+      if (visible) {
+        addVisibleAncestors(box.element);
+      }
+      // The projected border box bounds every background and border quad. Once
+      // those bounds miss the active viewport/clip, avoid style resolution,
+      // color parsing, opacity walks, and per-quad polygon projection.
+      if (!visible) continue;
+    } else {
+      continue;
+    }
+    const opacity = opacityFor(box.element);
+    const radius = parseFloat(style.borderRadius) || 0;
+    push(box, box.borderBox, withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity), project, radius);
+    if (box.element.localName === "canvas") {
+      const state = elementState(box.element);
+      const surface = canvasSurface(state.canvasContext);
+      const window = box.element.ownerDocument?.defaultView;
+      if (surface && window) {
+        if (!state.image || state.image.width !== surface.width || state.image.height !== surface.height) {
+          if (state.image) window.deleteImageTexture(state.image.textureId);
+          state.image = { textureId: window.createImageTexture(surface.width, surface.height, surface.data()),
+            width: surface.width, height: surface.height };
+        } else window.updateImageTexture(state.image.textureId, surface.data());
+      }
+      const commands = canvasCommands(elementState(box.element).canvasContext);
+      const scaleX = box.element.width ? box.width / box.element.width : 1;
+      const scaleY = box.element.height ? box.height / box.element.height : 1;
+      const canvasViewport = box.clip ? intersection(box.clip, viewport) : viewport;
+      const canvasClip = intersection(canvasViewport, box.contentBox);
+      const canvasMatrix = projectPoint.matrixFor(box);
+      if (commands.length && canvasClip.width > 0 && canvasClip.height > 0) {
+        if (canvasMatrix === IDENTITY_MATRIX) {
+          // Keep an identity canvas mesh packed and let the renderer apply its
+          // placement, scaling, opacity, and scissor in one native batch.
+          values.push(2, canvasClip.x, canvasClip.y, canvasClip.width, canvasClip.height,
+            box.x, box.y, scaleX, scaleY, opacity, commands.length / 10);
+          for (const value of commands) values.push(value);
+          commandCount++;
+        } else {
+        const clipRight = canvasClip.x + canvasClip.width, clipBottom = canvasClip.y + canvasClip.height;
+        const projectCanvasPoint = (x, y) => project(x * scaleX, y * scaleY);
+        for (let offset = 0; offset < commands.length; offset += 10) {
+          const a = projectCanvasPoint(commands[offset], commands[offset + 1]);
+          const b = projectCanvasPoint(commands[offset + 2], commands[offset + 3]);
+          const c = projectCanvasPoint(commands[offset + 4], commands[offset + 5]);
+          if (!a || !b || !c) continue;
+          const red = commands[offset + 6], green = commands[offset + 7], blue = commands[offset + 8];
+          const alpha = commands[offset + 9] * opacity;
+          const allInside = a.x >= canvasClip.x && a.x <= clipRight && a.y >= canvasClip.y && a.y <= clipBottom
+            && b.x >= canvasClip.x && b.x <= clipRight && b.y >= canvasClip.y && b.y <= clipBottom
+            && c.x >= canvasClip.x && c.x <= clipRight && c.y >= canvasClip.y && c.y <= clipBottom;
+          if (allInside) {
+            values.push(0, a.x, a.y, b.x, b.y, c.x, c.y, red, green, blue, alpha);
+            commandCount++;
+            continue;
+          }
+          const visible = clipPolygon([a, b, c], canvasClip);
+          for (let index = 1; index < visible.length - 1; index++) {
+            values.push(0, visible[0].x, visible[0].y, visible[index].x, visible[index].y,
+              visible[index + 1].x, visible[index + 1].y, red, green, blue, alpha);
+            commandCount++;
+          }
+        }
+        }
+      }
+    }
     const { borderBox, border } = box;
+    const image = elementState(box.element).image;
+    const content = box.contentBox;
+    if (image && content.width > 0 && content.height > 0) {
+      const imageClip = box.clip ? intersection(box.clip, viewport) : viewport;
+      const corners = [
+        [content.x, content.y, 0, 0], [content.x + content.width, content.y, 1, 0],
+        [content.x + content.width, content.y + content.height, 1, 1], [content.x, content.y + content.height, 0, 1],
+      ].map(([x, y, u, v]) => {
+        const point = projectPoint(box, x, y);
+        return Number.isFinite(point.x) && Number.isFinite(point.y) ? { ...point, u, v } : null;
+      });
+      if (corners.every(Boolean) && imageClip.width > 0 && imageClip.height > 0) {
+        const clipped = clipTexturedPolygon(corners, imageClip);
+        if (clipped.length >= 3) {
+          const triangles = [];
+          for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
+          values.push(1, image.textureId, imageClip.x, imageClip.y, imageClip.width, imageClip.height, triangles.length);
+          for (const point of triangles) values.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+          commandCount++;
+        }
+      }
+    }
     for (const side of SIDES) {
       const edge = side.toLowerCase();
       const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
@@ -391,13 +547,8 @@ export function buildTransformedDisplayList(boxes, width, height) {
       push(box, rect, withOpacity(parseColor(color), opacity), project);
     }
   }
-  values[1] = triangleCount;
+  values[1] = commandCount;
   const displayList = Buffer.from(new Float32Array(values).buffer);
-  let elements = elementsByBoxArray.get(boxes);
-  if (!elements) {
-    elements = new Set(boxes.map(({ element }) => element));
-    elementsByBoxArray.set(boxes, elements);
-  }
-  transformedListElements.set(displayList, elements);
+  transformedListElements.set(displayList, visibleElements);
   return displayList;
 }

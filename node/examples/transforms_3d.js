@@ -72,8 +72,8 @@ assert.equal(boxes.length, 43, "42 cards plus body should be laid out");
 const before = buildTransformedDisplayList(boxes, viewport.width, viewport.height);
 for (const card of cards) card.style.transform = "perspective(450px) rotateY(24deg) rotateX(-12deg) translateZ(12px)";
 const transformed = buildTransformedDisplayList(boxes, viewport.width, viewport.height);
-assert.equal(new Float32Array(before.buffer, before.byteOffset, 1)[0], 3);
-assert.equal(new Float32Array(transformed.buffer, transformed.byteOffset, 1)[0], 3);
+assert.equal(new Float32Array(before.buffer, before.byteOffset, 1)[0], 4);
+assert.equal(new Float32Array(transformed.buffer, transformed.byteOffset, 1)[0], 4);
 assert.ok(!Buffer.from(before).equals(Buffer.from(transformed)), "3D transforms should change projected GPU geometry");
 assert.equal(documentState(document).dirty, false, "transform-only changes must not invalidate Taffy layout");
 

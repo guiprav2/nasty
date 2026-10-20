@@ -1,32 +1,39 @@
 //! Small Node binding for Taffy. The document and frame clock live in JavaScript.
 
+use glyphon::cosmic_text::{Weight, Wrap};
 use glyphon::{
-    Attrs, Buffer as TextBuffer, Cache as TextCache, Color as TextColor, Family, FontSystem,
-    Edit, Editor, Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
+    Attrs, Buffer as TextBuffer, Cache as TextCache, Color as TextColor, Edit, Editor, Family,
+    FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
     TextRenderer, Viewport,
 };
-use glyphon::cosmic_text::Wrap;
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{Buffer, Function};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+#[cfg(target_os = "android")]
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 use taffy::prelude::*;
 use taffy::tree::TaffyError;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{Ime, MouseScrollDelta, WindowEvent as OsWindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent as OsWindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-use winit::window::{Window as OsWindow, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window as OsWindow, WindowId};
 
 #[napi(object)]
 #[derive(Default)]
 pub struct LayoutStyle {
     pub display: Option<String>,
+    pub position: Option<String>,
+    pub top: Option<f64>,
+    pub right: Option<f64>,
+    pub bottom: Option<f64>,
+    pub left: Option<f64>,
     pub direction: Option<String>,
     pub width: Option<f64>,
     pub height: Option<f64>,
@@ -34,6 +41,9 @@ pub struct LayoutStyle {
     pub height_percent: Option<f64>,
     pub min_width: Option<f64>,
     pub min_height: Option<f64>,
+    pub max_width: Option<f64>,
+    pub max_height: Option<f64>,
+    pub flex_wrap: Option<String>,
     pub padding: Option<f64>,
     pub padding_top: Option<f64>,
     pub padding_right: Option<f64>,
@@ -104,6 +114,23 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
     let mut style = Style::default();
     // Nasty uses reset-style border-box sizing. There is no public boxSizing option.
     style.box_sizing = BoxSizing::BorderBox;
+    if let Some(position) = input.position.as_deref() {
+        style.position = match position {
+            "static" | "relative" => Position::Relative,
+            "absolute" | "fixed" => Position::Absolute,
+            _ => return Err(Error::new(Status::InvalidArg, format!("unknown position: {position}"))),
+        };
+    }
+    for (name, value, target) in [
+        ("top", input.top, &mut style.inset.top),
+        ("right", input.right, &mut style.inset.right),
+        ("bottom", input.bottom, &mut style.inset.bottom),
+        ("left", input.left, &mut style.inset.left),
+    ] {
+        if let Some(value) = value {
+            *target = LengthPercentageAuto::length(finite_signed(value, name)?);
+        }
+    }
     if let Some(display) = input.display.as_deref() {
         style.display = match display {
             "block" => Display::Block,
@@ -165,33 +192,76 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
         style.min_size.height =
             LengthPercentageAuto::length(finite_nonnegative(value, "minHeight")?);
     }
+    if let Some(value) = input.max_width {
+        style.max_size.width = LengthPercentageAuto::length(finite_nonnegative(value, "maxWidth")?);
+    }
+    if let Some(value) = input.max_height {
+        style.max_size.height = LengthPercentageAuto::length(finite_nonnegative(value, "maxHeight")?);
+    }
+    style.flex_wrap = match input.flex_wrap.as_deref() {
+        Some("wrap") => FlexWrap::Wrap,
+        Some("wrap-reverse") => FlexWrap::WrapReverse,
+        _ => FlexWrap::NoWrap,
+    };
     let padding = input.padding.unwrap_or(0.0);
     style.padding = Rect {
-        top: LengthPercentage::length(finite_nonnegative(input.padding_top.unwrap_or(padding), "paddingTop")?),
-        right: LengthPercentage::length(finite_nonnegative(input.padding_right.unwrap_or(padding), "paddingRight")?),
-        bottom: LengthPercentage::length(finite_nonnegative(input.padding_bottom.unwrap_or(padding), "paddingBottom")?),
-        left: LengthPercentage::length(finite_nonnegative(input.padding_left.unwrap_or(padding), "paddingLeft")?),
+        top: LengthPercentage::length(finite_nonnegative(
+            input.padding_top.unwrap_or(padding),
+            "paddingTop",
+        )?),
+        right: LengthPercentage::length(finite_nonnegative(
+            input.padding_right.unwrap_or(padding),
+            "paddingRight",
+        )?),
+        bottom: LengthPercentage::length(finite_nonnegative(
+            input.padding_bottom.unwrap_or(padding),
+            "paddingBottom",
+        )?),
+        left: LengthPercentage::length(finite_nonnegative(
+            input.padding_left.unwrap_or(padding),
+            "paddingLeft",
+        )?),
     };
     let margin = input.margin.unwrap_or(0.0);
-    let margin_edge = |value: Option<f64>, auto: Option<bool>, name: &str| -> Result<LengthPercentageAuto> {
-        if auto.unwrap_or(false) {
-            Ok(LengthPercentageAuto::auto())
-        } else {
-            Ok(LengthPercentageAuto::length(finite_signed(value.unwrap_or(margin), name)?))
-        }
-    };
+    let margin_edge =
+        |value: Option<f64>, auto: Option<bool>, name: &str| -> Result<LengthPercentageAuto> {
+            if auto.unwrap_or(false) {
+                Ok(LengthPercentageAuto::auto())
+            } else {
+                Ok(LengthPercentageAuto::length(finite_signed(
+                    value.unwrap_or(margin),
+                    name,
+                )?))
+            }
+        };
     style.margin = Rect {
         top: margin_edge(input.margin_top, input.margin_top_auto, "marginTop")?,
         right: margin_edge(input.margin_right, input.margin_right_auto, "marginRight")?,
-        bottom: margin_edge(input.margin_bottom, input.margin_bottom_auto, "marginBottom")?,
+        bottom: margin_edge(
+            input.margin_bottom,
+            input.margin_bottom_auto,
+            "marginBottom",
+        )?,
         left: margin_edge(input.margin_left, input.margin_left_auto, "marginLeft")?,
     };
     let border = input.border_width.unwrap_or(0.0);
     style.border = Rect {
-        top: LengthPercentage::length(finite_nonnegative(input.border_top_width.unwrap_or(border), "borderTopWidth")?),
-        right: LengthPercentage::length(finite_nonnegative(input.border_right_width.unwrap_or(border), "borderRightWidth")?),
-        bottom: LengthPercentage::length(finite_nonnegative(input.border_bottom_width.unwrap_or(border), "borderBottomWidth")?),
-        left: LengthPercentage::length(finite_nonnegative(input.border_left_width.unwrap_or(border), "borderLeftWidth")?),
+        top: LengthPercentage::length(finite_nonnegative(
+            input.border_top_width.unwrap_or(border),
+            "borderTopWidth",
+        )?),
+        right: LengthPercentage::length(finite_nonnegative(
+            input.border_right_width.unwrap_or(border),
+            "borderRightWidth",
+        )?),
+        bottom: LengthPercentage::length(finite_nonnegative(
+            input.border_bottom_width.unwrap_or(border),
+            "borderBottomWidth",
+        )?),
+        left: LengthPercentage::length(finite_nonnegative(
+            input.border_left_width.unwrap_or(border),
+            "borderLeftWidth",
+        )?),
     };
     if let Some(value) = input.gap {
         let value = LengthPercentage::length(finite_nonnegative(value, "gap")?);
@@ -208,8 +278,8 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
     }
     if let Some(value) = input.align_items.as_deref() {
         style.align_items = Some(match value {
-            "start" => AlignItems::START,
-            "end" => AlignItems::END,
+            "start" | "flex-start" => AlignItems::START,
+            "end" | "flex-end" => AlignItems::END,
             "center" => AlignItems::CENTER,
             "stretch" => AlignItems::STRETCH,
             _ => {
@@ -222,8 +292,8 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
     }
     if let Some(value) = input.justify_content.as_deref() {
         style.justify_content = Some(match value {
-            "start" => JustifyContent::START,
-            "end" => JustifyContent::END,
+            "start" | "flex-start" => JustifyContent::START,
+            "end" | "flex-end" => JustifyContent::END,
             "center" => JustifyContent::CENTER,
             "space-between" => JustifyContent::SPACE_BETWEEN,
             "space-around" => JustifyContent::SPACE_AROUND,
@@ -245,9 +315,20 @@ fn taffy_error(error: TaffyError) -> Error {
 
 #[napi]
 pub struct LayoutTree {
-    tree: TaffyTree<()>,
+    tree: TaffyTree<u32>,
     nodes: Vec<NodeId>,
 }
+
+#[napi(object)]
+pub struct MeasureInput {
+    pub node: u32,
+    pub known_width: Option<f64>,
+    pub known_height: Option<f64>,
+    pub available_width: Option<f64>,
+    pub min_content: bool,
+}
+#[napi(object)]
+pub struct MeasureOutput { pub width: f64, pub height: f64 }
 
 #[napi]
 impl LayoutTree {
@@ -263,7 +344,7 @@ impl LayoutTree {
     pub fn create_node(&mut self, style: LayoutStyle) -> Result<u32> {
         let id = self
             .tree
-            .new_leaf(convert_style(style)?)
+            .new_leaf_with_context(convert_style(style)?, self.nodes.len() as u32)
             .map_err(taffy_error)?;
         let handle = u32::try_from(self.nodes.len())
             .map_err(|_| Error::new(Status::GenericFailure, "too many layout nodes"))?;
@@ -292,19 +373,41 @@ impl LayoutTree {
     }
 
     #[napi]
-    pub fn compute(&mut self, root: u32, width: f64, height: f64) -> Result<()> {
+    pub fn invalidate(&mut self, handle: u32) -> Result<()> {
+        let node = self.node(handle)?;
+        self.tree.mark_dirty(node).map_err(taffy_error)
+    }
+
+    #[napi]
+    pub fn set_rounding(&mut self, enabled: bool) {
+        if enabled { self.tree.enable_rounding(); } else { self.tree.disable_rounding(); }
+    }
+
+    #[napi]
+    pub fn compute(&mut self, root: u32, width: f64, height: f64,
+        measure: Option<Function<'_, MeasureInput, MeasureOutput>>) -> Result<()> {
         let root = self.node(root)?;
         let width = finite_nonnegative(width, "viewport width")?;
         let height = finite_nonnegative(height, "viewport height")?;
-        self.tree
-            .compute_layout(
-                root,
-                Size {
-                    width: AvailableSpace::Definite(width),
-                    height: AvailableSpace::Definite(height),
-                },
-            )
-            .map_err(taffy_error)
+        let mut failure = None;
+        self.tree.compute_layout_with_measure(root,
+            Size { width: AvailableSpace::Definite(width), height: AvailableSpace::Definite(height) },
+            |inputs, _, node, style| taffy::compute_leaf_layout(inputs, style, |_, _| 0.0,
+                |known, available| {
+                    let (Some(callback), Some(node)) = (measure.as_ref(), node) else { return Size::ZERO; };
+                    let request = MeasureInput { node: *node,
+                        known_width: known.width.map(f64::from), known_height: known.height.map(f64::from),
+                        available_width: match available.width { AvailableSpace::Definite(value) => Some(value as f64), _ => None },
+                        min_content: matches!(available.width, AvailableSpace::MinContent) };
+                    match callback.call(request) {
+                        Ok(size) if size.width.is_finite() && size.height.is_finite() && size.width >= 0.0 && size.height >= 0.0 =>
+                            Size { width: size.width as f32, height: size.height as f32 },
+                        Ok(_) => { failure = Some(Error::new(Status::InvalidArg, "measure must return finite nonnegative dimensions")); Size::ZERO },
+                        Err(error) => { failure = Some(error); Size::ZERO },
+                    }
+                })) .map_err(taffy_error)?;
+        if let Some(error) = failure { return Err(error); }
+        Ok(())
     }
 
     #[napi]
@@ -339,6 +442,109 @@ impl LayoutTree {
     }
 }
 
+#[cfg(target_os = "android")]
+static ANDROID_APP: OnceLock<winit::platform::android::activity::AndroidApp> = OnceLock::new();
+
+#[cfg(target_os = "android")]
+extern "C" {
+    fn nasty_set_android_activity(
+        java_vm: *mut std::ffi::c_void,
+        activity: *mut std::ffi::c_void,
+    );
+    fn nasty_set_requested_orientation(orientation: i32) -> i32;
+    fn nasty_node_start(script_path: *const std::ffi::c_char) -> i32;
+    fn nasty_native_library_path() -> *const std::ffi::c_char;
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub fn android_main(android_app: winit::platform::android::activity::AndroidApp) {
+    use std::ffi::{CStr, CString};
+
+    unsafe {
+        nasty_set_android_activity(android_app.vm_as_ptr(), android_app.activity_as_ptr())
+    };
+    if ANDROID_APP.set(android_app.clone()).is_err() {
+        eprintln!("Nasty: Android app was initialized more than once");
+        return;
+    }
+
+    let Some(files_dir) = android_app.internal_data_path() else {
+        eprintln!("Nasty: Android did not provide an internal files directory");
+        return;
+    };
+    let project_dir = files_dir.join("nasty");
+    if let Err(error) = std::fs::remove_dir_all(&project_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("Nasty: could not reset app files: {error}");
+            return;
+        }
+    }
+    if let Err(error) = std::fs::create_dir_all(&project_dir) {
+        eprintln!("Nasty: could not create app directory: {error}");
+        return;
+    }
+    let assets = android_app.asset_manager();
+    let manifest_path = CString::new("nasty/files.list").expect("APK asset path");
+    let Some(mut manifest) = assets.open(&manifest_path) else {
+        eprintln!("Nasty: APK is missing its asset manifest");
+        return;
+    };
+    let mut files = String::new();
+    if let Err(error) = std::io::Read::read_to_string(&mut manifest, &mut files) {
+        eprintln!("Nasty: could not read APK asset manifest: {error}");
+        return;
+    }
+    let copy_result = (|| -> std::io::Result<()> {
+        for relative_path in files.lines().filter(|line| !line.is_empty()) {
+            let asset_path = format!("nasty/{relative_path}");
+            let asset_c = CString::new(asset_path.as_str()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid APK asset path")
+            })?;
+            let Some(mut asset) = assets.open(&asset_c) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("APK asset {asset_path} is missing"),
+                ));
+            };
+            let output = project_dir.join(relative_path);
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::io::copy(&mut asset, &mut std::fs::File::create(output)?)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        eprintln!("Nasty: could not extract APK assets: {error}");
+        return;
+    }
+    if let Err(error) = std::env::set_current_dir(&project_dir) {
+        eprintln!("Nasty: could not enter app directory: {error}");
+        return;
+    }
+    std::env::set_var("HOME", files_dir.join("home"));
+    unsafe {
+        let library_path = nasty_native_library_path();
+        if !library_path.is_null() {
+            std::env::set_var(
+                "NASTY_NATIVE_PATH",
+                CStr::from_ptr(library_path).to_string_lossy().as_ref(),
+            );
+        }
+    }
+
+    let script_path = project_dir.join("node/examples/tour.js");
+    let script_path = match CString::new(script_path.to_string_lossy().as_bytes()) {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!("Nasty: invalid tour script path");
+            return;
+        }
+    };
+    unsafe { nasty_node_start(script_path.as_ptr()) };
+}
+
 // Display list v1 is a Float32Array: [1, x, y, width, height, r, g, b, a, ...].
 // Coordinates are physical window pixels and colors are straight RGBA in [0, 1].
 #[repr(C)]
@@ -353,6 +559,7 @@ struct Vertex {
 struct ImageVertex {
     position: [f32; 2],
     uv: [f32; 2],
+    reciprocal_w: f32,
 }
 
 #[napi(object)]
@@ -371,6 +578,7 @@ pub struct ImageDraw {
     pub clip_width: Option<f64>,
     #[napi(js_name = "clipHeight")]
     pub clip_height: Option<f64>,
+    pub vertices: Option<Vec<f64>>,
 }
 
 struct GpuImage {
@@ -383,6 +591,13 @@ struct GpuImage {
 enum DrawOrder {
     Solids(std::ops::Range<u32>),
     Triangles(std::ops::Range<u32>),
+    CanvasTriangles {
+        range: std::ops::Range<u32>,
+        clip_x: f64,
+        clip_y: f64,
+        clip_width: f64,
+        clip_height: f64,
+    },
     Image(usize),
 }
 
@@ -395,6 +610,7 @@ pub struct WindowOptions {
     pub allow_any_thread: Option<bool>,
     pub visible: Option<bool>,
     pub resizable: Option<String>,
+    pub orientation: Option<String>,
 }
 
 #[napi(object)]
@@ -517,6 +733,8 @@ pub struct TextRunOptions {
     pub color: String,
     #[napi(js_name = "fontFamily")]
     pub font_family: Option<String>,
+    #[napi(js_name = "fontWeight")]
+    pub font_weight: Option<u16>,
     #[napi(js_name = "clipX")]
     pub clip_x: Option<f64>,
     #[napi(js_name = "clipY")]
@@ -529,15 +747,46 @@ pub struct TextRunOptions {
 }
 
 fn text_bounds(run: &TextRunOptions, width: u32, height: u32) -> TextBounds {
-    let left = run.clip_x.unwrap_or(0.0).floor().clamp(0.0, i32::MAX as f64) as i32;
-    let top = run.clip_y.unwrap_or(0.0).floor().clamp(0.0, i32::MAX as f64) as i32;
-    let right = run.clip_x.zip(run.clip_width)
+    let left = run
+        .clip_x
+        .unwrap_or(0.0)
+        .floor()
+        .clamp(0.0, i32::MAX as f64) as i32;
+    let top = run
+        .clip_y
+        .unwrap_or(0.0)
+        .floor()
+        .clamp(0.0, i32::MAX as f64) as i32;
+    let right = run
+        .clip_x
+        .zip(run.clip_width)
         .map(|(x, w)| (x + w).ceil().clamp(0.0, i32::MAX as f64) as i32)
         .unwrap_or(width.min(i32::MAX as u32) as i32);
-    let bottom = run.clip_y.zip(run.clip_height)
+    let bottom = run
+        .clip_y
+        .zip(run.clip_height)
         .map(|(y, h)| (y + h).ceil().clamp(0.0, i32::MAX as f64) as i32)
         .unwrap_or(height.min(i32::MAX as u32) as i32);
-    TextBounds { left, top, right: right.max(left), bottom: bottom.max(top) }
+    TextBounds {
+        left,
+        top,
+        right: right.max(left),
+        bottom: bottom.max(top),
+    }
+}
+
+fn text_family(family: Option<&str>) -> Family<'_> {
+    let Some(family) = family else {
+        return Family::SansSerif;
+    };
+    match family.trim().to_ascii_lowercase().as_str() {
+        "serif" | "ui-serif" | "fangsong" => Family::Serif,
+        "sans-serif" | "system-ui" | "ui-sans-serif" | "ui-rounded" => Family::SansSerif,
+        "monospace" | "ui-monospace" => Family::Monospace,
+        "cursive" => Family::Cursive,
+        "fantasy" => Family::Fantasy,
+        _ => Family::Name(family),
+    }
 }
 
 #[napi(object)]
@@ -619,7 +868,7 @@ struct TextRuntime {
     swash_cache: SwashCache,
     text_viewport: Viewport,
     text_atlas: TextAtlas,
-    text_renderers: Vec<TextRenderer>,
+    text_renderer: Option<TextRenderer>,
     text_buffers: Vec<PositionedText>,
     text_run_options: Vec<TextRunOptions>,
 }
@@ -652,17 +901,14 @@ struct WordDragState {
 }
 
 fn egui_word_range(text: &str, cursor_index: usize) -> (usize, usize) {
+    use egui::text::CCursor;
     use egui::text_selection::text_cursor_state::{
         ccursor_next_word, ccursor_previous_word, is_word_char,
     };
-    use egui::text::CCursor;
 
     let cursor = CCursor::new(cursor_index.min(text.chars().count()));
     if cursor.index == 0 {
-        return (
-            cursor.index,
-            ccursor_next_word(text, cursor).index,
-        );
+        return (cursor.index, ccursor_next_word(text, cursor).index);
     }
 
     let mut chars = text.chars().skip(cursor.index - 1);
@@ -712,6 +958,11 @@ const SYSTEM_EDITOR_FONT_KEY: &str = "nasty-system-sans";
 fn load_system_editor_font() -> std::result::Result<SystemEditorFont, String> {
     let started = Instant::now();
     let mut database = fontdb::Database::new();
+    #[cfg(target_os = "android")]
+    database
+        .load_font_file("/system/fonts/Roboto-Regular.ttf")
+        .map_err(|error| format!("could not load Android system font: {error}"))?;
+    #[cfg(not(target_os = "android"))]
     database.load_system_fonts();
     let families = [fontdb::Family::SansSerif];
     let id = database
@@ -734,6 +985,21 @@ fn load_system_editor_font() -> std::result::Result<SystemEditorFont, String> {
         family_name,
         load_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+fn create_font_system() -> FontSystem {
+    #[cfg(target_os = "android")]
+    {
+        let mut database = fontdb::Database::new();
+        if let Err(error) = database.load_font_file("/system/fonts/Roboto-Regular.ttf") {
+            eprintln!("Nasty: could not load Android system font: {error}");
+        }
+        FontSystem::new_with_locale_and_db("en-US".to_owned(), database)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        FontSystem::new()
+    }
 }
 
 impl TextEditor {
@@ -812,7 +1078,8 @@ impl TextEditor {
                 );
                 let multiline = options.multiline.unwrap_or(true);
                 let font_size = options.font_size.clamp(1.0, 256.0) as f32 / pixels_per_point;
-                let line_height = options.line_height
+                let line_height = options
+                    .line_height
                     .filter(|height| height.is_finite() && *height > 0.0)
                     .map(|height| height.clamp(1.0, 512.0) as f32 / pixels_per_point)
                     .unwrap_or(font_size * 1.2);
@@ -822,9 +1089,18 @@ impl TextEditor {
                 let mut value = options.value.clone();
                 let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
                     let mut job = if multiline {
-                        egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(font_size), egui::Color32::TRANSPARENT, wrap_width)
+                        egui::text::LayoutJob::simple(
+                            text.to_owned(),
+                            egui::FontId::proportional(font_size),
+                            egui::Color32::TRANSPARENT,
+                            wrap_width,
+                        )
                     } else {
-                        egui::text::LayoutJob::simple_singleline(text.to_owned(), egui::FontId::proportional(font_size), egui::Color32::TRANSPARENT)
+                        egui::text::LayoutJob::simple_singleline(
+                            text.to_owned(),
+                            egui::FontId::proportional(font_size),
+                            egui::Color32::TRANSPARENT,
+                        )
                     };
                     job.sections[0].format.line_height = Some(line_height);
                     ui.fonts(|fonts| fonts.layout_job(job))
@@ -844,77 +1120,79 @@ impl TextEditor {
                         ui.set_clip_rect(rect);
                         ui.set_min_size(rect.size());
                         ui.set_max_size(rect.size());
-                        edit.id(id).frame(false).margin(egui::Margin::ZERO)
-                            .desired_width(rect.width()).min_size(rect.size())
+                        edit.id(id)
+                            .frame(false)
+                            .margin(egui::Margin::ZERO)
+                            .desired_width(rect.width())
+                            .min_size(rect.size())
                             .font(egui::FontId::proportional(font_size))
-                            .layouter(&mut layouter).text_color(egui::Color32::TRANSPARENT).show(ui)
-                    }).inner;
+                            .layouter(&mut layouter)
+                            .text_color(egui::Color32::TRANSPARENT)
+                            .show(ui)
+                    })
+                    .inner;
                 edit_results.push((options.clone(), value, edit));
             }
         });
         let mut states = Vec::with_capacity(edit_results.len());
         for (options, value, mut edit) in edit_results {
-        let font_size = options.font_size.clamp(1.0, 256.0) as f32 / pixels_per_point;
-        if self
-            .word_drag
-            .as_ref()
-            .is_some_and(|state| state.control_id == options.id && state.text != edit.galley.text())
-        {
-            self.word_drag = None;
-        }
-        let pointer_button = egui::PointerButton::Primary;
-        let pointer_pressed = self
-            .context
-            .input(|input| input.pointer.button_pressed(pointer_button));
-        let pointer_down = self
-            .context
-            .input(|input| input.pointer.button_down(pointer_button));
-        let pointer_position = self
-            .context
-            .input(|input| input.pointer.latest_pos());
-        let pointer_released = self
-            .context
-            .input(|input| input.pointer.button_released(pointer_button));
-        // After a tap, egui only exposes interact_pointer_pos while a widget
-        // owns an active press/drag. For touchpad tap-drag, movement can arrive
-        // after that synthetic press has ended, so use the hover position while
-        // our short-lived word-drag gesture is armed.
-        let pointer_for_cursor = edit.response.interact_pointer_pos().or_else(|| {
-            self.word_drag
-                .as_ref()
-                .filter(|state| state.control_id == options.id && state.tap_drag_active)
-                .and_then(|_| pointer_position.filter(|position| edit.response.rect.contains(*position)))
-        });
-        let pointer_cursor = pointer_for_cursor.map(|pointer| {
-            edit.galley
-                .cursor_from_pos(pointer - edit.galley_pos)
-                .ccursor
-                .index
-        });
-        if options.trace.unwrap_or(false)
-            && (pointer_pressed
-                || pointer_released
-                || pointer_down
-                || edit.response.dragged_by(pointer_button)
-                || edit.response.double_clicked_by(pointer_button)
-                || edit.response.triple_clicked_by(pointer_button)
-                || self
-                    .word_drag
+            let font_size = options.font_size.clamp(1.0, 256.0) as f32 / pixels_per_point;
+            if self.word_drag.as_ref().is_some_and(|state| {
+                state.control_id == options.id && state.text != edit.galley.text()
+            }) {
+                self.word_drag = None;
+            }
+            let pointer_button = egui::PointerButton::Primary;
+            let pointer_pressed = self
+                .context
+                .input(|input| input.pointer.button_pressed(pointer_button));
+            let pointer_down = self
+                .context
+                .input(|input| input.pointer.button_down(pointer_button));
+            let pointer_position = self.context.input(|input| input.pointer.latest_pos());
+            let pointer_released = self
+                .context
+                .input(|input| input.pointer.button_released(pointer_button));
+            // After a tap, egui only exposes interact_pointer_pos while a widget
+            // owns an active press/drag. For touchpad tap-drag, movement can arrive
+            // after that synthetic press has ended, so use the hover position while
+            // our short-lived word-drag gesture is armed.
+            let pointer_for_cursor = edit.response.interact_pointer_pos().or_else(|| {
+                self.word_drag
                     .as_ref()
-                    .is_some_and(|state| state.control_id == options.id && state.tap_drag_active)
-                    && self
+                    .filter(|state| state.control_id == options.id && state.tap_drag_active)
+                    .and_then(|_| {
+                        pointer_position.filter(|position| edit.response.rect.contains(*position))
+                    })
+            });
+            let pointer_cursor = pointer_for_cursor.map(|pointer| {
+                edit.galley
+                    .cursor_from_pos(pointer - edit.galley_pos)
+                    .ccursor
+                    .index
+            });
+            if options.trace.unwrap_or(false)
+                && (pointer_pressed
+                    || pointer_released
+                    || pointer_down
+                    || edit.response.dragged_by(pointer_button)
+                    || edit.response.double_clicked_by(pointer_button)
+                    || edit.response.triple_clicked_by(pointer_button)
+                    || self.word_drag.as_ref().is_some_and(|state| {
+                        state.control_id == options.id && state.tap_drag_active
+                    }) && self
                         .context
                         .input(|input| input.pointer.delta().length_sq() > 0.0))
-        {
-            let (double, triple, pos, delta) = self.context.input(|input| {
-                (
-                    input.pointer.button_double_clicked(pointer_button),
-                    input.pointer.button_triple_clicked(pointer_button),
-                    input.pointer.latest_pos(),
-                    input.pointer.delta(),
-                )
-            });
-            eprintln!(
+            {
+                let (double, triple, pos, delta) = self.context.input(|input| {
+                    (
+                        input.pointer.button_double_clicked(pointer_button),
+                        input.pointer.button_triple_clicked(pointer_button),
+                        input.pointer.latest_pos(),
+                        input.pointer.delta(),
+                    )
+                });
+                eprintln!(
                 "[textarea pointer] pressed={pointer_pressed} released={pointer_released} down={pointer_down} double={double} triple={triple} dragged={} pos={pos:?} delta={delta:?} hit={pointer_cursor:?} range={:?} word_drag={:?}",
                 edit.response.dragged_by(pointer_button),
                 edit.cursor_range.map(|range| range.as_sorted_char_range()),
@@ -931,299 +1209,304 @@ impl TextEditor {
                         )
                     }),
             );
-        }
-        // A touchpad's tap-and-drag gesture starts with a third tap on the
-        // selected word. egui may classify that press as another multi-click
-        // and replace the selection before the drag threshold is crossed.
-        let continue_word_drag = pointer_pressed
-            && pointer_cursor.is_some_and(|index| {
-                self.word_drag
-                    .as_ref()
-                    .is_some_and(|state| {
+            }
+            // A touchpad's tap-and-drag gesture starts with a third tap on the
+            // selected word. egui may classify that press as another multi-click
+            // and replace the selection before the drag threshold is crossed.
+            let continue_word_drag = pointer_pressed
+                && pointer_cursor.is_some_and(|index| {
+                    self.word_drag.as_ref().is_some_and(|state| {
                         state.control_id == options.id
-                            &&
-                        state.armed_for_followup
+                            && state.armed_for_followup
                             && state
                                 .tap_drag_armed_at
-                                .is_some_and(|armed| {
-                                    armed.elapsed() <= Duration::from_millis(650)
-                                })
+                                .is_some_and(|armed| armed.elapsed() <= Duration::from_millis(650))
                             && (state.start..=state.end).contains(&index)
                     })
-            });
-        if continue_word_drag {
-            if let Some(state) = self.word_drag.as_mut() {
-                state.armed_for_followup = false;
-                state.dragging = true;
-                state.anchor = None;
-                state.tap_drag_active = true;
-                state.tap_drag_origin = pointer_for_cursor;
-                state.tap_drag_last_pos = pointer_for_cursor;
-                state.tap_drag_armed_at = Some(Instant::now());
-                state.tap_drag_last_motion = None;
-                let range = egui::text::CursorRange::two(
-                    edit.galley
-                        .from_ccursor(egui::text::CCursor::new(state.start)),
-                    edit.galley
-                        .from_ccursor(egui::text::CCursor::new(state.end)),
-                );
-                edit.cursor_range = Some(range);
-                edit.state.cursor.set_range(Some(range));
-                edit.state.clone().store(&self.context, edit.response.id);
-            }
-        } else if pointer_pressed
-            && pointer_released
-            && pointer_down
-            && !edit.response.double_clicked_by(pointer_button)
-        {
-            // Some touchpad drivers coalesce the first tap's release and the
-            // second tap's press into one egui frame. If the second press is
-            // then held and moved, egui sees only a normal drag and never emits
-            // its double-click selection. Seed word selection before that drag.
-            if let Some(pointer_index) = pointer_cursor {
-                let (start, end) = egui_word_range(edit.galley.text(), pointer_index);
-                if start != end {
+                });
+            if continue_word_drag {
+                if let Some(state) = self.word_drag.as_mut() {
+                    state.armed_for_followup = false;
+                    state.dragging = true;
+                    state.anchor = None;
+                    state.tap_drag_active = true;
+                    state.tap_drag_origin = pointer_for_cursor;
+                    state.tap_drag_last_pos = pointer_for_cursor;
+                    state.tap_drag_armed_at = Some(Instant::now());
+                    state.tap_drag_last_motion = None;
+                    let range = egui::text::CursorRange::two(
+                        edit.galley
+                            .from_ccursor(egui::text::CCursor::new(state.start)),
+                        edit.galley
+                            .from_ccursor(egui::text::CCursor::new(state.end)),
+                    );
+                    edit.cursor_range = Some(range);
+                    edit.state.cursor.set_range(Some(range));
+                    edit.state.clone().store(&self.context, edit.response.id);
+                }
+            } else if pointer_pressed
+                && pointer_released
+                && pointer_down
+                && !edit.response.double_clicked_by(pointer_button)
+            {
+                // Some touchpad drivers coalesce the first tap's release and the
+                // second tap's press into one egui frame. If the second press is
+                // then held and moved, egui sees only a normal drag and never emits
+                // its double-click selection. Seed word selection before that drag.
+                if let Some(pointer_index) = pointer_cursor {
+                    let (start, end) = egui_word_range(edit.galley.text(), pointer_index);
+                    if start != end {
+                        self.word_drag = Some(WordDragState {
+                            control_id: options.id.clone(),
+                            start,
+                            end,
+                            anchor: None,
+                            dragging: true,
+                            armed_for_followup: false,
+                            tap_drag_active: true,
+                            tap_drag_origin: pointer_for_cursor,
+                            tap_drag_last_pos: pointer_for_cursor,
+                            tap_drag_armed_at: Some(Instant::now()),
+                            tap_drag_last_motion: None,
+                            text: edit.galley.text().to_owned(),
+                        });
+                        let range = egui::text::CursorRange::two(
+                            edit.galley.from_ccursor(egui::text::CCursor::new(start)),
+                            edit.galley.from_ccursor(egui::text::CCursor::new(end)),
+                        );
+                        edit.cursor_range = Some(range);
+                        edit.state.cursor.set_range(Some(range));
+                        edit.state.clone().store(&self.context, edit.response.id);
+                    }
+                }
+            } else if edit.response.double_clicked_by(pointer_button) {
+                if let Some(range) = edit.cursor_range.filter(|range| !range.is_empty()) {
+                    let selected = range.as_sorted_char_range();
                     self.word_drag = Some(WordDragState {
                         control_id: options.id.clone(),
-                        start,
-                        end,
+                        start: selected.start,
+                        end: selected.end,
                         anchor: None,
-                        dragging: true,
-                        armed_for_followup: false,
-                        tap_drag_active: true,
+                        dragging: pointer_down,
+                        armed_for_followup: !pointer_down,
+                        tap_drag_active: pointer_down,
                         tap_drag_origin: pointer_for_cursor,
                         tap_drag_last_pos: pointer_for_cursor,
                         tap_drag_armed_at: Some(Instant::now()),
                         tap_drag_last_motion: None,
                         text: edit.galley.text().to_owned(),
                     });
-                    let range = egui::text::CursorRange::two(
-                        edit.galley.from_ccursor(egui::text::CCursor::new(start)),
-                        edit.galley.from_ccursor(egui::text::CCursor::new(end)),
-                    );
-                    edit.cursor_range = Some(range);
-                    edit.state.cursor.set_range(Some(range));
-                    edit.state.clone().store(&self.context, edit.response.id);
                 }
+            } else if pointer_pressed && pointer_cursor.is_some() {
+                // A new press after a completed word drag starts a fresh selection
+                // at that point, even if it lies inside the previous word range.
+                self.word_drag = None;
             }
-        } else if edit.response.double_clicked_by(pointer_button) {
-            if let Some(range) = edit.cursor_range.filter(|range| !range.is_empty()) {
-                let selected = range.as_sorted_char_range();
-                self.word_drag = Some(WordDragState {
-                    control_id: options.id.clone(),
-                    start: selected.start,
-                    end: selected.end,
-                    anchor: None,
-                    dragging: pointer_down,
-                    armed_for_followup: !pointer_down,
-                    tap_drag_active: pointer_down,
-                    tap_drag_origin: pointer_for_cursor,
-                    tap_drag_last_pos: pointer_for_cursor,
-                    tap_drag_armed_at: Some(Instant::now()),
-                    tap_drag_last_motion: None,
-                    text: edit.galley.text().to_owned(),
-                });
-            }
-        } else if pointer_pressed && pointer_cursor.is_some() {
-            // A new press after a completed word drag starts a fresh selection
-            // at that point, even if it lies inside the previous word range.
-            self.word_drag = None;
-        }
-        if let (Some(state), Some(pointer_index)) = (self.word_drag.as_mut(), pointer_cursor) {
-            if state.control_id != options.id {
-                // Word drag belongs to whichever text control initiated it.
-            } else {
-            let now = Instant::now();
-            let mut tap_drag_motion = false;
-            if state.tap_drag_active {
-                if let Some(position) = pointer_position {
-                    let moved = state
-                        .tap_drag_last_pos
-                        .is_some_and(|previous| previous.distance(position) >= 1.5);
-                    let passed_drag_threshold = state
-                        .tap_drag_origin
-                        .is_some_and(|origin| origin.distance(position) >= 3.0);
-                    if moved && (passed_drag_threshold || state.tap_drag_last_motion.is_some()) {
-                        state.tap_drag_last_pos = Some(position);
-                        state.tap_drag_last_motion = Some(now);
-                        tap_drag_motion = !pointer_down;
+            if let (Some(state), Some(pointer_index)) = (self.word_drag.as_mut(), pointer_cursor) {
+                if state.control_id != options.id {
+                    // Word drag belongs to whichever text control initiated it.
+                } else {
+                    let now = Instant::now();
+                    let mut tap_drag_motion = false;
+                    if state.tap_drag_active {
+                        if let Some(position) = pointer_position {
+                            let moved = state
+                                .tap_drag_last_pos
+                                .is_some_and(|previous| previous.distance(position) >= 1.5);
+                            let passed_drag_threshold = state
+                                .tap_drag_origin
+                                .is_some_and(|origin| origin.distance(position) >= 3.0);
+                            if moved
+                                && (passed_drag_threshold || state.tap_drag_last_motion.is_some())
+                            {
+                                state.tap_drag_last_pos = Some(position);
+                                state.tap_drag_last_motion = Some(now);
+                                tap_drag_motion = !pointer_down;
+                            }
+                        }
+                        let started = state.tap_drag_armed_at.unwrap_or(now);
+                        let expired_before_motion = state.tap_drag_last_motion.is_none()
+                            && now.duration_since(started) > Duration::from_millis(650);
+                        let idle_after_motion =
+                            state.tap_drag_last_motion.is_some_and(|last_motion| {
+                                now.duration_since(last_motion) > Duration::from_millis(500)
+                            });
+                        if expired_before_motion || idle_after_motion {
+                            state.tap_drag_active = false;
+                            if !pointer_down {
+                                state.dragging = false;
+                            }
+                        }
                     }
-                }
-                let started = state.tap_drag_armed_at.unwrap_or(now);
-                let expired_before_motion = state.tap_drag_last_motion.is_none()
-                    && now.duration_since(started) > Duration::from_millis(650);
-                let idle_after_motion = state.tap_drag_last_motion.is_some_and(|last_motion| {
-                    now.duration_since(last_motion) > Duration::from_millis(500)
-                });
-                if expired_before_motion || idle_after_motion {
-                    state.tap_drag_active = false;
-                    if !pointer_down {
+                    let native_drag = pointer_down && edit.response.dragged_by(pointer_button);
+                    if state.dragging && (native_drag || tap_drag_motion) {
+                        if native_drag {
+                            state.tap_drag_active = false;
+                        }
+                        if pointer_index < state.start {
+                            state.anchor = Some(state.end);
+                        } else if pointer_index > state.end {
+                            state.anchor = Some(state.start);
+                        }
+                        if let Some(anchor) = state.anchor {
+                            let (word_start, word_end) =
+                                egui_word_range(edit.galley.text(), pointer_index);
+                            let endpoint = if word_end <= anchor {
+                                word_start
+                            } else if word_start >= anchor {
+                                word_end
+                            } else {
+                                anchor
+                            };
+                            let primary =
+                                edit.galley.from_ccursor(egui::text::CCursor::new(endpoint));
+                            let secondary =
+                                edit.galley.from_ccursor(egui::text::CCursor::new(anchor));
+                            let range = egui::text::CursorRange { primary, secondary };
+                            edit.cursor_range = Some(range);
+                            edit.state.cursor.set_range(Some(range));
+                            edit.state.store(&self.context, edit.response.id);
+                        } else {
+                            let range = egui::text::CursorRange::two(
+                                edit.galley
+                                    .from_ccursor(egui::text::CCursor::new(state.start)),
+                                edit.galley
+                                    .from_ccursor(egui::text::CCursor::new(state.end)),
+                            );
+                            edit.cursor_range = Some(range);
+                            edit.state.cursor.set_range(Some(range));
+                            edit.state.store(&self.context, edit.response.id);
+                        }
+                    } else if !pointer_down && !state.tap_drag_active {
+                        if state.anchor.is_some() {
+                            if let Some(range) = edit.cursor_range.filter(|range| !range.is_empty())
+                            {
+                                let selected = range.as_sorted_char_range();
+                                state.start = selected.start;
+                                state.end = selected.end;
+                                state.anchor = None;
+                            }
+                        }
                         state.dragging = false;
                     }
                 }
             }
-            let native_drag = pointer_down && edit.response.dragged_by(pointer_button);
-            if state.dragging && (native_drag || tap_drag_motion) {
-                if native_drag {
-                    state.tap_drag_active = false;
-                }
-                if pointer_index < state.start {
-                    state.anchor = Some(state.end);
-                } else if pointer_index > state.end {
-                    state.anchor = Some(state.start);
-                }
-                if let Some(anchor) = state.anchor {
-                    let (word_start, word_end) = egui_word_range(edit.galley.text(), pointer_index);
-                    let endpoint = if word_end <= anchor {
-                        word_start
-                    } else if word_start >= anchor {
-                        word_end
-                    } else {
-                        anchor
-                    };
-                    let primary = edit.galley.from_ccursor(egui::text::CCursor::new(endpoint));
-                    let secondary = edit.galley.from_ccursor(egui::text::CCursor::new(anchor));
-                    let range = egui::text::CursorRange { primary, secondary };
-                    edit.cursor_range = Some(range);
-                    edit.state.cursor.set_range(Some(range));
-                    edit.state.store(&self.context, edit.response.id);
-                } else {
-                    let range = egui::text::CursorRange::two(
-                        edit.galley
-                            .from_ccursor(egui::text::CCursor::new(state.start)),
-                        edit.galley.from_ccursor(egui::text::CCursor::new(state.end)),
-                    );
-                    edit.cursor_range = Some(range);
-                    edit.state.cursor.set_range(Some(range));
-                    edit.state.store(&self.context, edit.response.id);
-                }
-            } else if !pointer_down && !state.tap_drag_active {
-                if state.anchor.is_some() {
-                    if let Some(range) = edit.cursor_range.filter(|range| !range.is_empty()) {
-                        let selected = range.as_sorted_char_range();
-                        state.start = selected.start;
-                        state.end = selected.end;
-                        state.anchor = None;
-                    }
-                }
-                state.dragging = false;
-            }
-            }
-        }
-        let range = edit.cursor_range;
-        let (selection_start, selection_end) = range
-            .map(|range| {
-                let selected = range.as_sorted_char_range();
-                (selected.start, selected.end)
-            })
-            .unwrap_or((0, 0));
-        let caret_index = range
-            .map(|range| range.primary.ccursor.index)
-            .unwrap_or(selection_end);
-        let mut selection_rects = Vec::new();
-        let mut caret_x = edit.galley_pos.x as f64;
-        let mut caret_y = edit.galley_pos.y as f64;
-        let mut caret_height = font_size as f64;
-        if let Some(range) = range {
-            let cursor = edit.galley.pos_from_cursor(&range.primary);
-            caret_x = (edit.galley_pos.x + cursor.left()) as f64;
-            caret_y = (edit.galley_pos.y + cursor.top()) as f64;
-            caret_height = cursor.height() as f64;
-            if !range.is_empty() {
-                let [start, end] = range.sorted_cursors();
-                for row_index in start.rcursor.row..=end.rcursor.row {
-                    let Some(row) = edit.galley.rows.get(row_index) else {
-                        continue;
-                    };
-                    let left = if row_index == start.rcursor.row {
-                        row.x_offset(start.rcursor.column)
-                    } else {
-                        row.rect.left()
-                    };
-                    let right = if row_index == end.rcursor.row {
-                        row.x_offset(end.rcursor.column)
-                    } else {
-                        row.rect.right()
-                            + if row.ends_with_newline {
-                                row.height() * 0.5
-                            } else {
-                                0.0
-                            }
-                    };
-                    if right > left {
-                        selection_rects.push(TextSelectionRect {
-                            x: (edit.galley_pos.x + left) as f64 * pixels_per_point as f64,
-                            y: (edit.galley_pos.y + row.min_y()) as f64 * pixels_per_point as f64,
-                            width: (right - left) as f64 * pixels_per_point as f64,
-                            height: row.height() as f64 * pixels_per_point as f64,
-                        });
+            let range = edit.cursor_range;
+            let (selection_start, selection_end) = range
+                .map(|range| {
+                    let selected = range.as_sorted_char_range();
+                    (selected.start, selected.end)
+                })
+                .unwrap_or((0, 0));
+            let caret_index = range
+                .map(|range| range.primary.ccursor.index)
+                .unwrap_or(selection_end);
+            let mut selection_rects = Vec::new();
+            let mut caret_x = edit.galley_pos.x as f64;
+            let mut caret_y = edit.galley_pos.y as f64;
+            let mut caret_height = font_size as f64;
+            if let Some(range) = range {
+                let cursor = edit.galley.pos_from_cursor(&range.primary);
+                caret_x = (edit.galley_pos.x + cursor.left()) as f64;
+                caret_y = (edit.galley_pos.y + cursor.top()) as f64;
+                caret_height = cursor.height() as f64;
+                if !range.is_empty() {
+                    let [start, end] = range.sorted_cursors();
+                    for row_index in start.rcursor.row..=end.rcursor.row {
+                        let Some(row) = edit.galley.rows.get(row_index) else {
+                            continue;
+                        };
+                        let left = if row_index == start.rcursor.row {
+                            row.x_offset(start.rcursor.column)
+                        } else {
+                            row.rect.left()
+                        };
+                        let right = if row_index == end.rcursor.row {
+                            row.x_offset(end.rcursor.column)
+                        } else {
+                            row.rect.right()
+                                + if row.ends_with_newline {
+                                    row.height() * 0.5
+                                } else {
+                                    0.0
+                                }
+                        };
+                        if right > left {
+                            selection_rects.push(TextSelectionRect {
+                                x: (edit.galley_pos.x + left) as f64 * pixels_per_point as f64,
+                                y: (edit.galley_pos.y + row.min_y()) as f64
+                                    * pixels_per_point as f64,
+                                width: (right - left) as f64 * pixels_per_point as f64,
+                                height: row.height() as f64 * pixels_per_point as f64,
+                            });
+                        }
                     }
                 }
             }
-        }
-        let mut state = TextAreaState {
-            value,
-            display_text: edit.galley.job.text.to_string(),
-            selection_start: selection_start.min(u32::MAX as usize) as u32,
-            selection_end: selection_end.min(u32::MAX as usize) as u32,
-            caret_index: caret_index.min(u32::MAX as usize) as u32,
-            caret_x: caret_x * pixels_per_point as f64,
-            caret_y: caret_y * pixels_per_point as f64,
-            caret_height: caret_height * pixels_per_point as f64,
-            editor_caret_x: caret_x * pixels_per_point as f64,
-            text_origin_x: edit.galley_pos.x as f64 * pixels_per_point as f64,
-            text_origin_y: edit.galley_pos.y as f64 * pixels_per_point as f64,
-            focused: edit.response.has_focus(),
-            system_font_ready: self.system_font_ready,
-            system_font_load_ms: self.system_font_load_ms,
-            selection_rects,
-        };
-        let exact_geometry = renderer.and_then(|renderer| {
-            renderer.textarea_geometry(
-                &state.display_text,
-                state.selection_start,
-                state.selection_end,
-                state.caret_index,
-            )
-        });
-        if let Some((x, y, height, rects)) = exact_geometry {
-            state.caret_x = x;
-            state.caret_y = y;
-            state.caret_height = height;
-            state.selection_rects = rects;
-            self.caret_geometry_calibration = Some(CaretGeometryCalibration {
-                control_id: options.id.clone(),
-                rendered_x: x,
-                rendered_y: y,
-                rendered_height: height,
+            let mut state = TextAreaState {
+                value,
+                display_text: edit.galley.job.text.to_string(),
+                selection_start: selection_start.min(u32::MAX as usize) as u32,
+                selection_end: selection_end.min(u32::MAX as usize) as u32,
+                caret_index: caret_index.min(u32::MAX as usize) as u32,
+                caret_x: caret_x * pixels_per_point as f64,
+                caret_y: caret_y * pixels_per_point as f64,
+                caret_height: caret_height * pixels_per_point as f64,
+                editor_caret_x: caret_x * pixels_per_point as f64,
+                text_origin_x: edit.galley_pos.x as f64 * pixels_per_point as f64,
+                text_origin_y: edit.galley_pos.y as f64 * pixels_per_point as f64,
+                focused: edit.response.has_focus(),
+                system_font_ready: self.system_font_ready,
+                system_font_load_ms: self.system_font_load_ms,
+                selection_rects,
+            };
+            let exact_geometry = renderer.and_then(|renderer| {
+                renderer.textarea_geometry(
+                    &state.display_text,
+                    state.selection_start,
+                    state.selection_end,
+                    state.caret_index,
+                )
             });
-        } else if let Some(calibration) = self
-            .caret_geometry_calibration
-            .as_ref()
-            .filter(|calibration| calibration.control_id == options.id)
-        {
-            state.caret_x = calibration.rendered_x;
-            state.caret_y = calibration.rendered_y;
-            state.caret_height = calibration.rendered_height;
-        }
-        if state.focused
-            && self
+            if let Some((x, y, height, rects)) = exact_geometry {
+                state.caret_x = x;
+                state.caret_y = y;
+                state.caret_height = height;
+                state.selection_rects = rects;
+                self.caret_geometry_calibration = Some(CaretGeometryCalibration {
+                    control_id: options.id.clone(),
+                    rendered_x: x,
+                    rendered_y: y,
+                    rendered_height: height,
+                });
+            } else if let Some(calibration) = self
                 .caret_geometry_calibration
                 .as_ref()
-                .is_some_and(|calibration| calibration.control_id == options.id)
-        {
-            if let Some(ime) = output.platform_output.ime.as_mut() {
-                let caret_rect = egui::Rect::from_min_size(
-                    egui::pos2(state.caret_x as f32, state.caret_y as f32) / pixels_per_point,
-                    egui::vec2(1.0, state.caret_height as f32) / pixels_per_point,
-                );
-                ime.rect = caret_rect;
-                ime.cursor_rect = caret_rect;
+                .filter(|calibration| calibration.control_id == options.id)
+            {
+                state.caret_x = calibration.rendered_x;
+                state.caret_y = calibration.rendered_y;
+                state.caret_height = calibration.rendered_height;
             }
+            if state.focused
+                && self
+                    .caret_geometry_calibration
+                    .as_ref()
+                    .is_some_and(|calibration| calibration.control_id == options.id)
+            {
+                if let Some(ime) = output.platform_output.ime.as_mut() {
+                    let caret_rect = egui::Rect::from_min_size(
+                        egui::pos2(state.caret_x as f32, state.caret_y as f32) / pixels_per_point,
+                        egui::vec2(1.0, state.caret_height as f32) / pixels_per_point,
+                    );
+                    ime.rect = caret_rect;
+                    ime.cursor_rect = caret_rect;
+                }
+            }
+            states.push(state);
         }
-        states.push(state);
-        }
-        self.winit.handle_platform_output(window, output.platform_output);
+        self.winit
+            .handle_platform_output(window, output.platform_output);
         states
     }
 }
@@ -1263,7 +1546,7 @@ fn create_text_runtime(
         swash_cache: SwashCache::new(),
         text_viewport: viewport,
         text_atlas: atlas,
-        text_renderers: Vec::new(),
+        text_renderer: None,
         text_buffers: Vec::new(),
         text_run_options: Vec::new(),
     }
@@ -1271,7 +1554,14 @@ fn create_text_runtime(
 
 impl Renderer {
     fn new(window: Arc<OsWindow>) -> std::result::Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: if cfg!(target_os = "android") {
+                wgpu::Backends::GL
+            } else {
+                wgpu::Backends::all()
+            },
+            ..Default::default()
+        });
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| format!("create GPU surface: {error}"))?;
@@ -1286,12 +1576,15 @@ impl Renderer {
             &wgpu::DeviceDescriptor {
                 label: Some("Nasty device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
         ))
         .map_err(|error| format!("create GPU device: {error}"))?;
+        device.on_uncaptured_error(Box::new(|error| {
+            eprintln!("Nasty WGPU uncaptured error: {error}");
+        }));
 
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
@@ -1398,38 +1691,41 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
-        let image_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Nasty image bindings"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let image_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Nasty image bindings"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let image_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Nasty image pipeline layout"),
-            bind_group_layouts: &[&image_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Nasty image pipeline layout"),
+                bind_group_layouts: &[&image_bind_group_layout],
+                push_constant_ranges: &[],
+            });
         let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Nasty image shader"),
             source: wgpu::ShaderSource::Wgsl(r#"
                 struct VertexInput {
                     @location(0) position: vec2<f32>,
                     @location(1) uv: vec2<f32>,
+                    @location(2) reciprocal_w: f32,
                 };
                 struct VertexOutput {
                     @builtin(position) position: vec4<f32>,
@@ -1437,7 +1733,7 @@ impl Renderer {
                 };
                 @vertex fn vs_main(input: VertexInput) -> VertexOutput {
                     var output: VertexOutput;
-                    output.position = vec4<f32>(input.position, 0.0, 1.0);
+                    output.position = vec4<f32>(input.position * input.reciprocal_w, 0.0, input.reciprocal_w);
                     output.uv = input.uv;
                     return output;
                 }
@@ -1448,8 +1744,8 @@ impl Renderer {
                 }
             "#.into()),
         });
-        const IMAGE_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
-            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+        const IMAGE_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32];
         let image_vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<ImageVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -1558,7 +1854,12 @@ impl Renderer {
         })
     }
 
-    fn upload_image(&mut self, width: u32, height: u32, pixels: &[u8]) -> std::result::Result<u32, String> {
+    fn upload_image(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> std::result::Result<u32, String> {
         if width == 0 || height == 0 || width > 16384 || height > 16384 {
             return Err("image dimensions must be between 1 and 16384 pixels".into());
         }
@@ -1567,7 +1868,11 @@ impl Renderer {
         }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Nasty decoded image"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1576,10 +1881,23 @@ impl Renderer {
             view_formats: &[],
         });
         self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             pixels,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1594,13 +1912,27 @@ impl Renderer {
             label: Some("Nasty image bind group"),
             layout: &self.image_bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
             ],
         });
         let id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
-        self.images.insert(id, GpuImage { _texture: texture, bind_group, width, height });
+        self.images.insert(
+            id,
+            GpuImage {
+                _texture: texture,
+                bind_group,
+                width,
+                height,
+            },
+        );
         Ok(id)
     }
 
@@ -1671,7 +2003,10 @@ impl Renderer {
         for vertex in triangles.chunks_exact(6) {
             let x = vertex[0] / width * 2.0 - 1.0;
             let y = 1.0 - vertex[1] / height * 2.0;
-            vertices.push(Vertex { position: [x, y], color: [vertex[2], vertex[3], vertex[4], vertex[5]] });
+            vertices.push(Vertex {
+                position: [x, y],
+                color: [vertex[2], vertex[3], vertex[4], vertex[5]],
+            });
         }
         let bytes = bytemuck::cast_slice(&vertices);
         if bytes.len() > self.vertex_capacity {
@@ -1691,8 +2026,68 @@ impl Renderer {
         let mut image_vertices = Vec::with_capacity(image_draws.len() * 6);
         let mut image_batches = Vec::with_capacity(image_draws.len());
         for image in image_draws {
-            let gpu_image = self.images.get(&image.texture_id)
+            let gpu_image = self
+                .images
+                .get(&image.texture_id)
                 .ok_or_else(|| format!("unknown image texture {}", image.texture_id))?;
+            if let Some(vertices) = image.vertices.as_ref() {
+                if vertices.is_empty() || vertices.len() % 15 != 0 {
+                    return Err("transformed image vertices must contain complete triangles".into());
+                }
+                let cx = image.clip_x.unwrap_or(0.0).floor().clamp(0.0, width as f64) as u32;
+                let cy = image
+                    .clip_y
+                    .unwrap_or(0.0)
+                    .floor()
+                    .clamp(0.0, height as f64) as u32;
+                let cr = image
+                    .clip_x
+                    .zip(image.clip_width)
+                    .map(|(x, w)| (x + w).ceil().clamp(0.0, width as f64) as u32)
+                    .unwrap_or(self.config.width);
+                let cb = image
+                    .clip_y
+                    .zip(image.clip_height)
+                    .map(|(y, h)| (y + h).ceil().clamp(0.0, height as f64) as u32)
+                    .unwrap_or(self.config.height);
+                if cr <= cx || cb <= cy {
+                    image_batches.push(None);
+                    continue;
+                }
+                let start = image_vertices.len() as u32;
+                for vertex in vertices.chunks_exact(5) {
+                    let (x, y, u, v, reciprocal_w) =
+                        (vertex[0], vertex[1], vertex[2], vertex[3], vertex[4]);
+                    if !x.is_finite()
+                        || !y.is_finite()
+                        || !u.is_finite()
+                        || !v.is_finite()
+                        || !reciprocal_w.is_finite()
+                        || reciprocal_w <= 0.0
+                    {
+                        return Err("transformed image vertex contains an invalid value".into());
+                    }
+                    image_vertices.push(ImageVertex {
+                        position: [
+                            (x as f32 / width as f32) * 2.0 - 1.0,
+                            1.0 - (y as f32 / height as f32) * 2.0,
+                        ],
+                        uv: [u as f32, v as f32],
+                        reciprocal_w: reciprocal_w as f32,
+                    });
+                }
+                let end = image_vertices.len() as u32;
+                image_batches.push(Some((
+                    image.texture_id,
+                    start..end,
+                    cx,
+                    cy,
+                    cr - cx,
+                    cb - cy,
+                )));
+                let _intrinsic_size = (gpu_image.width, gpu_image.height);
+                continue;
+            }
             let x0 = image.x.max(0.0);
             let y0 = image.y.max(0.0);
             let x1 = (image.x + image.width).min(width as f64);
@@ -1711,34 +2106,82 @@ impl Renderer {
             let py1 = 1.0 - y1 as f32 / height * 2.0;
             let start = image_vertices.len() as u32;
             image_vertices.extend_from_slice(&[
-                ImageVertex { position: [px0, py0], uv: [u0, v0] },
-                ImageVertex { position: [px1, py0], uv: [u1, v0] },
-                ImageVertex { position: [px0, py1], uv: [u0, v1] },
-                ImageVertex { position: [px0, py1], uv: [u0, v1] },
-                ImageVertex { position: [px1, py0], uv: [u1, v0] },
-                ImageVertex { position: [px1, py1], uv: [u1, v1] },
+                ImageVertex {
+                    position: [px0, py0],
+                    uv: [u0, v0],
+                    reciprocal_w: 1.0,
+                },
+                ImageVertex {
+                    position: [px1, py0],
+                    uv: [u1, v0],
+                    reciprocal_w: 1.0,
+                },
+                ImageVertex {
+                    position: [px0, py1],
+                    uv: [u0, v1],
+                    reciprocal_w: 1.0,
+                },
+                ImageVertex {
+                    position: [px0, py1],
+                    uv: [u0, v1],
+                    reciprocal_w: 1.0,
+                },
+                ImageVertex {
+                    position: [px1, py0],
+                    uv: [u1, v0],
+                    reciprocal_w: 1.0,
+                },
+                ImageVertex {
+                    position: [px1, py1],
+                    uv: [u1, v1],
+                    reciprocal_w: 1.0,
+                },
             ]);
             let cx = image.clip_x.unwrap_or(0.0).floor().clamp(0.0, width as f64) as u32;
-            let cy = image.clip_y.unwrap_or(0.0).floor().clamp(0.0, height as f64) as u32;
-            let cr = image.clip_x.zip(image.clip_width).map(|(x, w)| (x + w).ceil().clamp(0.0, width as f64) as u32).unwrap_or(self.config.width);
-            let cb = image.clip_y.zip(image.clip_height).map(|(y, h)| (y + h).ceil().clamp(0.0, height as f64) as u32).unwrap_or(self.config.height);
+            let cy = image
+                .clip_y
+                .unwrap_or(0.0)
+                .floor()
+                .clamp(0.0, height as f64) as u32;
+            let cr = image
+                .clip_x
+                .zip(image.clip_width)
+                .map(|(x, w)| (x + w).ceil().clamp(0.0, width as f64) as u32)
+                .unwrap_or(self.config.width);
+            let cb = image
+                .clip_y
+                .zip(image.clip_height)
+                .map(|(y, h)| (y + h).ceil().clamp(0.0, height as f64) as u32)
+                .unwrap_or(self.config.height);
             if cr <= cx || cb <= cy {
                 image_vertices.truncate(start as usize);
                 image_batches.push(None);
                 continue;
             }
-            image_batches.push(Some((image.texture_id, start..start + 6, cx, cy, cr - cx, cb - cy)));
+            image_batches.push(Some((
+                image.texture_id,
+                start..start + 6,
+                cx,
+                cy,
+                cr - cx,
+                cb - cy,
+            )));
             let _intrinsic_size = (gpu_image.width, gpu_image.height);
         }
         let image_bytes = bytemuck::cast_slice(&image_vertices);
         if image_bytes.len() > self.image_vertex_capacity {
             self.image_vertex_capacity = image_bytes.len().next_power_of_two();
             self.image_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Nasty image vertices"), size: self.image_vertex_capacity as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+                label: Some("Nasty image vertices"),
+                size: self.image_vertex_capacity as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
         }
-        if !image_bytes.is_empty() { self.queue.write_buffer(&self.image_vertex_buffer, 0, image_bytes); }
+        if !image_bytes.is_empty() {
+            self.queue
+                .write_buffer(&self.image_vertex_buffer, 0, image_bytes);
+        }
 
         let acquire_started = Instant::now();
         let frame = match self.surface.get_current_texture() {
@@ -1810,10 +2253,42 @@ impl Renderer {
                             pass.set_pipeline(&self.pipeline);
                             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                             pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
-                            pass.draw((triangle_vertex_offset + range.start)..(triangle_vertex_offset + range.end), 0..1);
+                            pass.draw(
+                                (triangle_vertex_offset + range.start)
+                                    ..(triangle_vertex_offset + range.end),
+                                0..1,
+                            );
+                        }
+                        DrawOrder::CanvasTriangles {
+                            range,
+                            clip_x,
+                            clip_y,
+                            clip_width,
+                            clip_height,
+                        } => {
+                            let left = clip_x.floor().clamp(0.0, width as f64) as u32;
+                            let top = clip_y.floor().clamp(0.0, height as f64) as u32;
+                            let right = (*clip_x + *clip_width).ceil().clamp(0.0, width as f64) as u32;
+                            let bottom = (*clip_y + *clip_height).ceil().clamp(0.0, height as f64) as u32;
+                            if right <= left || bottom <= top {
+                                continue;
+                            }
+                            pass.set_pipeline(&self.pipeline);
+                            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                            pass.set_scissor_rect(left, top, right - left, bottom - top);
+                            pass.draw(
+                                (triangle_vertex_offset + range.start)
+                                    ..(triangle_vertex_offset + range.end),
+                                0..1,
+                            );
+                            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                         }
                         DrawOrder::Image(index) => {
-                            let Some((texture_id, range, x, y, w, h)) = image_batches.get(*index).and_then(Option::as_ref) else { continue };
+                            let Some((texture_id, range, x, y, w, h)) =
+                                image_batches.get(*index).and_then(Option::as_ref)
+                            else {
+                                continue;
+                            };
                             pass.set_pipeline(&self.image_pipeline);
                             pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
                             pass.set_scissor_rect(*x, *y, *w, *h);
@@ -1830,7 +2305,7 @@ impl Renderer {
                 .as_ref()
                 .filter(|runtime| !runtime.text_buffers.is_empty())
             {
-                for text_renderer in &runtime.text_renderers {
+                if let Some(text_renderer) = runtime.text_renderer.as_ref() {
                     text_renderer
                         .render(&runtime.text_atlas, &runtime.text_viewport, &mut pass)
                         .map_err(|error| format!("render text: {error}"))?;
@@ -1933,9 +2408,9 @@ impl Renderer {
             .text_runtime
             .as_mut()
             .ok_or_else(|| "active text resources are unavailable".to_string())?;
-        let stats = if let Some(index) = update_run_index.filter(|index| {
-            *index < runs.len() && runtime.text_buffers.len() == runs.len()
-        }) {
+        let stats = if let Some(index) = update_run_index
+            .filter(|index| *index < runs.len() && runtime.text_buffers.len() == runs.len())
+        {
             runtime.set_text_run(
                 index,
                 runs.swap_remove(index),
@@ -2014,6 +2489,62 @@ impl Renderer {
 }
 
 impl TextRuntime {
+    fn prepare_text_areas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) -> std::result::Result<(), String> {
+        if self.text_buffers.is_empty() {
+            return Ok(());
+        }
+        if self.text_renderer.is_none() {
+            self.text_renderer = Some(TextRenderer::new(
+                &mut self.text_atlas,
+                device,
+                wgpu::MultisampleState::default(),
+                None,
+            ));
+        }
+        self.text_viewport
+            .update(queue, Resolution { width, height });
+        let areas = self
+            .text_buffers
+            .iter()
+            .zip(&self.text_run_options)
+            .filter_map(|(text, options)| {
+                let bounds = text_bounds(options, width, height);
+                (bounds.right > bounds.left && bounds.bottom > bounds.top).then_some(TextArea {
+                    buffer: &text.buffer,
+                    left: text.x,
+                    top: text.y,
+                    scale: 1.0,
+                    bounds,
+                    default_color: text.color,
+                    custom_glyphs: &[],
+                })
+            })
+            .collect::<Vec<_>>();
+        let font_system = self
+            .font_system
+            .as_mut()
+            .ok_or_else(|| "font system is unavailable".to_string())?;
+        self.text_renderer
+            .as_mut()
+            .expect("text renderer initialized")
+            .prepare(
+                device,
+                queue,
+                font_system,
+                &mut self.text_atlas,
+                &self.text_viewport,
+                areas,
+                &mut self.swash_cache,
+            )
+            .map_err(|error| error.to_string())
+    }
+
     fn set_text_run(
         &mut self,
         index: usize,
@@ -2024,13 +2555,13 @@ impl TextRuntime {
         width: u32,
         height: u32,
     ) -> std::result::Result<TextPreparationStats, String> {
-        if index >= self.text_buffers.len() || index >= self.text_renderers.len() {
+        if index >= self.text_buffers.len() {
             return Err("text run index is outside the active text list".into());
         }
         let total_started = Instant::now();
         if self.font_system.is_none() {
             let font_init_started = Instant::now();
-            self.font_system = Some(FontSystem::new());
+            self.font_system = Some(create_font_system());
             self.system_font_init_ms = font_init_started.elapsed().as_secs_f64() * 1000.0;
         }
         let font_system = self.font_system.as_mut().expect("font system initialized");
@@ -2086,11 +2617,25 @@ impl TextRuntime {
             } else {
                 let old_chars = old_text.chars().collect::<Vec<_>>();
                 let new_chars = run.text.chars().collect::<Vec<_>>();
-                let prefix = old_chars.iter().zip(&new_chars).take_while(|(old, new)| old == new).count();
-                let suffix = old_chars[prefix..].iter().rev().zip(new_chars[prefix..].iter().rev()).take_while(|(old, new)| old == new).count();
-                let inserted = new_chars[prefix..new_chars.len() - suffix].iter().collect::<String>();
+                let prefix = old_chars
+                    .iter()
+                    .zip(&new_chars)
+                    .take_while(|(old, new)| old == new)
+                    .count();
+                let suffix = old_chars[prefix..]
+                    .iter()
+                    .rev()
+                    .zip(new_chars[prefix..].iter().rev())
+                    .take_while(|(old, new)| old == new)
+                    .count();
+                let inserted = new_chars[prefix..new_chars.len() - suffix]
+                    .iter()
+                    .collect::<String>();
                 let start = cosmic_cursor_at_char(&self.text_buffers[index].buffer, prefix);
-                let end = cosmic_cursor_at_char(&self.text_buffers[index].buffer, old_chars.len() - suffix);
+                let end = cosmic_cursor_at_char(
+                    &self.text_buffers[index].buffer,
+                    old_chars.len() - suffix,
+                );
                 let mut editor = Editor::new(&mut self.text_buffers[index].buffer);
                 editor.set_cursor(start);
                 editor.set_selection(glyphon::cosmic_text::Selection::Normal(end));
@@ -2101,11 +2646,16 @@ impl TextRuntime {
                 self.text_run_options[index] = run.clone();
             }
         } else {
-            let mut buffer = TextBuffer::new_empty(Metrics::new(
-                font_size as f32,
-                line_height as f32,
-            ));
-            buffer.set_wrap(font_system, if run.wrap == Some(false) { Wrap::None } else { Wrap::Word });
+            let mut buffer =
+                TextBuffer::new_empty(Metrics::new(font_size as f32, line_height as f32));
+            buffer.set_wrap(
+                font_system,
+                if run.wrap == Some(false) {
+                    Wrap::None
+                } else {
+                    Wrap::Word
+                },
+            );
             buffer.set_size(
                 font_system,
                 Some((run_width as f32).max(1.0)),
@@ -2114,12 +2664,9 @@ impl TextRuntime {
             buffer.set_text(
                 font_system,
                 &run.text,
-                Attrs::new().family(
-                    run.font_family
-                        .as_deref()
-                        .map(Family::Name)
-                        .unwrap_or(Family::SansSerif),
-                ),
+                Attrs::new()
+                    .family(text_family(run.font_family.as_deref()))
+                    .weight(Weight(run.font_weight.unwrap_or(400))),
                 Shaping::Advanced,
             );
             self.text_buffers[index] = PositionedText {
@@ -2140,29 +2687,8 @@ impl TextRuntime {
             glyph_count += layout_run.glyphs.len() as u32;
         }
         let shaping_ms = shaping_started.elapsed().as_secs_f64() * 1000.0;
-        self.text_viewport.update(queue, Resolution { width, height });
-        let bounds = text_bounds(&self.text_run_options[index], width, height);
-        let text = &self.text_buffers[index];
         let prepare_started = Instant::now();
-        self.text_renderers[index]
-            .prepare(
-                device,
-                queue,
-                font_system,
-                &mut self.text_atlas,
-                &self.text_viewport,
-                [TextArea {
-                    buffer: &text.buffer,
-                    left: text.x,
-                    top: text.y,
-                    scale: 1.0,
-                    bounds,
-                    default_color: text.color,
-                    custom_glyphs: &[],
-                }],
-                &mut self.swash_cache,
-            )
-            .map_err(|error| error.to_string())?;
+        self.prepare_text_areas(device, queue, width, height)?;
         let atlas_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
         Ok(TextPreparationStats {
             system_font_init_ms: self.system_font_init_ms,
@@ -2191,7 +2717,7 @@ impl TextRuntime {
         let text_run_options = runs.clone();
         if self.font_system.is_none() {
             let font_init_started = Instant::now();
-            self.font_system = Some(FontSystem::new());
+            self.font_system = Some(create_font_system());
             self.system_font_init_ms = font_init_started.elapsed().as_secs_f64() * 1000.0;
         }
         let font_system = self.font_system.as_mut().expect("font system initialized");
@@ -2225,25 +2751,23 @@ impl TextRuntime {
             }
             let color = parse_text_color(&run.color)
                 .ok_or_else(|| format!("invalid text color: {}", run.color))?;
-            let mut buffer = TextBuffer::new_empty(Metrics::new(
-                font_size as f32,
-                line_height as f32,
-            ));
-            buffer.set_wrap(font_system, if run.wrap == Some(false) { Wrap::None } else { Wrap::Word });
-            buffer.set_size(
+            let mut buffer =
+                TextBuffer::new_empty(Metrics::new(font_size as f32, line_height as f32));
+            buffer.set_wrap(
                 font_system,
-                Some((run_width as f32).max(1.0)),
-                None,
+                if run.wrap == Some(false) {
+                    Wrap::None
+                } else {
+                    Wrap::Word
+                },
             );
+            buffer.set_size(font_system, Some((run_width as f32).max(1.0)), None);
             buffer.set_text(
                 font_system,
                 &run.text,
-                Attrs::new().family(
-                    run.font_family
-                        .as_deref()
-                        .map(Family::Name)
-                        .unwrap_or(Family::SansSerif),
-                ),
+                Attrs::new()
+                    .family(text_family(run.font_family.as_deref()))
+                    .weight(Weight(run.font_weight.unwrap_or(400))),
                 Shaping::Advanced,
             );
             for layout_run in buffer.layout_runs() {
@@ -2259,51 +2783,11 @@ impl TextRuntime {
         }
         let shaping_ms = shaping_started.elapsed().as_secs_f64() * 1000.0;
 
-        self.text_viewport.update(
-            queue,
-            Resolution {
-                width,
-                height: height as u32,
-            },
-        );
         let prepare_started = Instant::now();
-        self.text_renderers.resize_with(positioned.len(), || {
-            TextRenderer::new(
-                &mut self.text_atlas,
-                device,
-                wgpu::MultisampleState::default(),
-                None,
-            )
-        });
-        for ((text, options), text_renderer) in positioned
-            .iter()
-            .zip(text_run_options.iter())
-            .zip(self.text_renderers.iter_mut())
-        {
-            let bounds = text_bounds(options, width, height as u32);
-            text_renderer
-            .prepare(
-                device,
-                queue,
-                font_system,
-                &mut self.text_atlas,
-                &self.text_viewport,
-                [TextArea {
-                    buffer: &text.buffer,
-                    left: text.x,
-                    top: text.y,
-                    scale: 1.0,
-                    bounds,
-                    default_color: text.color,
-                    custom_glyphs: &[],
-                }],
-                &mut self.swash_cache,
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        let atlas_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
         self.text_buffers = positioned;
         self.text_run_options = text_run_options;
+        self.prepare_text_areas(device, queue, width, height as u32)?;
+        let atlas_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
 
         Ok(TextPreparationStats {
             system_font_init_ms: self.system_font_init_ms,
@@ -2337,7 +2821,11 @@ fn cosmic_cursor_at_char(buffer: &TextBuffer, char_index: usize) -> glyphon::Cur
     }
     glyphon::Cursor::new(
         buffer.lines.len().saturating_sub(1),
-        buffer.lines.last().map(|line| line.text().len()).unwrap_or(0),
+        buffer
+            .lines
+            .last()
+            .map(|line| line.text().len())
+            .unwrap_or(0),
     )
 }
 
@@ -2413,9 +2901,7 @@ impl Renderer {
                     run.line_height as f64,
                 ));
             }
-            if start < selection_end
-                && run.line_i >= start.line
-                && run.line_i <= selection_end.line
+            if start < selection_end && run.line_i >= start.line && run.line_i <= selection_end.line
             {
                 let run_start = if run.line_i == start.line {
                     start
@@ -2467,12 +2953,14 @@ struct WindowApp {
     height: f64,
     visible: bool,
     resizable: String,
+    orientation: String,
     window: Option<Arc<OsWindow>>,
     renderer: Option<Renderer>,
     text_editor: Option<TextEditor>,
     error: Option<String>,
     events: Vec<NativeEvent>,
     cursor: (f64, f64),
+    cursor_icon: Option<CursorIcon>,
     modifiers: ModifiersState,
     display_list: Vec<f32>,
     display_triangles: Vec<f32>,
@@ -2508,7 +2996,10 @@ impl ApplicationHandler for WindowApp {
                         self.window = Some(window);
                         self.renderer = Some(renderer);
                     }
-                    Err(error) => self.error = Some(error),
+                    Err(error) => {
+                        eprintln!("Nasty: could not initialize renderer: {error}");
+                        self.error = Some(error);
+                    }
                 }
             }
             Err(error) => self.error = Some(format!("create native window: {error}")),
@@ -2572,6 +3063,22 @@ impl ApplicationHandler for WindowApp {
             }
             OsWindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                if let Some(window) = self.window.as_ref() {
+                    let scale = window.scale_factor();
+                    let logical_size = window.inner_size().to_logical::<f64>(scale);
+                    let direction = resize_direction(
+                        &self.resizable,
+                        position.x / scale,
+                        position.y / scale,
+                        logical_size.width,
+                        logical_size.height,
+                    );
+                    let cursor = direction.map(CursorIcon::from).unwrap_or(CursorIcon::Default);
+                    if self.cursor_icon != Some(cursor) {
+                        window.set_cursor(cursor);
+                        self.cursor_icon = Some(cursor);
+                    }
+                }
                 self.events.push(NativeEvent {
                     kind: "pointermove".into(),
                     x: position.x,
@@ -2583,21 +3090,44 @@ impl ApplicationHandler for WindowApp {
                     delta_y: None,
                 });
             }
-            OsWindowEvent::MouseInput { state, .. } => self.events.push(NativeEvent {
-                kind: if state.is_pressed() {
-                    "pointerdown"
-                } else {
-                    "pointerup"
+            OsWindowEvent::CursorLeft { .. } => {
+                if let Some(window) = self.window.as_ref() {
+                    if self.cursor_icon != Some(CursorIcon::Default) {
+                        window.set_cursor(CursorIcon::Default);
+                        self.cursor_icon = Some(CursorIcon::Default);
+                    }
                 }
-                .into(),
-                x: self.cursor.0,
-                y: self.cursor.1,
-                key: None,
-                text: None,
-                modifiers: None,
-                delta_x: None,
-                delta_y: None,
-            }),
+            }
+            OsWindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    if let Some(window) = self.window.as_ref() {
+                        let scale = window.scale_factor();
+                        let logical_size = window.inner_size().to_logical::<f64>(scale);
+                        let direction = resize_direction(
+                            &self.resizable,
+                            self.cursor.0 / scale,
+                            self.cursor.1 / scale,
+                            logical_size.width,
+                            logical_size.height,
+                        );
+                        if let Some(direction) = direction {
+                            if window.drag_resize_window(direction).is_ok() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                self.events.push(NativeEvent {
+                    kind: if state.is_pressed() { "pointerdown" } else { "pointerup" }.into(),
+                    x: self.cursor.0,
+                    y: self.cursor.1,
+                    key: None,
+                    text: None,
+                    modifiers: None,
+                    delta_x: None,
+                    delta_y: None,
+                });
+            }
             OsWindowEvent::MouseWheel { delta, .. } => {
                 let (delta_x, delta_y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x as f64 * 40.0, y as f64 * 40.0),
@@ -2656,7 +3186,13 @@ impl ApplicationHandler for WindowApp {
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
-                match renderer.render(window, &self.display_list, &self.display_triangles, &self.image_draws, &self.draw_order) {
+                match renderer.render(
+                    window,
+                    &self.display_list,
+                    &self.display_triangles,
+                    &self.image_draws,
+                    &self.draw_order,
+                ) {
                     Ok(timings) => {
                         self.last_render_ms = timings.total_ms;
                         self.last_prepare_ms = timings.prepare_ms;
@@ -2701,6 +3237,40 @@ impl WindowApp {
     }
 }
 
+fn resize_direction(
+    mode: &str,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Option<ResizeDirection> {
+    let horizontal = matches!(mode, "horizontal" | "both");
+    let vertical = matches!(mode, "vertical" | "both");
+    if !horizontal && !vertical {
+        return None;
+    }
+
+    // Use a small logical-pixel strip inside the client area as a resize handle.
+    // The compositor performs the actual drag, so resizing never depends on a
+    // JavaScript pointer-move loop or repeated set_inner_size calls.
+    const EDGE: f64 = 12.0;
+    let left = horizontal && x < EDGE;
+    let right = horizontal && x >= width - EDGE;
+    let top = vertical && y < EDGE;
+    let bottom = vertical && y >= height - EDGE;
+    Some(match (left, right, top, bottom) {
+        (true, _, true, _) => ResizeDirection::NorthWest,
+        (_, true, true, _) => ResizeDirection::NorthEast,
+        (true, _, _, true) => ResizeDirection::SouthWest,
+        (_, true, _, true) => ResizeDirection::SouthEast,
+        (true, _, _, _) => ResizeDirection::West,
+        (_, true, _, _) => ResizeDirection::East,
+        (_, _, true, _) => ResizeDirection::North,
+        (_, _, _, true) => ResizeDirection::South,
+        _ => return None,
+    })
+}
+
 #[napi]
 pub struct Window {
     event_loop: EventLoop<()>,
@@ -2712,6 +3282,14 @@ impl Window {
     #[napi(constructor)]
     pub fn new(options: WindowOptions) -> Result<Self> {
         let mut builder = EventLoop::builder();
+        #[cfg(target_os = "android")]
+        {
+            use winit::platform::android::EventLoopBuilderExtAndroid;
+            let android_app = ANDROID_APP.get().cloned().ok_or_else(|| {
+                Error::new(Status::GenericFailure, "Android app host is not initialized")
+            })?;
+            builder.with_android_app(android_app);
+        }
         if options.allow_any_thread.unwrap_or(false) {
             #[cfg(target_os = "linux")]
             winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
@@ -2736,10 +3314,20 @@ impl Window {
             )
         })?;
         let resizable = options.resizable.unwrap_or_else(|| "both".into());
-        if !matches!(resizable.as_str(), "horizontal" | "vertical" | "both" | "none") {
+        if !matches!(
+            resizable.as_str(),
+            "horizontal" | "vertical" | "both" | "none"
+        ) {
             return Err(Error::new(
                 Status::InvalidArg,
                 "resizable must be horizontal, vertical, both, or none",
+            ));
+        }
+        let orientation = options.orientation.unwrap_or_else(|| "auto".into());
+        if !matches!(orientation.as_str(), "auto" | "portrait" | "landscape") {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "orientation must be auto, portrait, or landscape",
             ));
         }
         let app = WindowApp {
@@ -2748,6 +3336,7 @@ impl Window {
             height: options.height.unwrap_or(600.0),
             visible: options.visible.unwrap_or(true),
             resizable,
+            orientation,
             ..Default::default()
         };
         if !app.width.is_finite() || !app.height.is_finite() || app.width < 1.0 || app.height < 1.0
@@ -2758,16 +3347,35 @@ impl Window {
             ));
         }
         let mut window = Self { event_loop, app };
+        window.apply_orientation()?;
         window.pump(Duration::ZERO)?;
+        #[cfg(target_os = "android")]
+        {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while window.app.renderer.is_none()
+                && window.app.error.is_none()
+                && !window.app.closed
+                && Instant::now() < deadline
+            {
+                window.pump(Duration::from_millis(16))?;
+            }
+            if window.app.renderer.is_none() && window.app.error.is_none() {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "Android window did not finish initializing its renderer",
+                ));
+            }
+        }
         window.check_error()?;
         Ok(window)
     }
 
     #[napi]
     pub fn show(&self) -> Result<()> {
-        let window = self.app.window.as_ref().ok_or_else(|| {
-            Error::new(Status::GenericFailure, "native window is unavailable")
-        })?;
+        let window =
+            self.app.window.as_ref().ok_or_else(|| {
+                Error::new(Status::GenericFailure, "native window is unavailable")
+            })?;
         window.set_visible(true);
         window.request_redraw();
         Ok(())
@@ -2791,6 +3399,43 @@ impl Window {
     #[napi(js_name = "resizableMode")]
     pub fn resizable_mode(&self) -> String {
         self.app.resizable.clone()
+    }
+
+    fn apply_orientation(&self) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            let orientation = match self.app.orientation.as_str() {
+                "auto" => -1,
+                "landscape" => 0,
+                "portrait" => 1,
+                _ => unreachable!("orientation mode validated in constructor and setter"),
+            };
+            let result = unsafe { nasty_set_requested_orientation(orientation) };
+            if result != 0 {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "Android could not change the requested screen orientation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[napi(js_name = "setOrientationMode")]
+    pub fn set_orientation_mode(&mut self, mode: String) -> Result<()> {
+        if !matches!(mode.as_str(), "auto" | "portrait" | "landscape") {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "orientation must be auto, portrait, or landscape",
+            ));
+        }
+        self.app.orientation = mode;
+        self.apply_orientation()
+    }
+
+    #[napi(js_name = "orientationMode")]
+    pub fn orientation_mode(&self) -> String {
+        self.app.orientation.clone()
     }
 
     #[napi]
@@ -2843,16 +3488,12 @@ impl Window {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
-        let system_font = self
-            .app
-            .text_editor
-            .as_ref()
-            .and_then(|editor| {
-                Some((
-                    editor.system_font_family.clone()?,
-                    editor.system_font_bytes.clone()?,
-                ))
-            });
+        let system_font = self.app.text_editor.as_ref().and_then(|editor| {
+            Some((
+                editor.system_font_family.clone()?,
+                editor.system_font_bytes.clone()?,
+            ))
+        });
         let renderer = self
             .app
             .renderer
@@ -2915,47 +3556,71 @@ impl Window {
         runs: Vec<TextRunOptions>,
         update_indices: Option<Vec<u32>>,
     ) -> Result<()> {
-        let renderer = self.app.renderer.as_mut()
+        let renderer = self
+            .app
+            .renderer
+            .as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
-        let runtime = renderer.text_runtime.as_mut()
+        let runtime = renderer
+            .text_runtime
+            .as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "text runtime unavailable"))?;
         if update_indices.is_none() && runs.len() != runtime.text_buffers.len() {
-            return Err(Error::new(Status::InvalidArg, "text placement count mismatch"));
+            return Err(Error::new(
+                Status::InvalidArg,
+                "text placement count mismatch",
+            ));
         }
         let indices = update_indices.unwrap_or_else(|| (0..runs.len() as u32).collect());
         if runs.len() != indices.len() {
-            return Err(Error::new(Status::InvalidArg, "sparse text placement count mismatch"));
+            return Err(Error::new(
+                Status::InvalidArg,
+                "sparse text placement count mismatch",
+            ));
         }
-        if indices.iter().any(|index| *index as usize >= runtime.text_buffers.len()) {
-            return Err(Error::new(Status::InvalidArg, "text placement index out of range"));
+        if indices
+            .iter()
+            .any(|index| *index as usize >= runtime.text_buffers.len())
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "text placement index out of range",
+            ));
         }
         for (run, index) in runs.iter().zip(&indices) {
             let old = &runtime.text_run_options[*index as usize];
-            if run.text != old.text || run.width != old.width || run.font_size != old.font_size
-                || run.line_height != old.line_height || run.font_family != old.font_family || run.wrap != old.wrap
-                || !run.x.is_finite() || !run.y.is_finite() || parse_text_color(&run.color).is_none() {
-                return Err(Error::new(Status::InvalidArg, "placement must preserve shaped text and use valid geometry/color"));
+            if run.text != old.text
+                || run.width != old.width
+                || run.font_size != old.font_size
+                || run.line_height != old.line_height
+                || run.font_family != old.font_family
+                || run.wrap != old.wrap
+                || !run.x.is_finite()
+                || !run.y.is_finite()
+                || parse_text_color(&run.color).is_none()
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "placement must preserve shaped text and use valid geometry/color",
+                ));
             }
         }
-        let font_system = runtime.font_system.as_mut()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "font system unavailable"))?;
         for (run, index) in runs.iter().zip(indices) {
             let index = index as usize;
-            {
-                let text = &mut runtime.text_buffers[index];
-                let painter = &mut runtime.text_renderers[index];
-                text.x = run.x as f32;
-                text.y = run.y as f32;
-                text.color = parse_text_color(&run.color).unwrap();
-                painter.prepare(&renderer.device, &renderer.queue, font_system,
-                    &mut runtime.text_atlas, &runtime.text_viewport,
-                    [TextArea { buffer: &text.buffer, left: text.x, top: text.y, scale: 1.0,
-                        bounds: text_bounds(run, renderer.config.width, renderer.config.height),
-                        default_color: text.color, custom_glyphs: &[] }], &mut runtime.swash_cache)
-                    .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))?;
-            }
+            let text = &mut runtime.text_buffers[index];
+            text.x = run.x as f32;
+            text.y = run.y as f32;
+            text.color = parse_text_color(&run.color).unwrap();
             runtime.text_run_options[index] = run.clone();
         }
+        runtime
+            .prepare_text_areas(
+                &renderer.device,
+                &renderer.queue,
+                renderer.config.width,
+                renderer.config.height,
+            )
+            .map_err(|error| Error::new(Status::GenericFailure, error))?;
         Ok(())
     }
 
@@ -3031,7 +3696,10 @@ impl Window {
     }
 
     #[napi(js_name = "updateTextAreas")]
-    pub fn update_text_areas(&mut self, options: Vec<TextAreaOptions>) -> Result<Vec<TextAreaState>> {
+    pub fn update_text_areas(
+        &mut self,
+        options: Vec<TextAreaOptions>,
+    ) -> Result<Vec<TextAreaState>> {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
@@ -3055,19 +3723,46 @@ impl Window {
 
     #[napi(js_name = "createImageTexture")]
     pub fn create_image_texture(&mut self, width: u32, height: u32, pixels: Buffer) -> Result<u32> {
-        let renderer = self.app.renderer.as_mut()
+        let renderer = self
+            .app
+            .renderer
+            .as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
-        renderer.upload_image(width, height, pixels.as_ref())
+        renderer
+            .upload_image(width, height, pixels.as_ref())
             .map_err(|error| Error::new(Status::InvalidArg, error))
     }
 
     #[napi(js_name = "deleteImageTexture")]
     pub fn delete_image_texture(&mut self, texture_id: u32) -> bool {
-        self.app.renderer.as_mut().is_some_and(|renderer| renderer.images.remove(&texture_id).is_some())
+        self.app
+            .renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.images.remove(&texture_id).is_some())
+    }
+
+    #[napi(js_name = "updateImageTexture")]
+    pub fn update_image_texture(&mut self, texture_id: u32, pixels: Buffer) -> Result<()> {
+        let renderer = self.app.renderer.as_ref().ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        let image = renderer.images.get(&texture_id).ok_or_else(|| Error::new(Status::InvalidArg, "unknown image texture"))?;
+        if pixels.len() != image.width as usize * image.height as usize * 4 {
+            return Err(Error::new(Status::InvalidArg, "image update must match the texture dimensions"));
+        }
+        renderer.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &image._texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            pixels.as_ref(),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(image.width * 4), rows_per_image: Some(image.height) },
+            wgpu::Extent3d { width: image.width, height: image.height, depth_or_array_layers: 1 },
+        );
+        Ok(())
     }
 
     #[napi(js_name = "presentWithImages")]
-    pub fn present_with_images(&mut self, display_list: Buffer, images: Vec<ImageDraw>) -> Result<PresentStats> {
+    pub fn present_with_images(
+        &mut self,
+        display_list: Buffer,
+        images: Vec<ImageDraw>,
+    ) -> Result<PresentStats> {
         self.present_display_list(display_list, images)
     }
 
@@ -3085,13 +3780,17 @@ impl Window {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
-        let (triangles, order) = parse_transformed_display_list(display_list.as_ref())?;
-        self.present_parsed(Vec::new(), triangles, Vec::new(), order)
+        let (triangles, images, order) = parse_transformed_display_list(display_list.as_ref())?;
+        self.present_parsed(Vec::new(), triangles, images, order)
     }
 }
 
 impl Window {
-    fn present_display_list(&mut self, display_list: Buffer, images: Vec<ImageDraw>) -> Result<PresentStats> {
+    fn present_display_list(
+        &mut self,
+        display_list: Buffer,
+        images: Vec<ImageDraw>,
+    ) -> Result<PresentStats> {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
@@ -3099,7 +3798,13 @@ impl Window {
         self.present_parsed(list, Vec::new(), images, Vec::new())
     }
 
-    fn present_parsed(&mut self, list: Vec<f32>, triangles: Vec<f32>, images: Vec<ImageDraw>, order: Vec<DrawOrder>) -> Result<PresentStats> {
+    fn present_parsed(
+        &mut self,
+        list: Vec<f32>,
+        triangles: Vec<f32>,
+        images: Vec<ImageDraw>,
+        order: Vec<DrawOrder>,
+    ) -> Result<PresentStats> {
         self.app.display_list = list;
         self.app.display_triangles = triangles;
         self.app.image_draws = images;
@@ -3187,17 +3892,27 @@ fn parse_display_list(bytes: &[u8]) -> Result<Vec<f32>> {
 
 fn parse_ordered_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<ImageDraw>, Vec<DrawOrder>)> {
     if bytes.len() < 8 || bytes.len() % 4 != 0 {
-        return Err(Error::new(Status::InvalidArg, "ordered display list must be a Float32Array"));
+        return Err(Error::new(
+            Status::InvalidArg,
+            "ordered display list must be a Float32Array",
+        ));
     }
-    let values = bytes.chunks_exact(4)
+    let values = bytes
+        .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect::<Vec<_>>();
     if values[0] != 2.0 || !values[1].is_finite() || values[1] < 0.0 || values[1].fract() != 0.0 {
-        return Err(Error::new(Status::InvalidArg, "unsupported ordered display-list header"));
+        return Err(Error::new(
+            Status::InvalidArg,
+            "unsupported ordered display-list header",
+        ));
     }
     let command_count = values[1] as usize;
     if command_count > 1_000_000 || values.len() != 2 + command_count * 10 {
-        return Err(Error::new(Status::InvalidArg, "ordered display-list command count does not match its data"));
+        return Err(Error::new(
+            Status::InvalidArg,
+            "ordered display-list command count does not match its data",
+        ));
     }
 
     let mut quads = Vec::new();
@@ -3205,13 +3920,22 @@ fn parse_ordered_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<ImageDraw>,
     let mut order = Vec::<DrawOrder>::new();
     for record in values[2..].chunks_exact(10) {
         if record.iter().any(|value| !value.is_finite()) {
-            return Err(Error::new(Status::InvalidArg, "display-list command values must be finite"));
+            return Err(Error::new(
+                Status::InvalidArg,
+                "display-list command values must be finite",
+            ));
         }
         match record[0] {
             0.0 => {
                 let quad = &record[1..9];
-                if quad[2] < 0.0 || quad[3] < 0.0 || quad[4..].iter().any(|value| !(0.0..=1.0).contains(value)) {
-                    return Err(Error::new(Status::InvalidArg, "solid command has invalid dimensions or color"));
+                if quad[2] < 0.0
+                    || quad[3] < 0.0
+                    || quad[4..].iter().any(|value| !(0.0..=1.0).contains(value))
+                {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        "solid command has invalid dimensions or color",
+                    ));
                 }
                 let first_vertex = (quads.len() / 8 * 6) as u32;
                 quads.extend_from_slice(quad);
@@ -3224,10 +3948,20 @@ fn parse_ordered_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<ImageDraw>,
             }
             1.0 => {
                 let texture_id = record[1];
-                if texture_id < 1.0 || texture_id > u32::MAX as f32 || texture_id.fract() != 0.0
-                    || record[4] < 0.0 || record[5] < 0.0 || record[6] < 0.0 || record[7] < 0.0 || record[8] < 0.0 || record[9] < 0.0
+                if texture_id < 1.0
+                    || texture_id > u32::MAX as f32
+                    || texture_id.fract() != 0.0
+                    || record[4] < 0.0
+                    || record[5] < 0.0
+                    || record[6] < 0.0
+                    || record[7] < 0.0
+                    || record[8] < 0.0
+                    || record[9] < 0.0
                 {
-                    return Err(Error::new(Status::InvalidArg, "image command has an invalid texture or dimensions"));
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        "image command has an invalid texture or dimensions",
+                    ));
                 }
                 let image_index = images.len();
                 images.push(ImageDraw {
@@ -3240,42 +3974,275 @@ fn parse_ordered_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<ImageDraw>,
                     clip_y: Some(record[7] as f64),
                     clip_width: Some(record[8] as f64),
                     clip_height: Some(record[9] as f64),
+                    vertices: None,
                 });
                 order.push(DrawOrder::Image(image_index));
             }
-            _ => return Err(Error::new(Status::InvalidArg, "ordered display-list command type is unknown")),
+            _ => {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "ordered display-list command type is unknown",
+                ))
+            }
         }
     }
     Ok((quads, images, order))
 }
 
-fn parse_transformed_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<DrawOrder>)> {
+fn parse_transformed_display_list(
+    bytes: &[u8],
+) -> Result<(Vec<f32>, Vec<ImageDraw>, Vec<DrawOrder>)> {
     if bytes.len() < 8 || bytes.len() % 4 != 0 {
-        return Err(Error::new(Status::InvalidArg, "transformed display list must be a Float32Array"));
+        return Err(Error::new(
+            Status::InvalidArg,
+            "transformed display list must be a Float32Array",
+        ));
     }
-    let values = bytes.chunks_exact(4)
+    let values = bytes
+        .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect::<Vec<_>>();
-    if values[0] != 3.0 || !values[1].is_finite() || values[1] < 0.0 || values[1].fract() != 0.0 {
-        return Err(Error::new(Status::InvalidArg, "unsupported transformed display-list header"));
+    if !matches!(values[0], 3.0 | 4.0 | 5.0)
+        || !values[1].is_finite()
+        || values[1] < 0.0
+        || values[1].fract() != 0.0
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "unsupported transformed display-list header",
+        ));
+    }
+    if values[0] == 3.0 {
+        let triangle_count = values[1] as usize;
+        if triangle_count > 1_000_000 || values.len() != 2 + triangle_count * 11 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "transformed display-list triangle count does not match its data",
+            ));
+        }
+        let mut vertices = Vec::with_capacity(triangle_count * 18);
+        for record in values[2..].chunks_exact(11) {
+            if record.iter().any(|value| !value.is_finite())
+                || record[0] != 0.0
+                || record[7..11]
+                    .iter()
+                    .any(|value| !(0.0..=1.0).contains(value))
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "transformed triangle contains invalid coordinates or color",
+                ));
+            }
+            for position in record[1..7].chunks_exact(2) {
+                vertices.extend_from_slice(&[
+                    position[0],
+                    position[1],
+                    record[7],
+                    record[8],
+                    record[9],
+                    record[10],
+                ]);
+            }
+        }
+        let order = if triangle_count == 0 {
+            Vec::new()
+        } else {
+            vec![DrawOrder::Triangles(0..(triangle_count * 3) as u32)]
+        };
+        return Ok((vertices, Vec::new(), order));
     }
     let triangle_count = values[1] as usize;
-    if triangle_count > 1_000_000 || values.len() != 2 + triangle_count * 11 {
-        return Err(Error::new(Status::InvalidArg, "transformed display-list triangle count does not match its data"));
+    if triangle_count > 1_000_000 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "transformed display list contains too many commands",
+        ));
     }
-    let mut vertices = Vec::with_capacity(triangle_count * 18);
-    for record in values[2..].chunks_exact(11) {
-        if record.iter().any(|value| !value.is_finite()) || record[0] != 0.0
-            || record[7..11].iter().any(|value| !(0.0..=1.0).contains(value))
-        {
-            return Err(Error::new(Status::InvalidArg, "transformed triangle contains invalid coordinates or color"));
-        }
-        for position in record[1..7].chunks_exact(2) {
-            vertices.extend_from_slice(&[position[0], position[1], record[7], record[8], record[9], record[10]]);
+    let mut vertices = Vec::with_capacity(values.len().saturating_mul(2));
+    let mut images = Vec::new();
+    // Most adjacent triangle records collapse into a single GPU range.
+    let mut order = Vec::with_capacity(triangle_count.min(64));
+    let mut cursor = 2;
+    for _ in 0..triangle_count {
+        let tag = *values
+            .get(cursor)
+            .ok_or_else(|| Error::new(Status::InvalidArg, "truncated transformed display list"))?;
+        cursor += 1;
+        if tag == 0.0 {
+            let end = cursor + 10;
+            let record = values
+                .get(cursor..end)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "truncated transformed triangle"))?;
+            if record.iter().any(|value| !value.is_finite())
+                || record[6..10]
+                    .iter()
+                    .any(|value| !(0.0..=1.0).contains(value))
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "transformed triangle contains invalid coordinates or color",
+                ));
+            }
+            let start = (vertices.len() / 6) as u32;
+            for position in record[0..6].chunks_exact(2) {
+                vertices.extend_from_slice(&[
+                    position[0],
+                    position[1],
+                    record[6],
+                    record[7],
+                    record[8],
+                    record[9],
+                ]);
+            }
+            let finish = (vertices.len() / 6) as u32;
+            let extends_previous = matches!(order.last(), Some(DrawOrder::Triangles(previous)) if previous.end == start);
+            if extends_previous {
+                if let Some(DrawOrder::Triangles(previous)) = order.last_mut() {
+                    previous.end = finish;
+                }
+            } else {
+                order.push(DrawOrder::Triangles(start..finish));
+            }
+            cursor = end;
+        } else if tag == 2.0 && values[0] == 5.0 {
+            let header_end = cursor.checked_add(10).ok_or_else(|| {
+                Error::new(Status::InvalidArg, "transformed canvas is too large")
+            })?;
+            let header = values.get(cursor..header_end).ok_or_else(|| {
+                Error::new(Status::InvalidArg, "truncated transformed canvas header")
+            })?;
+            let (clip_x, clip_y, clip_width, clip_height) =
+                (header[0], header[1], header[2], header[3]);
+            let (origin_x, origin_y, scale_x, scale_y, opacity) =
+                (header[4], header[5], header[6], header[7], header[8]);
+            let canvas_triangles = header[9];
+            if header.iter().any(|value| !value.is_finite())
+                || clip_width < 0.0
+                || clip_height < 0.0
+                || !(0.0..=1.0).contains(&opacity)
+                || canvas_triangles < 0.0
+                || canvas_triangles.fract() != 0.0
+                || canvas_triangles > 1_000_000.0
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "transformed canvas header is invalid",
+                ));
+            }
+            let canvas_triangles = canvas_triangles as usize;
+            cursor = header_end;
+            let end = cursor
+                .checked_add(canvas_triangles.checked_mul(10).ok_or_else(|| {
+                    Error::new(Status::InvalidArg, "transformed canvas is too large")
+                })?)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "transformed canvas is too large"))?;
+            let raw_triangles = values.get(cursor..end).ok_or_else(|| {
+                Error::new(Status::InvalidArg, "truncated transformed canvas triangles")
+            })?;
+            let start = (vertices.len() / 6) as u32;
+            for triangle in raw_triangles.chunks_exact(10) {
+                if triangle.iter().any(|value| !value.is_finite())
+                    || triangle[6..10]
+                        .iter()
+                        .any(|value| !(0.0..=1.0).contains(value))
+                {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        "transformed canvas triangle is invalid",
+                    ));
+                }
+                for position in triangle[0..6].chunks_exact(2) {
+                    vertices.extend_from_slice(&[
+                        origin_x + position[0] * scale_x,
+                        origin_y + position[1] * scale_y,
+                        triangle[6],
+                        triangle[7],
+                        triangle[8],
+                        triangle[9] * opacity,
+                    ]);
+                }
+            }
+            let finish = (vertices.len() / 6) as u32;
+            if finish > start {
+                order.push(DrawOrder::CanvasTriangles {
+                    range: start..finish,
+                    clip_x: clip_x as f64,
+                    clip_y: clip_y as f64,
+                    clip_width: clip_width as f64,
+                    clip_height: clip_height as f64,
+                });
+            }
+            cursor = end;
+        } else if tag == 1.0 {
+            let header_end = cursor + 6;
+            let header = values.get(cursor..header_end).ok_or_else(|| {
+                Error::new(Status::InvalidArg, "truncated transformed image header")
+            })?;
+            let texture_id = header[0];
+            let triangle_vertices = header[5];
+            if !texture_id.is_finite()
+                || texture_id <= 0.0
+                || texture_id.fract() != 0.0
+                || header[1..5].iter().any(|value| !value.is_finite())
+                || header[3] < 0.0
+                || header[4] < 0.0
+                || !triangle_vertices.is_finite()
+                || triangle_vertices < 3.0
+                || triangle_vertices.fract() != 0.0
+                || (triangle_vertices as usize) % 3 != 0
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "transformed image header is invalid",
+                ));
+            }
+            cursor = header_end;
+            let vertex_count = triangle_vertices as usize;
+            let end = cursor
+                .checked_add(vertex_count.checked_mul(5).ok_or_else(|| {
+                    Error::new(Status::InvalidArg, "transformed image is too large")
+                })?)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "transformed image is too large"))?;
+            let raw_vertices = values.get(cursor..end).ok_or_else(|| {
+                Error::new(Status::InvalidArg, "truncated transformed image vertices")
+            })?;
+            if raw_vertices
+                .chunks_exact(5)
+                .any(|vertex| vertex.iter().any(|value| !value.is_finite()) || vertex[4] <= 0.0)
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "transformed image vertex is invalid",
+                ));
+            }
+            images.push(ImageDraw {
+                texture_id: texture_id as u32,
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                clip_x: Some(header[1] as f64),
+                clip_y: Some(header[2] as f64),
+                clip_width: Some(header[3] as f64),
+                clip_height: Some(header[4] as f64),
+                vertices: Some(raw_vertices.iter().map(|value| *value as f64).collect()),
+            });
+            order.push(DrawOrder::Image(images.len() - 1));
+            cursor = end;
+        } else {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "unknown transformed display-list command",
+            ));
         }
     }
-    let order = if triangle_count == 0 { Vec::new() } else { vec![DrawOrder::Triangles(0..(triangle_count * 3) as u32)] };
-    Ok((vertices, order))
+    if cursor != values.len() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "transformed display list contains trailing data",
+        ));
+    }
+    Ok((vertices, images, order))
 }
 
 impl LayoutTree {

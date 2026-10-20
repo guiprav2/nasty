@@ -1,35 +1,22 @@
-import os from "node:os";
-import { spawn } from "node:child_process";
-import { promisify } from "node:util";
-import { execFile } from "node:child_process";
-const execFileAsync = promisify(execFile);
-import { performance } from "node:perf_hooks";
-import { Document, TransitionEvent, Window, buildTransformedDisplayList } from "../index.js";
-import { documentBoxesFor, layoutDocument } from "../internal/dom-state.js";
-import { prepareDocumentText } from "../internal/dom-text.js";
-
-// Automatic feature tour; all artwork is built from DOM primitives.
+// Browser-native promo tour; uses only DOM, CSSOM, and animation-frame APIs.
 // 1 = twice the original duration; 0.5 = original pace; 2 = slower still.
-const args = process.argv.slice(2);
-let recordPath = null;
-if (args.length) {
-  if (args.length !== 2 || args[0] !== "--record" || !args[1]) throw new Error("Usage: node node/examples/tour.js [--record <path_to_mp4>]");
-  recordPath = args[1];
+if (typeof document === "undefined") {
+  await import("./tour-node-host.js").then(({ install }) => install());
 }
-const timeMultiplier = Number(process.env.NASTY_TOUR_TIME_MULTIPLIER ?? 1);
+const parameters = new URLSearchParams(location.search);
+const timeMultiplier = Number(parameters.get("timeMultiplier") ?? 1);
+const recording = parameters.get("record") === "1";
 if (!Number.isFinite(timeMultiplier) || timeMultiplier <= 0) {
-  throw new RangeError("NASTY_TOUR_TIME_MULTIPLIER must be a finite positive number");
+  throw new RangeError("timeMultiplier must be a finite positive number");
 }
 const duration = (milliseconds) => milliseconds * 2 * timeMultiplier;
 const layoutWidth = 900;
 const layoutHeight = 560;
-const width = 1280;
-const height = 720;
-const renderScale = height / layoutHeight;
-const sceneOffsetX = (width - layoutWidth * renderScale) / 2;
-const window = new Window({ resizable: "none", title: "Nasty — JavaScript & DOM, full circle", width, height, visible: false });
-const document = new Document();
-window.document = document;
+let width = window.innerWidth;
+let height = window.innerHeight;
+let renderScale = Math.min(width / layoutWidth, height / layoutHeight);
+let sceneOffsetX = (width - layoutWidth * renderScale) / 2;
+let sceneOffsetY = (height - layoutHeight * renderScale) / 2;
 
 const theme = {
   // Solid colors enter the current linear-color compositor; these two dark
@@ -40,24 +27,38 @@ const theme = {
 const cols = 5;
 const rows = 4;
 const viewport = document.body;
-Object.assign(viewport.style, { width, height, overflow: "hidden", backgroundColor: theme.ink });
+setStyles(viewport, { width, height, margin: 0, overflow: "hidden", backgroundColor: theme.ink });
 const canvas = document.createElement("div");
-Object.assign(canvas.style, {
-  display: "flex", direction: "column", width: cols * layoutWidth, height: rows * layoutHeight,
-  transform: `translateX(${sceneOffsetX}px) scale(${renderScale}) translate(0px, 0px)`, transformOrigin: "top left",
+setStyles(canvas, {
+  display: "flex", flexDirection: "column", width: cols * layoutWidth, height: rows * layoutHeight,
+  transform: `translate(${sceneOffsetX}px, ${sceneOffsetY}px) scale(${renderScale})`, transformOrigin: "top left",
 });
 viewport.appendChild(canvas);
+let cameraCol = 0;
+let cameraRow = 0;
+
+function cssPixel(value) {
+  const rounded = Math.abs(value) < 0.0005 ? 0 : Number(value.toFixed(3));
+  return `${rounded}px`;
+}
+function setStyles(element, styles) {
+  const pixelProperties = /^(width|height|minWidth|minHeight|maxWidth|maxHeight|gap|rowGap|columnGap|padding(?:Top|Right|Bottom|Left)?|margin(?:Top|Right|Bottom|Left)?|border(?:Top|Right|Bottom|Left)?Width|fontSize|lineHeight)$/;
+  for (const [property, value] of Object.entries(styles)) {
+    element.style[property] = typeof value === "number" && pixelProperties.test(property) ? cssPixel(value) : value;
+  }
+}
 
 const slides = [];
 const motionBySlide = new Map();
 const threeDCards = [];
 const springCards = [];
+const tourImages = [];
 let capturingSlide = null;
 let capturingGroup = null;
 
 function box(parent, styles) {
   const element = document.createElement("div");
-  Object.assign(element.style, styles);
+  setStyles(element, { margin: 0, padding: 0, borderWidth: 0, borderStyle: "none", ...styles });
   parent.appendChild(element);
   if (capturingSlide) {
     capturingSlide.elements.push(element);
@@ -66,22 +67,30 @@ function box(parent, styles) {
   return element;
 }
 function horizontal(parent, styles = {}) {
-  return box(parent, { display: "flex", direction: "row", alignItems: "center", ...styles });
+  return box(parent, { display: "flex", flexDirection: "row", alignItems: "center", ...styles });
 }
 function vertical(parent, styles = {}) {
-  return box(parent, { display: "flex", direction: "column", ...styles });
+  return box(parent, { display: "flex", flexDirection: "column", ...styles });
 }
 function setCamera(col, row) {
-  canvas.style.transform = `translateX(${sceneOffsetX}px) scale(${renderScale}) translate(${-col * layoutWidth}px, ${-row * layoutHeight}px)`;
+  cameraCol = col;
+  cameraRow = row;
+  canvas.style.transform = `translate(${cssPixel(sceneOffsetX)}, ${cssPixel(sceneOffsetY)}) scale(${renderScale}) translate(${cssPixel(-col * layoutWidth)}, ${cssPixel(-row * layoutHeight)})`;
 }
+window.addEventListener("resize", () => {
+  width = window.innerWidth;
+  height = window.innerHeight;
+  renderScale = Math.min(width / layoutWidth, height / layoutHeight);
+  sceneOffsetX = (width - layoutWidth * renderScale) / 2;
+  sceneOffsetY = (height - layoutHeight * renderScale) / 2;
+  setStyles(viewport, { width, height });
+  setCamera(cameraCol, cameraRow);
+});
 
 function copy(parent, tag, text, styles) {
   const element = document.createElement(tag);
   element.textContent = text;
-  const sizedStyles = { ...styles };
-  if (typeof sizedStyles.fontSize === "number") sizedStyles.fontSize *= renderScale;
-  if (typeof sizedStyles.lineHeight === "number") sizedStyles.lineHeight *= renderScale;
-  Object.assign(element.style, { flexShrink: 0, color: theme.white, fontFamily: "sans-serif", ...sizedStyles });
+  setStyles(element, { margin: 0, padding: 0, borderWidth: 0, borderStyle: "none", flexShrink: 0, color: theme.white, fontFamily: "sans-serif", ...(text.includes("\n") ? { whiteSpace: "pre-line" } : {}), ...styles });
   parent.appendChild(element);
   capturingSlide.elements.push(element);
   capturingGroup?.elements.push(element);
@@ -111,34 +120,16 @@ function endSlide() {
   for (const group of capturingSlide.groups) {
     const groupElements = new Set(group.elements);
     group.entries = group.elements
-      .filter(element => !groupElements.has(element.parent))
+      .filter(element => !groupElements.has(element.parentElement))
       .map(element => ({ element, transform: element.style.transform }));
     group.elements = undefined;
   }
   const boxElements = new Set([capturingSlide.slide.cell, ...capturingSlide.elements]);
   for (const element of capturingSlide.elements) {
-    for (let parent = element.parent; parent; parent = parent.parent) boxElements.add(parent);
+    for (let parent = element.parentElement; parent && parent !== document.body; parent = parent.parentElement) boxElements.add(parent);
   }
   capturingSlide.slide.boxElements = boxElements;
   capturingSlide = null;
-}
-const sceneElementSets = new Map();
-function sceneElements(sceneSlides) {
-  const key = sceneSlides.map((slide) => `${slide.col},${slide.row}`).join("|");
-  let elements = sceneElementSets.get(key);
-  if (!elements) {
-    const visible = new Set();
-    for (const slide of sceneSlides) for (const element of slide.boxElements) visible.add(element);
-    const ordered = [];
-    const collectInPaintOrder = (element) => {
-      if (visible.has(element)) ordered.push(element);
-      for (const child of element.children) collectInPaintOrder(child);
-    };
-    collectInPaintOrder(document.body);
-    elements = new Set(ordered);
-    sceneElementSets.set(key, elements);
-  }
-  return elements;
 }
 function architecture(stage) {
       const shell = vertical(stage, {
@@ -244,7 +235,7 @@ function lazyFontArt(stage) {
     justifyContent: "center", gap: 16, width: 350, height: 255, padding: 21,
     backgroundColor: "#142238", borderWidth: 1, borderStyle: "solid", borderColor: "#405671",
   });
-  copy(panel, "p", "font-[Family_Name]", { height: 34, fontSize: 22, lineHeight: 30, color: theme.gold, fontFamily: "monospace" });
+  copy(panel, "p", 'style.fontFamily', { height: 34, fontSize: 22, lineHeight: 30, color: theme.gold, fontFamily: "Liberation Mono" });
   const loading = horizontal(panel, { alignItems: "center", gap: 10, height: 18 });
   box(loading, { width: 10, height: 10, backgroundColor: theme.cyan });
   box(loading, { width: 112, height: 5, backgroundColor: "#637d9b" });
@@ -262,17 +253,19 @@ function lazyFontArt(stage) {
 
 function imageArt(stage) {
   const frame = vertical(stage, {
-    width: 330, height: 245, overflow: "hidden", borderWidth: 2, borderStyle: "solid", borderColor: "#8ca8ca",
+    width: 330, height: 250, borderWidth: 2, borderStyle: "solid", borderColor: "#8ca8ca",
     backgroundColor: "#274866", transform: "perspective(800px) rotateY(-8deg) rotateX(2deg)", transformOrigin: "center center",
   });
-  const sky = vertical(frame, { width: 340, height: 138, backgroundColor: "#4985a9" });
-  box(sky, { width: 42, height: 42, marginLeft: 245, marginTop: 18, backgroundColor: theme.gold });
-  const ridge = horizontal(frame, { alignItems: "end", width: 350, height: 92, marginTop: -4 });
-  for (const [width, height, color] of [[128, 88, "#152c3d"], [178, 69, "#1d3e50"], [122, 51, "#315d69"]]) {
-    box(ridge, { width, height, marginLeft: -24, backgroundColor: color });
-  }
-  horizontal(frame, { justifyContent: "space-between", width: 326, height: 13, paddingLeft: 12, paddingRight: 12, backgroundColor: "#0e1926" });
-  box(frame, { width: 150, height: 5, marginLeft: 14, marginTop: -9, backgroundColor: theme.cyan });
+  const image = document.createElement("img");
+  image.width = 326;
+  image.height = 244;
+  image.setAttribute("alt", "Calm Yellowstone Lake with distant snowy mountains under a cloudy sky");
+  image.src = new URL("./assets/yellowstone-lake.jpg", import.meta.url).href;
+  setStyles(image, { width: 326, height: 244, flexShrink: 0 });
+  frame.appendChild(image);
+  capturingSlide.elements.push(image);
+  capturingGroup?.elements.push(image);
+  tourImages.push(image);
 }
 
 function inputArt(stage) {
@@ -346,8 +339,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "NASTY     /     JAVASCRIPT + NATIVE GRAPHICS", { height: 28, fontSize: 13, lineHeight: 20, color: theme.muted });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.cyan, gap: 16 });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.cyan, gap: 16 });
   beginMotionGroup("eyebrow");
   copy(words, "p", "JAVASCRIPT & DOM, FULL CIRCLE", { height: 22, fontSize: 14, lineHeight: 22, color: theme.cyan });
   endMotionGroup();
@@ -370,8 +363,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "01   /   DOM + LAYOUT", { height: 28, fontSize: 14, lineHeight: 22, color: theme.blue });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.blue, gap: 18 });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.blue, gap: 18 });
   beginMotionGroup("title");
   copy(words, "h1", "Web structure.\nNative speed.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -391,8 +384,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "02   /   TRANSFORMS + GPU", { height: 28, fontSize: 14, lineHeight: 22, color: theme.lilac });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.lilac });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.lilac });
   beginMotionGroup("title");
   copy(words, "h1", "JavaScript shapes\nthe scene.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -412,8 +405,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "03   /   CSS TRANSITIONS", { height: 28, fontSize: 14, lineHeight: 22, color: theme.cyan });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.cyan });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.cyan });
   beginMotionGroup("title");
   copy(words, "h1", "Motion with\nintent.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -433,8 +426,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "04   /   SYSTEM TYPOGRAPHY", { height: 28, fontSize: 14, lineHeight: 22, color: theme.gold });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.gold });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.gold });
   beginMotionGroup("title");
   copy(words, "h1", "Your system.\nEvery script.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -445,7 +438,7 @@ function framePacingArt(stage) {
   systemFontArt(horizontal(main, { width: 350, height: 320, justifyContent: "center" }));
   endMotionGroup();
   beginMotionGroup("meta");
-  copy(cell, "p", "NO BAKED FONT FILES. WORKER-SHAPED GLYPHS.", { height: 22, fontSize: 12, lineHeight: 18, color: theme.muted });
+  copy(cell, "p", "SYSTEM FALLBACK. WORKER-SHAPED GLYPHS.", { height: 22, fontSize: 12, lineHeight: 18, color: theme.muted });
   endMotionGroup();
   endSlide();
 }
@@ -454,13 +447,13 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "05   /   CUSTOM FONT LOADING", { height: 28, fontSize: 14, lineHeight: 22, color: theme.gold });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.gold });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.gold });
   beginMotionGroup("title");
   copy(words, "h1", "Bring your\nown type.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
   beginMotionGroup("body");
-  copy(words, "p", "Tailwind-style font-[Family_Name] utilities resolve lazily on first use. Font bytes load once, then shaping happens off the frame loop.", { height: 145, fontSize: 17, lineHeight: 27, color: theme.muted });
+  copy(words, "p", "Set style.fontFamily to load shared fonts from fonts/. Family names map to lowercase ASCII filenames with underscores for spaces.", { height: 145, fontSize: 17, lineHeight: 27, color: theme.muted });
   endMotionGroup();
   beginMotionGroup("art");
   lazyFontArt(horizontal(main, { width: 350, height: 320, justifyContent: "center" }));
@@ -475,8 +468,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "06   /   IMAGE ELEMENTS", { height: 28, fontSize: 14, lineHeight: 22, color: theme.cyan });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.cyan });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.cyan });
   beginMotionGroup("title");
   copy(words, "h1", "Images belong\nin the DOM.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -496,8 +489,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "07   /   TEXT CONTROLS", { height: 28, fontSize: 14, lineHeight: 22, color: theme.blue });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.blue });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.blue });
   beginMotionGroup("title");
   copy(words, "h1", "Caret-close\nediting.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -517,8 +510,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "08   /   BOX MODEL + OVERFLOW", { height: 28, fontSize: 14, lineHeight: 22, color: theme.cyan });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.cyan });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.cyan });
   beginMotionGroup("title");
   copy(words, "h1", "Layout that\nclips cleanly.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -538,8 +531,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "09   /   THREADED LAYOUT", { height: 28, fontSize: 14, lineHeight: 22, color: theme.lilac });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.lilac });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.lilac });
   beginMotionGroup("title");
   copy(words, "h1", "Keep the frame\nloop clear.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -559,8 +552,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "10   /   THREADED RENDERING", { height: 28, fontSize: 14, lineHeight: 22, color: theme.lilac });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.lilac });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.lilac });
   beginMotionGroup("title");
   copy(words, "h1", "A free main\nthread.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -580,8 +573,8 @@ function framePacingArt(stage) {
   beginMotionGroup("kicker");
   copy(cell, "p", "11   /   MEASURED PRESENTATION", { height: 28, fontSize: 14, lineHeight: 22, color: theme.gold });
   endMotionGroup();
-  const main = horizontal(cell, { height: 350, gap: 30 });
-  const words = vertical(main, { width: 370, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.gold });
+  const main = horizontal(cell, { height: 350, gap: 30, justifyContent: "space-between" });
+  const words = vertical(main, { width: 340, flexShrink: 0, gap: 18, paddingLeft: 28, borderLeftWidth: 3, borderStyle: "solid", borderColor: theme.gold });
   beginMotionGroup("title");
   copy(words, "h1", "Every frame\ngets counted.", { height: 96, fontSize: 36, lineHeight: 47 });
   endMotionGroup();
@@ -611,17 +604,17 @@ const floatingArtwork = slides.map((slide, index) => ({
 if (floatingArtwork.some((artwork) => !artwork.entry)) {
   throw new Error("every tour slide must define a top-level artwork group");
 }
-await layoutDocument(document, width, height);
+for (const [index, slide] of slides.entries()) {
+  slide.cell.style.opacity = index === 0 ? "1" : "0";
+}
 setCamera(0, 0);
-const fontPrepareStarted = performance.now();
-await prepareDocumentText(window, document);
-console.log(`opening DOM fonts and glyphs ready in ${(performance.now() - fontPrepareStarted).toFixed(1)} ms before window show`);
-let refreshHz = window.refreshRate() > 0 ? window.refreshRate() : 60;
-let frameBudget = 1000 / refreshHz;
-const dwellMs = duration(Number(process.env.NASTY_TOUR_DWELL_MS ?? 5200));
+await document.fonts?.ready;
+await Promise.all(tourImages.map((image) => image.decode()));
+document.body.setAttribute("data-promo-status", "running");
+document.body.setAttribute("data-tour-perf-stage", "hold:00");
+const dwellMs = duration(Number(parameters.get("dwellMs") ?? 5200));
 const scrollMs = duration(1100);
 let started = performance.now();
-let deadline = started;
 let previous = started;
 let pacedTicks = 0;
 let presentedFrames = 0;
@@ -647,32 +640,18 @@ const route = forwardRoute;
 let routeIndex = 0;
 let completedCycles = 0;
 let completedTransitions = 0;
-const cycleLimit = recordPath ? 1 : Number(process.env.NASTY_TOUR_CYCLES ?? 0);
-if (!Number.isInteger(cycleLimit) || cycleLimit < 0) throw new RangeError("NASTY_TOUR_CYCLES must be a nonnegative integer");
-let skippedDeadlines = 0;
+const cycleLimit = Number(parameters.get("cycles") ?? 0);
+if (!Number.isInteger(cycleLimit) || cycleLimit < 0) throw new RangeError("cycles must be a nonnegative integer");
 const frameIntervals = [];
-const buildTimes = [];
-const boxTimes = [];
-const presentTimes = [];
-const nativeRenderTimes = [];
-const nativePrepareTimes = [];
-console.log(`Nasty ${slides.length}-slide promo; ${refreshHz.toFixed(3)} Hz target; adapter ${window.adapterName()}; timing multiplier ${timeMultiplier}; ${dwellMs / 1000}s per slide`);
-console.log(`Automatic presentation — close the window to exit.${recordPath ? ` Recording MP4 to ${recordPath}` : ""}.`);
-let recorder = null;
-const initialElements = sceneElements([slides[0]]);
-const initialDisplayList = buildTransformedDisplayList(documentBoxesFor(document, initialElements), width, height);
-window.presentTransformed(initialDisplayList);
-window.show();
-if (recordPath) recorder = await startRecorder(recordPath);
-started = performance.now();
-deadline = started;
-previous = started;
+console.log(`Nasty DOM feature tour; ${slides.length} slides; timing multiplier ${timeMultiplier}; ${dwellMs / 1000}s per slide`);
+if (recording) console.log("Recording mode — one forward pass, ending on the final slide.");
+console.log("Automatic presentation — press Escape to pause/exit.");
 nextSlideAt = started + dwellMs;
 floatingArtworkStart[0] = started;
-const cpuStart = process.cpuUsage();
-const hostCpuStart = os.cpus();
-const hostTotalStart = hostCpuStart.reduce((sum, cpu) => sum + Object.values(cpu.times).reduce((a, b) => a + b, 0), 0);
-const hostIdleStart = hostCpuStart.reduce((sum, cpu) => sum + cpu.times.idle, 0);
+let stopped = false;
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") stopped = true;
+});
 
 function setElementTransform(entry, transform) {
   entry.element.style.transform = transform || "none";
@@ -691,8 +670,10 @@ function animateFloatingArtwork(now) {
   const began = floatingArtworkStart[slideIndex];
   if (!artwork?.entry || began === null) return false;
   const seconds = (now - began) / 1000;
-  const x = artwork.xAmplitude * Math.sin((2 * Math.PI * seconds) / (artwork.xPeriod * timeMultiplier) + artwork.phase);
-  const y = artwork.yAmplitude * Math.sin((2 * Math.PI * seconds) / (artwork.yPeriod * timeMultiplier) + artwork.phase * 0.73);
+  const xPhase = artwork.phase;
+  const yPhase = artwork.phase * 0.73;
+  const x = artwork.xAmplitude * (Math.sin((2 * Math.PI * seconds) / (artwork.xPeriod * timeMultiplier) + xPhase) - Math.sin(xPhase)) / (1 + Math.abs(Math.sin(xPhase)));
+  const y = artwork.yAmplitude * (Math.sin((2 * Math.PI * seconds) / (artwork.yPeriod * timeMultiplier) + yPhase) - Math.sin(yPhase)) / (1 + Math.abs(Math.sin(yPhase)));
   const base = artwork.entry.transform && artwork.entry.transform !== "none" ? `${artwork.entry.transform} ` : "";
   setElementTransform(artwork.entry, `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0px) ${base}`);
   return true;
@@ -762,107 +743,54 @@ function animateThreeDCards(now) {
   }
 }
 
-async function startRecorder(path) {
-  const display = process.env.DISPLAY;
-  if (!display) throw new Error("--record needs an X11 DISPLAY for streaming capture");
-  let windowId;
-  for (let attempt = 0; attempt < 50; attempt++) {
-    try {
-      ({ stdout: windowId } = await execFileAsync("xdotool", ["search", "--onlyvisible", "--name", "Nasty"]));
-      windowId = windowId.trim().split(/\s+/).at(-1);
-      if (windowId) break;
-    } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  if (!windowId) throw new Error("could not locate the Nasty window for recording");
-  const { stdout } = await execFileAsync("xwininfo", ["-id", windowId]);
-  const readGeometry = (label) => {
-    const match = stdout.match(new RegExp(`${label}:\\s+(-?\\d+)`));
-    if (!match) throw new Error(`could not read Nasty client ${label.toLowerCase()}`);
-    return Number(match[1]);
-  };
-  const x = readGeometry("Absolute upper-left X");
-  const y = readGeometry("Absolute upper-left Y");
-  if (readGeometry("Width") !== width || readGeometry("Height") !== height) throw new Error("Nasty client size changed before recording started");
-  const input = `${display}+${x},${y}`;
-  const child = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "x11grab", "-framerate", String(refreshHz), "-video_size", `${width}x${height}`, "-draw_mouse", "0", "-i", input, "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", path], { stdio: ["ignore", "ignore", "pipe"] });
-  let errorText = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => { errorText = (errorText + chunk).slice(-4096); });
-  let stopping = false;
-  const exited = new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) => code === 0 || (stopping && (signal === "SIGINT" || code === 255))
-      ? resolve() : reject(new Error(`ffmpeg exited ${code ?? signal}: ${errorText.trim()}`)));
-  });
-  exited.catch(() => {});
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  if (child.exitCode !== null) throw new Error(`ffmpeg exited early: ${errorText.trim()}`);
-  console.log(`streaming ${width}x${height} display capture at ${refreshHz.toFixed(3)} Hz to ${path}`);
-  return { child, exited, set stopping(value) { stopping = value; } };
-}
-
-async function stopRecorder(state) {
-  state.stopping = true;
-  state.child.kill("SIGINT");
-  await state.exited;
-  console.log("MP4 recording finalized");
-}
-
-function draw() {
-  if (window.closed) return finish();
-  const now = performance.now();
-  const phaseAtStart = phase;
+function draw(now) {
+  if (stopped) return finish();
   let finishAfterFrame = false;
   let sceneChanged = false;
   let completedTransition = null;
   const interval = pacedTicks ? now - previous : 0;
   if (pacedTicks) frameIntervals.push(interval);
   previous = now;
-  if (phase === "recordFinalWait" && now >= nextSlideAt) return finish();
-  if (phase === "recordEnd" && now >= nextSlideAt) {
-    for (const card of threeDCards) setElementTransform(card, card.baseTransform);
-    phase = "recordFinalFrame";
-  }
-  if (phase === "hold" && now >= nextSlideAt && !(slideIndex === 2 && !threeDAnimationFinished)) {
+  const recordingFinalSlide = recording && routeIndex === route.length - 1;
+  if (phase === "hold" && now >= nextSlideAt && recordingFinalSlide) finishAfterFrame = true;
+  if (phase === "hold" && now >= nextSlideAt && !recordingFinalSlide && !(slideIndex === 2 && !threeDAnimationFinished)) {
     let loopToStart = false;
     if (routeIndex === route.length - 1) {
-      if (recordPath) {
-        phase = "recordEnd";
-        nextSlideAt = now + Math.max(5700, duration(2850));
-      } else {
-        routeIndex = 0;
-        loopToStart = true;
-      }
+      routeIndex = 0;
+      loopToStart = true;
     }
-    if (phase !== "recordEnd") {
-      const previousSlide = slideIndex;
-      nextSlideIndex = loopToStart ? route[0] : route[++routeIndex];
-      const incomingArtwork = floatingArtwork[nextSlideIndex];
-      if (incomingArtwork?.entry) setElementTransform(incomingArtwork.entry, incomingArtwork.entry.transform);
-      if (previousSlide === 2) {
-        slideTwoSettledAt = Number.POSITIVE_INFINITY;
-        for (const card of threeDCards) setElementTransform(card, card.baseTransform);
-      }
-      if (previousSlide === springSlideIndex) {
-        springArtworkFinished = true;
-        for (const card of springCards) setElementTransform(card, card.baseTransform);
-      }
-      phase = "scroll";
-      phaseStarted = now;
-      activeTransition = { from: slides[previousSlide], to: slides[nextSlideIndex], intervals: [], presents: [], nativePrepare: [], acquire: [], submit: [], surface: [] };
-      console.log(`scroll to slide ${String(nextSlideIndex).padStart(2, "0")}`);
+    const previousSlide = slideIndex;
+    nextSlideIndex = loopToStart ? route[0] : route[++routeIndex];
+    const incomingArtwork = floatingArtwork[nextSlideIndex];
+    if (incomingArtwork?.entry) setElementTransform(incomingArtwork.entry, incomingArtwork.entry.transform);
+    if (previousSlide === 2) {
+      slideTwoSettledAt = Number.POSITIVE_INFINITY;
+      for (const card of threeDCards) setElementTransform(card, card.baseTransform);
     }
+    if (previousSlide === springSlideIndex) {
+      springArtworkFinished = true;
+      for (const card of springCards) setElementTransform(card, card.baseTransform);
+    }
+    phase = "scroll";
+    phaseStarted = now;
+    activeTransition = { from: slides[previousSlide], to: slides[nextSlideIndex], intervals: [] };
+    document.body.setAttribute("data-tour-perf-stage", `pan:${String(previousSlide).padStart(2, "0")}→${String(nextSlideIndex).padStart(2, "0")}`);
+    console.log(`scroll to slide ${String(nextSlideIndex).padStart(2, "0")}`);
   }
   if (phase === "scroll") {
     const t = Math.min(1, (now - phaseStarted) / scrollMs);
     const amount = easeInOut(t);
     const { from, to } = activeTransition;
     setCamera(from.col + (to.col - from.col) * amount, from.row + (to.row - from.row) * amount);
+    from.cell.style.opacity = String(1 - amount);
+    to.cell.style.opacity = String(amount);
     if (t === 1) {
       completedTransition = activeTransition;
       slideIndex = nextSlideIndex;
+      document.body.setAttribute("data-tour-perf-stage", `hold:${String(slideIndex).padStart(2, "0")}`);
       setCamera(to.col, to.row);
+      from.cell.style.opacity = "0";
+      to.cell.style.opacity = "1";
       completedTransitions++;
       sceneChanged = true;
       console.log(`show slide ${String(nextSlideIndex).padStart(2, "0")}`);
@@ -881,7 +809,7 @@ function draw() {
         springArtworkStartedAt = now;
         springArtworkFinished = false;
       }
-      if (from === slides.at(-1) && to === slides[0] && !recordPath) {
+      if (from === slides.at(-1) && to === slides[0]) {
         completedCycles++;
         console.log(`cycle ${completedCycles} complete — opening slide rendered`);
         if (cycleLimit && completedCycles >= cycleLimit) finishAfterFrame = true;
@@ -893,99 +821,25 @@ function draw() {
   }
   const transitionForFrame = phase === "scroll" ? activeTransition : completedTransition;
   if (transitionForFrame) transitionForFrame.intervals.push(interval);
-  const floatingAnimating = animateFloatingArtwork(now);
-  const springAnimating = animateSpringArtwork(now);
-  if (slideIndex === 2 && (phase === "hold" || phase === "recordEnd")) animateThreeDCards(now);
-  const threeDElapsed = now - slideTwoSettledAt - 1000;
-  const threeDAnimating = slideIndex === 2 && Number.isFinite(slideTwoSettledAt)
-    && threeDElapsed >= 0 && (!threeDAnimationFinished || threeDElapsed <= threeDSequenceSpan + frameBudget);
-  const shouldPresent = sceneChanged || phaseAtStart !== "hold" || phase !== "hold"
-    || floatingAnimating
-    || springAnimating
-    || threeDAnimating;
-  if (shouldPresent) {
-    const sceneSlides = activeTransition ? [activeTransition.from, activeTransition.to] : [slides[slideIndex]];
-    const elements = sceneElements(sceneSlides);
-    const boxesStart = performance.now();
-    const boxes = documentBoxesFor(document, elements);
-    boxTimes.push(performance.now() - boxesStart);
-    const buildStart = performance.now();
-    const displayList = buildTransformedDisplayList(boxes, width, height);
-    buildTimes.push(performance.now() - buildStart);
-    const presentStart = performance.now();
-    const nativeStats = window.presentTransformed(displayList);
-    const presentMs = performance.now() - presentStart;
-    presentTimes.push(presentMs);
-    if (transitionForFrame) {
-      transitionForFrame.presents.push(presentMs);
-      if (nativeStats.prepareMs !== undefined) transitionForFrame.nativePrepare.push(nativeStats.prepareMs);
-      if (nativeStats.acquireMs !== undefined) transitionForFrame.acquire.push(nativeStats.acquireMs);
-      if (nativeStats.submitMs !== undefined) transitionForFrame.submit.push(nativeStats.submitMs);
-      if (nativeStats.presentMs !== undefined) transitionForFrame.surface.push(nativeStats.presentMs);
-    }
-    presentedFrames++;
-    if (nativeStats.rendered) {
-      nativeRenderTimes.push(nativeStats.nativeRenderMs);
-      nativePrepareTimes.push(nativeStats.prepareMs);
-    }
-  }
+  animateFloatingArtwork(now);
+  animateSpringArtwork(now);
+  if (slideIndex === 2 && phase === "hold") animateThreeDCards(now);
   if (sceneChanged && completedTransitions > 0 && transitionForFrame) {
-    console.log(`pan ${String(slides.indexOf(transitionForFrame.from)).padStart(2, "0")}→${String(slides.indexOf(transitionForFrame.to)).padStart(2, "0")}: interval p95/max ${percentile(transitionForFrame.intervals, .95).toFixed(2)}/${percentile(transitionForFrame.intervals, 1).toFixed(2)} ms; present p95 ${percentile(transitionForFrame.presents, .95).toFixed(2)} ms; text prepare ${percentile(transitionForFrame.nativePrepare, .95).toFixed(2)} ms; GPU acquire/submit/surface ${percentile(transitionForFrame.acquire, .95).toFixed(2)}/${percentile(transitionForFrame.submit, .95).toFixed(2)}/${percentile(transitionForFrame.surface, .95).toFixed(2)} ms`);
+    console.log(`pan ${String(slides.indexOf(transitionForFrame.from)).padStart(2, "0")}→${String(slides.indexOf(transitionForFrame.to)).padStart(2, "0")}: frame interval p95/max ${percentile(transitionForFrame.intervals, .95).toFixed(2)}/${percentile(transitionForFrame.intervals, 1).toFixed(2)} ms`);
   }
   pacedTicks++;
-  if (phase === "recordFinalFrame") {
-    phase = "recordFinalWait";
-    nextSlideAt = now + Math.max(500, frameBudget * 4);
-  }
-  // Bound profiling storage during an indefinitely looping presentation.
-  if (frameIntervals.length > 3600) frameIntervals.shift();
-  if (boxTimes.length > 3600) boxTimes.shift();
-  if (buildTimes.length > 3600) buildTimes.shift();
-  if (presentTimes.length > 3600) presentTimes.shift();
-  for (const event of window.drainEvents()) {
-    if (event.type === "refreshRate" && event.x > 0) { refreshHz = event.x; frameBudget = 1000 / refreshHz; }
-    if (event.type === "keydown" && event.key === "Named(Escape)") window.close();
-  }
   if (finishAfterFrame) return finish();
-  deadline += frameBudget;
-  const delay = deadline - performance.now();
-  if (delay > 1) setTimeout(spin, delay - 1);
-  else {
-    if (delay <= -frameBudget) {
-      const count = Math.floor(-delay / frameBudget) + 1;
-      skippedDeadlines += count;
-      deadline += count * frameBudget;
-    }
-    setImmediate(spin);
-  }
-}
-
-function spin() {
-  while (performance.now() < deadline) {}
-  draw();
+  requestAnimationFrame(draw);
 }
 
 function percentile(values, p) {
   return [...values].sort((a, b) => a - b)[Math.min(values.length - 1, Math.floor(values.length * p))] ?? 0;
 }
 
-async function finish() {
+function finish() {
   const elapsed = performance.now() - started;
-  const cpu = process.cpuUsage(cpuStart);
-  const cpuMs = (cpu.user + cpu.system) / 1000;
-  const memory = process.memoryUsage();
-  const hostEnd = os.cpus();
-  const hostTotalEnd = hostEnd.reduce((sum, cpu) => sum + Object.values(cpu.times).reduce((a, b) => a + b, 0), 0);
-  const hostIdleEnd = hostEnd.reduce((sum, cpu) => sum + cpu.times.idle, 0);
-  const hostPercent = ((hostTotalEnd - hostIdleEnd) - (hostTotalStart - hostIdleStart)) / (hostTotalEnd - hostTotalStart) * 100;
-  const expectedTransitions = recordPath ? route.length - 1 : completedCycles * route.length + routeIndex;
-  console.log(`promo complete: ${slides.length} slides, ${completedCycles} cycles, ${completedTransitions}/${expectedTransitions} slide changes, ${presentedFrames} GPU frames across ${pacedTicks} refresh-paced ticks in ${(elapsed / 1000).toFixed(1)} s; ${(pacedTicks / elapsed * 1000).toFixed(1)} Hz loop; expired deadlines skipped ${skippedDeadlines}`);
-  console.log(`frame interval median/p95/max ${percentile(frameIntervals, .5).toFixed(3)}/${percentile(frameIntervals, .95).toFixed(3)}/${percentile(frameIntervals, 1).toFixed(3)} ms; geometry median/p95 ${percentile(boxTimes, .5).toFixed(3)}/${percentile(boxTimes, .95).toFixed(3)} ms; display-list median/p95 ${percentile(buildTimes, .5).toFixed(3)}/${percentile(buildTimes, .95).toFixed(3)} ms; text + native present median/p95 ${percentile(presentTimes, .5).toFixed(3)}/${percentile(presentTimes, .95).toFixed(3)} ms; native render median/p95 ${percentile(nativeRenderTimes, .5).toFixed(3)}/${percentile(nativeRenderTimes, .95).toFixed(3)} ms; native prep median/p95 ${percentile(nativePrepareTimes, .5).toFixed(3)}/${percentile(nativePrepareTimes, .95).toFixed(3)} ms`);
-  console.log(`process CPU ${(cpuMs / elapsed / os.cpus().length * 100).toFixed(1)}% machine / ${(cpuMs / elapsed).toFixed(2)} cores; RSS ${(memory.rss / 1048576).toFixed(1)} MB`);
-  console.log(`host CPU ${hostPercent.toFixed(1)}% (${hostEnd.length} logical CPUs); load avg ${os.loadavg().map((value) => value.toFixed(2)).join("/")}; available ${(os.freemem() / 1048576).toFixed(1)} MB`);
-  window.document = null;
-  document.close();
-  if (recorder) await stopRecorder(recorder);
+  document.body.setAttribute("data-promo-status", "complete");
+  console.log(`promo complete: ${slides.length} slides, ${completedCycles} cycles, ${completedTransitions} slide changes, ${pacedTicks} animation frames in ${(elapsed / 1000).toFixed(1)} s; ${(pacedTicks / elapsed * 1000).toFixed(1)} Hz callback rate; frame interval median/p95/max ${percentile(frameIntervals, .5).toFixed(3)}/${percentile(frameIntervals, .95).toFixed(3)}/${percentile(frameIntervals, 1).toFixed(3)} ms`);
 }
 
-draw();
+requestAnimationFrame(draw);

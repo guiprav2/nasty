@@ -59,7 +59,7 @@ export async function loadImage(path, window) {
   const uploadStarted = performance.now();
   const textureId = window.createImageTexture(decoded.width, decoded.height, Buffer.from(decoded.pixels));
   const uploadMs = performance.now() - uploadStarted;
-  return { textureId, width: decoded.width, height: decoded.height, readMs: decoded.readMs, decodeMs: decoded.decodeMs, decoderStartupMs: decoded.decoderStartupMs, workerRoundTripMs: decoded.workerRoundTripMs, uploadMs };
+  return { textureId, width: decoded.width, height: decoded.height, pixels: decoded.pixels, readMs: decoded.readMs, decodeMs: decoded.decodeMs, decoderStartupMs: decoded.decoderStartupMs, workerRoundTripMs: decoded.workerRoundTripMs, uploadMs };
 }
 
 export function unloadImage(element, window) {

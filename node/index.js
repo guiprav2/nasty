@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { LayoutWorker } from "./layout-worker.js";
@@ -8,9 +9,26 @@ import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
 import { isPaintColorProperty, registerStyleTransitionState, startColorTransition, TransitionEvent } from "./internal/css-transitions.js";
 import { displayListElements } from "./render.js";
+import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
+import { textMetrics } from "./internal/text-metrics.js";
+import { documentImage } from "./internal/raster-document.js";
 
 const require = createRequire(import.meta.url);
-const native = require(join(fileURLToPath(new URL(".", import.meta.url)), "native/debug/nasty.node"));
+const packageRoot = fileURLToPath(new URL(".", import.meta.url));
+const nativePath = process.env.NASTY_NATIVE_PATH
+  ?? (process.platform === "android"
+    ? join(packageRoot, "native/android-arm64/nasty.node")
+    : join(packageRoot, "native/debug/nasty.node"));
+if (!existsSync(nativePath)) {
+  throw new Error(`Nasty native addon not found at ${nativePath}; build it with npm run build:debug or npm run build:android-arm64`);
+}
+const native = process.platform === "android"
+  ? (() => {
+      const nativeModule = { exports: {} };
+      process.dlopen(nativeModule, nativePath);
+      return nativeModule.exports;
+    })()
+  : require(nativePath);
 
 export const LayoutTree = native.LayoutTree;
 export { DOMRect };
@@ -18,13 +36,19 @@ export { TransitionEvent };
 export class Window extends native.Window {
   #document = null;
   #resizable;
+  #orientation;
   constructor(options = {}) {
     const initialResizable = options.resizable ?? "both";
     if (!RESIZABLE_MODES.has(initialResizable)) {
       throw new TypeError('resizable must be "horizontal", "vertical", "both", or "none"');
     }
-    super({ ...options, resizable: initialResizable });
+    const initialOrientation = options.orientation ?? "auto";
+    if (!ORIENTATION_MODES.has(initialOrientation)) {
+      throw new TypeError('orientation must be "auto", "portrait", or "landscape"');
+    }
+    super({ ...options, resizable: initialResizable, orientation: initialOrientation });
     this.#resizable = initialResizable;
+    this.#orientation = initialOrientation;
     this.DOMRect = DOMRect;
   }
 
@@ -37,10 +61,23 @@ export class Window extends native.Window {
     this.#resizable = mode;
   }
 
+  get orientation() { return this.#orientation; }
+  set orientation(mode) {
+    if (!ORIENTATION_MODES.has(mode)) {
+      throw new TypeError('orientation must be "auto", "portrait", or "landscape"');
+    }
+    super.setOrientationMode(mode);
+    this.#orientation = mode;
+  }
+
   present(list) { syncDocumentTextForPresent(this, this.#document); return super.present(list); }
   presentWithImages(list, images) { syncDocumentTextForPresent(this, this.#document); return super.presentWithImages(list, images); }
   presentOrdered(list) { syncDocumentTextForPresent(this, this.#document); return super.presentOrdered(list); }
   presentTransformed(list) { syncDocumentTextForPresent(this, this.#document, displayListElements(list)); return super.presentTransformed(list); }
+  presentDocument() {
+    const frame = documentImage(this, this.#document);
+    return super.presentWithImages(frame.list, frame.images);
+  }
 
   get document() {
     return this.#document;
@@ -54,6 +91,7 @@ export class Window extends native.Window {
 }
 
 const RESIZABLE_MODES = new Set(["horizontal", "vertical", "both", "none"]);
+const ORIENTATION_MODES = new Set(["auto", "portrait", "landscape"]);
 export { FontRegistry } from "./font-registry.js";
 export { buildBoxDisplayList } from "./render.js";
 export { buildImageDraws } from "./render.js";
@@ -64,10 +102,34 @@ export { closeImageDecoder } from "./image-decoder.js";
 function styleForTaffy(style) {
   const result = { ...style };
   delete result.boxSizing;
-  const margin = style.margin;
+  for (const name of ["width", "height"]) {
+    if (typeof result[name] === "string" && result[name].endsWith("%")) {
+      result[`${name}Percent`] = parseFloat(result[name]) / 100;
+      delete result[name];
+    } else if (result[name] === "auto") delete result[name];
+  }
+  for (const name of ["top", "right", "bottom", "left"]) if (result[name] === "auto") delete result[name];
+  const pixelLengths = [
+    "width", "height", "minWidth", "minHeight", "maxWidth", "maxHeight",
+    "top", "right", "bottom", "left",
+    "padding", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft",
+    "margin", "marginTop", "marginRight", "marginBottom", "marginLeft",
+    "borderWidth", "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth", "gap",
+  ];
+  for (const property of pixelLengths) {
+    const value = result[property];
+    if (typeof value === "string" && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:px)?$/.test(value.trim())) {
+      result[property] = Number.parseFloat(value);
+    }
+  }
+  if (result.flexDirection !== undefined) {
+    result.direction = result.flexDirection;
+    delete result.flexDirection;
+  }
+  const margin = result.margin;
   if (margin === "auto") delete result.margin;
   for (const side of ["marginTop", "marginRight", "marginBottom", "marginLeft"]) {
-    const value = style[side] ?? margin;
+    const value = result[side] ?? margin;
     delete result[`${side}Auto`];
     if (value === "auto") {
       result[`${side}Auto`] = true;
@@ -76,20 +138,20 @@ function styleForTaffy(style) {
       result[side] = value;
     }
   }
-  const borderWidth = style.borderWidth ?? 0;
+  const borderWidth = result.borderWidth ?? 0;
   result.borderWidth = 0;
   for (const side of ["Top", "Right", "Bottom", "Left"]) {
     const edge = `border${side}Width`;
-    const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
+    const borderStyle = result[`border${side}Style`] ?? result.borderStyle ?? "none";
     result[edge] = borderStyle === "none" || borderStyle === "hidden"
       ? 0
-      : (style[edge] ?? borderWidth);
+      : (result[edge] ?? borderWidth);
   }
   return result;
 }
 
 function defaultElementStyle(name) {
-  const reset = { padding: 0, margin: 0, borderWidth: 0, borderStyle: "none", backgroundColor: "transparent" };
+  const reset = { display: "block", padding: 0, margin: 0, borderWidth: 0, borderStyle: "none", backgroundColor: "transparent" };
   if (name === "input") {
     return { ...reset, display: "flex", justifyContent: "start", alignItems: "center", overflow: "hidden" };
   }
@@ -168,7 +230,7 @@ export class Element extends EventTarget {
     this.parent = null;
     this.children = [];
     this.attributes = new Map();
-    const state = { image: null, imageLoad: null, imageLoadState: "empty", currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null };
+    const state = { image: null, imageLoad: null, imageLoadState: "empty", currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null };
     registerElementState(this, state);
     documentState(document).elements.add(this);
     this.style = new CSSStyleDeclaration(this, { ...defaultElementStyle(this.localName) });
@@ -181,9 +243,64 @@ export class Element extends EventTarget {
     return (elementState(this).text ?? "") + this.children.map((child) => child.textContent).join("");
   }
 
+  get parentElement() {
+    return this.parent;
+  }
+
   set textContent(value) {
+    if (this.children.length === 0 && elementState(this).text === String(value ?? "")) return;
     for (const child of [...this.children]) this.removeChild(child);
     elementState(this).text = value == null ? "" : String(value);
+    this._styleChanged();
+  }
+
+  get ownerDocument() { return this.document; }
+  get className() { return this.getAttribute("class") || ""; }
+  set className(value) { this.setAttribute("class", value); }
+  get classList() {
+    const element = this;
+    const tokens = () => element.className.split(/\s+/).filter(Boolean);
+    return {
+      contains: token => tokens().includes(token),
+      add(...values) { element.className = [...new Set([...tokens(), ...values])].join(" "); },
+      remove(...values) { element.className = tokens().filter(value => !values.includes(value)).join(" "); },
+      toggle(token, force) {
+        const add = force ?? !this.contains(token);
+        if (add) this.add(token); else this.remove(token);
+        return add;
+      },
+      [Symbol.iterator]: () => tokens()[Symbol.iterator](),
+    };
+  }
+  get hidden() { return this.hasAttribute("hidden"); }
+  set hidden(value) { if (value) this.setAttribute("hidden", ""); else this.removeAttribute("hidden"); }
+  get offsetWidth() { return Math.round(this.getBoundingClientRect().width); }
+  get offsetHeight() { return Math.round(this.getBoundingClientRect().height); }
+  matches(selector) {
+    return selector.split(",").some(part => {
+      const pattern = part.trim();
+      if (!/^(?:[a-z][\w-]*|\*)?(?:[.#][\w-]+)*$/i.test(pattern)) throw new DOMException("Unsupported selector", "SyntaxError");
+      const tag = pattern.match(/^[a-z][\w-]*/i)?.[0];
+      if (tag && tag.toLowerCase() !== this.localName) return false;
+      return [...pattern.matchAll(/([.#])([\w-]+)/g)].every(([, type, name]) =>
+        type === "#" ? this.id === name : this.classList.contains(name));
+    });
+  }
+  querySelectorAll(selector) {
+    const found = [];
+    const visit = parent => { for (const child of parent.children) { if (child.matches(selector)) found.push(child); visit(child); } };
+    visit(this); return found;
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
+  append(...children) { for (const child of children) this.appendChild(child); }
+  replaceChildren(...children) { for (const child of [...this.children]) this.removeChild(child); this.append(...children); }
+  setPointerCapture(id) { (documentState(this.document).pointerCapture ??= new Map()).set(id, this); }
+  releasePointerCapture(id) { documentState(this.document).pointerCapture?.delete(id); }
+  hasPointerCapture(id) { return documentState(this.document).pointerCapture?.get(id) === this; }
+  dispatchEvent(event) {
+    const result = super.dispatchEvent(event);
+    this[`on${event.type}`]?.call(this, event);
+    return result;
   }
 
   getAttribute(name) {
@@ -206,16 +323,29 @@ export class Element extends EventTarget {
     name = String(name).toLowerCase();
     value = String(value);
     this.attributes.set(name, value);
+    if (name === "hidden") this._styleChanged();
     if (name === "src" && this.localName === "img") this._setImageSource(value === "" ? "" : this.src);
     else if ((name === "width" || name === "height") && this.localName === "img") this._styleChanged();
+    else if ((name === "width" || name === "height") && this.localName === "canvas") {
+      const dimension = Number.parseInt(value, 10);
+      elementState(this)[name === "width" ? "canvasWidth" : "canvasHeight"] = Number.isFinite(dimension) ? Math.max(0, Math.min(0xffffffff, dimension)) : (name === "width" ? 300 : 150);
+      if (elementState(this).canvasContext) resetCanvasContext(elementState(this).canvasContext);
+      this._styleChanged();
+    }
   }
 
   removeAttribute(name) {
     name = String(name).toLowerCase();
     this.attributes.delete(name);
+    if (name === "hidden") this._styleChanged();
     if (name === "src" && this.localName === "img") {
       this._cancelImageRequest();
     } else if ((name === "width" || name === "height") && this.localName === "img") this._styleChanged();
+    else if ((name === "width" || name === "height") && this.localName === "canvas") {
+      elementState(this)[name === "width" ? "canvasWidth" : "canvasHeight"] = name === "width" ? 300 : 150;
+      if (elementState(this).canvasContext) resetCanvasContext(elementState(this).canvasContext);
+      this._styleChanged();
+    }
   }
 
   get src() {
@@ -244,19 +374,30 @@ export class Element extends EventTarget {
   }
 
   get width() {
+    if (this.localName === "canvas") return elementState(this).canvasWidth;
     return parseDimension(this.getAttribute("width")) ?? this.naturalWidth;
   }
 
   set width(value) {
+    if (this.localName === "canvas") { this.setAttribute("width", value); return; }
     this.setAttribute("width", value);
   }
 
   get height() {
+    if (this.localName === "canvas") return elementState(this).canvasHeight;
     return parseDimension(this.getAttribute("height")) ?? this.naturalHeight;
   }
 
   set height(value) {
+    if (this.localName === "canvas") { this.setAttribute("height", value); return; }
     this.setAttribute("height", value);
+  }
+
+  getContext(contextId, options = undefined) {
+    if (this.localName !== "canvas" || contextId !== "2d") return null;
+    const state = elementState(this);
+    state.canvasContext ??= new CanvasRenderingContext2D(this, options);
+    return state.canvasContext;
   }
 
   decode() {
@@ -286,7 +427,7 @@ export class Element extends EventTarget {
         window.deleteImageTexture(result.textureId);
         return;
       }
-      elementState(this).image = { textureId: result.textureId, width: result.width, height: result.height };
+      elementState(this).image = { textureId: result.textureId, width: result.width, height: result.height, pixels: result.pixels };
       this._styleChanged();
       elementState(this).imageLoadState = "loaded";
       elementState(this).resolveImageLoad?.(result);
@@ -315,7 +456,7 @@ export class Element extends EventTarget {
   }
 
   _styleChanged(property) {
-    if (isPaintColorProperty(property) || property === "opacity" || property === "transition" || property === "transform" || property === "transformOrigin") return;
+    if (isPaintColorProperty(property) || property === "opacity" || property === "transition" || property === "transform" || property === "transformOrigin" || property === "zIndex" || property === "borderRadius" || property === "fontWeight" || property === "letterSpacing" || property === "pointerEvents" || property === "cursor") return;
     const doc = documentState(this.document);
     doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
     doc.dirty = true;
@@ -323,12 +464,18 @@ export class Element extends EventTarget {
   }
 
   _taffyStyle() {
-    const style = styleData.get(this.style).values;
+    const style = { ...styleData.get(this.style).values, ...(this.hidden && { display: "none" }) };
     if (this.localName === "img") {
       const imageStyle = { ...style };
       if (imageStyle.width === undefined) imageStyle.width = parseDimension(this.getAttribute("width")) ?? elementState(this).image?.width;
       if (imageStyle.height === undefined) imageStyle.height = parseDimension(this.getAttribute("height")) ?? elementState(this).image?.height;
       return styleForTaffy(imageStyle);
+    }
+    if (this.localName === "canvas") {
+      const canvasStyle = { ...style };
+      if (canvasStyle.width === undefined) canvasStyle.width = this.width;
+      if (canvasStyle.height === undefined) canvasStyle.height = this.height;
+      return styleForTaffy(canvasStyle);
     }
     return styleForTaffy(style);
   }
@@ -408,6 +555,24 @@ export class Document {
     return new Element(this, name);
   }
 
+  querySelector(selector) { return this.body.matches(selector) ? this.body : this.body.querySelector(selector); }
+  querySelectorAll(selector) { return [...(this.body.matches(selector) ? [this.body] : []), ...this.body.querySelectorAll(selector)]; }
+  getElementById(id) { return [...documentState(this).elements].find(element => element.id === String(id)) ?? null; }
+
+  #prepareText() {
+    const doc = documentState(this);
+    for (const element of doc.elements) {
+      const state = elementState(element);
+      if (state.text === undefined) continue;
+      const metrics = textMetrics(element);
+      if (state.sentTextMetrics === metrics.key) continue;
+      state.sentTextMetrics = metrics.key;
+      doc.layoutTree.setTextMetrics(state.handle, { words: metrics.words, space: metrics.space,
+        lineHeight: metrics.style.line, wrap: metrics.style.wrap });
+      doc.dirty = true;
+    }
+  }
+
   _attachWindow(window) {
     documentState(this).defaultView = window;
     for (const element of documentState(this).elements) if (element.localName === "img" && elementState(element).imageLoadState === "pending") {
@@ -416,6 +581,7 @@ export class Document {
   }
 
   async #layout(width, height, timings) {
+    this.#prepareText();
     if (!Number.isFinite(width) || !Number.isFinite(height) || width < 0 || height < 0) {
       throw new RangeError("viewport must have finite nonnegative dimensions");
     }
@@ -443,6 +609,7 @@ export class Document {
   }
 
   #layoutSync() {
+    this.#prepareText();
     const size = documentState(this).defaultView?.size();
     const width = size?.width ?? documentState(this).viewport.width;
     const height = size?.height ?? documentState(this).viewport.height;

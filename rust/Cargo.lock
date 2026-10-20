@@ -1315,6 +1315,7 @@ name = "nasty-native"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cc",
  "egui",
  "egui-winit",
  "fontdb",

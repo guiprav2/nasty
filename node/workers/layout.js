@@ -3,10 +3,25 @@ import { performance } from "node:perf_hooks";
 import { LayoutTree } from "../index.js";
 
 const tree = new LayoutTree();
+tree.setRounding(false);
 let handles = [];
 let root = 0;
 let parents = [];
 let childLists = [];
+const measurements = new Map();
+function measure({ node, knownWidth, knownHeight, availableWidth, minContent }) {
+  const text = measurements.get(node);
+  if (!text || !text.words.length) return { width: 0, height: 0 };
+  const limit = knownWidth ?? (text.wrap ? (minContent ? Math.max(0, ...text.words) : availableWidth ?? Infinity) : Infinity);
+  let line = 0, widest = 0, lines = 1;
+  for (const word of text.words) {
+    if (word < 0) { widest = Math.max(widest, line); line = 0; lines++; continue; }
+    const next = line ? line + text.space + word : word;
+    if (text.wrap && next > limit + .01 && line > 0) { widest = Math.max(widest, line); line = word; lines++; }
+    else line = next;
+  }
+  return { width: knownWidth ?? Math.max(widest, line), height: knownHeight ?? lines * text.lineHeight };
+}
 
 function rebuildParents() {
   parents = handles.map(() => -1);
@@ -40,6 +55,11 @@ parentPort.on("message", ({ id, type, payload }) => {
       tree.setStyle(handles[payload.node], payload.style);
       return;
     }
+    if (type === "textMetrics") {
+      measurements.set(handles[payload.node], payload);
+      tree.invalidate(handles[payload.node]);
+      return;
+    }
     if (type === "children") {
       childLists[payload.node] = [...payload.children];
       tree.setChildren(handles[payload.node], payload.children.map((child) => handles[child]));
@@ -49,7 +69,7 @@ parentPort.on("message", ({ id, type, payload }) => {
     if (type === "layout" || type === "layoutSync") {
       const start = performance.now();
       const layoutRoot = handles[payload.root] ?? root;
-      tree.compute(layoutRoot, payload.width, payload.height);
+      tree.compute(layoutRoot, payload.width, payload.height, measure);
       const localBoxes = tree.layouts(handles);
       const computeMs = performance.now() - start;
       const boxes = localBoxes.map(() => undefined);

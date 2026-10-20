@@ -17,7 +17,8 @@ fontdb = "=0.16.2"
 glyphon = "0.8"
 pollster = "0.4"
 wgpu = { version = "24", default-features = false, features = ["wgsl"] }
-winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "android-native-activity"] }
 
 [build-dependencies]
 napi-build = "2"
+cc = "1"

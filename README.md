@@ -4,6 +4,17 @@ Nasty is a staged Node.js rebuild of Sweet. JavaScript owns the document and fra
 
 Node.js code and examples live in `node/`; the native workspace lives in `rust/`.
 
+## Android arm64 build
+
+The native addon can be cross-compiled for `arm64-v8a` and packaged with the Android NodeJS runtime from a `nodejs-mobile` release. Install the Android SDK and NDK, add Rust's Android target, and set `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME`, and `NODE_MOBILE_ROOT` to the SDK, NDK, and extracted nodejs-mobile directories:
+
+```sh
+rustup target add aarch64-linux-android
+npm --prefix node run build:android-arm64
+```
+
+The command writes the N-API addon to `node/native/android-arm64/nasty.node` and the required `libnode.so` and `libc++_shared.so` runtime libraries to `node/runtime/android-arm64/`. The `nodejs-mobile` runtime is expected to load the app's JavaScript bundle and expose N-API; place the `node/` package files and dependencies in the host application's app bundle. `ANDROID_API` controls the NDK API level and defaults to 26. This packages native runtime libraries; it does not build an APK or provide Android UI/activity glue.
+
 Build the debug native library and run an example from the repository root:
 
 ```sh
@@ -17,8 +28,18 @@ node node/examples/threaded_render.js
 node node/examples/threaded_layout.js
 ```
 
-The layout example checks positions, measures Taffy through the default persistent layout worker, and writes `node/examples/layout.svg`. The window example animates native GPU quads and reports timing data. The text example shapes and renders with installed system fonts, reports cold and repeated preparation costs, and measures frame pacing. The custom-font example demonstrates lazy `font-[Family_Name]` resolution from a host font file or an optional path argument, plus concurrent load deduplication and worker preparation timings. The textarea example uses Sweet's egui editing engine through an invisible input surface; JavaScript owns the value and Nasty draws the text, selection, and caret. It supports word selection, select-all, keyboard editing, and clipboard shortcuts; egui-winit routes platform IME events and Nasty draws composition text, but IME behavior still needs validation across target platforms. `--benchmark-typing` measures worker readiness and frame timing; `--trace-editor` keeps the window open for caret/selection inspection. The threaded-render example owns the native window and frame loop in a persistent Node worker while measuring worker frame pacing and main-thread event-loop delay. The threaded-layout example isolates a paced Taffy workload, returns versioned layout snapshots, and measures transfer cost and stale-result handling.
+The layout example checks positions, measures Taffy through the default persistent layout worker, and writes `node/examples/layout.svg`. The window example animates native GPU quads and reports timing data. The text example shapes and renders with installed system fonts, reports cold and repeated preparation costs, and measures frame pacing. The custom-font example demonstrates lazy `fontFamily` resolution from a host font file or an optional path argument, plus concurrent load deduplication and worker preparation timings. The textarea example uses Sweet's egui editing engine through an invisible input surface; JavaScript owns the value and Nasty draws the text, selection, and caret. It supports word selection, select-all, keyboard editing, and clipboard shortcuts; egui-winit routes platform IME events and Nasty draws composition text, but IME behavior still needs validation across target platforms. `--benchmark-typing` measures worker readiness and frame timing; `--trace-editor` keeps the window open for caret/selection inspection. The threaded-render example owns the native window and frame loop in a persistent Node worker while measuring worker frame pacing and main-thread event-loop delay. The threaded-layout example isolates a paced Taffy workload, returns versioned layout snapshots, and measures transfer cost and stale-result handling.
 
-`FontRegistry` is also exported from `node/index.js`. Register a family with a local path, URL, or async loader, then pass a run's `fontClass: "font-[Family_Name]"` through `resolveRuns()` and give the resolved `runs` and `fonts` to `window.requestTextRuns()`. The custom-font example accepts an optional family and matching file path: `node node/examples/custom_fonts.js "Acme Sans" ./AcmeSans.ttf`.
+`FontRegistry` is also exported from `node/index.js`. Set `element.style.fontFamily` to load from root `fonts/`: family names become lowercase ASCII with whitespace replaced by underscores (for example, `DejaVu Sans` → `dejavu_sans.ttf`). Low-level text runs use `fontFamily: "DejaVu Sans"` through `resolveRuns()` and give the resolved `runs` and `fonts` to `window.requestTextRuns()`. The custom-font example accepts an optional family and matching file path: `node node/examples/custom_fonts.js "Acme Sans" ./AcmeSans.ttf`.
 
 `Document.layout(width, height)` is asynchronous and returns the latest completed box snapshot; styles changed while layout runs are applied on the next worker request. Call `document.close()` when the document is no longer needed to stop its persistent worker.
+
+## Build the Android tour APK
+
+`Window` accepts `orientation: "auto" | "portrait" | "landscape"` and exposes the same resettable `window.orientation` property as `window.resizable`. On Android, changing the property updates the Activity's requested orientation. Build the arm64 tour APK with the SDK, NDK, Java 17, and nodejs-mobile runtime installed under `~/prog`:
+
+```sh
+npm --prefix node run build:tour-apk
+```
+
+The script packages `node/examples/tour.js` and its assets into a NativeActivity APK at `target/android-apk/tour.apk`. The APK starts the bundled NodeJS runtime, extracts the JavaScript package into app-private storage, then runs the tour host.

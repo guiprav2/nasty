@@ -1,8 +1,11 @@
+import { fontsForRuns } from '../font-registry.js';
 import { documentBoxes, documentBoxesFor, documentState, elementState } from './dom-state.js';
 import { computedStyleValue } from './css-transitions.js';
 import { createBoxProjector, parseColor } from '../render.js';
 
 const windows = new WeakMap();
+const lastSyncTimes = new WeakMap();
+const lastSyncDetails = new WeakMap();
 const placementProperties = ['x', 'y', 'color', 'clipX', 'clipY', 'clipWidth', 'clipHeight'];
 function placementChanged(previous, next) {
   return !previous || placementProperties.some((property) => previous[property] !== next[property]);
@@ -10,7 +13,7 @@ function placementChanged(previous, next) {
 function sameShape(previous, next, allowProjectedWidthChange = false) {
   return previous && previous.text === next.text && (allowProjectedWidthChange || previous.width === next.width)
     && previous.fontSize === next.fontSize && previous.lineHeight === next.lineHeight
-    && previous.fontFamily === next.fontFamily && previous.wrap === next.wrap;
+    && previous.fontFamily === next.fontFamily && previous.fontWeight === next.fontWeight && previous.wrap === next.wrap;
 }
 function sendPlacements(window, runs, indices) {
   window.updateTextPlacement(indices.map((index) => runs[index]), indices);
@@ -44,7 +47,8 @@ function textEntries(document, selectedElements = null) {
     const transformedWidth = bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
     const run = { text, x: textOrigin.x, y: textOrigin.y, width: transformedWidth, fontSize,
       lineHeight: parseFloat(inherited(element, 'lineHeight', fontSize * 1.2)),
-      fontFamily: inherited(element, 'fontFamily', 'sans-serif'), color,
+      fontFamily: inherited(element, 'fontFamily', 'sans-serif'),
+      fontWeight: Math.max(100, Math.min(900, parseInt(inherited(element, 'fontWeight', 400), 10) || 400)), color,
       wrap: inherited(element, 'whiteSpace', 'normal') !== 'nowrap' };
     if (clip) Object.assign(run, { clipX: clip.x, clipY: clip.y, clipWidth: clip.width, clipHeight: clip.height });
     entries.push({ element, run });
@@ -52,16 +56,43 @@ function textEntries(document, selectedElements = null) {
   return entries;
 }
 function textShape(runs) {
-  return JSON.stringify(runs.map(({ text, width, fontSize, lineHeight, fontFamily, wrap }) =>
-    ({ text, width, fontSize, lineHeight, fontFamily, wrap })));
+  return JSON.stringify(runs.map(({ text, width, fontSize, lineHeight, fontFamily, fontWeight, wrap }) =>
+    ({ text, width, fontSize, lineHeight, fontFamily, fontWeight, wrap })));
+}
+function prewarmRuns(runs, document) {
+  const viewport = documentState(document).viewport;
+  return runs.map((run) => ({
+    ...run,
+    x: 0,
+    y: 0,
+    clipX: 0,
+    clipY: 0,
+    clipWidth: Math.min(1_000_000, Math.max(1, viewport.width, run.width)),
+    clipHeight: Math.min(1_000_000, Math.max(1, viewport.height, run.lineHeight * (run.text.length + 1))),
+  }));
 }
 export function documentTextRuns(document) {
   return textEntries(document).map(({ run }) => run);
 }
 export function syncDocumentTextForPresent(window, document, selectedElements = null) {
-  syncDocumentText(window, document, selectedElements);
+  const started = performance.now();
+  try {
+    syncDocumentText(window, document, selectedElements);
+  } finally {
+    const elapsedMs = performance.now() - started;
+    lastSyncTimes.set(window, elapsedMs);
+    lastSyncDetails.set(window, { ...lastSyncDetails.get(window), elapsedMs });
+  }
+}
+export function lastDocumentTextSyncMs(window) {
+  return lastSyncTimes.get(window) ?? 0;
+}
+export function lastDocumentTextSyncDetails(window) {
+  return lastSyncDetails.get(window) ?? null;
 }
 export function syncDocumentText(window, document, selectedElements = null) {
+  const details = { mode: "start", visibleRuns: 0, fullRuns: 0, changedRuns: 0, reshaped: false };
+  lastSyncDetails.set(window, details);
   let state = windows.get(window);
   if (state?.pending && window.pollTextRuns()) {
     state.shape = state.pending.shape;
@@ -76,6 +107,8 @@ export function syncDocumentText(window, document, selectedElements = null) {
   const geometryGeneration = document ? documentState(document).geometryGeneration : -1;
   if (selectedElements && state.shape && state.paintRuns && !state.pending) {
     const entries = document ? textEntries(document, selectedElements) : [];
+    details.mode = "selected-placement";
+    details.visibleRuns = entries.length;
     const previousRuns = state.paintRuns;
     const runs = previousRuns.slice();
     const parked = new Set(state.parked);
@@ -85,6 +118,21 @@ export function syncDocumentText(window, document, selectedElements = null) {
     for (const { element, run } of entries) {
       const index = state.elementIndices.get(element);
       if (index === undefined || !sameShape(runs[index], run, allowProjectedWidthChange)) {
+        details.shapeMismatch = {
+          tag: element.tagName,
+          text: run.text.slice(0, 48),
+          missing: index === undefined,
+          allowProjectedWidthChange,
+          previous: index === undefined ? null : {
+            width: runs[index].width,
+            fontSize: runs[index].fontSize,
+            lineHeight: runs[index].lineHeight,
+            fontFamily: runs[index].fontFamily,
+            wrap: runs[index].wrap,
+            text: runs[index].text.slice(0, 48),
+          },
+          next: { width: run.width, fontSize: run.fontSize, lineHeight: run.lineHeight, fontFamily: run.fontFamily, wrap: run.wrap, text: run.text.slice(0, 48) },
+        };
         needsReshape = true;
         break;
       }
@@ -100,13 +148,17 @@ export function syncDocumentText(window, document, selectedElements = null) {
         }
       }
       const changed = runs.flatMap((run, index) => placementChanged(previousRuns[index], run) ? [index] : []);
+      details.changedRuns = changed.length;
       if (changed.length) sendPlacements(window, runs, changed);
       state.paintRuns = runs;
       state.parked = parked;
       return;
     }
+    details.mode = "selected-shape-mismatch";
   }
   const entries = document ? textEntries(document) : [];
+  details.fullRuns = entries.length;
+  if (details.mode === "start") details.mode = "full-document";
   const activeElements = selectedElements ? new Set(selectedElements) : null;
   const parked = new Set();
   const runs = entries.map(({ element, run }, index) => {
@@ -120,14 +172,22 @@ export function syncDocumentText(window, document, selectedElements = null) {
   const shape = textShape(entries.map(({ run }) => run));
   if (shape !== state.shape) {
     if (!state.pending) {
-      window.requestTextRuns(runs);
-      state.pending = { shape, elements: entries.map(({ element }) => element), runs, parked, shapeGeneration: geometryGeneration };
+      const preparedRuns = document ? prewarmRuns(runs, document) : runs;
+      details.mode = "request-reshape";
+      details.reshaped = true;
+      window.requestTextRuns(preparedRuns, fontsForRuns(preparedRuns));
+      // All glyphs are prepared at a visible origin before the run set becomes
+      // active. The next present applies the live camera positions and parks
+      // unrelated runs without rasterizing a slide's first glyphs mid-pan.
+      state.pending = { shape, elements: entries.map(({ element }) => element), runs: preparedRuns, parked: new Set(), shapeGeneration: geometryGeneration };
     }
     return;
   }
   const changed = state.paintRuns
     ? runs.flatMap((run, index) => placementChanged(state.paintRuns[index], run) ? [index] : [])
     : runs.map((_, index) => index);
+  details.changedRuns = changed.length;
+  if (details.mode === "full-document") details.mode = "full-document-placement";
   if (changed.length) sendPlacements(window, runs, changed);
   state.paintRuns = runs;
   state.parked = parked;
