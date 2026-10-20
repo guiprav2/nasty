@@ -37,6 +37,9 @@ export class Window extends native.Window {
   #document = null;
   #resizable;
   #orientation;
+  #borderless;
+  #dragAnywhere;
+  #maximizable;
   constructor(options = {}) {
     const initialResizable = options.resizable ?? "both";
     if (!RESIZABLE_MODES.has(initialResizable)) {
@@ -46,9 +49,24 @@ export class Window extends native.Window {
     if (!ORIENTATION_MODES.has(initialOrientation)) {
       throw new TypeError('orientation must be "auto", "portrait", or "landscape"');
     }
-    super({ ...options, resizable: initialResizable, orientation: initialOrientation });
+    const initialBorderless = options.borderless ?? false;
+    const initialDragAnywhere = options.dragAnywhere ?? false;
+    const initialMaximizable = options.maximizable ?? false;
+    const initialMaximized = options.maximized ?? false;
+    if (typeof initialBorderless !== 'boolean') throw new TypeError('borderless must be a boolean');
+    if (typeof initialDragAnywhere !== 'boolean' && typeof initialDragAnywhere !== 'string') throw new TypeError('dragAnywhere must be false, true, or a key name');
+    if (typeof initialDragAnywhere === 'string' && !initialDragAnywhere.trim()) throw new TypeError('dragAnywhere key name must not be empty');
+    for (const [name, value] of [['maximizable', initialMaximizable]]) {
+      if (typeof value !== 'boolean') throw new TypeError(`${name} must be a boolean`);
+    }
+    if (typeof initialMaximized !== 'boolean') throw new TypeError('maximized must be a boolean');
+    super({ ...options, resizable: initialResizable, orientation: initialOrientation, borderless: initialBorderless,
+      dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized });
     this.#resizable = initialResizable;
     this.#orientation = initialOrientation;
+    this.#borderless = initialBorderless;
+    this.#dragAnywhere = initialDragAnywhere;
+    this.#maximizable = initialMaximizable;
     this.DOMRect = DOMRect;
   }
 
@@ -70,6 +88,49 @@ export class Window extends native.Window {
     this.#orientation = mode;
   }
 
+  get borderless() { return this.#borderless; }
+  set borderless(value) {
+    if (typeof value !== 'boolean') throw new TypeError('borderless must be a boolean');
+    super.setBorderless(value);
+    this.#borderless = value;
+  }
+
+  get dragAnywhere() { return this.#dragAnywhere; }
+  set dragAnywhere(value) {
+    if (typeof value !== 'boolean' && typeof value !== 'string') throw new TypeError('dragAnywhere must be false, true, or a key name');
+    if (typeof value === 'string' && !value.trim()) throw new TypeError('dragAnywhere key name must not be empty');
+    super.setDragAnywhere(value);
+    this.#dragAnywhere = value;
+  }
+
+  get maximizable() { return this.#maximizable; }
+  set maximizable(value) {
+    if (typeof value !== 'boolean') throw new TypeError('maximizable must be a boolean');
+    if (value) this._validateDocumentMaxConstraints();
+    super.setMaximizable(value);
+    this.#maximizable = value;
+  }
+
+  get maximized() { return super.isMaximized(); }
+  set maximized(value) {
+    if (typeof value !== 'boolean') throw new TypeError('maximized must be a boolean');
+    super.setMaximized(value);
+  }
+
+  _validateDocumentMaxConstraints(style = this.#document?.body?.style, property = null, value = undefined) {
+    if (!this.#maximizable || !style) return;
+    const width = property === 'maxWidth' ? value : style.maxWidth;
+    const height = property === 'maxHeight' ? value : style.maxHeight;
+    const hasMaximum = candidate => candidate !== undefined && candidate !== null && candidate !== '' && candidate !== 'none' && candidate !== 'auto';
+    if (hasMaximum(width) || hasMaximum(height)) {
+      throw new TypeError('maximizable cannot be true when the document has maxWidth or maxHeight');
+    }
+  }
+
+  _validateDocumentStyleChange(property, value) {
+    if (property === 'maxWidth' || property === 'maxHeight') this._validateDocumentMaxConstraints(this.#document?.body?.style, property, value);
+  }
+
   present(list) { syncDocumentTextForPresent(this, this.#document); return super.present(list); }
   presentWithImages(list, images) { syncDocumentTextForPresent(this, this.#document); return super.presentWithImages(list, images); }
   presentOrdered(list) { syncDocumentTextForPresent(this, this.#document); return super.presentOrdered(list); }
@@ -84,6 +145,7 @@ export class Window extends native.Window {
   }
 
   set document(document) {
+    if (document) this._validateDocumentMaxConstraints(document.body.style);
     if (this.#document) documentState(this.#document).defaultView = null;
     this.#document = document;
     if (document) document._attachWindow(this);
@@ -92,6 +154,7 @@ export class Window extends native.Window {
   _syncDocumentSizeConstraints() {
     const style = this.#document?.body?.style;
     if (!style) return;
+    this._validateDocumentMaxConstraints(style);
     const dimension = value => {
       if (value === undefined || value === null || value === "" || value === "none" || value === "auto") return null;
       const parsed = typeof value === "number" ? value : /^\s*\d+(?:\.\d+)?(?:px)?\s*$/.test(String(value)) ? parseFloat(value) : NaN;
@@ -192,6 +255,7 @@ class CSSStyleDeclaration {
       set: (target, property, value, receiver) => {
         if (typeof property !== "string" || property in target) return Reflect.set(target, property, value, receiver);
         if (state.values[property] === value) return true;
+        state.element._validateStyleChange(property, value);
         if (isPaintColorProperty(property)) startColorTransition(state, property, String(value));
         state.values[property] = value;
         state.element._styleChanged(property);
@@ -334,7 +398,7 @@ export class Element extends EventTarget {
     name = String(name).toLowerCase();
     value = String(value);
     this.attributes.set(name, value);
-    if (name === "hidden") this._styleChanged();
+    if (name === "hidden" || name === "class") this._styleChanged();
     if (name === "src" && this.localName === "img") this._setImageSource(value === "" ? "" : this.src);
     else if ((name === "width" || name === "height") && this.localName === "img") this._styleChanged();
     else if ((name === "width" || name === "height") && this.localName === "canvas") {
@@ -348,7 +412,7 @@ export class Element extends EventTarget {
   removeAttribute(name) {
     name = String(name).toLowerCase();
     this.attributes.delete(name);
-    if (name === "hidden") this._styleChanged();
+    if (name === "hidden" || name === "class") this._styleChanged();
     if (name === "src" && this.localName === "img") {
       this._cancelImageRequest();
     } else if ((name === "width" || name === "height") && this.localName === "img") this._styleChanged();
@@ -475,6 +539,12 @@ export class Element extends EventTarget {
     if (this === this.document.body && ["minWidth", "minHeight", "maxWidth", "maxHeight"].includes(property)) doc.defaultView?._syncDocumentSizeConstraints();
   }
 
+  _validateStyleChange(property, value) {
+    if (this === this.document.body && (property === "maxWidth" || property === "maxHeight")) {
+      documentState(this.document).defaultView?._validateDocumentStyleChange(property, value);
+    }
+  }
+
   _taffyStyle() {
     const style = { ...styleData.get(this.style).values, ...(this.hidden && { display: "none" }) };
     if (this.localName === "img") {
@@ -540,8 +610,9 @@ export class Element extends EventTarget {
   }
 }
 
-export class Document {
+export class Document extends EventTarget {
   constructor() {
+    super();
     registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
     this.body = new Element(this, "body");
     this.body.style.display = "block";
@@ -563,6 +634,12 @@ export class Document {
   get baseURI() { return documentState(this).baseURI; }
   get defaultView() { return documentState(this).defaultView; }
 
+  dispatchEvent(event) {
+    const result = super.dispatchEvent(event);
+    this[`on${event.type}`]?.call(this, event);
+    return result;
+  }
+
   createElement(name) {
     return new Element(this, name);
   }
@@ -575,7 +652,7 @@ export class Document {
     const doc = documentState(this);
     for (const element of doc.elements) {
       const state = elementState(element);
-      if (state.text === undefined) continue;
+      if (!state.text && !element.classList.contains("nf")) continue;
       const metrics = textMetrics(element);
       if (state.sentTextMetrics === metrics.key) continue;
       state.sentTextMetrics = metrics.key;

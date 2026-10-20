@@ -6,7 +6,7 @@ use glyphon::{
     FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
     TextRenderer, Viewport,
 };
-use napi::bindgen_prelude::{Buffer, Function};
+use napi::bindgen_prelude::{Buffer, Either, Function};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -611,6 +611,11 @@ pub struct WindowOptions {
     pub visible: Option<bool>,
     pub resizable: Option<String>,
     pub orientation: Option<String>,
+    pub borderless: Option<bool>,
+    #[napi(js_name = "dragAnywhere")]
+    pub drag_anywhere: Option<Either<bool, String>>,
+    pub maximizable: Option<bool>,
+    pub maximized: Option<bool>,
 }
 
 #[napi(object)]
@@ -626,6 +631,7 @@ pub struct NativeEvent {
     pub x: f64,
     pub y: f64,
     pub key: Option<String>,
+    pub button: Option<u32>,
     pub text: Option<String>,
     pub modifiers: Option<String>,
     #[napi(js_name = "deltaX")]
@@ -833,6 +839,8 @@ struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    alpha_modes: Vec<wgpu::CompositeAlphaMode>,
+    transparent: bool,
     pipeline: wgpu::RenderPipeline,
     image_pipeline: wgpu::RenderPipeline,
     image_bind_group_layout: wgpu::BindGroupLayout,
@@ -1553,7 +1561,7 @@ fn create_text_runtime(
 }
 
 impl Renderer {
-    fn new(window: Arc<OsWindow>) -> std::result::Result<Self, String> {
+    fn new(window: Arc<OsWindow>, transparent: bool) -> std::result::Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: if cfg!(target_os = "android") {
                 wgpu::Backends::GL
@@ -1612,9 +1620,9 @@ impl Renderer {
                 .ok_or_else(|| "GPU surface has no presentation modes".to_string())?
         };
         let present_mode_name = format!("{present_mode:?}");
-        let alpha_mode = *capabilities
-            .alpha_modes
-            .first()
+        let preferred_alpha = if transparent { wgpu::CompositeAlphaMode::PreMultiplied } else { wgpu::CompositeAlphaMode::Opaque };
+        let alpha_mode = capabilities.alpha_modes.iter().copied().find(|mode| *mode == preferred_alpha)
+            .or_else(|| capabilities.alpha_modes.first().copied())
             .ok_or_else(|| "GPU surface has no alpha modes".to_string())?;
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
@@ -1832,6 +1840,8 @@ impl Renderer {
             device,
             queue,
             config,
+            alpha_modes: capabilities.alpha_modes.clone(),
+            transparent,
             pipeline,
             image_pipeline,
             image_bind_group_layout,
@@ -1947,6 +1957,18 @@ impl Renderer {
             runtime
                 .text_viewport
                 .update(&self.queue, Resolution { width, height });
+        }
+    }
+
+    fn set_transparent(&mut self, window: &OsWindow, transparent: bool) {
+        let preferred = if transparent { wgpu::CompositeAlphaMode::PreMultiplied } else { wgpu::CompositeAlphaMode::Opaque };
+        if let Some(mode) = self.alpha_modes.iter().copied().find(|mode| *mode == preferred)
+            .or_else(|| self.alpha_modes.first().copied())
+        {
+            self.config.alpha_mode = mode;
+            self.transparent = transparent;
+            self.surface.configure(&self.device, &self.config);
+            window.request_redraw();
         }
     }
 
@@ -2208,11 +2230,10 @@ impl Renderer {
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.035,
-                        g: 0.047,
-                        b: 0.078,
-                        a: 1.0,
+                    load: wgpu::LoadOp::Clear(if self.transparent {
+                        wgpu::Color::TRANSPARENT
+                    } else {
+                        wgpu::Color { r: 0.035, g: 0.047, b: 0.078, a: 1.0 }
                     }),
                     store: wgpu::StoreOp::Store,
                 },
@@ -2958,6 +2979,14 @@ struct WindowApp {
     visible: bool,
     resizable: String,
     orientation: String,
+    borderless: bool,
+    drag_anywhere: Option<String>,
+    drag_key_down: bool,
+    drag_active: bool,
+    left_mouse_down: bool,
+    last_drag_click: Option<(Instant, f64, f64)>,
+    maximizable: bool,
+    maximized: bool,
     window: Option<Arc<OsWindow>>,
     renderer: Option<Renderer>,
     text_editor: Option<TextEditor>,
@@ -2989,11 +3018,14 @@ impl ApplicationHandler for WindowApp {
             .with_title(self.title.clone())
             .with_visible(self.visible)
             .with_resizable(self.resizable != "none")
+            .with_decorations(!self.borderless)
+            .with_transparent(self.borderless)
+            .with_maximized(self.maximized)
             .with_inner_size(LogicalSize::new(self.width, self.height));
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
-                match Renderer::new(window.clone()) {
+                match Renderer::new(window.clone(), self.borderless) {
                     Ok(renderer) => {
                         self.text_editor = Some(TextEditor::new(window.as_ref()));
                         self.apply_resizable(&window);
@@ -3039,6 +3071,7 @@ impl ApplicationHandler for WindowApp {
                     x: size.width as f64,
                     y: size.height as f64,
                     key: None,
+                    button: None,
                     text: None,
                     modifiers: None,
                     delta_x: None,
@@ -3058,6 +3091,7 @@ impl ApplicationHandler for WindowApp {
                         x: rate as f64 / 1000.0,
                         y: 0.0,
                         key: None,
+                        button: None,
                         text: None,
                         modifiers: None,
                         delta_x: None,
@@ -3077,17 +3111,25 @@ impl ApplicationHandler for WindowApp {
                         logical_size.width,
                         logical_size.height,
                     );
-                    let cursor = direction.map(CursorIcon::from).unwrap_or(CursorIcon::Default);
+                    let cursor = if self.drag_active {
+                        CursorIcon::Grabbing
+                    } else if self.drag_key_is_down() {
+                        CursorIcon::Grab
+                    } else {
+                        direction.map(CursorIcon::from).unwrap_or(CursorIcon::Default)
+                    };
                     if self.cursor_icon != Some(cursor) {
                         window.set_cursor(cursor);
                         self.cursor_icon = Some(cursor);
                     }
                 }
+                if self.drag_key_is_down() || self.drag_active { return; }
                 self.events.push(NativeEvent {
                     kind: "pointermove".into(),
                     x: position.x,
                     y: position.y,
                     key: None,
+                    button: None,
                     text: None,
                     modifiers: None,
                     delta_x: None,
@@ -3095,14 +3137,47 @@ impl ApplicationHandler for WindowApp {
                 });
             }
             OsWindowEvent::CursorLeft { .. } => {
-                if let Some(window) = self.window.as_ref() {
-                    if self.cursor_icon != Some(CursorIcon::Default) {
-                        window.set_cursor(CursorIcon::Default);
-                        self.cursor_icon = Some(CursorIcon::Default);
+                if !self.drag_key_is_down() && !self.drag_active {
+                    if let Some(window) = self.window.as_ref() {
+                        if self.cursor_icon != Some(CursorIcon::Default) {
+                            window.set_cursor(CursorIcon::Default);
+                            self.cursor_icon = Some(CursorIcon::Default);
+                        }
                     }
                 }
             }
             OsWindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    self.left_mouse_down = state.is_pressed();
+                }
+                let drag_key_down = self.drag_key_is_down();
+                if button == MouseButton::Left && (drag_key_down || self.drag_active) {
+                    if state == ElementState::Pressed {
+                        let now = Instant::now();
+                        let double_click = self.last_drag_click.is_some_and(|(at, x, y)| {
+                            now.duration_since(at) <= Duration::from_millis(500)
+                                && (self.cursor.0 - x).hypot(self.cursor.1 - y) <= 8.0
+                        });
+                        if double_click {
+                            self.last_drag_click = None;
+                            if self.maximizable {
+                                if let Some(window) = self.window.as_ref() {
+                                    let maximized = !window.is_maximized();
+                                    window.set_maximized(maximized);
+                                    self.maximized = maximized;
+                                }
+                            }
+                        } else {
+                            self.last_drag_click = Some((now, self.cursor.0, self.cursor.1));
+                            if let Some(window) = self.window.as_ref() { let _ = window.drag_window(); }
+                            self.drag_active = true;
+                        }
+                    } else {
+                        self.drag_active = false;
+                    }
+                    return;
+                }
+                if drag_key_down { return; }
                 if state == ElementState::Pressed && button == MouseButton::Left {
                     if let Some(window) = self.window.as_ref() {
                         let scale = window.scale_factor();
@@ -3126,6 +3201,7 @@ impl ApplicationHandler for WindowApp {
                     x: self.cursor.0,
                     y: self.cursor.1,
                     key: None,
+                    button: Some(match button { MouseButton::Left => 0, MouseButton::Middle => 1, MouseButton::Right => 2, MouseButton::Back => 3, MouseButton::Forward => 4, MouseButton::Other(id) => u32::from(id) }),
                     text: None,
                     modifiers: None,
                     delta_x: None,
@@ -3133,6 +3209,7 @@ impl ApplicationHandler for WindowApp {
                 });
             }
             OsWindowEvent::MouseWheel { delta, .. } => {
+                if self.drag_key_is_down() || self.drag_active { return; }
                 let (delta_x, delta_y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x as f64 * 40.0, y as f64 * 40.0),
                     MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
@@ -3142,14 +3219,28 @@ impl ApplicationHandler for WindowApp {
                     x: self.cursor.0,
                     y: self.cursor.1,
                     key: None,
+                    button: None,
                     text: None,
                     modifiers: None,
                     delta_x: Some(delta_x),
                     delta_y: Some(delta_y),
                 });
             }
-            OsWindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
-            OsWindowEvent::KeyboardInput { event, .. } => self.events.push(NativeEvent {
+            OsWindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+                self.update_drag_cursor();
+            }
+            OsWindowEvent::KeyboardInput { event, .. } => {
+                if let Some(configured) = self.drag_anywhere.as_deref() {
+                    if configured != "*" && !matches!(configured, "Ctrl" | "Shift" | "Alt" | "Meta") {
+                        let key = format!("{:?}", event.logical_key);
+                        if key_matches(configured, &key, event.logical_key.to_text()) {
+                            self.drag_key_down = event.state.is_pressed();
+                        }
+                    }
+                }
+                self.update_drag_cursor();
+                self.events.push(NativeEvent {
                 kind: if event.state.is_pressed() {
                     "keydown"
                 } else {
@@ -3159,11 +3250,13 @@ impl ApplicationHandler for WindowApp {
                 x: self.cursor.0,
                 y: self.cursor.1,
                 key: Some(format!("{:?}", event.logical_key)),
+                button: None,
                 text: event.text.map(|text| text.to_string()),
                 modifiers: Some(format!("{:?}", self.modifiers)),
                 delta_x: None,
                 delta_y: None,
-            }),
+            })
+            }
             OsWindowEvent::Ime(ime) => {
                 let (kind, text, cursor) = match ime {
                     Ime::Enabled => ("imeEnabled", None, None),
@@ -3176,6 +3269,7 @@ impl ApplicationHandler for WindowApp {
                     x: cursor.map(|range| range.0 as f64).unwrap_or(-1.0),
                     y: cursor.map(|range| range.1 as f64).unwrap_or(-1.0),
                     key: None,
+                    button: None,
                     text,
                     modifiers: None,
                     delta_x: None,
@@ -3218,6 +3312,40 @@ impl ApplicationHandler for WindowApp {
 }
 
 impl WindowApp {
+    fn drag_key_is_down(&self) -> bool {
+        match self.drag_anywhere.as_deref() {
+            None => false,
+            Some("*") => true,
+            Some(key) if key.eq_ignore_ascii_case("ctrl") || key.eq_ignore_ascii_case("control") => self.modifiers.control_key(),
+            Some(key) if key.eq_ignore_ascii_case("shift") => self.modifiers.shift_key(),
+            Some(key) if key.eq_ignore_ascii_case("alt") => self.modifiers.alt_key(),
+            Some(key) if key.eq_ignore_ascii_case("meta") || key.eq_ignore_ascii_case("super") => self.modifiers.super_key(),
+            Some(_) => self.drag_key_down,
+        }
+    }
+
+    fn update_drag_cursor(&mut self) {
+        if self.drag_key_is_down() && self.left_mouse_down && !self.drag_active {
+            if let Some(window) = self.window.as_ref() { let _ = window.drag_window(); }
+            self.drag_active = true;
+        }
+        let Some(window) = self.window.as_ref() else { return; };
+        let scale = window.scale_factor();
+        let size = window.inner_size().to_logical::<f64>(scale);
+        let cursor = if self.drag_active {
+            CursorIcon::Grabbing
+        } else if self.drag_key_is_down() {
+            CursorIcon::Grab
+        } else {
+            resize_direction(&self.resizable, self.cursor.0 / scale, self.cursor.1 / scale, size.width, size.height)
+                .map(CursorIcon::from).unwrap_or(CursorIcon::Default)
+        };
+        if self.cursor_icon != Some(cursor) {
+            window.set_cursor(cursor);
+            self.cursor_icon = Some(cursor);
+        }
+    }
+
     fn apply_resizable(&self, window: &OsWindow) {
         window.set_min_inner_size::<LogicalSize<f64>>(None);
         window.set_max_inner_size::<LogicalSize<f64>>(None);
@@ -3255,6 +3383,12 @@ impl WindowApp {
             let _ = window.request_inner_size(bounded);
         }
     }
+}
+
+fn key_matches(configured: &str, debug_key: &str, text: Option<&str>) -> bool {
+    let configured = configured.trim();
+    configured.eq_ignore_ascii_case(debug_key)
+        || text.is_some_and(|text| configured.eq_ignore_ascii_case(text))
 }
 
 fn resize_direction(
@@ -3357,6 +3491,15 @@ impl Window {
             visible: options.visible.unwrap_or(true),
             resizable,
             orientation,
+            borderless: options.borderless.unwrap_or(false),
+            drag_anywhere: match options.drag_anywhere {
+                None | Some(Either::A(false)) => None,
+                Some(Either::A(true)) => Some("*".into()),
+                Some(Either::B(key)) if !key.trim().is_empty() => Some(key),
+                Some(Either::B(_)) => return Err(Error::new(Status::InvalidArg, "dragAnywhere key must not be empty")),
+            },
+            maximizable: options.maximizable.unwrap_or(false),
+            maximized: options.maximized.unwrap_or(false),
             ..Default::default()
         };
         if !app.width.is_finite() || !app.height.is_finite() || app.width < 1.0 || app.height < 1.0
@@ -3419,6 +3562,69 @@ impl Window {
     #[napi(js_name = "resizableMode")]
     pub fn resizable_mode(&self) -> String {
         self.app.resizable.clone()
+    }
+
+    #[napi(js_name = "setBorderless")]
+    pub fn set_borderless(&mut self, value: bool) -> Result<()> {
+        self.app.borderless = value;
+        if let Some(window) = self.app.window.as_ref() {
+            window.set_decorations(!value);
+            window.set_transparent(value);
+            if let Some(renderer) = self.app.renderer.as_mut() { renderer.set_transparent(window, value); }
+        }
+        Ok(())
+    }
+
+    #[napi(js_name = "setDragAnywhere")]
+    pub fn set_drag_anywhere(&mut self, value: Either<bool, String>) -> Result<()> {
+        let configured = match value {
+            Either::A(false) => None,
+            Either::A(true) => Some("*".into()),
+            Either::B(key) if !key.trim().is_empty() => Some(key),
+            Either::B(_) => return Err(Error::new(Status::InvalidArg, "dragAnywhere key must not be empty")),
+        };
+        self.app.drag_anywhere = configured;
+        self.app.drag_key_down = false;
+        self.app.drag_active = false;
+        self.app.left_mouse_down = false;
+        self.app.update_drag_cursor();
+        Ok(())
+    }
+
+    #[napi(js_name = "setMaximizable")]
+    pub fn set_maximizable(&mut self, value: bool) {
+        self.app.maximizable = value;
+    }
+
+    #[napi(js_name = "setMaximized")]
+    pub fn set_maximized(&mut self, value: bool) -> Result<()> {
+        self.app.maximized = value;
+        if let Some(window) = self.app.window.as_ref() {
+            window.set_maximized(value);
+        }
+        Ok(())
+    }
+
+    #[napi(js_name = "isMaximized")]
+    pub fn is_maximized(&self) -> bool {
+        self.app.maximized
+    }
+
+    #[napi]
+    pub fn start_dragging(&self) -> Result<()> {
+        if self.app.drag_anywhere.is_none() { return Ok(()); }
+        let window = self.app.window.as_ref().ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+        window.drag_window().map_err(|error| Error::new(Status::GenericFailure, format!("start window drag: {error}")))
+    }
+
+    #[napi]
+    pub fn toggle_maximize(&mut self) -> Result<()> {
+        if !self.app.maximizable { return Ok(()); }
+        let window = self.app.window.as_ref().ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+        let maximized = !window.is_maximized();
+        window.set_maximized(maximized);
+        self.app.maximized = maximized;
+        Ok(())
     }
 
     #[napi(js_name = "setSizeConstraints")]

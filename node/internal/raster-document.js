@@ -3,6 +3,7 @@ import { documentBoxes, elementState } from './dom-state.js';
 import { canvasSurface, imageSurface } from '../canvas-2d.js';
 import { textMetrics, textLines, inherited } from './text-metrics.js';
 import { computedStyleValue } from './css-transitions.js';
+import { renderedText } from './nerd-icon.js';
 const windows = new WeakMap();
 export const paintProfile = new Map();
 const backgrounds = new Map();
@@ -35,12 +36,19 @@ export function rasterizeDocument(document, width, height, surface = createCanva
   if (surface.height !== height) surface.height = height;
   const ctx = surface.getContext('2d');
   ctx.clearRect(0, 0, width, height);
-  for (const box of stackingOrder(documentBoxes(document))) {
+  const boxes = documentBoxes(document);
+  const documentBox = boxes.find(box => box.element === document.body);
+  const documentRadius = documentBox ? radius(document.body.style.borderRadius, documentBox.width, documentBox.height) : 0;
+  for (const box of stackingOrder(boxes)) {
     if (box.width <= 0 || box.height <= 0) continue;
     const element = box.element, style = element.style;
     const elementStarted = performance.now();
     ctx.save();
     if (box.clip) { ctx.beginPath(); ctx.rect(box.clip.x, box.clip.y, box.clip.width, box.clip.height); ctx.clip(); }
+    if (documentRadius && element !== document.body && documentBox) {
+      round(ctx, documentBox.x, documentBox.y, documentBox.width, documentBox.height, documentRadius);
+      ctx.clip();
+    }
     for (let ancestor = element; ancestor; ancestor = ancestor.parent) {
       if (ancestor.style.opacity !== undefined) ctx.globalAlpha *= Math.max(0, Math.min(1, Number(ancestor.style.opacity)));
     }
@@ -103,7 +111,7 @@ export function rasterizeDocument(document, width, height, surface = createCanva
       const image = state.canvasContext ? canvasSurface(state.canvasContext) : imageSurface(element);
       if (image && content.width > 0 && content.height > 0) ctx.drawImage(image, content.x, content.y, content.width, content.height);
     }
-    if (state.text) {
+    if (renderedText(element)) {
       const metrics = textMetrics(element), text = metrics.style;
       let textColor = text.color;
       for (let current = element; current; current = current.parent) {

@@ -1,6 +1,7 @@
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { findFontFiles, fontFamilies, systemFontFamily } from '../font-registry.js';
 import { elementState } from './dom-state.js';
+import { nerdIcon, renderedText } from './nerd-icon.js';
 const loaded = new Set();
 function loadFamilies(stack) {
   for (const family of fontFamilies(stack)) {
@@ -21,7 +22,7 @@ export function inherited(element, name, fallback) {
 export function textStyle(element) {
   const size = parseFloat(inherited(element, 'fontSize', 16));
   const weight = inherited(element, 'fontWeight', 400);
-  const requestedFamilies = fontFamilies(inherited(element, 'fontFamily', 'sans-serif'))
+  const requestedFamilies = (nerdIcon(element) ? ['Nerd Symbols'] : fontFamilies(inherited(element, 'fontFamily', 'sans-serif')))
     .map(name => ['sans-serif', 'ui-sans-serif', 'system-ui'].includes(name) ? systemFontFamily
       : name.toLowerCase() === 'monospace' ? 'Liberation Mono' : name);
   // Skia does not inherit the host system's CSS font fallback list. Keep the
@@ -43,8 +44,8 @@ export function textStyle(element) {
 }
 export function textMetrics(element) {
   const style = textStyle(element);
-  let text = elementState(element).text || '';
-  if (inherited(element, 'textTransform', '') === 'uppercase') text = text.toUpperCase();
+  let text = renderedText(element);
+  if (!nerdIcon(element) && inherited(element, 'textTransform', '') === 'uppercase') text = text.toUpperCase();
   const key = JSON.stringify([text, style]);
   const state = elementState(element);
   if (state.textMetrics?.key === key) return state.textMetrics;

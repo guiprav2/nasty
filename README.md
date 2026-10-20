@@ -32,6 +32,8 @@ The layout example checks positions, measures Taffy through the default persiste
 
 `FontRegistry` is also exported from `node/index.js`. Set `element.style.fontFamily` to load from root `fonts/`: family names become lowercase ASCII with whitespace replaced by underscores (for example, `DejaVu Sans` → `dejavu_sans.ttf`). Low-level text runs use `fontFamily: "DejaVu Sans"` through `resolveRuns()` and give the resolved `runs` and `fonts` to `window.requestTextRuns()`. The custom-font example accepts an optional family and matching file path: `node node/examples/custom_fonts.js "Acme Sans" ./AcmeSans.ttf`.
 
+Nerd Fonts Symbols are bundled in root `fonts/`. Give an otherwise empty element `class="nf nf-md-home"` (or another supported `nf-*` glyph class); Nasty resolves the glyph and applies the bundled icon font while inline styles control its size and color.
+
 `Document.layout(width, height)` is asynchronous and returns the latest completed box snapshot; styles changed while layout runs are applied on the next worker request. Call `document.close()` when the document is no longer needed to stop its persistent worker.
 
 ## Build the Android tour APK

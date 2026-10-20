@@ -2,6 +2,7 @@ import { fontsForRuns } from '../font-registry.js';
 import { documentBoxes, documentBoxesFor, documentState, elementState } from './dom-state.js';
 import { computedStyleValue } from './css-transitions.js';
 import { createBoxProjector, parseColor } from '../render.js';
+import { fontFamilyForElement, renderedText } from './nerd-icon.js';
 
 const windows = new WeakMap();
 const lastSyncTimes = new WeakMap();
@@ -34,7 +35,7 @@ function textEntries(document, selectedElements = null) {
   const projectPoint = createBoxProjector(boxes);
   for (const box of boxes) {
     const { element, contentBox: bounds, clip } = box;
-    const text = elementState(element).text;
+    const text = renderedText(element);
     if (!text || !bounds.width || !bounds.height) continue;
     const rgba = parseColor(inherited(element, 'color', '#000000')) ?? [0, 0, 0, 0];
     for (let current = element; current; current = current.parent) {
@@ -47,7 +48,7 @@ function textEntries(document, selectedElements = null) {
     const transformedWidth = bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
     const run = { text, x: textOrigin.x, y: textOrigin.y, width: transformedWidth, fontSize,
       lineHeight: parseFloat(inherited(element, 'lineHeight', fontSize * 1.2)),
-      fontFamily: inherited(element, 'fontFamily', 'sans-serif'),
+      fontFamily: fontFamilyForElement(element, inherited(element, 'fontFamily', 'sans-serif')),
       fontWeight: Math.max(100, Math.min(900, parseInt(inherited(element, 'fontWeight', 400), 10) || 400)), color,
       wrap: inherited(element, 'whiteSpace', 'normal') !== 'nowrap' };
     if (clip) Object.assign(run, { clipX: clip.x, clipY: clip.y, clipWidth: clip.width, clipHeight: clip.height });

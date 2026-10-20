@@ -492,9 +492,11 @@ class DirectEventSource {
 }
 
 let netOnly = options.netOnly;
-const window = new Window({ title: 'Rainbow — process field', width: 1180, height: 760, resizable: 'both' });
+const window = new Window({ title: 'Rainbow — process field', width: 1180, height: 760, resizable: 'both', borderless: true, dragAnywhere: 'Ctrl', maximizable: true, maximized: true });
 const document = new Document(); window.document = document;
 const ui = createRainbowUI(document);
+ui.setMaximized(window.maximized);
+ui.maximizeButton.addEventListener('click', () => { window.maximized = !window.maximized; ui.setMaximized(window.maximized); });
 let viewport = window.size(); ui.resize(viewport.width, viewport.height);
 const events = new EventTarget(), frames = new Map(), timers = new Set(), intervals = new Set();
 events.addEventListener('message', event => {
@@ -504,6 +506,7 @@ events.addEventListener('message', event => {
 });
 let nextFrame = 0, shown = false, count = 0, pointer = { x: 0, y: 0 }, lastTarget = null, shiftDown = false;
 const actionKeysDown = new Set();
+let pointerDownTarget = null;
 const browser = {
   document, console, performance, devicePixelRatio: 1,
   usageScale: options.usageScale,
@@ -538,6 +541,7 @@ function pointerEvent(target, type, button = 0, extra = {}) {
   const event = new Event(type, { bubbles: true, cancelable: true });
   Object.assign(event, { pointerId: 1, pointerType: 'mouse', clientX: pointer.x, clientY: pointer.y, button, shiftKey: shiftDown, ...extra });
   target.dispatchEvent(event);
+  return event;
 }
 function hitElement() {
   return [...documentBoxes(document)].reverse().find(box => {
@@ -592,7 +596,14 @@ function dispatch() {
     const hit = hitElement();
     const target = capture || hit;
     if (!capture && target !== lastTarget) { pointerEvent(lastTarget, 'pointerleave'); lastTarget = target; }
-    pointerEvent(target, event.type, event.key === 'right' ? 2 : 0);
+    const button = event.button ?? 0;
+    pointerEvent(target, event.type, button);
+    if (event.type === 'pointerdown' && button === 0) pointerDownTarget = target;
+    if (event.type === 'pointerup' && button === 0) {
+      if (target && target === pointerDownTarget) target.dispatchEvent(new Event('click', { bubbles: true, cancelable: true }));
+      pointerDownTarget = null;
+    }
+    if (event.type === 'pointercancel') pointerDownTarget = null;
     if (event.type === 'pointerup' || event.type === 'pointercancel') capture?.releasePointerCapture(1);
   }
 }
@@ -621,6 +632,7 @@ async function frame() {
   await layoutDocument(document, viewport.width, viewport.height);
   const laidOut = performance.now();
   const result = window.presentDocument();
+  ui.setMaximized(window.maximized);
   if (limit) phases.push({ dispatch: dispatched - start, draw: drawn - dispatched, layout: laidOut - drawn, ...rasterTimings.get(window), native: result.nativeRenderMs });
   if (!shown) { window.show(); shown = true; }
   elapsed.push(performance.now() - start); count++;

@@ -17,7 +17,7 @@ export function createRainbowUI(document) {
   const absolute = { position: 'absolute' };
   const fixed = { position: 'fixed' };
   const body = document.body;
-  style(body, { backgroundColor: '#080a12', color: '#f4f3f7', fontFamily: sans, overflow: 'hidden', minWidth: 480, minHeight: 360, transition: 'background-color 800ms ease-in-out' });
+  style(body, { backgroundColor: '#080a12', color: '#f4f3f7', fontFamily: sans, overflow: 'hidden', borderRadius: 14, minWidth: 480, minHeight: 360, transition: 'background-color 800ms ease-in-out' });
   const canvas = el(body, 'canvas', '', '', { ...fixed, top: 0, left: 0, width: '100%', height: '100%', zIndex: 0, cursor: 'grab', touchAction: 'none' }, 'field');
   canvas.setAttribute('aria-label', 'Live process constellation');
   const grain = el(body, 'div', 'grain', '', { ...fixed, top: 0, left: 0, width: '100%', height: '100%', zIndex: 1, pointerEvents: 'none', opacity: .045,
@@ -34,6 +34,20 @@ export function createRainbowUI(document) {
   el(live, 'span', '', 'CONNECTING', {}, 'connection');
   el(live, 'span', 'divider', '/', { color: '#515568' });
   el(live, 'span', '', '--:--:--', {}, 'clock');
+  const maximizeButton = el(live, 'button', 'maximize-control', '', { ...row, justifyContent: 'center', width: 26, height: 26, marginLeft: 2, padding: 0, borderWidth: 0, borderStyle: 'none', borderRadius: 5, backgroundColor: 'transparent', color: '#c7a8ff', pointerEvents: 'auto', cursor: 'pointer' }, 'maximize-control');
+  maximizeButton.setAttribute('aria-label', 'Maximize window');
+  maximizeButton.setAttribute('title', 'Maximize window');
+  const maximizeGlyph = el(maximizeButton, 'span', 'nf nf-md-window-maximize', '', { position: 'relative', top: -6, fontSize: 15, lineHeight: 1 });
+  let maximizedState = null;
+  function setMaximized(maximized) {
+    maximized = Boolean(maximized);
+    if (maximizedState === maximized) return;
+    maximizedState = maximized;
+    maximizeGlyph.className = `nf nf-md-window-${maximized ? 'restore' : 'maximize'}`;
+    maximizeGlyph.style.top = maximized ? -0.33 : 0;
+    maximizeButton.setAttribute('aria-label', `${maximized ? 'Restore' : 'Maximize'} window`);
+    maximizeButton.setAttribute('title', `${maximized ? 'Restore' : 'Maximize'} window`);
+  }
   const intro = el(shell, 'section', 'intro', '', { display: 'block', maxWidth: 540, flexShrink: 0 });
   const eyebrow = { fontFamily: mono, fontSize: 9, color: '#a7a8b6', letterSpacing: '.16em' };
   el(intro, 'p', 'eyebrow', 'A QUIET WINDOW INTO YOUR MACHINE', { ...eyebrow, color: '#bd9fff', marginTop: 9, marginBottom: 9 });
@@ -160,5 +174,5 @@ export function createRainbowUI(document) {
       style(meta.querySelector('small'), { ...truncated, fontSize: 8, marginTop: 4, color: '#888b9e' });
     }
   }
-  return { canvas, resize, update, showRecentCommands, clearRecentCommands, setTracingEnabled };
+  return { canvas, maximizeButton, resize, update, showRecentCommands, clearRecentCommands, setTracingEnabled, setMaximized };
 }
