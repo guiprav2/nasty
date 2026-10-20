@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use taffy::prelude::*;
 use taffy::tree::TaffyError;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent as OsWindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
@@ -2951,6 +2951,10 @@ struct WindowApp {
     title: String,
     width: f64,
     height: f64,
+    min_width: Option<f64>,
+    min_height: Option<f64>,
+    max_width: Option<f64>,
+    max_height: Option<f64>,
     visible: bool,
     resizable: String,
     orientation: String,
@@ -3217,22 +3221,38 @@ impl WindowApp {
     fn apply_resizable(&self, window: &OsWindow) {
         window.set_min_inner_size::<LogicalSize<f64>>(None);
         window.set_max_inner_size::<LogicalSize<f64>>(None);
-        match self.resizable.as_str() {
-            "none" => window.set_resizable(false),
-            "both" => window.set_resizable(true),
+        let scale = window.scale_factor();
+        let size = window.inner_size().to_logical::<f64>(scale);
+        let (min_width, min_height, max_width, max_height) = match self.resizable.as_str() {
+            "none" => { window.set_resizable(false); return; }
+            "both" => (self.min_width, self.min_height, self.max_width, self.max_height),
             "horizontal" => {
-                let size = window.inner_size();
                 window.set_resizable(true);
-                window.set_min_inner_size(Some(PhysicalSize::new(1, size.height)));
-                window.set_max_inner_size(Some(PhysicalSize::new(i32::MAX as u32, size.height)));
+                (self.min_width, Some(size.height), self.max_width, Some(size.height))
             }
             "vertical" => {
-                let size = window.inner_size();
                 window.set_resizable(true);
-                window.set_min_inner_size(Some(PhysicalSize::new(size.width, 1)));
-                window.set_max_inner_size(Some(PhysicalSize::new(size.width, i32::MAX as u32)));
+                (Some(size.width), self.min_height, Some(size.width), self.max_height)
             }
             _ => unreachable!("resizable mode validated in constructor and setter"),
+        };
+        if min_width.is_some() || min_height.is_some() {
+            window.set_min_inner_size(Some(LogicalSize::new(min_width.unwrap_or(1.0).max(1.0), min_height.unwrap_or(1.0).max(1.0))));
+        }
+        if max_width.is_some() || max_height.is_some() {
+            window.set_max_inner_size(Some(LogicalSize::new(
+                max_width.unwrap_or(i32::MAX as f64).max(1.0),
+                max_height.unwrap_or(i32::MAX as f64).max(1.0),
+            )));
+        }
+        let upper_width = max_width.unwrap_or(i32::MAX as f64).max(1.0);
+        let upper_height = max_height.unwrap_or(i32::MAX as f64).max(1.0);
+        let bounded = LogicalSize::new(
+            size.width.clamp(min_width.unwrap_or(1.0).max(1.0), upper_width),
+            size.height.clamp(min_height.unwrap_or(1.0).max(1.0), upper_height),
+        );
+        if (bounded.width - size.width).abs() > 0.5 || (bounded.height - size.height).abs() > 0.5 {
+            let _ = window.request_inner_size(bounded);
         }
     }
 }
@@ -3399,6 +3419,32 @@ impl Window {
     #[napi(js_name = "resizableMode")]
     pub fn resizable_mode(&self) -> String {
         self.app.resizable.clone()
+    }
+
+    #[napi(js_name = "setSizeConstraints")]
+    pub fn set_size_constraints(
+        &mut self,
+        min_width: Option<f64>,
+        min_height: Option<f64>,
+        max_width: Option<f64>,
+        max_height: Option<f64>,
+    ) -> Result<()> {
+        for (name, value) in [("minWidth", min_width), ("minHeight", min_height), ("maxWidth", max_width), ("maxHeight", max_height)] {
+            if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                return Err(Error::new(Status::InvalidArg, format!("{name} must be a finite nonnegative number")));
+            }
+        }
+        if min_width.unwrap_or(1.0).max(1.0) > max_width.unwrap_or(i32::MAX as f64).max(1.0)
+            || min_height.unwrap_or(1.0).max(1.0) > max_height.unwrap_or(i32::MAX as f64).max(1.0)
+        {
+            return Err(Error::new(Status::InvalidArg, "minimum window dimensions cannot exceed maximum dimensions"));
+        }
+        self.app.min_width = min_width;
+        self.app.min_height = min_height;
+        self.app.max_width = max_width;
+        self.app.max_height = max_height;
+        if let Some(window) = self.app.window.as_ref() { self.app.apply_resizable(window); }
+        Ok(())
     }
 
     fn apply_orientation(&self) -> Result<()> {

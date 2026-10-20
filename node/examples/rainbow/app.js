@@ -5,14 +5,28 @@ const seen = new Map();
 let processes = [], nodes = [], width = 0, height = 0, dpr = 1;
 let lastNew = new Set(), pointer = { x: -1, y: -1 }, hover = null;
 let rotation = { yaw: -0.16, pitch: 0.62 }, dragging = null;
+let zoom = 1, pan = { x: 0, y: 0 };
 let hasInitialSample = false;
 let baseRadius = 86;
 let layerHeight = 72;
-let newProcessTimer = null;
-let newProcessPid = null;
 let windowSnapshots = [];
+const recentCommands = [];
 
 function hash(text) { let h = 2166136261; for (const ch of text) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; }
+function loadUnit(value, scale) { return Math.min(1, Math.log1p(Math.max(0, value) / scale) / Math.log1p(16)); }
+function processActivity(node) {
+  const cpu = loadUnit(node.cpuPercent || 0, 6.25);
+  const memory = loadUnit(node.rssBytes || 0, 64 * 1024 * 1024);
+  const network = loadUnit((node.networkUpBps || 0) + (node.networkDownBps || 0), 64 * 1024);
+  const disk = loadUnit((node.diskReadBps || 0) + (node.diskWriteBps || 0), 256 * 1024);
+  return Math.sqrt(.35 * cpu * cpu + .25 * memory * memory + .2 * network * network + .2 * disk * disk);
+}
+function formatBytes(value) {
+  const units = ['B', 'KiB', 'MiB', 'GiB']; let amount = Math.max(0, value || 0), unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit++; }
+  return `${amount.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+function formatRate(value) { return `${formatBytes(value)}/s`; }
 function familyOf(proc) {
   const text = proc.label.toLowerCase();
   const base = proc.executable.toLowerCase();
@@ -97,8 +111,7 @@ function placeNodes() {
       y=Math.sin(angle)*radius;
       z=depth*layerHeight+((nodeSeed>>>10)%17);
     }
-    const seenKey = `${proc.pid}:${proc.label}`;
-    next.push({ ...proc, root: depth === 0, x, y, z, hue: hueFor(proc.family), fresh: lastNew.has(proc.pid), bornAt: seen.get(seenKey) || Date.now(), size: depth === 0 ? 5 : 2.8 });
+    next.push({ ...proc, root: depth === 0, x, y, z, hue: hueFor(proc.family), fresh: lastNew.has(proc.pid), size: depth === 0 ? 5 : 2.8 });
   }
   nodes = next;
   const families = new Set(processes.map(familyOf));
@@ -117,12 +130,31 @@ function update(data) {
       // The first snapshot is a baseline: these processes were not created
       // during this Rainbow session, so show them at their normal size.
       seen.set(key, hasInitialSample ? now : now - 90000);
-      if (hasInitialSample) fresh.add(proc.pid);
+      if (hasInitialSample) {
+        fresh.add(proc.pid);
+        recentCommands.unshift({ pid: proc.pid, commandLine: proc.commandLine || proc.label });
+      }
     }
   }
+  recentCommands.splice(10);
+  document.querySelector('#recent-commands').replaceChildren(...recentCommands.map(item => {
+    const line = document.createElement('div');
+    line.textContent = item.commandLine;
+    line.setAttribute('title', item.commandLine);
+    return line;
+  }));
+  if (recentCommands.length) document.querySelector('#window-stack').hidden = false;
   // Mark only recently started commands; old processes are no longer highlighted.
   lastNew = new Set(data.processes.filter(p => now-(seen.get(`${p.pid}:${p.label}`)||now) < 12000 && fresh.has(p.pid)).map(p=>p.pid));
   processes = data.processes;
+  const byPid = new Map(processes.map(proc => [proc.pid, proc]));
+  windowSnapshots = windowSnapshots.map(item => ({ ...item, owner: byPid.get(item.pid)?.executable }));
+  for (const [index, card] of [...document.querySelector('#window-list').children].entries()) {
+    const item = windowSnapshots[index], owner = item && (item.owner || `PID ${item.pid}`);
+    const label = item && `${owner} · ${item.width} × ${item.height}`;
+    const small = card.querySelector('small');
+    if (label && small.textContent !== label) small.textContent = label;
+  }
   hasInitialSample = true;
   document.querySelector('#connection').textContent='LIVE'; document.querySelector('.live').classList.remove('offline');
   document.querySelector('#clock').textContent=new Date().toLocaleTimeString([], {hour12:false});
@@ -132,16 +164,15 @@ function update(data) {
     if (hover) drawHoverCard(hover);
     else { hideCard(); drawWindowSnapshots(); }
   }
-  let arrivingNode=null;
-  for(const node of nodes)if(fresh.has(node.pid))arrivingNode=node;
-  if(arrivingNode)showNewProcessCard(arrivingNode);
-  window.lastNewNotice = fresh.size;
 }
 function drawWindowSnapshots() {
   const list = document.querySelector('#window-list');
   const associated = hover ? windowSnapshots.filter(window => window.pid === hover.pid) : [];
   const stack = document.querySelector('#window-stack');
-  stack.hidden = associated.length === 0;
+  stack.hidden = associated.length === 0 && recentCommands.length === 0;
+  document.querySelector('#windows-rule').hidden = associated.length === 0;
+  document.querySelector('#window-head').hidden = associated.length === 0;
+  list.hidden = associated.length === 0;
   document.querySelector('#window-count').textContent = associated.length;
   list.replaceChildren(...associated.map(window => {
     const card = document.createElement('article'); card.className = 'window-card';
@@ -151,20 +182,17 @@ function drawWindowSnapshots() {
     const owner = document.createElement('small'); owner.textContent = `${window.owner || `PID ${window.pid}`} · ${window.width} × ${window.height}`;
     meta.append(title, owner); card.append(canvas, meta);
     const image = new Image(); image.onload = () => { const c = canvas.getContext('2d'); c.clearRect(0,0,canvas.width,canvas.height); c.drawImage(image,0,0,canvas.width,canvas.height); };
-    image.src = `/api/windows/${window.id}.png?t=${Date.now()}`;
+    if (window.preview) image.src = window.preview;
     return card;
   }));
 }
-async function refreshWindows() {
-  try {
-    const response = await fetch('/api/windows', { cache: 'no-store' });
-    const data = await response.json();
+function updateWindows(data) {
     const byPid = new Map(processes.map(proc => [proc.pid, proc]));
     windowSnapshots = (data.windows || []).map(window => ({ ...window, owner: byPid.get(window.pid)?.executable })).slice(0, 12);
     drawWindowSnapshots();
-  } catch { /* Window previews are optional if the desktop service is unavailable. */ }
 }
-refreshWindows(); setInterval(refreshWindows, 1600);
+const windowStream = new EventSource('/windows');
+windowStream.onmessage = event => { try { updateWindows(JSON.parse(event.data)); } catch(error) { console.error(error); } };
 let noticeTimer;
 function showNotice(message) { const el=document.querySelector('#notice'); el.textContent=message; el.hidden=false; clearTimeout(noticeTimer); noticeTimer=setTimeout(()=>el.hidden=true,5000); }
 
@@ -179,7 +207,7 @@ function project(x, y, z = 0) {
   const depth = ry * Math.cos(elevation) - z * Math.sin(elevation);
   const focal = Math.max(width, height) * 1.8;
   const scale = Math.max(.48, Math.min(1.9, focal / (focal - depth)));
-  return { x: pivotX + rx * scale, y: pivotY + screenY * scale, depth, scale };
+  return { x: pivotX + rx * scale * zoom + pan.x, y: pivotY + screenY * scale * zoom + pan.y, depth, scale };
 }
 
 function positionCard(card,x,y){
@@ -191,28 +219,13 @@ function drawHoverCard(node){
   tooltip.style.display='block';
   tooltip.querySelector('.tip-family').textContent=node.family;
   tooltip.querySelector('strong').textContent=node.label;
-  tooltip.querySelector('small').textContent=`PID ${node.pid} · parent ${node.ppid} · running`;
+  const networkRates = node.networkRatesAvailable ? `↑ ${formatRate(node.networkUpBps)} · ↓ ${formatRate(node.networkDownBps)}` : 'rates unavailable';
+  tooltip.querySelector('small').textContent = `PID ${node.pid} · parent ${node.ppid}\nCPU ${Number(node.cpuPercent || 0).toFixed(1)}% · RAM ${formatBytes(node.rssBytes)} (${Number(node.memoryPercent || 0).toFixed(2)}%)\nTCP ${networkRates} · ${node.sockets || 0} sockets\nDISK R ${formatRate(node.diskReadBps)} · W ${formatRate(node.diskWriteBps)}`;
   positionCard(tooltip,node.screenX ?? project(node.x,node.y,node.z).x,node.screenY ?? project(node.x,node.y,node.z).y);
 }
 function hideCard(){
   tooltip.style.display='none';
 }
-function showNewProcessCard(node){
-  const card=document.querySelector('#new-process-card');
-  newProcessPid=node.pid;
-  card.querySelector('strong').textContent=node.label;
-  card.querySelector('small').textContent=`PID ${node.pid} · parent ${node.ppid}`;
-  card.hidden=false;
-  positionNewProcessCard(node);
-  clearTimeout(newProcessTimer);
-  newProcessTimer=setTimeout(()=>{card.hidden=true;newProcessPid=null;},3500);
-}
-function positionNewProcessCard(node){
-  if (!node) return;
-  const card=document.querySelector('#new-process-card');
-  positionCard(card,node.screenX ?? project(node.x,node.y,node.z).x,node.screenY ?? project(node.x,node.y,node.z).y);
-}
-
 function draw(t) {
   ctx.clearRect(0,0,width,height);
   const glow=ctx.createRadialGradient(width*.69,height*.66,5,width*.69,height*.66,Math.max(width,height)*.66);
@@ -223,9 +236,8 @@ function draw(t) {
   const projected = nodes.map(n => {
     const p = project(n.x, n.y, n.z);
     n.screenX = p.x; n.screenY = p.y; n.depth = p.depth; n.perspective = p.scale;
-    const age = Math.max(0, Date.now() - n.bornAt);
-    const growth = 1 + 2.8 * Math.pow(Math.max(0, 1 - age / 90000), 2);
-    n.displaySize = n.size * growth * p.scale;
+    n.activity = processActivity(n);
+    n.displaySize = n.size * p.scale * zoom * (.78 + .95 * Math.sqrt(n.activity));
     return { n, ...p };
   }).sort((a,b) => a.depth-b.depth);
   // Draw the root guide as a projected circle, so it tilts with the process plane.
@@ -253,13 +265,13 @@ function draw(t) {
     const pulse=n.fresh ? .75+.25*Math.sin(t/220) : 1;
     const color=`hsla(${n.hue},76%,72%,${n.fresh?.94:.68})`;
     if(n.fresh){ctx.beginPath();ctx.arc(x,y,size+5+Math.sin(t/250)*1.5,0,Math.PI*2);ctx.strokeStyle=`hsla(${n.hue},88%,82%,${.25*pulse})`;ctx.lineWidth=.8;ctx.stroke();}
-    const g=ctx.createRadialGradient(x,y,0,x,y,size*3.5);g.addColorStop(0,`hsla(${n.hue},90%,75%,${.4*pulse})`);g.addColorStop(1,`hsla(${n.hue},80%,65%,0)`);ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,size*3.5,0,Math.PI*2);ctx.fill();
+    const glowRadius = size * (3 + 2 * n.activity);
+    const g=ctx.createRadialGradient(x,y,0,x,y,glowRadius);g.addColorStop(0,`hsla(${n.hue},90%,75%,${(.24 + .32 * n.activity)*pulse})`);g.addColorStop(1,`hsla(${n.hue},80%,65%,0)`);ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,glowRadius,0,Math.PI*2);ctx.fill();
     ctx.beginPath();ctx.arc(x,y,size*(n.pid===hover?.pid?1.7:1),0,Math.PI*2);ctx.fillStyle=color;ctx.fill();
     if(n.pid===hover?.pid){ctx.beginPath();ctx.arc(x,y,size+5,0,Math.PI*2);ctx.strokeStyle=`hsla(${n.hue},85%,88%,.8)`;ctx.lineWidth=1;ctx.stroke();}
   }
   for(let i=0;i<22;i++){const x=(hash(`dust${i}`)%10000)/10000*width,y=(hash(`dusty${i}`)%10000)/10000*height;ctx.fillStyle='rgba(205,195,237,.1)';ctx.fillRect(x,y,1,1);}
   if (hover && tooltip.style.display !== 'none') drawHoverCard(hover);
-  if (newProcessPid !== null) positionNewProcessCard(nodes.find(node => node.pid === newProcessPid));
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
@@ -280,7 +292,8 @@ canvas.addEventListener('pointerdown',e=>{
 canvas.addEventListener('pointermove',e=>{
   if(dragging&&dragging.id===e.pointerId){
     const dx=e.clientX-dragging.x,dy=e.clientY-dragging.y;
-    rotation.yaw-=dx*.006;rotation.pitch-=dy*.006;
+    if (e.shiftKey) { pan.x += dx; pan.y += dy; }
+    else { rotation.yaw-=dx*.006;rotation.pitch-=dy*.006; }
     dragging.x=e.clientX;dragging.y=e.clientY;return;
   }
   inspect(e.clientX,e.clientY);canvas.style.cursor=hover?'pointer':'grab';
@@ -288,6 +301,16 @@ canvas.addEventListener('pointermove',e=>{
 const endDrag=e=>{if(dragging&&dragging.id===e.pointerId){dragging=null;canvas.style.cursor='grab';}};
 canvas.addEventListener('pointerup',endDrag);canvas.addEventListener('pointercancel',endDrag);
 canvas.addEventListener('pointerleave',()=>{if(!dragging){hover=null;drawWindowSnapshots();canvas.style.cursor='grab';hideCard();}});
-const stream = new EventSource('/api/processes?stream=1');
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const factor = Math.exp(-e.deltaY * .001);
+  const next = Math.max(.35, Math.min(4, zoom * factor));
+  if (next === zoom) return;
+  const pivotX = width * .59, pivotY = height * .78;
+  pan.x = e.clientX - pivotX - (e.clientX - pivotX - pan.x) * next / zoom;
+  pan.y = e.clientY - pivotY - (e.clientY - pivotY - pan.y) * next / zoom;
+  zoom = next;
+}, { passive: false });
+const stream = new EventSource('/processes');
 stream.onmessage = event => { try { update(JSON.parse(event.data)); } catch(error) { console.error(error); } };
 stream.onerror = () => { document.querySelector('#connection').textContent='RECONNECTING'; document.querySelector('.live').classList.add('offline'); };

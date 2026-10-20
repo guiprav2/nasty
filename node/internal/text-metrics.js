@@ -21,8 +21,15 @@ export function inherited(element, name, fallback) {
 export function textStyle(element) {
   const size = parseFloat(inherited(element, 'fontSize', 16));
   const weight = inherited(element, 'fontWeight', 400);
-  const family = fontFamilies(inherited(element, 'fontFamily', 'sans-serif')).map(name => ['sans-serif', 'ui-sans-serif', 'system-ui'].includes(name) ? systemFontFamily : name === 'monospace' ? 'Liberation Mono' : name).map(name => `'${name}'`).join(', ');
-  loadFamilies(family);
+  const requestedFamilies = fontFamilies(inherited(element, 'fontFamily', 'sans-serif'))
+    .map(name => ['sans-serif', 'ui-sans-serif', 'system-ui'].includes(name) ? systemFontFamily
+      : name.toLowerCase() === 'monospace' ? 'Liberation Mono' : name);
+  // Skia does not inherit the host system's CSS font fallback list. Keep the
+  // requested families first, then use the bundled system sans face for glyphs
+  // that those families (or our named font files) do not contain.
+  if (!requestedFamilies.some(name => name.toLowerCase() === 'dejavu sans')) requestedFamilies.push('DejaVu Sans');
+  const family = requestedFamilies.map(name => `'${name}'`).join(', ');
+  loadFamilies(requestedFamilies.join(', '));
   const rawSpacing = inherited(element, 'letterSpacing', 0);
   const spacing = parseFloat(rawSpacing) * (String(rawSpacing).endsWith('em') ? size : 1) || 0;
   const rawLine = inherited(element, 'lineHeight', 'normal');

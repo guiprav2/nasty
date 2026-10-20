@@ -17,12 +17,12 @@ export function createRainbowUI(document) {
   const absolute = { position: 'absolute' };
   const fixed = { position: 'fixed' };
   const body = document.body;
-  style(body, { backgroundColor: '#080a12', color: '#f4f3f7', fontFamily: sans, overflow: 'hidden' });
+  style(body, { backgroundColor: '#080a12', color: '#f4f3f7', fontFamily: sans, overflow: 'hidden', minWidth: 480, minHeight: 360 });
   const canvas = el(body, 'canvas', '', '', { ...fixed, top: 0, left: 0, width: '100%', height: '100%', zIndex: 0, cursor: 'grab', touchAction: 'none' }, 'field');
   canvas.setAttribute('aria-label', 'Live process constellation');
   const grain = el(body, 'div', 'grain', '', { ...fixed, top: 0, left: 0, width: '100%', height: '100%', zIndex: 1, pointerEvents: 'none', opacity: .045,
     backgroundImage: 'url("data:image/svg+xml,%3Csvg viewBox=\'0 0 180 180\' xmlns=\'http://www.w3.org/2000/svg\'%3E%3Cfilter id=\'n\'%3E%3CfeTurbulence type=\'fractalNoise\' baseFrequency=\'.9\' numOctaves=\'3\' stitchTiles=\'stitch\'/%3E%3C/filter%3E%3Crect width=\'100%25\' height=\'100%25\' filter=\'url(%23n)\' opacity=\'.6\'/%3E%3C/svg%3E")' });
-  const shell = el(body, 'main', 'shell', '', { ...col, position: 'relative', zIndex: 2, width: '100%', maxWidth: 1480, marginLeft: 'auto', marginRight: 'auto', pointerEvents: 'none' });
+  const shell = el(body, 'main', 'shell', '', { ...col, position: 'relative', zIndex: 2, width: '100%', pointerEvents: 'none' });
   const top = el(shell, 'header', 'topbar', '', { ...row, justifyContent: 'space-between', flexShrink: 0 });
   const wordmark = el(top, 'a', 'wordmark', '', { ...row, color: '#f4f3f7', fontWeight: 700, fontSize: 16, letterSpacing: '-.5px', textDecoration: 'none' }); wordmark.setAttribute('href', '#');
   el(wordmark, 'span', 'mark', '◉', { color: '#bb94ff', fontSize: 20, marginRight: 7 });
@@ -50,7 +50,7 @@ export function createRainbowUI(document) {
   const hud = el(shell, 'section', 'map-hud', '', { ...absolute, ...row, justifyContent: 'space-between', alignItems: 'flex-end', bottom: 124 });
   const hudLabels = el(hud, 'div', '', '', { ...col, gap: 8 });
   el(hudLabels, 'span', 'eyebrow', 'PROCESS TREE', eyebrow);
-  const hint = el(hudLabels, 'span', 'hint', 'Drag to orbit · roots on the circular base · branches spread by descendants', { fontFamily: mono, fontSize: 9, color: '#888b9c' });
+  const hint = el(hudLabels, 'span', 'hint', 'Drag to orbit · Shift-drag to pan · scroll to zoom', { fontFamily: mono, fontSize: 9, color: '#888b9c' });
   el(hud, 'span', 'map-count', '— NODES', { fontFamily: mono, fontSize: 9, color: '#999bad', letterSpacing: '.1em' }, 'mapCount');
   const legend = el(shell, 'div', 'legend', '', { ...absolute, ...row, bottom: 77, borderTopWidth: 1, borderTopStyle: 'solid', borderTopColor: line, paddingTop: 13, gap: 22, fontFamily: mono, fontSize: 9, color: '#999bad' });
   for (const [className, label, values] of [
@@ -62,30 +62,30 @@ export function createRainbowUI(document) {
     el(item, 'i', className, '', { ...values, borderRadius: '50%', flexShrink: 0 });
     el(item, 'span', '', label);
   }
-  const legendNote = el(legend, 'span', 'legend-note', 'Nodes stay still; color is a visual cue, not a verdict.', { marginLeft: 'auto', color: '#737789' });
+  const legendNote = el(legend, 'span', 'legend-note', 'Size and glow combine CPU, RAM, network, and disk activity.', { marginLeft: 'auto', color: '#737789' });
   const footer = el(shell, 'footer', '', '', { ...absolute, ...row, bottom: 27, justifyContent: 'space-between', color: '#666a7b', fontFamily: mono, fontSize: 8, letterSpacing: '.1em' });
   const local = el(footer, 'span', '', '', row);
   el(local, 'span', '', 'LOCAL ONLY'); el(local, 'b', '', '·', { color: '#9c82d3', fontWeight: 400, marginLeft: 5, marginRight: 5 }); el(local, 'span', '', 'READ-ONLY PROCESS VIEW');
   el(footer, 'span', '', 'UPDATED EVERY 2 SECONDS');
   const cardBase = { ...fixed, ...col, borderWidth: 1, borderStyle: 'solid', borderColor: 'rgba(233,225,255,.2)', borderRadius: 8, pointerEvents: 'none' };
+  const truncated = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: mono };
   const tooltip = el(body, 'div', '', '', { ...cardBase, zIndex: 5, display: 'none', minWidth: 230, paddingTop: 13, paddingBottom: 13, paddingLeft: 15, paddingRight: 15, backgroundColor: 'rgba(13,14,25,.92)', backdropFilter: 'blur(14px)', boxShadow: '0px 12px 50px #0008' }, 'tooltip'); tooltip.setAttribute('role', 'status');
   el(tooltip, 'span', 'tip-family', '', { fontFamily: mono, fontSize: 9, color: '#9c9db0', letterSpacing: '.12em', textTransform: 'uppercase' });
   el(tooltip, 'strong', '', '', { fontFamily: mono, fontWeight: 400, fontSize: 12, color: '#f4f0ff', marginTop: 7, marginBottom: 5, overflowWrap: 'anywhere' });
-  el(tooltip, 'small', '', '', { fontFamily: mono, fontSize: 9, color: '#9c9db0', overflowWrap: 'anywhere' });
-  const arrival = el(body, 'div', 'new-process-card', '', { ...cardBase, zIndex: 4, top: 0, left: 0, paddingTop: 11, paddingBottom: 11, paddingLeft: 15, paddingRight: 15, backgroundColor: 'rgba(29,24,43,.94)', backdropFilter: 'blur(14px)', boxShadow: '0px 12px 40px #0008' }, 'new-process-card'); arrival.hidden = true; arrival.setAttribute('role', 'status');
-  const truncated = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: mono };
-  el(arrival, 'span', '', 'NEW PROCESS', { ...truncated, fontSize: 9, letterSpacing: '.14em', color: '#c4a6ff' });
-  el(arrival, 'strong', '', '', { ...truncated, fontSize: 11, fontWeight: 400, color: '#f4f0ff', marginTop: 6, marginBottom: 4 });
-  el(arrival, 'small', '', '', { ...truncated, fontSize: 9, color: '#9c9db0' });
-  const stack = el(body, 'aside', 'window-stack', '', { ...fixed, ...col, zIndex: 3, padding: 12, gap: 10, borderWidth: 1, borderStyle: 'solid', borderColor: 'rgba(208,196,238,.18)', borderRadius: 10, backgroundColor: 'rgba(10,12,21,.62)', backdropFilter: 'blur(12px)', pointerEvents: 'auto' }, 'window-stack'); stack.hidden = true; stack.setAttribute('aria-label', 'Open windows for hovered process');
-  const stackHead = el(stack, 'div', 'window-stack-head', '', { ...row, justifyContent: 'space-between', color: '#9b9daf', fontFamily: mono, fontSize: 9, letterSpacing: '.12em' });
+  el(tooltip, 'small', '', '', { fontFamily: mono, fontSize: 9, lineHeight: '1.6', whiteSpace: 'pre-line', color: '#9c9db0', overflowWrap: 'anywhere' });
+  const stack = el(body, 'aside', 'window-stack', '', { ...fixed, ...col, zIndex: 3, padding: 12, gap: 10, borderWidth: 1, borderStyle: 'solid', borderColor: 'rgba(208,196,238,.18)', borderRadius: 10, backgroundColor: 'rgba(10,12,21,.62)', backdropFilter: 'blur(12px)', pointerEvents: 'auto' }, 'window-stack'); stack.hidden = true; stack.setAttribute('aria-label', 'Recent commands and open windows');
+  const activityHead = el(stack, 'div', 'window-stack-head', '', { ...row, color: '#9b9daf', fontFamily: mono, fontSize: 9, letterSpacing: '.12em' });
+  el(activityHead, 'span', '', 'RECENTLY STARTED COMMANDS');
+  const recentList = el(stack, 'div', 'recent-command-list', '', { ...col, gap: 6, overflow: 'auto', maxHeight: 230 }, 'recent-commands');
+  const windowsRule = el(stack, 'div', '', '', { height: 1, backgroundColor: line, flexShrink: 0 }, 'windows-rule');
+  const stackHead = el(stack, 'div', 'window-stack-head', '', { ...row, justifyContent: 'space-between', color: '#9b9daf', fontFamily: mono, fontSize: 9, letterSpacing: '.12em' }, 'window-head');
   el(stackHead, 'span', 'eyebrow', 'OPEN WINDOWS', eyebrow); el(stackHead, 'span', '', '0', { color: '#c7b4f3' }, 'window-count');
-  const windowList = el(stack, 'div', 'window-list', '', { ...col, overflow: 'auto', gap: 9, paddingRight: 2 }, 'window-list');
+  const windowList = el(stack, 'div', 'window-list', '', { ...col, overflow: 'auto', gap: 9, paddingRight: 2 }, 'window-list'); windowList.hidden = true; stackHead.hidden = true;
   el(windowList, 'p', 'window-empty', 'Waiting for visible windows…', { paddingTop: 10, paddingBottom: 10, paddingLeft: 2, paddingRight: 2, color: '#85899a', fontSize: 10, lineHeight: '1.5' });
   const notice = el(body, 'div', 'notice', '', { ...fixed, zIndex: 4, top: 16, transform: 'translateX(-50%)', backgroundColor: '#2b1b29', borderWidth: 1, borderStyle: 'solid', borderColor: '#64364e', borderRadius: 8, paddingTop: 10, paddingBottom: 10, paddingLeft: 16, paddingRight: 16, fontSize: 12, color: '#ffd0dc' }, 'notice'); notice.hidden = true;
-  const styledCards = new WeakSet();
+  const styledCards = new WeakSet(), styledCommands = new WeakSet();
   function resize(width, height) {
-    const mobile = width <= 700, inset = mobile ? 22 : width * .063;
+    const mobile = width <= 700, inset = mobile ? 22 : 32;
     style(shell, { minHeight: height, paddingTop: mobile ? 22 : 30, paddingBottom: mobile ? 20 : 24, paddingLeft: inset, paddingRight: inset });
     style(intro, { marginTop: mobile ? 52 : Math.max(38, Math.min(88, height * .07)) });
     heading.style.fontSize = Math.max(43, Math.min(78, width * .062));
@@ -97,7 +97,6 @@ export function createRainbowUI(document) {
     style(footer, { left: inset, right: inset, bottom: mobile ? 22 : 27, fontSize: mobile ? 7 : 8 });
     style(live, { fontSize: mobile ? 8 : 10, gap: mobile ? 6 : 10 });
     tooltip.style.maxWidth = Math.min(420, width * .75);
-    arrival.style.width = Math.min(440, width - 28);
     style(stack, { right: mobile ? 14 : width * .05, top: mobile ? 'auto' : 112, bottom: mobile ? 150 : 'auto', width: mobile ? Math.min(220, width * .55) : Math.min(280, width * .27), maxHeight: mobile ? height * .42 : height - 250 });
     notice.style.left = width * .5;
   }
@@ -113,6 +112,11 @@ export function createRainbowUI(document) {
       const meta = card.querySelector('.window-meta'); style(meta, { ...col, paddingTop: 7, paddingBottom: 8, paddingLeft: 9, paddingRight: 9 });
       style(meta.querySelector('strong'), { ...truncated, fontFamily: sans, fontSize: 10, fontWeight: 500, color: '#e9e5f2' });
       style(meta.querySelector('small'), { ...truncated, fontSize: 8, marginTop: 4, color: '#888b9e' });
+    }
+    for (const command of recentList.children) {
+      if (styledCommands.has(command)) continue;
+      styledCommands.add(command);
+      style(command, { color: '#d8d3e5', fontFamily: mono, fontSize: 9, lineHeight: '1.45', overflowWrap: 'anywhere' });
     }
   }
   return { canvas, resize, update };

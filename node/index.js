@@ -88,6 +88,17 @@ export class Window extends native.Window {
     this.#document = document;
     if (document) document._attachWindow(this);
   }
+
+  _syncDocumentSizeConstraints() {
+    const style = this.#document?.body?.style;
+    if (!style) return;
+    const dimension = value => {
+      if (value === undefined || value === null || value === "" || value === "none" || value === "auto") return null;
+      const parsed = typeof value === "number" ? value : /^\s*\d+(?:\.\d+)?(?:px)?\s*$/.test(String(value)) ? parseFloat(value) : NaN;
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+    };
+    super.setSizeConstraints(dimension(style.minWidth), dimension(style.minHeight), dimension(style.maxWidth), dimension(style.maxHeight));
+  }
 }
 
 const RESIZABLE_MODES = new Set(["horizontal", "vertical", "both", "none"]);
@@ -461,6 +472,7 @@ export class Element extends EventTarget {
     doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
     doc.dirty = true;
     markGeometryDirty(doc);
+    if (this === this.document.body && ["minWidth", "minHeight", "maxWidth", "maxHeight"].includes(property)) doc.defaultView?._syncDocumentSizeConstraints();
   }
 
   _taffyStyle() {
@@ -575,6 +587,7 @@ export class Document {
 
   _attachWindow(window) {
     documentState(this).defaultView = window;
+    window._syncDocumentSizeConstraints();
     for (const element of documentState(this).elements) if (element.localName === "img" && elementState(element).imageLoadState === "pending") {
       element._beginImageLoad(element.src, window, elementState(element).imageRequest);
     }
