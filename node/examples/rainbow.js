@@ -6,17 +6,39 @@ import path from 'node:path';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import os from 'node:os';
 import vm from 'node:vm';
+import { Command, InvalidArgumentError } from 'commander';
 import { Window, Document, closeImageDecoder } from '../index.js';
 import { documentState, documentBoxes, layoutDocument } from '../internal/dom-state.js';
 import { inherited } from '../internal/text-metrics.js';
 import { rasterizeDocument, rasterTimings, paintProfile } from '../internal/raster-document.js';
 import { createRainbowUI } from './rainbow/ui.js';
 
+function parseUsageScale(value) {
+  const multiplier = Number(value);
+  if (!Number.isFinite(multiplier) || multiplier <= 0 || multiplier > 100) {
+    throw new InvalidArgumentError('must be greater than 0 and at most 100');
+  }
+  return multiplier;
+}
+
+const cli = new Command();
+cli
+  .name('rainbow')
+  .description('Show a live process graph in Nasty')
+  .option('--net-only', 'show only processes with active network sockets')
+  .option('--usage-scale <multiplier>', 'adjust how strongly resource usage changes node size and glow', parseUsageScale, 1)
+  .parse(process.argv);
+const options = cli.opts();
+
 let previousSamples = new Map();
-let windowEvents = null, fallbackRefreshTimer = null, windowRefreshTimer = null, windowRefreshQueued = false;
+let stopped = false;
+let windowEvents = null, structureEvents = null;
+let fallbackRefreshTimer = null, windowRefreshTimer = null, windowRefreshQueued = false;
 let cachedWindows = [], latestProcesses = [], windowSignature = null;
 const directStreams = new Set();
 const ticksPerSecond = (() => { try { return Number(execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8', timeout: 500 })) || 100; } catch { return 100; } })();
+const windowCaptures = new Map();
+let requestedWindowIds = new Set();
 
 function readProcesses() {
   if (process.platform !== 'linux') return { processes: [], platform: process.platform, error: 'Live process discovery currently requires Linux (/proc).' };
@@ -154,9 +176,10 @@ async function readWindows() {
         ]);
         const pid = Number(pidText.trim());
         const fields = Object.fromEntries(geometry.trim().split('\n').map(line => line.split('=')));
+        const x = Number(fields.X), y = Number(fields.Y);
         const width = Number(fields.WIDTH), height = Number(fields.HEIGHT);
-        if (!pid || !title.trim() || width < 80 || height < 60) return null;
-        return { id, pid, title: title.trim().slice(0, 180), width, height };
+        if (!pid || pid === process.pid || !title.trim() || width < 80 || height < 60) return null;
+        return { id, pid, title: title.trim().slice(0, 180), x, y, width, height };
       } catch { return null; }
     }));
     return windows.filter(Boolean).sort((a, b) => Number(a.id) - Number(b.id));
@@ -167,30 +190,68 @@ async function readWindows() {
 function execute(command, args, options = {}) {
   return new Promise((resolve, reject) => execFile(command, args, { encoding: 'utf8', timeout: 2500, maxBuffer: 1024 * 1024, ...options }, (error, stdout) => error ? reject(error) : resolve(stdout)));
 }
-async function captureWindow(window) {
-  try {
-    const image = await execute('import', ['-window', window.id, '-resize', '480x270>', 'png:-'], { encoding: 'buffer', timeout: 3000, maxBuffer: 4 * 1024 * 1024 });
-    return { ...window, preview: `data:image/png;base64,${image.toString('base64')}` };
-  } catch { return window; }
+function stopWindowCapture(capture) {
+  if (windowCaptures.get(capture.id) === capture) windowCaptures.delete(capture.id);
+  capture.child.kill();
+}
+function publishWindowFrame(capture, frame) {
+  if (stopped || windowCaptures.get(capture.id) !== capture) return;
+  const preview = `data:image/jpeg;base64,${frame.toString('base64')}`;
+  cachedWindows = cachedWindows.map(window => window.id === capture.id ? { ...window, preview } : window);
+  emitStream('windows', { windows: cachedWindows });
+}
+function consumeWindowBytes(capture, chunk) {
+  capture.buffer = capture.buffer.length ? Buffer.concat([capture.buffer, chunk]) : chunk;
+  let newest = null;
+  for (;;) {
+    const start = capture.buffer.indexOf(Buffer.from([0xff, 0xd8]));
+    if (start < 0) { capture.buffer = capture.buffer.subarray(Math.max(0, capture.buffer.length - 1)); break; }
+    const end = capture.buffer.indexOf(Buffer.from([0xff, 0xd9]), start + 2);
+    if (end < 0) { if (start) capture.buffer = capture.buffer.subarray(start); break; }
+    newest = capture.buffer.subarray(start, end + 2);
+    capture.buffer = capture.buffer.subarray(end + 2);
+  }
+  if (capture.buffer.length > 4 * 1024 * 1024) capture.buffer = Buffer.alloc(0);
+  if (newest) publishWindowFrame(capture, newest);
+}
+function startWindowCapture(window) {
+  if (stopped || windowCaptures.has(window.id) || process.platform !== 'linux' || !process.env.DISPLAY) return;
+  const display = /:\d+\.\d+$/.test(process.env.DISPLAY) ? process.env.DISPLAY : `${process.env.DISPLAY}.0`;
+  const capture = { id: window.id, width: window.width, height: window.height, buffer: Buffer.alloc(0), child: null };
+  capture.child = spawn('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-f', 'x11grab', '-window_id', String(window.id),
+    '-draw_mouse', '0', '-framerate', '5', '-video_size', `${window.width}x${window.height}`, '-i', display,
+    '-vf', 'scale=320:180', '-an', '-c:v', 'mjpeg', '-q:v', '8', '-f', 'image2pipe', 'pipe:1'
+  ], { stdio: ['ignore', 'pipe', 'ignore'] });
+  windowCaptures.set(window.id, capture);
+  capture.child.stdout.on('data', chunk => consumeWindowBytes(capture, chunk));
+  capture.child.once('error', () => stopWindowCapture(capture));
+  capture.child.once('exit', () => { if (windowCaptures.get(capture.id) === capture) windowCaptures.delete(capture.id); });
+}
+function syncWindowCaptures() {
+  const desired = new Map(cachedWindows.filter(window => requestedWindowIds.has(window.id)).slice(0, 8).map(window => [window.id, window]));
+  for (const capture of windowCaptures.values()) {
+    const window = desired.get(capture.id);
+    if (!window || capture.width !== window.width || capture.height !== window.height) stopWindowCapture(capture);
+  }
+  for (const window of desired.values()) startWindowCapture(window);
 }
 async function refreshWindows() {
+  if (stopped) return;
   const windows = await readWindows();
-  const previous = new Map(cachedWindows.map(window => [window.id, window]));
-  const next = await Promise.all(windows.map(async window => {
-    const prior = previous.get(window.id);
-    if (prior && prior.title === window.title && prior.width === window.width && prior.height === window.height && prior.preview) return { ...window, preview: prior.preview };
-    return captureWindow(window);
-  }));
-  const updated = next.map(window => ({ ...window, owner: latestProcesses.find(proc => proc.pid === window.pid)?.executable }));
-  const signature = JSON.stringify(updated.map(({ preview, ...window }) => window));
+  const updated = windows.slice(0, 12).map(window => ({ ...window, owner: latestProcesses.find(proc => proc.pid === window.pid)?.executable,
+    preview: cachedWindows.find(old => old.id === window.id)?.preview }));
+  const signature = JSON.stringify(updated.map(({ preview, ...item }) => item));
+  const changed = signature !== windowSignature;
   cachedWindows = updated;
-  if (signature !== windowSignature) {
+  syncWindowCaptures();
+  if (changed) {
     windowSignature = signature;
     emitStream('windows', { windows: cachedWindows });
   }
 }
 function scheduleWindowRefresh() {
-  if (windowRefreshQueued) return;
+  if (stopped || windowRefreshQueued) return;
   windowRefreshQueued = true;
   clearTimeout(windowRefreshTimer);
   windowRefreshTimer = setTimeout(() => { windowRefreshQueued = false; refreshWindows().catch(() => {}); }, 180);
@@ -199,13 +260,20 @@ if (process.platform === 'linux' && process.env.DISPLAY) {
   try {
     windowEvents = spawn('xprop', ['-spy', '-root', '_NET_CLIENT_LIST_STACKING'], { stdio: ['ignore', 'pipe', 'ignore'] });
     windowEvents.stdout.on('data', scheduleWindowRefresh);
-    const fallback = () => { windowEvents = null; scheduleWindowFallback(); };
-    windowEvents.once('error', fallback); windowEvents.once('exit', fallback);
+    windowEvents.once('error', () => { windowEvents = null; scheduleWindowFallback(); });
+    windowEvents.once('exit', () => { windowEvents = null; scheduleWindowFallback(); });
   } catch { windowEvents = null; }
+  try {
+    structureEvents = spawn('xev', ['-root', '-event', 'substructure'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    structureEvents.stdout.on('data', scheduleWindowRefresh);
+    structureEvents.once('error', () => { structureEvents = null; scheduleWindowFallback(); });
+    structureEvents.once('exit', () => { structureEvents = null; scheduleWindowFallback(); });
+  } catch { structureEvents = null; }
 }
 function scheduleWindowFallback() {
+  if (stopped) return;
   clearTimeout(fallbackRefreshTimer);
-  fallbackRefreshTimer = setTimeout(() => { refreshWindows().catch(() => {}); scheduleWindowFallback(); }, windowEvents ? 5000 : 1000);
+  fallbackRefreshTimer = setTimeout(() => { refreshWindows().catch(() => {}); scheduleWindowFallback(); }, windowEvents || structureEvents ? 5000 : 1000);
   fallbackRefreshTimer.unref();
 }
 scheduleWindowFallback();
@@ -228,18 +296,33 @@ class DirectEventSource {
   close() { this.closed = true; clearInterval(this.timer); directStreams.delete(this); }
 }
 
-const netOnly = process.argv.includes('--net-only');
+const netOnly = options.netOnly;
 const window = new Window({ title: 'Rainbow — process field', width: 1180, height: 760, resizable: 'both' });
 const document = new Document(); window.document = document;
 const ui = createRainbowUI(document);
 let viewport = window.size(); ui.resize(viewport.width, viewport.height);
 const events = new EventTarget(), frames = new Map(), timers = new Set(), intervals = new Set();
-let nextFrame = 0, stopped = false, shown = false, count = 0, pointer = { x: 0, y: 0 }, lastTarget = null, shiftDown = false;
+events.addEventListener('message', event => {
+  if (event.data?.type !== 'rainbow-window-capture' || !Array.isArray(event.data.windowIds)) return;
+  requestedWindowIds = new Set(event.data.windowIds.map(String));
+  syncWindowCaptures();
+});
+let nextFrame = 0, shown = false, count = 0, pointer = { x: 0, y: 0 }, lastTarget = null, shiftDown = false;
 const browser = {
   document, console, performance, devicePixelRatio: 1,
+  usageScale: options.usageScale,
+  showRecentCommands: ui.showRecentCommands,
+  clearRecentCommands: ui.clearRecentCommands,
   innerWidth: viewport.width, innerHeight: viewport.height,
   addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events),
   dispatchEvent: events.dispatchEvent.bind(events),
+  postMessage(data) {
+    queueMicrotask(() => {
+      const event = new Event('message');
+      Object.assign(event, { data, origin: 'null', source: browser });
+      events.dispatchEvent(event);
+    });
+  },
   requestAnimationFrame(callback) { const id = ++nextFrame; frames.set(id, callback); return id; },
   cancelAnimationFrame(id) { frames.delete(id); },
   setTimeout(callback, delay, ...args) { const id = setTimeout(() => { timers.delete(id); callback(...args); }, delay); timers.add(id); return id; },
@@ -297,7 +380,10 @@ async function close() {
   if (stopped) return; stopped = true;
   for (const id of timers) clearTimeout(id);
   for (const id of intervals) clearInterval(id);
-  frames.clear(); for (const stream of directStreams) stream.close(); windowEvents?.kill(); clearTimeout(fallbackRefreshTimer); clearTimeout(windowRefreshTimer);
+  frames.clear(); for (const stream of directStreams) stream.close();
+  windowEvents?.kill(); structureEvents?.kill();
+  for (const capture of windowCaptures.values()) capture.child.kill();
+  clearTimeout(fallbackRefreshTimer); clearTimeout(windowRefreshTimer);
   await document.close(); window.close(); await closeImageDecoder();
 }
 async function frame() {
@@ -330,5 +416,9 @@ async function frame() {
 }
 async function fail(error) { console.error(error); await close(); process.exitCode = 1; }
 process.once('SIGINT', () => close()); process.once('SIGTERM', () => close());
-process.once('exit', () => { windowEvents?.kill(); clearTimeout(fallbackRefreshTimer); clearTimeout(windowRefreshTimer); });
+process.once('exit', () => {
+  windowEvents?.kill(); structureEvents?.kill();
+  for (const capture of windowCaptures.values()) capture.child.kill();
+  clearTimeout(fallbackRefreshTimer); clearTimeout(windowRefreshTimer);
+});
 frame().catch(fail);

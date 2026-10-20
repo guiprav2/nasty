@@ -6,11 +6,18 @@ let processes = [], nodes = [], width = 0, height = 0, dpr = 1;
 let lastNew = new Set(), pointer = { x: -1, y: -1 }, hover = null;
 let rotation = { yaw: -0.16, pitch: 0.62 }, dragging = null;
 let zoom = 1, pan = { x: 0, y: 0 };
+let userAdjustedView = false;
 let hasInitialSample = false;
+let fittedLayoutKey = '';
 let baseRadius = 86;
 let layerHeight = 72;
 let windowSnapshots = [];
+const windowCards = new Map();
 const recentCommands = [];
+const usageScale = Number(window.usageScale) || 1;
+const metricColors = Object.fromEntries(['cpu', 'memory', 'net-up', 'net-down', 'disk-read', 'disk-write'].map(key => [key, { current: 0, target: 0 }]));
+let metricColorTime = 0;
+let requestedPreviewKey = '';
 
 function hash(text) { let h = 2166136261; for (const ch of text) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; }
 function loadUnit(value, scale) { return Math.min(1, Math.log1p(Math.max(0, value) / scale) / Math.log1p(16)); }
@@ -20,6 +27,10 @@ function processActivity(node) {
   const network = loadUnit((node.networkUpBps || 0) + (node.networkDownBps || 0), 64 * 1024);
   const disk = loadUnit((node.diskReadBps || 0) + (node.diskWriteBps || 0), 256 * 1024);
   return Math.sqrt(.35 * cpu * cpu + .25 * memory * memory + .2 * network * network + .2 * disk * disk);
+}
+function networkGlowLevel(node) {
+  const traffic = Math.max(0, node.networkUpBps || 0) + Math.max(0, node.networkDownBps || 0);
+  return Math.min(1, Math.expm1(Math.min(Math.log(2), traffic * usageScale / (12 * 1024))));
 }
 function formatBytes(value) {
   const units = ['B', 'KiB', 'MiB', 'GiB']; let amount = Math.max(0, value || 0), unit = 0;
@@ -35,7 +46,12 @@ function familyOf(proc) {
   return `${base} ${words.join(' ')}`.trim();
 }
 function hueFor(key) { return hash(key) % 360; }
-function resize() { dpr = Math.min(devicePixelRatio || 1, 2); width = innerWidth; height = innerHeight; canvas.width = width*dpr; canvas.height = height*dpr; canvas.style.width = `${width}px`; canvas.style.height = `${height}px`; ctx.setTransform(dpr,0,0,dpr,0,0); }
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2); width = innerWidth; height = innerHeight;
+  canvas.width = width*dpr; canvas.height = height*dpr; canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  if (nodes.length) placeNodes();
+}
 addEventListener('resize', resize); resize();
 
 function placeNodes() {
@@ -114,6 +130,10 @@ function placeNodes() {
     next.push({ ...proc, root: depth === 0, x, y, z, hue: hueFor(proc.family), fresh: lastNew.has(proc.pid), size: depth === 0 ? 5 : 2.8 });
   }
   nodes = next;
+  if (!userAdjustedView) {
+    const layoutKey = `${width}x${height}:${nodes.map(node => `${node.pid},${node.x},${node.y},${node.z}`).join(';')}`;
+    if (layoutKey !== fittedLayoutKey) { fitGraph(); fittedLayoutKey = layoutKey; }
+  }
   const families = new Set(processes.map(familyOf));
   document.querySelector('#families').textContent = families.size.toLocaleString();
   document.querySelector('#count').textContent = processes.length.toLocaleString();
@@ -124,6 +144,7 @@ function placeNodes() {
 function update(data) {
   if (data.error) { document.querySelector('#connection').textContent='UNAVAILABLE'; document.querySelector('.live').classList.add('offline'); showNotice(data.error); return; }
   const now = Date.now(), fresh = new Set();
+  let addedRecentCommand = false;
   for (const proc of data.processes) {
     const key = `${proc.pid}:${proc.label}`;
     if (!seen.has(key)) {
@@ -133,16 +154,27 @@ function update(data) {
       if (hasInitialSample) {
         fresh.add(proc.pid);
         recentCommands.unshift({ pid: proc.pid, commandLine: proc.commandLine || proc.label });
+        addedRecentCommand = true;
       }
     }
   }
   recentCommands.splice(10);
-  document.querySelector('#recent-commands').replaceChildren(...recentCommands.map(item => {
-    const line = document.createElement('div');
-    line.textContent = item.commandLine;
-    line.setAttribute('title', item.commandLine);
-    return line;
-  }));
+  const commandList = document.querySelector('#recent-commands');
+  const existingCommands = [...commandList.children];
+  if (existingCommands.length !== recentCommands.length || existingCommands.some((line, index) => line.textContent !== recentCommands[index].commandLine)) {
+    commandList.replaceChildren(...recentCommands.map(item => {
+      const line = document.createElement('div');
+      line.textContent = item.commandLine;
+      line.setAttribute('title', item.commandLine);
+      Object.assign(line.style, { color: '#d8d3e5', fontFamily: "'SFMono-Regular', Consolas, 'Liberation Mono', monospace", fontSize: 9, lineHeight: '1.45', whiteSpace: 'nowrap' });
+      return line;
+    }));
+  }
+  if (addedRecentCommand) showRecentCommands(() => {
+    recentCommands.length = 0;
+    commandList.replaceChildren();
+  });
+  if (!recentCommands.length) clearRecentCommands();
   if (recentCommands.length) document.querySelector('#window-stack').hidden = false;
   // Mark only recently started commands; old processes are no longer highlighted.
   lastNew = new Set(data.processes.filter(p => now-(seen.get(`${p.pid}:${p.label}`)||now) < 12000 && fresh.has(p.pid)).map(p=>p.pid));
@@ -168,23 +200,46 @@ function update(data) {
 function drawWindowSnapshots() {
   const list = document.querySelector('#window-list');
   const associated = hover ? windowSnapshots.filter(window => window.pid === hover.pid) : [];
+  const previewKey = associated.map(window => window.id).join(',');
+  if (previewKey !== requestedPreviewKey) {
+    requestedPreviewKey = previewKey;
+    window.postMessage({ type: 'rainbow-window-capture', windowIds: associated.slice(0, 8).map(window => window.id) }, '*');
+  }
   const stack = document.querySelector('#window-stack');
-  stack.hidden = associated.length === 0 && recentCommands.length === 0;
-  document.querySelector('#windows-rule').hidden = associated.length === 0;
+  stack.hidden = associated.length === 0 && document.querySelector('#recent-command-section').hidden;
+  if (associated.length) {
+    stack.hidden = false;
+    stack.style.opacity = 1;
+  } else if (document.querySelector('#recent-command-section').hidden) {
+    stack.style.opacity = 0;
+  }
+  document.querySelector('#windows-rule').hidden = associated.length === 0 || document.querySelector('#recent-command-section').hidden;
   document.querySelector('#window-head').hidden = associated.length === 0;
   list.hidden = associated.length === 0;
   document.querySelector('#window-count').textContent = associated.length;
-  list.replaceChildren(...associated.map(window => {
-    const card = document.createElement('article'); card.className = 'window-card';
-    const canvas = document.createElement('canvas'); canvas.width = 320; canvas.height = 180; canvas.setAttribute('aria-label', `Preview of ${window.title}`);
-    const meta = document.createElement('div'); meta.className = 'window-meta';
-    const title = document.createElement('strong'); title.textContent = window.title;
-    const owner = document.createElement('small'); owner.textContent = `${window.owner || `PID ${window.pid}`} · ${window.width} × ${window.height}`;
-    meta.append(title, owner); card.append(canvas, meta);
-    const image = new Image(); image.onload = () => { const c = canvas.getContext('2d'); c.clearRect(0,0,canvas.width,canvas.height); c.drawImage(image,0,0,canvas.width,canvas.height); };
-    if (window.preview) image.src = window.preview;
-    return card;
-  }));
+  const cards = associated.map(window => {
+    let entry = windowCards.get(window.id);
+    if (!entry) {
+      const card = document.createElement('article'); card.className = 'window-card';
+      const canvas = document.createElement('canvas'); canvas.width = 320; canvas.height = 180;
+      const meta = document.createElement('div'); meta.className = 'window-meta';
+      const title = document.createElement('strong');
+      const owner = document.createElement('small');
+      meta.append(title, owner); card.append(canvas, meta);
+      const image = new Image();
+      image.onload = () => { const c = canvas.getContext('2d'); c.clearRect(0,0,canvas.width,canvas.height); c.drawImage(image,0,0,canvas.width,canvas.height); };
+      entry = { card, canvas, title, owner, image, preview: '' };
+      windowCards.set(window.id, entry);
+    }
+    entry.title.textContent = window.title;
+    entry.canvas.setAttribute('aria-label', `Preview of ${window.title}`);
+    entry.owner.textContent = `${window.owner || `PID ${window.pid}`} · ${window.width} × ${window.height}`;
+    if (window.preview && window.preview !== entry.preview) { entry.preview = window.preview; entry.image.src = window.preview; }
+    return entry.card;
+  });
+  for (const id of windowCards.keys()) if (!windowSnapshots.some(window => window.id === id)) windowCards.delete(id);
+  const children = [...list.children];
+  if (children.length !== cards.length || children.some((card, index) => card !== cards[index])) list.replaceChildren(...cards);
 }
 function updateWindows(data) {
     const byPid = new Map(processes.map(proc => [proc.pid, proc]));
@@ -196,7 +251,7 @@ windowStream.onmessage = event => { try { updateWindows(JSON.parse(event.data));
 let noticeTimer;
 function showNotice(message) { const el=document.querySelector('#notice'); el.textContent=message; el.hidden=false; clearTimeout(noticeTimer); noticeTimer=setTimeout(()=>el.hidden=true,5000); }
 
-function project(x, y, z = 0) {
+function projectBase(x, y, z = 0) {
   const pivotX = width * .59, pivotY = height * .78;
   const dx = x, dy = y;
   const cy = Math.cos(rotation.yaw), sy = Math.sin(rotation.yaw);
@@ -207,7 +262,49 @@ function project(x, y, z = 0) {
   const depth = ry * Math.cos(elevation) - z * Math.sin(elevation);
   const focal = Math.max(width, height) * 1.8;
   const scale = Math.max(.48, Math.min(1.9, focal / (focal - depth)));
-  return { x: pivotX + rx * scale * zoom + pan.x, y: pivotY + screenY * scale * zoom + pan.y, depth, scale };
+  return { x: pivotX + rx * scale, y: pivotY + screenY * scale, depth, scale, pivotX, pivotY };
+}
+function project(x, y, z = 0) {
+  const point = projectBase(x, y, z);
+  return { ...point, x: point.pivotX + (point.x - point.pivotX) * zoom + pan.x,
+    y: point.pivotY + (point.y - point.pivotY) * zoom + pan.y };
+}
+function fitGraph() {
+  if (!nodes.length || width <= 0 || height <= 0) return;
+  const bounds = { left: Infinity, right: -Infinity, top: Infinity, bottom: -Infinity };
+  for (const node of nodes) {
+    const point = projectBase(node.x, node.y, node.z);
+    const activity = 1 - Math.pow(1 - processActivity(node), usageScale);
+    const network = networkGlowLevel(node);
+    const displaySize = node.size * point.scale * (.72 + 1.6 * Math.sqrt(activity));
+    const glowRadius = displaySize * Math.min(11, 3 + 2 * activity + 2.8 * network);
+    const radius = Math.max(displaySize * 1.7, glowRadius);
+    bounds.left = Math.min(bounds.left, point.x - radius); bounds.right = Math.max(bounds.right, point.x + radius);
+    bounds.top = Math.min(bounds.top, point.y - radius); bounds.bottom = Math.max(bounds.bottom, point.y + radius);
+  }
+  // Keep the tree in the clear lower-right field: the intro occupies the
+  // upper-left, while the sidebar sits at the upper-right.
+  const mobile = width <= 700;
+  // Treat the center of the clear map area as its optical center. The title
+  // occupies the left side and the sidebar the upper-right corner.
+  const leftInset = mobile ? 18 : Math.min(width * .41, 490);
+  const rightInset = mobile ? 18 : Math.min(width * .08, 90);
+  const topInset = mobile ? Math.min(height * .34, 236) : Math.min(height * .37, 282);
+  const bottomInset = mobile ? 172 : 156;
+  const availableWidth = Math.max(1, width - leftInset - rightInset);
+  const availableHeight = Math.max(1, height - topInset - bottomInset);
+  const graphWidth = Math.max(1, bounds.right - bounds.left);
+  const graphHeight = Math.max(1, bounds.bottom - bounds.top);
+  const scale = Math.min(availableWidth / graphWidth, availableHeight / graphHeight);
+  // Center and scale the projected extrema directly. The projection pivot
+  // must not affect the final screen-space center, especially for uneven trees.
+  const compactGraphBoost = nodes.length <= 12 ? 1.65 : 1;
+  zoom = Math.max(.02, Math.min(4, scale * .94 * compactGraphBoost));
+  const centerX = (bounds.left + bounds.right) / 2, centerY = (bounds.top + bounds.bottom) / 2;
+  const targetX = (leftInset + width - rightInset) / 2, targetY = (topInset + height - bottomInset) / 2;
+  const pivotX = width * .59, pivotY = height * .78;
+  pan.x = targetX - pivotX - (centerX - pivotX) * zoom;
+  pan.y = targetY - pivotY - (centerY - pivotY) * zoom;
 }
 
 function positionCard(card,x,y){
@@ -217,11 +314,35 @@ function positionCard(card,x,y){
 }
 function drawHoverCard(node){
   tooltip.style.display='block';
-  tooltip.querySelector('.tip-family').textContent=node.family;
-  tooltip.querySelector('strong').textContent=node.label;
-  const networkRates = node.networkRatesAvailable ? `↑ ${formatRate(node.networkUpBps)} · ↓ ${formatRate(node.networkDownBps)}` : 'rates unavailable';
-  tooltip.querySelector('small').textContent = `PID ${node.pid} · parent ${node.ppid}\nCPU ${Number(node.cpuPercent || 0).toFixed(1)}% · RAM ${formatBytes(node.rssBytes)} (${Number(node.memoryPercent || 0).toFixed(2)}%)\nTCP ${networkRates} · ${node.sockets || 0} sockets\nDISK R ${formatRate(node.diskReadBps)} · W ${formatRate(node.diskWriteBps)}`;
+  const setText = (selector, value) => { const element = tooltip.querySelector(selector); if (element.textContent !== value) element.textContent = value; };
+  setText('.tip-family', node.family);
+  setText('strong', node.label);
+  setText('#tip-meta', `PID ${node.pid} · parent ${node.ppid} · ${node.sockets || 0} sockets${node.networkRatesAvailable ? '' : ' · network rates unavailable'}`);
+  const setMetric = (key, value, scale, text) => {
+    setText(`#tip-${key}`, text);
+    metricColors[key].target = loadUnit(value, scale);
+  };
+  setMetric('cpu', node.cpuPercent || 0, 6.25, `${Number(node.cpuPercent || 0).toFixed(1)}%`);
+  setMetric('memory', node.rssBytes || 0, 64 * 1024 * 1024, formatBytes(node.rssBytes));
+  setMetric('net-up', node.networkUpBps || 0, 64 * 1024, node.networkRatesAvailable ? formatRate(node.networkUpBps) : 'unavailable');
+  setMetric('net-down', node.networkDownBps || 0, 64 * 1024, node.networkRatesAvailable ? formatRate(node.networkDownBps) : 'unavailable');
+  setMetric('disk-read', node.diskReadBps || 0, 256 * 1024, formatRate(node.diskReadBps));
+  setMetric('disk-write', node.diskWriteBps || 0, 256 * 1024, formatRate(node.diskWriteBps));
   positionCard(tooltip,node.screenX ?? project(node.x,node.y,node.z).x,node.screenY ?? project(node.x,node.y,node.z).y);
+}
+function animateMetricColors(time) {
+  const elapsed = metricColorTime ? Math.max(0, time - metricColorTime) : 16;
+  metricColorTime = time;
+  const blend = 1 - Math.exp(-elapsed / 260);
+  for (const [key, state] of Object.entries(metricColors)) {
+    state.current += (state.target - state.current) * blend;
+    const intensity = Math.max(0, Math.min(1, state.current));
+    const low = [137, 140, 160], middle = [190, 164, 250], high = [255, 231, 151];
+    const from = intensity < .55 ? low : middle, to = intensity < .55 ? middle : high;
+    const amount = intensity < .55 ? intensity / .55 : (intensity - .55) / .45;
+    const rgb = from.map((channel, index) => Math.round(channel + (to[index] - channel) * amount));
+    tooltip.querySelector(`#tip-${key}`).style.color = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+  }
 }
 function hideCard(){
   tooltip.style.display='none';
@@ -236,8 +357,9 @@ function draw(t) {
   const projected = nodes.map(n => {
     const p = project(n.x, n.y, n.z);
     n.screenX = p.x; n.screenY = p.y; n.depth = p.depth; n.perspective = p.scale;
-    n.activity = processActivity(n);
-    n.displaySize = n.size * p.scale * zoom * (.78 + .95 * Math.sqrt(n.activity));
+    n.activity = 1 - Math.pow(1 - processActivity(n), usageScale);
+    n.networkGlow = networkGlowLevel(n);
+    n.displaySize = n.size * p.scale * zoom * (.72 + 1.6 * Math.sqrt(n.activity));
     return { n, ...p };
   }).sort((a,b) => a.depth-b.depth);
   // Draw the root guide as a projected circle, so it tilts with the process plane.
@@ -265,13 +387,15 @@ function draw(t) {
     const pulse=n.fresh ? .75+.25*Math.sin(t/220) : 1;
     const color=`hsla(${n.hue},76%,72%,${n.fresh?.94:.68})`;
     if(n.fresh){ctx.beginPath();ctx.arc(x,y,size+5+Math.sin(t/250)*1.5,0,Math.PI*2);ctx.strokeStyle=`hsla(${n.hue},88%,82%,${.25*pulse})`;ctx.lineWidth=.8;ctx.stroke();}
-    const glowRadius = size * (3 + 2 * n.activity);
-    const g=ctx.createRadialGradient(x,y,0,x,y,glowRadius);g.addColorStop(0,`hsla(${n.hue},90%,75%,${(.24 + .32 * n.activity)*pulse})`);g.addColorStop(1,`hsla(${n.hue},80%,65%,0)`);ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,glowRadius,0,Math.PI*2);ctx.fill();
+    const glowRadius = size * Math.min(11, 3 + 2 * n.activity + 2.8 * n.networkGlow);
+    const glowOpacity = Math.min(.92, .12 + .32 * n.activity + .22 * n.networkGlow);
+    const g=ctx.createRadialGradient(x,y,0,x,y,glowRadius);g.addColorStop(0,`hsla(${n.hue},90%,75%,${glowOpacity*pulse})`);g.addColorStop(1,`hsla(${n.hue},80%,65%,0)`);ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,glowRadius,0,Math.PI*2);ctx.fill();
     ctx.beginPath();ctx.arc(x,y,size*(n.pid===hover?.pid?1.7:1),0,Math.PI*2);ctx.fillStyle=color;ctx.fill();
     if(n.pid===hover?.pid){ctx.beginPath();ctx.arc(x,y,size+5,0,Math.PI*2);ctx.strokeStyle=`hsla(${n.hue},85%,88%,.8)`;ctx.lineWidth=1;ctx.stroke();}
   }
   for(let i=0;i<22;i++){const x=(hash(`dust${i}`)%10000)/10000*width,y=(hash(`dusty${i}`)%10000)/10000*height;ctx.fillStyle='rgba(205,195,237,.1)';ctx.fillRect(x,y,1,1);}
   if (hover && tooltip.style.display !== 'none') drawHoverCard(hover);
+  if (hover && tooltip.style.display !== 'none') animateMetricColors(t);
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
@@ -294,6 +418,7 @@ canvas.addEventListener('pointermove',e=>{
     const dx=e.clientX-dragging.x,dy=e.clientY-dragging.y;
     if (e.shiftKey) { pan.x += dx; pan.y += dy; }
     else { rotation.yaw-=dx*.006;rotation.pitch-=dy*.006; }
+    userAdjustedView = true;
     dragging.x=e.clientX;dragging.y=e.clientY;return;
   }
   inspect(e.clientX,e.clientY);canvas.style.cursor=hover?'pointer':'grab';
@@ -304,12 +429,13 @@ canvas.addEventListener('pointerleave',()=>{if(!dragging){hover=null;drawWindowS
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
   const factor = Math.exp(-e.deltaY * .001);
-  const next = Math.max(.35, Math.min(4, zoom * factor));
+  const next = Math.max(.08, Math.min(4, zoom * factor));
   if (next === zoom) return;
   const pivotX = width * .59, pivotY = height * .78;
   pan.x = e.clientX - pivotX - (e.clientX - pivotX - pan.x) * next / zoom;
   pan.y = e.clientY - pivotY - (e.clientY - pivotY - pan.y) * next / zoom;
   zoom = next;
+  userAdjustedView = true;
 }, { passive: false });
 const stream = new EventSource('/processes');
 stream.onmessage = event => { try { update(JSON.parse(event.data)); } catch(error) { console.error(error); } };

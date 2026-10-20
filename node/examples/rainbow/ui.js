@@ -62,28 +62,67 @@ export function createRainbowUI(document) {
     el(item, 'i', className, '', { ...values, borderRadius: '50%', flexShrink: 0 });
     el(item, 'span', '', label);
   }
-  const legendNote = el(legend, 'span', 'legend-note', 'Size and glow combine CPU, RAM, network, and disk activity.', { marginLeft: 'auto', color: '#737789' });
+  const legendNote = el(legend, 'span', 'legend-note', 'Size and glow combine CPU, RAM, network, and disk activity; adjust with --usage-scale.', { marginLeft: 'auto', color: '#737789' });
   const footer = el(shell, 'footer', '', '', { ...absolute, ...row, bottom: 27, justifyContent: 'space-between', color: '#666a7b', fontFamily: mono, fontSize: 8, letterSpacing: '.1em' });
   const local = el(footer, 'span', '', '', row);
   el(local, 'span', '', 'LOCAL ONLY'); el(local, 'b', '', '·', { color: '#9c82d3', fontWeight: 400, marginLeft: 5, marginRight: 5 }); el(local, 'span', '', 'READ-ONLY PROCESS VIEW');
   el(footer, 'span', '', 'UPDATED EVERY 2 SECONDS');
   const cardBase = { ...fixed, ...col, borderWidth: 1, borderStyle: 'solid', borderColor: 'rgba(233,225,255,.2)', borderRadius: 8, pointerEvents: 'none' };
   const truncated = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: mono };
-  const tooltip = el(body, 'div', '', '', { ...cardBase, zIndex: 5, display: 'none', minWidth: 230, paddingTop: 13, paddingBottom: 13, paddingLeft: 15, paddingRight: 15, backgroundColor: 'rgba(13,14,25,.92)', backdropFilter: 'blur(14px)', boxShadow: '0px 12px 50px #0008' }, 'tooltip'); tooltip.setAttribute('role', 'status');
-  el(tooltip, 'span', 'tip-family', '', { fontFamily: mono, fontSize: 9, color: '#9c9db0', letterSpacing: '.12em', textTransform: 'uppercase' });
-  el(tooltip, 'strong', '', '', { fontFamily: mono, fontWeight: 400, fontSize: 12, color: '#f4f0ff', marginTop: 7, marginBottom: 5, overflowWrap: 'anywhere' });
-  el(tooltip, 'small', '', '', { fontFamily: mono, fontSize: 9, lineHeight: '1.6', whiteSpace: 'pre-line', color: '#9c9db0', overflowWrap: 'anywhere' });
-  const stack = el(body, 'aside', 'window-stack', '', { ...fixed, ...col, zIndex: 3, padding: 12, gap: 10, borderWidth: 1, borderStyle: 'solid', borderColor: 'rgba(208,196,238,.18)', borderRadius: 10, backgroundColor: 'rgba(10,12,21,.62)', backdropFilter: 'blur(12px)', pointerEvents: 'auto' }, 'window-stack'); stack.hidden = true; stack.setAttribute('aria-label', 'Recent commands and open windows');
-  const activityHead = el(stack, 'div', 'window-stack-head', '', { ...row, color: '#9b9daf', fontFamily: mono, fontSize: 9, letterSpacing: '.12em' });
+  const tooltip = el(body, 'div', '', '', { ...cardBase, zIndex: 5, display: 'none', width: 360, minWidth: 360, paddingTop: 12, paddingBottom: 8, paddingLeft: 14, paddingRight: 14, backgroundColor: 'rgba(13,14,25,.94)', backdropFilter: 'blur(14px)', boxShadow: '0px 12px 50px #0008' }, 'tooltip'); tooltip.setAttribute('role', 'status');
+  el(tooltip, 'span', 'tip-family', '', { ...truncated, width: '100%', fontSize: 9, color: '#9c9db0', letterSpacing: '.12em', textTransform: 'uppercase' });
+  el(tooltip, 'strong', '', '', { ...truncated, width: '100%', fontWeight: 400, fontSize: 12, color: '#f4f0ff', marginTop: 6, marginBottom: 3 });
+  el(tooltip, 'span', '', '', { ...truncated, width: '100%', fontSize: 8, color: '#85889b', marginBottom: 7 }, 'tip-meta');
+  const metrics = el(tooltip, 'div', '', '', { ...col, gap: 5, width: '100%' }, 'tip-metrics');
+  const metricPairRow = (parent, pairs) => {
+    const rowNode = el(parent, 'div', '', '', { ...row, justifyContent: 'space-between', gap: 10, height: 13, flexShrink: 0 });
+    for (const [id, label] of pairs) {
+      const pair = el(rowNode, 'div', '', '', { ...row, flex: 1, minWidth: 0, gap: 4 });
+      el(pair, 'span', '', label, { fontFamily: mono, fontSize: 8, color: '#777b91', flexShrink: 0 });
+      el(pair, 'strong', '', '—', { fontFamily: mono, fontSize: 9, fontWeight: 400, color: '#9093aa', textAlign: 'right', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }, id);
+    }
+  };
+  metricPairRow(metrics, [['tip-cpu', 'CPU'], ['tip-memory', 'RAM']]);
+  metricPairRow(metrics, [['tip-net-up', 'NET ↑'], ['tip-net-down', 'NET ↓']]);
+  metricPairRow(metrics, [['tip-disk-read', 'DISK R'], ['tip-disk-write', 'DISK W']]);
+  const stack = el(body, 'aside', 'window-stack', '', { ...fixed, ...col, zIndex: 3, padding: 12, gap: 10, borderWidth: 1, borderStyle: 'solid', borderColor: 'rgba(208,196,238,.18)', borderRadius: 10, backgroundColor: 'rgba(10,12,21,.62)', backdropFilter: 'blur(12px)', pointerEvents: 'auto', opacity: 0, transition: 'opacity 520ms ease' }, 'window-stack'); stack.hidden = true; stack.setAttribute('aria-label', 'Recent commands and open windows');
+  const activitySection = el(stack, 'section', 'recent-command-section', '', { ...col, gap: 8, overflow: 'hidden', opacity: 1, transition: 'opacity 520ms ease' }, 'recent-command-section');
+  const activityHead = el(activitySection, 'div', 'window-stack-head', '', { ...row, color: '#9b9daf', fontFamily: mono, fontSize: 9, letterSpacing: '.12em' });
   el(activityHead, 'span', '', 'RECENTLY STARTED COMMANDS');
-  const recentList = el(stack, 'div', 'recent-command-list', '', { ...col, gap: 6, overflow: 'auto', maxHeight: 230 }, 'recent-commands');
+  const recentList = el(activitySection, 'div', 'recent-command-list', '', { ...col, gap: 6, overflow: 'auto', maxHeight: 230 }, 'recent-commands');
   const windowsRule = el(stack, 'div', '', '', { height: 1, backgroundColor: line, flexShrink: 0 }, 'windows-rule');
   const stackHead = el(stack, 'div', 'window-stack-head', '', { ...row, justifyContent: 'space-between', color: '#9b9daf', fontFamily: mono, fontSize: 9, letterSpacing: '.12em' }, 'window-head');
   el(stackHead, 'span', 'eyebrow', 'OPEN WINDOWS', eyebrow); el(stackHead, 'span', '', '0', { color: '#c7b4f3' }, 'window-count');
   const windowList = el(stack, 'div', 'window-list', '', { ...col, overflow: 'auto', gap: 9, paddingRight: 2 }, 'window-list'); windowList.hidden = true; stackHead.hidden = true;
   el(windowList, 'p', 'window-empty', 'Waiting for visible windows…', { paddingTop: 10, paddingBottom: 10, paddingLeft: 2, paddingRight: 2, color: '#85899a', fontSize: 10, lineHeight: '1.5' });
   const notice = el(body, 'div', 'notice', '', { ...fixed, zIndex: 4, top: 16, transform: 'translateX(-50%)', backgroundColor: '#2b1b29', borderWidth: 1, borderStyle: 'solid', borderColor: '#64364e', borderRadius: 8, paddingTop: 10, paddingBottom: 10, paddingLeft: 16, paddingRight: 16, fontSize: 12, color: '#ffd0dc' }, 'notice'); notice.hidden = true;
-  const styledCards = new WeakSet(), styledCommands = new WeakSet();
+  const styledCards = new WeakSet();
+  let recentClearTimer = null, recentFadeTimer = null;
+  function showRecentCommands(onExpired) {
+    clearTimeout(recentClearTimer); clearTimeout(recentFadeTimer);
+    stack.hidden = false;
+    stack.style.opacity = 1;
+    activitySection.hidden = false;
+    activitySection.style.opacity = 1;
+    recentClearTimer = setTimeout(() => {
+      activitySection.style.opacity = 0;
+      recentFadeTimer = setTimeout(() => {
+        recentList.replaceChildren();
+        activitySection.hidden = true;
+        onExpired?.();
+        if (windowList.hidden) {
+          stack.style.opacity = 0;
+          setTimeout(() => { if (windowList.hidden && activitySection.hidden) stack.hidden = true; }, 300);
+        }
+      }, 540);
+    }, 2000);
+  }
+  function clearRecentCommands() {
+    clearTimeout(recentClearTimer); clearTimeout(recentFadeTimer);
+    recentList.replaceChildren();
+    activitySection.hidden = true;
+    if (windowList.hidden) { stack.style.opacity = 0; stack.hidden = true; }
+  }
   function resize(width, height) {
     const mobile = width <= 700, inset = mobile ? 22 : 32;
     style(shell, { minHeight: height, paddingTop: mobile ? 22 : 30, paddingBottom: mobile ? 20 : 24, paddingLeft: inset, paddingRight: inset });
@@ -113,11 +152,6 @@ export function createRainbowUI(document) {
       style(meta.querySelector('strong'), { ...truncated, fontFamily: sans, fontSize: 10, fontWeight: 500, color: '#e9e5f2' });
       style(meta.querySelector('small'), { ...truncated, fontSize: 8, marginTop: 4, color: '#888b9e' });
     }
-    for (const command of recentList.children) {
-      if (styledCommands.has(command)) continue;
-      styledCommands.add(command);
-      style(command, { color: '#d8d3e5', fontFamily: mono, fontSize: 9, lineHeight: '1.45', overflowWrap: 'anywhere' });
-    }
   }
-  return { canvas, resize, update };
+  return { canvas, resize, update, showRecentCommands, clearRecentCommands };
 }
