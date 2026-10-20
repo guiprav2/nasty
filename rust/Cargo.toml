@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nasty-native"]
+members = ["crates/nasty-native", "crates/nasty-proc-events"]
 
 [workspace.package]
 version = "0.1.0"

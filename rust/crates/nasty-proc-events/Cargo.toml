@@ -1,0 +1,7 @@
+[package]
+name = "nasty-proc-events"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc = "0.2"

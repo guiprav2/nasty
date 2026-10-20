@@ -17,11 +17,12 @@ export function createRainbowUI(document) {
   const absolute = { position: 'absolute' };
   const fixed = { position: 'fixed' };
   const body = document.body;
-  style(body, { backgroundColor: '#080a12', color: '#f4f3f7', fontFamily: sans, overflow: 'hidden', minWidth: 480, minHeight: 360 });
+  style(body, { backgroundColor: '#080a12', color: '#f4f3f7', fontFamily: sans, overflow: 'hidden', minWidth: 480, minHeight: 360, transition: 'background-color 800ms ease-in-out' });
   const canvas = el(body, 'canvas', '', '', { ...fixed, top: 0, left: 0, width: '100%', height: '100%', zIndex: 0, cursor: 'grab', touchAction: 'none' }, 'field');
   canvas.setAttribute('aria-label', 'Live process constellation');
   const grain = el(body, 'div', 'grain', '', { ...fixed, top: 0, left: 0, width: '100%', height: '100%', zIndex: 1, pointerEvents: 'none', opacity: .045,
     backgroundImage: 'url("data:image/svg+xml,%3Csvg viewBox=\'0 0 180 180\' xmlns=\'http://www.w3.org/2000/svg\'%3E%3Cfilter id=\'n\'%3E%3CfeTurbulence type=\'fractalNoise\' baseFrequency=\'.9\' numOctaves=\'3\' stitchTiles=\'stitch\'/%3E%3C/filter%3E%3Crect width=\'100%25\' height=\'100%25\' filter=\'url(%23n)\' opacity=\'.6\'/%3E%3C/svg%3E")' });
+  const traceMark = el(body, 'div', 'trace-mark', '!', { ...fixed, zIndex: 1, top: 0, left: 0, color: 'rgba(255,100,123,0)', fontSize: 420, lineHeight: '.8', fontWeight: 800, pointerEvents: 'none', userSelect: 'none', transition: 'color 800ms ease-in-out' }, 'trace-mark');
   const shell = el(body, 'main', 'shell', '', { ...col, position: 'relative', zIndex: 2, width: '100%', pointerEvents: 'none' });
   const top = el(shell, 'header', 'topbar', '', { ...row, justifyContent: 'space-between', flexShrink: 0 });
   const wordmark = el(top, 'a', 'wordmark', '', { ...row, color: '#f4f3f7', fontWeight: 700, fontSize: 16, letterSpacing: '-.5px', textDecoration: 'none' }); wordmark.setAttribute('href', '#');
@@ -125,6 +126,8 @@ export function createRainbowUI(document) {
   }
   function resize(width, height) {
     const mobile = width <= 700, inset = mobile ? 22 : 32;
+    const traceSize = Math.min(width * .64, height * .72);
+    style(traceMark, { fontSize: traceSize, left: width * .5 - traceSize * .18, top: height * .5 - traceSize * .4 });
     style(shell, { minHeight: height, paddingTop: mobile ? 22 : 30, paddingBottom: mobile ? 20 : 24, paddingLeft: inset, paddingRight: inset });
     style(intro, { marginTop: mobile ? 52 : Math.max(38, Math.min(88, height * .07)) });
     heading.style.fontSize = Math.max(43, Math.min(78, width * .062));
@@ -138,6 +141,10 @@ export function createRainbowUI(document) {
     tooltip.style.maxWidth = Math.min(420, width * .75);
     style(stack, { right: mobile ? 14 : width * .05, top: mobile ? 'auto' : 112, bottom: mobile ? 150 : 'auto', width: mobile ? Math.min(220, width * .55) : Math.min(280, width * .27), maxHeight: mobile ? height * .42 : height - 250 });
     notice.style.left = width * .5;
+  }
+  function setTracingEnabled(enabled) {
+    style(body, { backgroundColor: enabled ? '#220b13' : '#080a12' });
+    traceMark.style.color = enabled ? 'rgba(255,100,123,.11)' : 'rgba(255,100,123,0)';
   }
   function update(time) {
     const offline = live.classList.contains('offline');
@@ -153,5 +160,5 @@ export function createRainbowUI(document) {
       style(meta.querySelector('small'), { ...truncated, fontSize: 8, marginTop: 4, color: '#888b9e' });
     }
   }
-  return { canvas, resize, update, showRecentCommands, clearRecentCommands };
+  return { canvas, resize, update, showRecentCommands, clearRecentCommands, setTracingEnabled };
 }

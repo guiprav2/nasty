@@ -6,6 +6,8 @@ import path from 'node:path';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import os from 'node:os';
 import vm from 'node:vm';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import { Command, InvalidArgumentError } from 'commander';
 import { Window, Document, closeImageDecoder } from '../index.js';
 import { documentState, documentBoxes, layoutDocument } from '../internal/dom-state.js';
@@ -27,55 +29,176 @@ cli
   .description('Show a live process graph in Nasty')
   .option('--net-only', 'show only processes with active network sockets')
   .option('--usage-scale <multiplier>', 'adjust how strongly resource usage changes node size and glow', parseUsageScale, 1)
+  .option('--logfile <path>', 'write traced command lines here', path.join(os.homedir(), '.rainbow', 'trace.log'))
   .parse(process.argv);
 const options = cli.opts();
+const logfile = path.resolve(options.logfile);
+const maxLogBytes = 5 * 1024 * 1024;
+const rotatedLogCount = 3;
+let tracingEnabled = false;
+let tracedCommandLines = new Map();
+const observedCommandLines = new Map();
+const commandHistory = [];
+
+function appendTraceLine(message, time = Date.now()) {
+  const line = `${new Date(time).toISOString()} ${message}`;
+  const bytes = Buffer.from(`${line}\n`);
+  try {
+    fs.mkdirSync(path.dirname(logfile), { recursive: true });
+    const size = fs.existsSync(logfile) ? fs.statSync(logfile).size : 0;
+    if (size + bytes.length > maxLogBytes) {
+      try { fs.rmSync(`${logfile}.${rotatedLogCount}`, { force: true }); } catch { /* Rotation is best effort. */ }
+      for (let index = rotatedLogCount - 1; index >= 1; index--) {
+        try { fs.renameSync(`${logfile}.${index}`, `${logfile}.${index + 1}`); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
+      try { fs.renameSync(logfile, `${logfile}.1`); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    fs.appendFileSync(logfile, bytes);
+    return true;
+  } catch (error) {
+    console.error(`Rainbow: cannot write ${logfile}: ${error.message}`);
+    return false;
+  }
+}
+
+function setTracingEnabled(enabled) {
+  const now = Date.now();
+  while (commandHistory.length && now - commandHistory[0].time > 60_000) commandHistory.shift();
+  if (enabled) {
+    for (const command of commandHistory) {
+      if (!appendTraceLine(command.commandLine, command.time)) return false;
+    }
+  }
+  if (!appendTraceLine(`--- tracing ${enabled ? 'enabled' : 'disabled'}`, now)) return false;
+  tracedCommandLines = enabled ? new Map(observedCommandLines) : new Map();
+  tracingEnabled = enabled;
+  return true;
+}
+
+function observeCommandLine(proc) {
+  if (observedCommandLines.get(proc.pid) === proc.commandLine) return;
+  observedCommandLines.set(proc.pid, proc.commandLine);
+  const time = Date.now();
+  commandHistory.push({ time, commandLine: proc.commandLine.replace(/[\r\n\0]+/g, ' ') });
+  while (commandHistory.length && time - commandHistory[0].time > 60_000) commandHistory.shift();
+}
+
+function traceCommandLine(proc) {
+  observeCommandLine(proc);
+  if (!tracingEnabled || tracedCommandLines.get(proc.pid) === proc.commandLine) return;
+  const commandLine = proc.commandLine.replace(/[\r\n\0]+/g, ' ');
+  if (appendTraceLine(commandLine)) tracedCommandLines.set(proc.pid, proc.commandLine);
+}
 
 let previousSamples = new Map();
+let cachedProcessPids = null;
 let stopped = false;
+let procConnector = null, procConnectorRetry = null, processRefreshTimer = null, lastEventSnapshotAt = 0;
+const pendingProcEvents = new Map();
 let windowEvents = null, structureEvents = null;
 let fallbackRefreshTimer = null, windowRefreshTimer = null, windowRefreshQueued = false;
-let cachedWindows = [], latestProcesses = [], windowSignature = null;
+let cachedWindows = [], latestProcesses = [], latestProcessSnapshot = null, windowSignature = null;
 const directStreams = new Set();
 const ticksPerSecond = (() => { try { return Number(execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8', timeout: 500 })) || 100; } catch { return 100; } })();
 const windowCaptures = new Map();
 let requestedWindowIds = new Set();
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const procEventHelper = path.join(repoRoot, 'rust', 'target', 'debug', 'nasty-proc-events');
 
-function readProcesses() {
+function startProcConnector() {
+  if (stopped || procConnector || process.platform !== 'linux') return;
+  execFile('cargo', ['build', '--manifest-path', path.join(repoRoot, 'rust', 'Cargo.toml'), '-p', 'nasty-proc-events'],
+    { cwd: repoRoot, timeout: 120000 }, error => {
+    if (error) {
+      if (!stopped) console.warn(`Rainbow: could not build proc connector helper: ${error.message}`);
+      return;
+    }
+    if (stopped || procConnector) return;
+    const child = spawn(procEventHelper, [], { stdio: ['ignore', 'pipe', 'pipe'] });
+    procConnector = child;
+    const lines = createInterface({ input: child.stdout });
+    lines.on('line', line => {
+      try {
+        const event = JSON.parse(line);
+        if (!['fork', 'exec', 'exit'].includes(event.type) || !Number.isInteger(event.pid)) return;
+        pendingProcEvents.set(event.pid, event.type);
+        if (processRefreshTimer) return;
+        const delay = Math.max(50, 200 - (Date.now() - lastEventSnapshotAt));
+        processRefreshTimer = setTimeout(() => {
+          processRefreshTimer = null;
+          if ([...directStreams].some(stream => stream.route === 'processes')) {
+            lastEventSnapshotAt = Date.now();
+            const changes = [...pendingProcEvents];
+            pendingProcEvents.clear();
+            publishProcessEvents(changes);
+          }
+        }, delay);
+        processRefreshTimer.unref();
+      } catch { /* Ignore malformed helper output. */ }
+    });
+    let errorText = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', chunk => { errorText = (errorText + chunk).slice(-2048); });
+    child.once('error', error => {
+      if (procConnector === child) procConnector = null;
+      if (!stopped) console.warn(`Rainbow: proc connector unavailable: ${error.message}`);
+    });
+    child.once('exit', (code, signal) => {
+      lines.close();
+      if (procConnector === child) procConnector = null;
+      if (!stopped) {
+        const detail = errorText.trim() || `exit ${code ?? signal}`;
+        console.warn(`Rainbow: proc connector stopped (${detail}); process list will reconcile periodically.`);
+        procConnectorRetry = setTimeout(startProcConnector, 5000);
+        procConnectorRetry.unref();
+      }
+    });
+  });
+}
+
+function readProcessRecord(pid) {
+  try {
+    const base = `/proc/${pid}`;
+    const argv = fs.readFileSync(`${base}/cmdline`).toString().split('\0').filter(Boolean);
+    const stat = fs.readFileSync(`${base}/stat`, 'utf8');
+    const end = stat.lastIndexOf(')');
+    if (end < 0) return null;
+    const fields = stat.slice(end + 2).split(' ');
+    const comm = stat.slice(stat.indexOf('(') + 1, end);
+    let rssBytes = 0, readBytes = 0, writeBytes = 0;
+    try { rssBytes = Number(fs.readFileSync(`${base}/status`, 'utf8').match(/^VmRSS:\s+(\d+)\s+kB/m)?.[1]) * 1024 || 0; } catch { /* Optional process metric. */ }
+    try {
+      const io = fs.readFileSync(`${base}/io`, 'utf8');
+      readBytes = Number(io.match(/^read_bytes:\s+(\d+)/m)?.[1]) || 0;
+      writeBytes = Number(io.match(/^write_bytes:\s+(\d+)/m)?.[1]) || 0;
+    } catch { /* Process I/O counters may be restricted. */ }
+    const executable = argv[0] || comm;
+    const label = [path.basename(executable), ...argv.slice(1).map(arg => {
+      if (/^\d+$/.test(arg) || /^\/(tmp|run|var\/tmp)\//.test(arg)) return '…';
+      return arg.length > 100 ? `${arg.slice(0, 96)}…` : arg;
+    })].join(' ');
+    return { pid, ppid: Number(fields[1]) || 0, name: comm, executable: path.basename(executable), label: label || comm,
+      commandLine: argv.join(' ') || comm, cpuTicks: Number(fields[11]) + Number(fields[12]), rssBytes, readBytes, writeBytes };
+  } catch { return null; }
+}
+
+function readProcesses(refreshProcessList = true) {
   if (process.platform !== 'linux') return { processes: [], platform: process.platform, error: 'Live process discovery currently requires Linux (/proc).' };
   let entries;
-  try { entries = fs.readdirSync('/proc').filter(name => /^\d+$/.test(name)); }
+  try {
+    if (refreshProcessList || cachedProcessPids === null) cachedProcessPids = fs.readdirSync('/proc').filter(name => /^\d+$/.test(name));
+    entries = cachedProcessPids;
+  }
   catch (error) { return { processes: [], platform: process.platform, error: error.message }; }
   const sampledAt = Date.now();
   let systemMemoryBytes = 0;
   try { systemMemoryBytes = Number(fs.readFileSync('/proc/meminfo', 'utf8').match(/^MemTotal:\s+(\d+)\s+kB/m)?.[1]) * 1024 || 0; } catch { /* Optional metric. */ }
   const processes = [];
   for (const entry of entries) {
-    try {
-      const base = `/proc/${entry}`;
-      const raw = fs.readFileSync(`${base}/cmdline`);
-      const argv = raw.toString().split('\0').filter(Boolean);
-      const stat = fs.readFileSync(`${base}/stat`, 'utf8');
-      const end = stat.lastIndexOf(')');
-      const fields = stat.slice(end + 2).split(' ');
-      const comm = stat.slice(stat.indexOf('(') + 1, end);
-      const pid = Number(entry);
-      const ppid = Number(fields[1]);
-      let rssBytes = 0, readBytes = 0, writeBytes = 0;
-      try { rssBytes = Number(fs.readFileSync(`${base}/status`, 'utf8').match(/^VmRSS:\s+(\d+)\s+kB/m)?.[1]) * 1024 || 0; } catch { /* Process exited. */ }
-      try {
-        const io = fs.readFileSync(`${base}/io`, 'utf8');
-        readBytes = Number(io.match(/^read_bytes:\s+(\d+)/m)?.[1]) || 0;
-        writeBytes = Number(io.match(/^write_bytes:\s+(\d+)/m)?.[1]) || 0;
-      } catch { /* Hide inaccessible I/O counters as zero. */ }
-      const executable = argv[0] || comm;
-      // Keep recognizable arguments, while removing high-churn identity values and data paths.
-      const label = [path.basename(executable), ...argv.slice(1).map(arg => {
-        if (/^\d+$/.test(arg) || /^\/(tmp|run|var\/tmp)\//.test(arg)) return '…';
-        return arg.length > 100 ? `${arg.slice(0, 96)}…` : arg;
-      })].join(' ');
-      processes.push({ pid, ppid: Number.isFinite(ppid) ? ppid : 0, name: comm, executable: path.basename(executable), label: label || comm, commandLine: argv.join(' ') || comm,
-        cpuTicks: Number(fields[11]) + Number(fields[12]), rssBytes, readBytes, writeBytes });
-    } catch { /* Processes can exit or be hidden between listing and reading. */ }
+    const proc = readProcessRecord(Number(entry));
+    if (proc) processes.push(proc);
   }
   // Keep Rainbow (and any helpers it launches) out of its own process tree.
   const byPid = new Map(processes.map(proc => [proc.pid, proc]));
@@ -90,6 +213,8 @@ function readProcesses() {
     }
   }
   const visible = processes.filter(proc => !excluded.has(proc.pid));
+  // Command tracing covers the full process set, independently of the graph's --net-only filter.
+  for (const proc of visible) traceCommandLine(proc);
   const socketOwners = new Map();
   for (const proc of visible) {
     try {
@@ -155,7 +280,7 @@ function readProcesses() {
   });
   for (const pid of previousSamples.keys()) if (!alive.has(pid)) previousSamples.delete(pid);
   const filtered = netOnly ? enriched.filter(proc => active.has(proc.pid)) : enriched;
-  return { processes: filtered, platform: process.platform, sampledAt, systemMemoryBytes, cpuCount: os.cpus().length, netOnly: netOnly };
+  return { processes: filtered, platform: process.platform, sampledAt, systemMemoryBytes, cpuCount: os.cpus().length, netOnly };
 }
 
 
@@ -281,22 +406,92 @@ function emitStream(url, data) {
   const route = new URL(url, 'http://nasty.local').pathname.slice(1);
   for (const stream of directStreams) if (stream.route === route && typeof stream.onmessage === 'function') stream.onmessage({ data: JSON.stringify(data) });
 }
+function publishProcessSnapshot(refreshProcessList = false) {
+  const data = readProcesses(refreshProcessList);
+  latestProcesses = data.processes;
+  latestProcessSnapshot = data;
+  emitStream('/processes', data);
+}
+function isRainbowDescendant(proc) {
+  let parent = proc.ppid;
+  const visited = new Set();
+  while (parent && !visited.has(parent)) {
+    if (parent === process.pid) return true;
+    visited.add(parent);
+    parent = readProcessRecord(parent)?.ppid || 0;
+  }
+  return false;
+}
+function publishProcessEvents(changes, retry = 0) {
+  if (!latestProcessSnapshot || !Array.isArray(cachedProcessPids)) {
+    publishProcessSnapshot(true);
+    return;
+  }
+  const byPid = new Map(latestProcesses.map(proc => [proc.pid, proc]));
+  const pids = new Set(cachedProcessPids);
+  const notReady = [];
+  const systemMemoryBytes = latestProcessSnapshot.systemMemoryBytes;
+  for (const [pid, type] of changes) {
+    if (type === 'exit') {
+      byPid.delete(pid);
+      pids.delete(String(pid));
+      previousSamples.delete(pid);
+      observedCommandLines.delete(pid);
+      tracedCommandLines.delete(pid);
+      continue;
+    }
+    const raw = readProcessRecord(pid);
+    if (!raw) { if (retry < 3) notReady.push([pid, type]); continue; }
+    if (type === 'exec') traceCommandLine(raw);
+    pids.add(String(pid));
+    if (isRainbowDescendant(raw)) { byPid.delete(pid); continue; }
+    if (netOnly) continue; // Socket ownership is refreshed with the metric sample.
+    const previous = byPid.get(pid);
+    byPid.set(pid, {
+      pid: raw.pid, ppid: raw.ppid, name: raw.name, executable: raw.executable, label: raw.label, commandLine: raw.commandLine,
+      rssBytes: raw.rssBytes,
+      cpuPercent: previous?.cpuPercent || 0,
+      memoryPercent: systemMemoryBytes ? raw.rssBytes / systemMemoryBytes * 100 : 0,
+      diskReadBps: previous?.diskReadBps || 0,
+      diskWriteBps: previous?.diskWriteBps || 0,
+      networkUpBps: previous?.networkUpBps || 0,
+      networkDownBps: previous?.networkDownBps || 0,
+      networkRatesAvailable: previous?.networkRatesAvailable || false,
+      sockets: previous?.sockets || 0,
+    });
+  }
+  cachedProcessPids = [...pids];
+  latestProcesses = [...byPid.values()];
+  latestProcessSnapshot = { ...latestProcessSnapshot, sampledAt: Date.now(), processes: latestProcesses };
+  emitStream('/processes', latestProcessSnapshot);
+  if (notReady.length && !stopped) setTimeout(() => publishProcessEvents(notReady, retry + 1), 50 * (retry + 1)).unref();
+}
 class DirectEventSource {
   constructor(url) {
     this.route = new URL(url, 'http://nasty.local').pathname.slice(1);
     this.closed = false;
     directStreams.add(this);
     if (this.route === 'processes') {
-      const sample = () => { if (!this.closed) { const data = readProcesses(); latestProcesses = data.processes; this.onmessage?.({ data: JSON.stringify(data) }); } };
-      queueMicrotask(sample); this.timer = setInterval(sample, 2000);
+      const sample = refresh => {
+        if (this.closed) return;
+        const data = readProcesses(refresh || !procConnector);
+        for (const proc of data.processes) traceCommandLine(proc);
+        latestProcesses = data.processes;
+        latestProcessSnapshot = data;
+        this.onmessage?.({ data: JSON.stringify(data) });
+      };
+      queueMicrotask(() => sample(true));
+      this.timer = setInterval(() => sample(false), 2000);
+      this.reconcileTimer = setInterval(() => sample(true), 30000);
+      startProcConnector();
     } else if (this.route === 'windows') {
       refreshWindows().catch(() => {});
     }
   }
-  close() { this.closed = true; clearInterval(this.timer); directStreams.delete(this); }
+  close() { this.closed = true; clearInterval(this.timer); clearInterval(this.reconcileTimer); directStreams.delete(this); }
 }
 
-const netOnly = options.netOnly;
+let netOnly = options.netOnly;
 const window = new Window({ title: 'Rainbow — process field', width: 1180, height: 760, resizable: 'both' });
 const document = new Document(); window.document = document;
 const ui = createRainbowUI(document);
@@ -308,6 +503,7 @@ events.addEventListener('message', event => {
   syncWindowCaptures();
 });
 let nextFrame = 0, shown = false, count = 0, pointer = { x: 0, y: 0 }, lastTarget = null, shiftDown = false;
+const actionKeysDown = new Set();
 const browser = {
   document, console, performance, devicePixelRatio: 1,
   usageScale: options.usageScale,
@@ -358,6 +554,30 @@ function dispatch() {
   }
   for (const event of window.drainEvents()) {
     if (event.type === 'keydown' && event.key === 'Named(Escape)') window.close();
+    if (event.type === 'keydown' || event.type === 'keyup') {
+      const key = event.key === 'Character("n")' || event.key === "Character('n')" ? 'n'
+        : event.key === 'Character("N")' || event.key === "Character('N')" ? 'n'
+        : event.key === 'Character("q")' || event.key === "Character('q')" ? 'q'
+        : event.key === 'Character("Q")' || event.key === "Character('Q')" ? 'q'
+        : event.key === 'Character("t")' || event.key === "Character('t')" ? 't'
+        : event.key === 'Character("T")' || event.key === "Character('T')" ? 't' : null;
+      if (event.type === 'keyup') {
+        if (key) actionKeysDown.delete(key);
+      } else if (key && !actionKeysDown.has(key)) {
+        actionKeysDown.add(key);
+        if (key === 'q') window.close();
+        if (key === 'n') {
+          netOnly = !netOnly;
+          publishProcessSnapshot(true);
+        }
+        if (key === 't') {
+          const enabled = !tracingEnabled;
+          if (setTracingEnabled(enabled)) {
+            ui.setTracingEnabled(enabled);
+          }
+        }
+      }
+    }
     if (event.type === 'keydown' && /Shift/.test(event.key || '')) shiftDown = true;
     if (event.type === 'keyup' && /Shift/.test(event.key || '')) shiftDown = false;
     if (event.type === 'wheel') {
@@ -382,6 +602,8 @@ async function close() {
   for (const id of intervals) clearInterval(id);
   frames.clear(); for (const stream of directStreams) stream.close();
   windowEvents?.kill(); structureEvents?.kill();
+  clearTimeout(procConnectorRetry); clearTimeout(processRefreshTimer);
+  procConnector?.kill('SIGTERM'); procConnector = null;
   for (const capture of windowCaptures.values()) capture.child.kill();
   clearTimeout(fallbackRefreshTimer); clearTimeout(windowRefreshTimer);
   await document.close(); window.close(); await closeImageDecoder();
@@ -390,6 +612,7 @@ async function frame() {
   if (stopped) return;
   if (window.closed) { await close(); return; }
   const start = performance.now(); dispatch();
+  if (window.closed) { await close(); return; }
   const dispatched = performance.now();
   const callbacks = [...frames.values()]; frames.clear();
   for (const callback of callbacks) callback(start);
@@ -406,10 +629,6 @@ async function frame() {
       const surface = rasterizeDocument(document, viewport.width, viewport.height);
       await writeFile(process.env.NASTY_RAINBOW_CAPTURE, await surface.encode('png'));
     }
-    const sorted = elapsed.slice(5).sort((a, b) => a - b);
-    console.log(`Rainbow: ${count} frames, ${(count * 1000 / (performance.now() - started)).toFixed(1)} FPS, median frame ${(sorted[Math.floor(sorted.length / 2)] || 0).toFixed(1)} ms`);
-    console.log([...paintProfile].sort((a,b)=>b[1]-a[1]).slice(0,8));
-    console.log(Object.fromEntries(Object.keys(phases[0]).map(key => [key, +(phases.slice(5).reduce((sum, phase) => sum + phase[key], 0) / Math.max(1, phases.length - 5)).toFixed(2)])));
     await close(); return;
   }
   setTimeout(() => frame().catch(fail), Math.max(0, 1000 / 60 - (performance.now() - start)));
@@ -418,6 +637,8 @@ async function fail(error) { console.error(error); await close(); process.exitCo
 process.once('SIGINT', () => close()); process.once('SIGTERM', () => close());
 process.once('exit', () => {
   windowEvents?.kill(); structureEvents?.kill();
+  clearTimeout(procConnectorRetry); clearTimeout(processRefreshTimer);
+  procConnector?.kill('SIGTERM'); procConnector = null;
   for (const capture of windowCaptures.values()) capture.child.kill();
   clearTimeout(fallbackRefreshTimer); clearTimeout(windowRefreshTimer);
 });

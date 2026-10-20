@@ -6,9 +6,7 @@
   "scripts": {
     "build:debug": "cargo build --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js",
     "build:android-arm64": "bash scripts/build-android-arm64.sh",
-    "build:tour-apk": "bash scripts/build-tour-apk.sh",
-    "run:rainbow": "node examples/rainbow.js",
-    "run:rainbow:net-only": "node examples/rainbow.js --net-only"
+    "build:tour-apk": "bash scripts/build-tour-apk.sh"
   },
   "dependencies": {
     "@napi-rs/canvas": "1.0.11",

@@ -2,6 +2,7 @@ import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { documentBoxes, elementState } from './dom-state.js';
 import { canvasSurface, imageSurface } from '../canvas-2d.js';
 import { textMetrics, textLines, inherited } from './text-metrics.js';
+import { computedStyleValue } from './css-transitions.js';
 const windows = new WeakMap();
 export const paintProfile = new Map();
 const backgrounds = new Map();
@@ -63,8 +64,9 @@ export function rasterizeDocument(document, width, height, surface = createCanva
         ctx.drawImage(crop, x, y); ctx.restore();
       }
     }
-    if (style.backgroundColor && style.backgroundColor !== 'transparent') {
-      ctx.save(); shadow(ctx, style.boxShadow); ctx.fillStyle = style.backgroundColor;
+    const backgroundColor = computedStyleValue(style, 'backgroundColor');
+    if (backgroundColor && backgroundColor !== 'transparent') {
+      ctx.save(); shadow(ctx, style.boxShadow); ctx.fillStyle = backgroundColor;
       round(ctx, box.x, box.y, box.width, box.height, r); ctx.fill(); ctx.restore();
     }
     if (style.backgroundImage?.startsWith('url(')) {
@@ -89,11 +91,11 @@ export function rasterizeDocument(document, width, height, surface = createCanva
     const border = box.border;
     const uniform = border.top === border.right && border.top === border.bottom && border.top === border.left;
     if (uniform && border.top > 0) {
-      ctx.save(); shadow(ctx, style.boxShadow); ctx.strokeStyle = style.borderColor || '#000'; ctx.lineWidth = border.top;
+      ctx.save(); shadow(ctx, style.boxShadow); ctx.strokeStyle = computedStyleValue(style, 'borderColor') || '#000'; ctx.lineWidth = border.top;
       round(ctx, box.x + border.top / 2, box.y + border.top / 2, box.width - border.top, box.height - border.top, Math.max(0, r - border.top / 2)); ctx.stroke(); ctx.restore();
     } else {
       for (const [side, rect] of Object.entries({ Top: [box.x, box.y, box.width, border.top], Right: [box.x + box.width - border.right, box.y, border.right, box.height], Bottom: [box.x, box.y + box.height - border.bottom, box.width, border.bottom], Left: [box.x, box.y, border.left, box.height] })) {
-        ctx.fillStyle = style[`border${side}Color`] || style.borderColor || '#000'; ctx.fillRect(...rect);
+        ctx.fillStyle = computedStyleValue(style, `border${side}Color`) || computedStyleValue(style, 'borderColor') || '#000'; ctx.fillRect(...rect);
       }
     }
     const state = elementState(element), content = box.contentBox;
@@ -103,7 +105,15 @@ export function rasterizeDocument(document, width, height, surface = createCanva
     }
     if (state.text) {
       const metrics = textMetrics(element), text = metrics.style;
-      ctx.font = text.font; ctx.letterSpacing = `${text.spacing}px`; ctx.fillStyle = text.color;
+      let textColor = text.color;
+      for (let current = element; current; current = current.parent) {
+        const authoredColor = current.style.color;
+        if (authoredColor !== undefined && authoredColor !== '' && authoredColor !== 'inherit') {
+          textColor = computedStyleValue(current.style, 'color');
+          break;
+        }
+      }
+      ctx.font = text.font; ctx.letterSpacing = `${text.spacing}px`; ctx.fillStyle = textColor;
       if (['hidden', 'auto', 'scroll'].includes(style.overflow)) { round(ctx, content.x, content.y, content.width, content.height, 0); ctx.clip(); }
       const font = ctx.measureText('Mg');
       const ascent = font.fontBoundingBoxAscent || text.size * .8;
