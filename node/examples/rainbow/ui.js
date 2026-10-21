@@ -101,39 +101,45 @@ export function createRainbowUI(document) {
   metricPairRow(metrics, [['tip-net-up', 'NET ↑'], ['tip-net-down', 'NET ↓']]);
   metricPairRow(metrics, [['tip-disk-read', 'DISK R'], ['tip-disk-write', 'DISK W']]);
   const stack = el(body, 'aside', 'window-stack', '', { ...fixed, ...col, zIndex: 3, padding: 12, gap: 10, borderWidth: 1, borderStyle: 'solid', borderColor: 'rgba(208,196,238,.18)', borderRadius: 10, backgroundColor: 'rgba(10,12,21,.62)', backdropFilter: 'blur(12px)', pointerEvents: 'auto', opacity: 0, transition: 'opacity 520ms ease' }, 'window-stack'); stack.hidden = true; stack.setAttribute('aria-label', 'Recent commands and open windows');
-  const activitySection = el(stack, 'section', 'recent-command-section', '', { ...col, gap: 8, overflow: 'hidden', opacity: 1, transition: 'opacity 520ms ease' }, 'recent-command-section');
-  const activityHead = el(activitySection, 'div', 'window-stack-head', '', { ...row, color: '#9b9daf', fontFamily: mono, fontSize: 9, letterSpacing: '.12em' });
-  el(activityHead, 'span', '', 'RECENTLY STARTED COMMANDS');
-  const recentList = el(activitySection, 'div', 'recent-command-list', '', { ...col, gap: 6, overflow: 'auto', maxHeight: 230 }, 'recent-commands');
-  const windowsRule = el(stack, 'div', '', '', { height: 1, backgroundColor: line, flexShrink: 0 }, 'windows-rule');
   const stackHead = el(stack, 'div', 'window-stack-head', '', { ...row, justifyContent: 'space-between', color: '#9b9daf', fontFamily: mono, fontSize: 9, letterSpacing: '.12em' }, 'window-head');
   el(stackHead, 'span', 'eyebrow', 'OPEN WINDOWS', eyebrow); el(stackHead, 'span', '', '0', { color: '#c7b4f3' }, 'window-count');
   const windowList = el(stack, 'div', 'window-list', '', { ...col, overflow: 'auto', gap: 9, paddingRight: 2 }, 'window-list'); windowList.hidden = true; stackHead.hidden = true;
   el(windowList, 'p', 'window-empty', 'Waiting for visible windows…', { paddingTop: 10, paddingBottom: 10, paddingLeft: 2, paddingRight: 2, color: '#85899a', fontSize: 10, lineHeight: '1.5' });
+  const windowsRule = el(stack, 'div', '', '', { height: 1, backgroundColor: line, flexShrink: 0 }, 'windows-rule');
+  const activitySection = el(stack, 'section', 'recent-command-section', '', { ...col, gap: 8, overflow: 'hidden', opacity: 1, transition: 'opacity 520ms ease' }, 'recent-command-section');
+  const activityHead = el(activitySection, 'div', 'window-stack-head', '', { ...row, color: '#9b9daf', fontFamily: mono, fontSize: 9, letterSpacing: '.12em' });
+  el(activityHead, 'span', '', 'RECENTLY STARTED COMMANDS');
+  const recentList = el(activitySection, 'div', 'recent-command-list', '', { ...col, gap: 6, overflow: 'auto', maxHeight: 230 }, 'recent-commands');
   const notice = el(body, 'div', 'notice', '', { ...fixed, zIndex: 4, top: 16, transform: 'translateX(-50%)', backgroundColor: '#2b1b29', borderWidth: 1, borderStyle: 'solid', borderColor: '#64364e', borderRadius: 8, paddingTop: 10, paddingBottom: 10, paddingLeft: 16, paddingRight: 16, fontSize: 12, color: '#ffd0dc' }, 'notice'); notice.hidden = true;
   const styledCards = new WeakSet();
-  let recentClearTimer = null, recentFadeTimer = null;
+  let recentClearTimer = null, recentExpiryCallback = null;
+  activitySection.addEventListener('transitionend', event => {
+    if (event.target !== activitySection || event.propertyName !== 'opacity' || Number(activitySection.style.opacity) !== 0) return;
+    recentList.replaceChildren();
+    activitySection.hidden = true;
+    const onExpired = recentExpiryCallback;
+    recentExpiryCallback = null;
+    onExpired?.();
+    if (windowList.hidden && activitySection.hidden) stack.style.opacity = 0;
+  });
+  stack.addEventListener('transitionend', event => {
+    if (event.target === stack && event.propertyName === 'opacity' && Number(stack.style.opacity) === 0
+      && windowList.hidden && activitySection.hidden) stack.hidden = true;
+  });
   function showRecentCommands(onExpired) {
-    clearTimeout(recentClearTimer); clearTimeout(recentFadeTimer);
+    clearTimeout(recentClearTimer);
+    recentExpiryCallback = onExpired;
     stack.hidden = false;
     stack.style.opacity = 1;
     activitySection.hidden = false;
     activitySection.style.opacity = 1;
     recentClearTimer = setTimeout(() => {
       activitySection.style.opacity = 0;
-      recentFadeTimer = setTimeout(() => {
-        recentList.replaceChildren();
-        activitySection.hidden = true;
-        onExpired?.();
-        if (windowList.hidden) {
-          stack.style.opacity = 0;
-          setTimeout(() => { if (windowList.hidden && activitySection.hidden) stack.hidden = true; }, 300);
-        }
-      }, 540);
+      recentClearTimer = null;
     }, 2000);
   }
   function clearRecentCommands() {
-    clearTimeout(recentClearTimer); clearTimeout(recentFadeTimer);
+    clearTimeout(recentClearTimer); recentClearTimer = null; recentExpiryCallback = null;
     recentList.replaceChildren();
     activitySection.hidden = true;
     if (windowList.hidden) { stack.style.opacity = 0; stack.hidden = true; }

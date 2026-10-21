@@ -8,6 +8,8 @@
 - Construct interfaces with `document.createElement` and standard DOM operations. Do not introduce an HTML loader or parser for application ports.
 - Styling is limited to modifying inline `element.style` properties. Do not introduce CSS source parsing, stylesheets, or CSSOM stylesheet creation/insertion. Translate source styles to inline assignments. Class names may identify elements; they are not a stylesheet mechanism.
 - All compositing activity must be performed at the WGPU level. Do not use CPU canvas/image processing to combine layers or implement backdrop effects.
+- Sequence CSS transitions with `transitionend`; do not estimate transition completion with timers.
+- Pace animation loops from the active display refresh rate when available, and respect the window's `vsync` setting instead of assuming 60 Hz.
 
 ## Porting applications
 

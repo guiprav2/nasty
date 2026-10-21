@@ -18,6 +18,13 @@ use std::time::{Duration, Instant};
 use taffy::prelude::*;
 use taffy::tree::TaffyError;
 use wgpu::util::DeviceExt;
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "ffmpeg_decode.rs"]
+mod ffmpeg_decode;
+#[cfg(target_os = "linux")]
+mod audio_output;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent as OsWindowEvent};
@@ -768,6 +775,7 @@ pub struct WindowOptions {
     pub drag_anywhere: Option<Either<bool, String>>,
     pub maximizable: Option<bool>,
     pub maximized: Option<bool>,
+    pub vsync: Option<bool>,
 }
 
 #[napi(object)]
@@ -875,6 +883,173 @@ pub struct PresentStats {
     pub submit_ms: f64,
     #[napi(js_name = "presentMs")]
     pub present_ms: f64,
+}
+
+#[cfg(target_os = "linux")]
+#[napi(object)]
+pub struct DecodedVideoFrame {
+    pub width: u32,
+    pub height: u32,
+    #[napi(js_name = "sourceWidth")]
+    pub source_width: u32,
+    #[napi(js_name = "sourceHeight")]
+    pub source_height: u32,
+    pub pts: f64,
+    #[napi(js_name = "frameDuration")]
+    pub frame_duration: f64,
+    pub pixels: Buffer,
+}
+
+#[cfg(target_os = "linux")]
+#[napi(js_name = "VideoDecoder")]
+pub struct NativeVideoDecoder {
+    decoder: Option<ffmpeg_decode::Video>,
+    duration: f64,
+    frame_duration: f64,
+    source_width: u32,
+    source_height: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[napi(object)]
+pub struct DecodedAudioChunk {
+    pub pts: f64,
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub samples: Buffer,
+}
+
+#[cfg(target_os = "linux")]
+#[napi(js_name = "AudioDecoder")]
+pub struct NativeAudioDecoder {
+    decoder: Option<ffmpeg_decode::Audio>,
+}
+
+#[cfg(target_os = "linux")]
+#[napi]
+impl NativeAudioDecoder {
+    #[napi(constructor)]
+    pub fn new(source: String) -> Result<Self> {
+        let decoder = ffmpeg_decode::Audio::open(std::path::Path::new(&source))
+            .map_err(|error| Error::new(Status::GenericFailure, error))?;
+        Ok(Self { decoder: Some(decoder) })
+    }
+
+    #[napi(getter, js_name = "sampleRate")]
+    pub fn sample_rate(&self) -> u32 {
+        self.decoder.as_ref().map(ffmpeg_decode::Audio::rate).unwrap_or(0)
+    }
+
+    #[napi(getter)]
+    pub fn channels(&self) -> u32 {
+        self.decoder.as_ref().map(ffmpeg_decode::Audio::channels).unwrap_or(0) as u32
+    }
+
+    #[napi]
+    pub fn seek(&mut self, seconds: f64) -> Result<()> {
+        self.decoder.as_mut().ok_or_else(|| Error::new(Status::GenericFailure, "audio decoder is closed"))?
+            .seek(seconds.max(0.0)).map_err(|error| Error::new(Status::GenericFailure, error))
+    }
+
+    #[napi(js_name = "nextChunk")]
+    pub fn next_chunk(&mut self) -> Result<Option<DecodedAudioChunk>> {
+        let decoder = self.decoder.as_mut().ok_or_else(|| Error::new(Status::GenericFailure, "audio decoder is closed"))?;
+        let Some(chunk) = decoder.next_chunk().map_err(|error| Error::new(Status::GenericFailure, error))? else {
+            return Ok(None);
+        };
+        let channels = decoder.channels() as u32;
+        let sample_rate = decoder.rate();
+        let samples = bytemuck::cast_slice::<f32, u8>(&chunk.samples).to_vec();
+        Ok(Some(DecodedAudioChunk { pts: chunk.pts, sample_rate, channels, samples: Buffer::from(samples) }))
+    }
+
+    #[napi]
+    pub fn close(&mut self) { self.decoder.take(); }
+}
+
+#[cfg(target_os = "linux")]
+#[napi]
+impl NativeVideoDecoder {
+    #[napi(constructor)]
+    pub fn new(source: String) -> Result<Self> {
+        let path = std::path::Path::new(&source);
+        let probe = ffmpeg_decode::probe(path)
+            .map_err(|error| Error::new(Status::GenericFailure, error))?;
+        let decoder = ffmpeg_decode::Video::open(std::path::Path::new(&source))
+            .map_err(|error| Error::new(Status::GenericFailure, error))?;
+        let duration = probe.duration.unwrap_or(f64::NAN);
+        let frame_duration = 1.0 / probe.frame_rate;
+        Ok(Self { decoder: Some(decoder), duration, frame_duration,
+            source_width: probe.width, source_height: probe.height })
+    }
+
+    #[napi(getter)]
+    pub fn duration(&self) -> f64 {
+        self.duration
+    }
+
+    #[napi(getter, js_name = "frameDuration")]
+    pub fn frame_duration(&self) -> f64 {
+        self.frame_duration
+    }
+
+    #[napi]
+    pub fn seek(&mut self, seconds: f64) -> Result<()> {
+        self.decoder.as_mut().ok_or_else(|| Error::new(Status::GenericFailure, "video decoder is closed"))?
+            .seek(seconds.max(0.0))
+            .map_err(|error| Error::new(Status::GenericFailure, error))
+    }
+
+    #[napi(js_name = "skipFrame")]
+    pub fn skip_frame(&mut self) -> Result<Option<f64>> {
+        let decoder = self.decoder.as_mut().ok_or_else(|| Error::new(Status::GenericFailure, "video decoder is closed"))?;
+        let Some(held) = decoder.pull().map_err(|error| Error::new(Status::GenericFailure, error))? else {
+            return Ok(None);
+        };
+        decoder.discard();
+        Ok(Some(held.pts))
+    }
+
+    #[napi]
+    pub fn close(&mut self) {
+        self.decoder.take();
+    }
+
+    #[napi(js_name = "nextFrame")]
+    pub fn next_frame(&mut self, max_edge: Option<u32>) -> Result<Option<DecodedVideoFrame>> {
+        let decoder = self.decoder.as_mut().ok_or_else(|| Error::new(Status::GenericFailure, "video decoder is closed"))?;
+        let held = decoder.pull()
+            .map_err(|error| Error::new(Status::GenericFailure, error))?;
+        let Some(held) = held else { return Ok(None); };
+        let frame = decoder.export(max_edge.unwrap_or(0))
+            .map_err(|error| Error::new(Status::GenericFailure, error))?;
+        let row_bytes = (frame.width as usize).saturating_mul(4);
+        if frame.stride as usize == row_bytes {
+            Ok(Some(DecodedVideoFrame {
+                width: frame.width,
+                height: frame.height,
+                source_width: self.source_width,
+                source_height: self.source_height,
+                pts: held.pts,
+                frame_duration: self.frame_duration,
+                pixels: Buffer::from(frame.rgba),
+            }))
+        } else {
+            let mut packed = Vec::with_capacity(row_bytes * frame.height as usize);
+            for row in frame.rgba.chunks(frame.stride as usize).take(frame.height as usize) {
+                packed.extend_from_slice(&row[..row_bytes.min(row.len())]);
+            }
+            Ok(Some(DecodedVideoFrame {
+                width: frame.width,
+                height: frame.height,
+                source_width: self.source_width,
+                source_height: self.source_height,
+                pts: held.pts,
+                frame_duration: self.frame_duration,
+                pixels: Buffer::from(packed),
+            }))
+        }
+    }
 }
 
 #[napi(object)]
@@ -1023,6 +1198,7 @@ struct Renderer {
     adapter_name: String,
     format_name: String,
     present_mode_name: String,
+    supported_present_modes: Vec<wgpu::PresentMode>,
     backdrop: BackdropResources,
     surface_copy_src: bool,
 }
@@ -1726,13 +1902,25 @@ fn create_text_runtime(
 }
 
 impl Renderer {
-    fn new(window: Arc<OsWindow>, transparent: bool) -> std::result::Result<Self, String> {
+    fn select_present_mode(
+        supported: &[wgpu::PresentMode],
+        vsync: bool,
+    ) -> Option<wgpu::PresentMode> {
+        let preferred = if vsync {
+            [wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate]
+        } else {
+            [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
+        };
+        preferred.into_iter().find(|mode| supported.contains(mode))
+    }
+
+    fn new(window: Arc<OsWindow>, transparent: bool, vsync: bool) -> std::result::Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: if cfg!(target_os = "android") {
+            backends: wgpu::Backends::from_env().unwrap_or_else(|| if cfg!(target_os = "android") {
                 wgpu::Backends::GL
             } else {
                 wgpu::Backends::all()
-            },
+            }),
             ..Default::default()
         });
         let surface = instance
@@ -1769,22 +1957,9 @@ impl Renderer {
             .or_else(|| capabilities.formats.first().copied())
             .ok_or_else(|| "GPU surface has no supported formats".to_string())?;
         let format_name = format!("{format:?}");
-        let present_mode = if capabilities
-            .present_modes
-            .contains(&wgpu::PresentMode::Mailbox)
-        {
-            wgpu::PresentMode::Mailbox
-        } else if capabilities
-            .present_modes
-            .contains(&wgpu::PresentMode::Fifo)
-        {
-            wgpu::PresentMode::Fifo
-        } else {
-            *capabilities
-                .present_modes
-                .first()
-                .ok_or_else(|| "GPU surface has no presentation modes".to_string())?
-        };
+        let supported_present_modes = capabilities.present_modes.clone();
+        let present_mode = Self::select_present_mode(&supported_present_modes, vsync)
+            .ok_or_else(|| "GPU surface has no presentation modes".to_string())?;
         let present_mode_name = format!("{present_mode:?}");
         let preferred_alpha = if transparent { wgpu::CompositeAlphaMode::PreMultiplied } else { wgpu::CompositeAlphaMode::Opaque };
         let alpha_mode = capabilities.alpha_modes.iter().copied().find(|mode| *mode == preferred_alpha)
@@ -2279,9 +2454,21 @@ impl Renderer {
             adapter_name,
             format_name,
             present_mode_name,
+            supported_present_modes,
             backdrop,
             surface_copy_src,
         })
+    }
+
+    fn set_vsync(&mut self, vsync: bool) -> std::result::Result<(), String> {
+        let present_mode = Self::select_present_mode(&self.supported_present_modes, vsync)
+            .ok_or_else(|| "GPU surface has no presentation modes".to_string())?;
+        if present_mode == self.config.present_mode { return Ok(()); }
+        self.config.present_mode = present_mode;
+        self.config.desired_maximum_frame_latency = if present_mode == wgpu::PresentMode::Mailbox { 1 } else { 2 };
+        self.surface.configure(&self.device, &self.config);
+        self.present_mode_name = format!("{present_mode:?}");
+        Ok(())
     }
 
     fn upload_image(
@@ -3546,6 +3733,7 @@ struct WindowApp {
     last_drag_click: Option<(Instant, f64, f64)>,
     maximizable: bool,
     maximized: bool,
+    vsync: bool,
     window: Option<Arc<OsWindow>>,
     renderer: Option<Renderer>,
     text_editor: Option<TextEditor>,
@@ -3586,7 +3774,7 @@ impl ApplicationHandler for WindowApp {
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
-                match Renderer::new(window.clone(), self.borderless) {
+                match Renderer::new(window.clone(), self.borderless, self.vsync) {
                     Ok(renderer) => {
                         self.text_editor = Some(TextEditor::new(window.as_ref()));
                         self.apply_resizable(&window);
@@ -4063,6 +4251,7 @@ impl Window {
             },
             maximizable: options.maximizable.unwrap_or(false),
             maximized: options.maximized.unwrap_or(false),
+            vsync: options.vsync.unwrap_or(true),
             ..Default::default()
         };
         if !app.width.is_finite() || !app.height.is_finite() || app.width < 1.0 || app.height < 1.0
@@ -4151,6 +4340,15 @@ impl Window {
         self.app.drag_active = false;
         self.app.left_mouse_down = false;
         self.app.update_drag_cursor();
+        Ok(())
+    }
+
+    #[napi(js_name = "setVsync")]
+    pub fn set_vsync(&mut self, value: bool) -> Result<()> {
+        if let Some(renderer) = self.app.renderer.as_mut() {
+            renderer.set_vsync(value).map_err(|error| Error::new(Status::GenericFailure, error))?;
+        }
+        self.app.vsync = value;
         Ok(())
     }
 
@@ -4590,11 +4788,28 @@ impl Window {
         {
             return Err(Error::new(Status::InvalidArg, "image region is outside the texture or has an invalid byte length"));
         }
+        // Keep each uploaded row on WGPU's copy alignment. Some GL drivers
+        // otherwise reuse the previous unpack row length for narrow regions,
+        // leaving a one-pixel stale strip at the dirty rectangle edge.
+        let row_bytes = width as usize * 4;
+        let padded_row_bytes = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+        let upload = if padded_row_bytes == row_bytes {
+            pixels.to_vec()
+        } else {
+            let mut padded = vec![0; padded_row_bytes * height as usize];
+            for row in 0..height as usize {
+                let source = &pixels[row * row_bytes..(row + 1) * row_bytes];
+                let target = &mut padded[row * padded_row_bytes..row * padded_row_bytes + row_bytes];
+                target.copy_from_slice(source);
+            }
+            padded
+        };
         renderer.queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &image._texture, mip_level: 0,
                 origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
-            pixels.as_ref(),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            &upload,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded_row_bytes as u32), rows_per_image: Some(height) },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         Ok(())
@@ -4618,7 +4833,6 @@ impl Window {
         canvas_beziers: Option<Buffer>,
         canvas_operations: Option<Buffer>,
     ) -> Result<PresentStats> {
-        let input_started = Instant::now();
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
@@ -4639,9 +4853,7 @@ impl Window {
             return Err(Error::new(Status::InvalidArg, "canvas triangle vertices must be finite"));
         }
         let (quads, images, order) = parse_ordered_display_list(display_list.as_ref(), (triangles.len() / 6) as u32, (circles.len() / 16) as u32, (beziers.len() / 13) as u32, &operations)?;
-        let mut stats = self.present_parsed(quads, triangles, circles, beziers, images, order)?;
-        stats.input_ms = input_started.elapsed().as_secs_f64() * 1000.0 - stats.event_loop_ms;
-        Ok(stats)
+        self.present_parsed(quads, triangles, circles, beziers, images, order)
     }
 
     #[napi(js_name = "presentTransformed")]
@@ -4686,7 +4898,6 @@ impl Window {
         images: Vec<ImageDraw>,
         order: Vec<DrawOrder>,
     ) -> Result<PresentStats> {
-        let event_loop_started = Instant::now();
         self.app.display_list = list;
         self.app.display_triangles = triangles;
         self.app.display_circles = circles;
@@ -4714,8 +4925,6 @@ impl Window {
             acquire_ms: self.app.last_acquire_ms,
             submit_ms: self.app.last_submit_ms,
             present_ms: self.app.last_present_ms,
-            input_ms: 0.0,
-            event_loop_ms: event_loop_started.elapsed().as_secs_f64() * 1000.0,
         })
     }
 }

@@ -65,7 +65,6 @@ for (let i = 0; i < 42; i++) {
   document.body.appendChild(card);
   cards.push(card);
 }
-await layoutDocument(document, viewport.width, viewport.height);
 const boxes = documentBoxes(document);
 assert.equal(boxes.length, 43, "42 cards plus body should be laid out");
 
@@ -84,8 +83,6 @@ let deadline = start;
 let previous = start;
 let frames = 0;
 let missed = 0;
-let viewportWidth = viewport.width;
-let viewportHeight = viewport.height;
 const intervals = [];
 const jsUpdateTimes = [];
 const listTimes = [];
@@ -117,7 +114,8 @@ function draw() {
   }
   jsUpdateTimes.push(performance.now() - updateStart);
   const listStart = performance.now();
-  const list = buildTransformedDisplayList(boxes, viewportWidth, viewportHeight);
+  const size = window.size();
+  const list = buildTransformedDisplayList(documentBoxes(document), size.width, size.height);
   listTimes.push(performance.now() - listStart);
   const result = window.presentTransformed(list);
   nativePrepare.push(result.prepareMs);
@@ -126,7 +124,6 @@ function draw() {
   nativePresent.push(result.presentMs);
   frames++;
   for (const event of window.drainEvents()) {
-    if (event.type === "resize") { viewportWidth = event.x; viewportHeight = event.y; }
     if (event.type === "refreshRate" && event.x > 0) console.log(`frame pacing updated to ${event.x.toFixed(3)} Hz`);
     if (event.type === "keydown" && event.key === "Named(Escape)") window.close();
   }

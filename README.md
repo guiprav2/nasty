@@ -40,6 +40,8 @@ Nerd Fonts Symbols are bundled in root `fonts/`. Give an otherwise empty element
 
 `Window` accepts `orientation: "auto" | "portrait" | "landscape"` and exposes the same resettable `window.orientation` property as `window.resizable`. On Android, changing the property updates the Activity's requested orientation. Build the arm64 tour APK with the SDK, NDK, Java 17, and nodejs-mobile runtime installed under `~/prog`:
 
+On Linux, `window.audioOutputs` lists available output devices with IDs, names, default status, and default sample rate, channel count, and sample format. Read or change `window.audioOutput` to select a device; assign `null` to select the system default. Changing the selection switches active video audio at its current playback time.
+
 ```sh
 npm --prefix node run build:tour-apk
 ```

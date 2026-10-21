@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { Document, Window, buildBoxDisplayList } from "../index.js";
-import { documentBoxes, layoutDocument } from "../internal/dom-state.js";
+import { documentBoxes } from "../internal/dom-state.js";
 
 const window = new Window({ resizable: "none", title: "Nasty box model", width: 720, height: 480 });
 const doc = new Document();
+window.document = doc;
 const element = (id, style = {}) => {
   const result = doc.createElement("div");
   result.id = id;
@@ -53,7 +54,7 @@ doc.body.appendChild(scroller);
 doc.body.appendChild(negativeMargin);
 doc.body.appendChild(noBorderStyle);
 
-let boxes = await layoutDocument(doc, 720, 480);
+let boxes = documentBoxes(doc);
 const box = (element) => boxes.find((entry) => entry.element === element);
 const cardBox = box(card);
 assert.equal(cardBox.width, 280, "declared width includes padding and border (border-box reset)");

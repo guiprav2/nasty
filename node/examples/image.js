@@ -9,7 +9,7 @@ import { performance } from "node:perf_hooks";
 import { PNG } from "pngjs";
 import jpeg from "jpeg-js";
 import { closeImageDecoder, Document, Window, buildOrderedDisplayList } from "../index.js";
-import { documentBoxes, layoutDocument } from "../internal/dom-state.js";
+import { documentBoxes } from "../internal/dom-state.js";
 
 const width = 256;
 const height = 160;
@@ -39,7 +39,7 @@ assert.equal(emptySourceImage.complete, true, "an img with an empty src is compl
 await assert.rejects(emptySourceImage.decode(), { name: "EncodingError" });
 Object.assign(document.body.style, {
   display: "flex", direction: "row", justifyContent: "center", alignItems: "center", gap: 20,
-  width: 720, height: 480, backgroundColor: "#101827",
+  backgroundColor: "#101827",
 });
 const scroller = document.createElement("div");
 Object.assign(scroller.style, {
@@ -94,7 +94,7 @@ window.document = document;
 const [pngDecodeMs, jpegDecodeMs] = await Promise.all([pngDecoded, jpegDecoded]);
 await Promise.all([dataImage.decode(), httpImage.decode()]);
 await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-await layoutDocument(document, 720, 480);
+documentBoxes(document);
 image.style.width = 450;
 const flushStart = performance.now();
 const flushedRect = image.getBoundingClientRect();
@@ -126,7 +126,7 @@ assert.equal(secondImage.naturalWidth, width);
 assert.equal(secondImage.naturalHeight, height);
 assert.equal(secondImage.width, 220, "img width reflects its HTML dimension attribute");
 assert.equal(secondImage.height, 180, "img height reflects its HTML dimension attribute");
-let boxes = await layoutDocument(document, 720, 480);
+let boxes = documentBoxes(document);
 const initialImageBox = boxes.find((box) => box.element === image);
 const scrollerBox = boxes.find((box) => box.element === scroller);
 assert.ok(scrollerBox.scrollWidth > scrollerBox.paddingBox.width);

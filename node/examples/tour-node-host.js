@@ -112,7 +112,7 @@ export async function install() {
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
   const { Document, TransitionEvent, Window, buildTransformedDisplayList } = await import("../index.js");
-  const { documentBoxes, documentState, layoutDocument } = await import("../internal/dom-state.js");
+  const { documentBoxes, documentState } = await import("../internal/dom-state.js");
   const { lastDocumentTextSyncDetails, lastDocumentTextSyncMs, prepareDocumentText } = await import("../internal/dom-text.js");
 
   const { parameters, recordPath: requestedRecordPath } = parseTourArguments(process.argv.slice(2), process.env);
@@ -145,7 +145,6 @@ export async function install() {
     value: Object.freeze({
       get ready() {
         fontsReady ??= (async () => {
-          await layoutDocument(document, width, height);
           await prepareDocumentText(nativeWindow, document);
         })();
         return fontsReady;
@@ -231,16 +230,17 @@ export async function install() {
     sample(perfStage, "callbacks", stageSamples.callbacks.at(-1));
     stageStart = performance.now();
     const layoutWasDirty = documentState(document).dirty;
-    await layoutDocument(document, width, height);
-    stageSamples.layout.push(performance.now() - stageStart);
+    const timings = {};
+    const boxes = documentBoxes(document, timings);
+    const boxesElapsed = performance.now() - stageStart;
+    stageSamples.layout.push(timings.layout ?? 0);
     sample(perfStage, "layout", stageSamples.layout.at(-1));
     sample(perfStage, "layoutDirty", layoutWasDirty);
-    stageStart = performance.now();
-    const boxes = documentBoxes(document);
-    stageSamples.boxes.push(performance.now() - stageStart);
+    stageSamples.boxes.push(Math.max(0, boxesElapsed - (timings.layout ?? 0)));
     sample(perfStage, "boxes", stageSamples.boxes.at(-1));
     stageStart = performance.now();
-    const displayList = buildTransformedDisplayList(boxes, width, height);
+    const size = nativeWindow.size();
+    const displayList = buildTransformedDisplayList(boxes, size.width, size.height);
     stageSamples.displayList.push(performance.now() - stageStart);
     sample(perfStage, "displayList", stageSamples.displayList.at(-1));
     stageStart = performance.now();

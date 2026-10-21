@@ -10,7 +10,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { Command, InvalidArgumentError } from 'commander';
 import { Window, Document, closeImageDecoder } from '../index.js';
-import { documentState, documentBoxes, layoutDocument } from '../internal/dom-state.js';
+import { documentState, documentBoxes } from '../internal/dom-state.js';
 import { inherited } from '../internal/text-metrics.js';
 import { createRainbowUI } from './rainbow/ui.js';
 import { ProcessSampler } from './rainbow/process-sampler.js';
@@ -366,6 +366,9 @@ events.addEventListener('message', event => {
   syncWindowCaptures();
 });
 let nextFrame = 0, shown = false, pointer = { x: 0, y: 0 }, lastTarget = null, shiftDown = false;
+let refreshRate = Number(window.refreshRate());
+let frameInterval = 1000 / (Number.isFinite(refreshRate) && refreshRate > 0 ? refreshRate : 60);
+let nextFrameDeadline = performance.now();
 const actionKeysDown = new Set();
 let pointerDownTarget = null;
 const browser = {
@@ -416,6 +419,12 @@ function dispatch() {
     ui.resize(size.width, size.height); events.dispatchEvent(new Event('resize'));
   }
   for (const event of window.drainEvents()) {
+    if (event.type === 'refreshRate' && Number.isFinite(event.x) && event.x > 0) {
+      refreshRate = event.x;
+      frameInterval = 1000 / refreshRate;
+      nextFrameDeadline = performance.now();
+      continue;
+    }
     if (event.type === 'keydown' && event.key === 'Named(Escape)') window.close();
     if (event.type === 'keydown' || event.type === 'keyup') {
       const key = event.key === 'Character("n")' || event.key === "Character('n')" ? 'n'
@@ -488,23 +497,38 @@ async function frame() {
   const callbacks = [...frames.values()]; frames.clear();
   for (const callback of callbacks) callback(start);
   ui.update(start);
-  const layoutResult = layoutDocument(document, viewport.width, viewport.height);
-  if (layoutResult?.then) {
-    if (!documentState(document).layoutSnapshot) await layoutResult;
-    else layoutResult.catch(fail);
-  }
   window.presentDocument();
   ui.setMaximized(window.maximized);
   if (!shown) { window.show(); shown = true; }
-  const deadline = start + 1000 / 60 - 1.25;
-  const remaining = deadline - performance.now();
+  if (!(refreshRate > 0)) {
+    const currentRefreshRate = Number(window.refreshRate());
+    if (Number.isFinite(currentRefreshRate) && currentRefreshRate > 0) {
+      refreshRate = currentRefreshRate;
+      frameInterval = 1000 / refreshRate;
+      nextFrameDeadline = start;
+    }
+  }
+  const afterPresent = performance.now();
+  if (!window.vsync) {
+    nextFrameDeadline = afterPresent;
+    setImmediate(() => frame().catch(fail));
+    return;
+  }
+  nextFrameDeadline += frameInterval;
+  if (nextFrameDeadline <= afterPresent) {
+    const missed = Math.floor((afterPresent - nextFrameDeadline) / frameInterval) + 1;
+    nextFrameDeadline += missed * frameInterval;
+  }
+  const remaining = nextFrameDeadline - afterPresent;
+  const continueAtDeadline = () => {
+    while (performance.now() < nextFrameDeadline) {}
+    frame().catch(fail);
+  };
   if (remaining > 1.5) {
-    setTimeout(() => {
-      while (performance.now() < deadline) {}
-      frame().catch(fail);
-    }, remaining - 1.5);
+    setTimeout(continueAtDeadline, remaining - 1.5);
+  } else if (remaining > 0) {
+    continueAtDeadline();
   } else {
-    while (performance.now() < deadline) {}
     setImmediate(() => frame().catch(fail));
   }
 }

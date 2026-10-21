@@ -26,7 +26,7 @@ export function parseColor(value) {
 function opacityFor(element) {
   let opacity = 1;
   for (let current = element; current; current = current.parentElement ?? current.parentNode ?? current.parent) {
-    const value = Number(current.style.opacity);
+    const value = Number(computedStyleValue(current.style, "opacity"));
     if (current.style.opacity !== undefined && Number.isFinite(value)) opacity *= Math.max(0, Math.min(1, value));
   }
   return opacity;
@@ -81,7 +81,8 @@ export function buildBoxDisplayList(boxes, width, height) {
 export function buildImageDraws(boxes) {
   const draws = [];
   for (const box of boxes) {
-    const image = elementState(box.element).image;
+    const state = elementState(box.element);
+    const image = state.image ?? state.video?.image;
     const content = box.contentBox;
     if (!image || content.width <= 0 || content.height <= 0) continue;
     draws.push({
@@ -120,7 +121,8 @@ export function buildOrderedDisplayList(boxes, width, height) {
     const clip = box.clip;
     pushQuad(borderBox, parseColor(computedStyleValue(style, "backgroundColor")), clip);
 
-    const image = elementState(element).image;
+    const state = elementState(element);
+    const image = state.image ?? state.video?.image;
     const content = box.contentBox;
     if (image && content.width > 0 && content.height > 0) {
       const imageClip = clip ? intersection(clip, viewport) : viewport;
@@ -508,7 +510,8 @@ export function buildTransformedDisplayList(boxes, width, height) {
       }
     }
     const { borderBox, border } = box;
-    const image = elementState(box.element).image;
+    const state = elementState(box.element);
+    const image = state.image ?? state.video?.image;
     const content = box.contentBox;
     if (image && content.width > 0 && content.height > 0) {
       const imageClip = box.clip ? intersection(box.clip, viewport) : viewport;

@@ -3,6 +3,7 @@ import { parseColor } from "../render.js";
 const COLOR_PROPERTIES = new Set([
   "color", "backgroundColor", "borderColor", "borderTopColor", "borderRightColor", "borderBottomColor", "borderLeftColor",
 ]);
+const NUMBER_PROPERTIES = new Set(["opacity"]);
 const styleTransitionStates = new WeakMap();
 
 export class TransitionEvent extends Event {
@@ -24,9 +25,10 @@ export function registerStyleTransitionState(style, state) {
 
 export function computedStyleValue(style, property) {
   const state = styleTransitionStates.get(style);
-  return state && COLOR_PROPERTIES.has(property)
-    ? sampleColorTransition(state, property)
-    : style[property];
+  if (!state) return style[property];
+  if (COLOR_PROPERTIES.has(property)) return sampleColorTransition(state, property);
+  if (NUMBER_PROPERTIES.has(property)) return sampleNumberTransition(state, property);
+  return style[property];
 }
 
 export function hasActiveStyleTransition(style) {
@@ -130,6 +132,38 @@ export function startColorTransition(state, property, target, now = performance.
   }
   if (duration <= 0) { state.transitions.delete(property); return; }
   state.transitions.set(property, { from, to, started: now + options.delay, duration, easing: options.easing });
+}
+
+export function startNumberTransition(state, property, target, now = performance.now()) {
+  if (!NUMBER_PROPERTIES.has(property)) return;
+  const options = transitionOptions(state, property);
+  if (!options) { state.transitions.delete(property); return; }
+  const current = Number(sampleNumberTransition(state, property, now));
+  const to = Number(target);
+  if (!Number.isFinite(current) || !Number.isFinite(to)) { state.transitions.delete(property); return; }
+  const previous = state.transitions.get(property);
+  let duration = options.duration;
+  if (previous && typeof previous.from === "number" && previous.to === current) {
+    const fullDistance = Math.abs(previous.to - previous.from);
+    if (fullDistance > 0) duration *= Math.min(1, Math.abs(to - current) / fullDistance);
+  }
+  if (duration <= 0) { state.transitions.delete(property); return; }
+  state.transitions.set(property, { from: current, to, started: now + options.delay, duration, easing: options.easing });
+}
+
+function sampleNumberTransition(state, property, now = performance.now()) {
+  const transition = state.transitions.get(property);
+  if (!transition) return state.values[property];
+  const progress = Math.max(0, Math.min(1, (now - transition.started) / transition.duration));
+  const t = timingProgress(transition.easing, progress);
+  if (progress >= 1) {
+    state.transitions.delete(property);
+    queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
+      propertyName: kebab(property), elapsedTime: transition.duration / 1000,
+    })));
+    return state.values[property];
+  }
+  return transition.from + (transition.to - transition.from) * t;
 }
 
 export function sampleColorTransition(state, property, now = performance.now()) {

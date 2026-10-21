@@ -8,10 +8,19 @@ import { parseColor } from '../render.js';
 const windows = new WeakMap();
 const stackingOrders = new WeakMap();
 const backgrounds = new Map();
+const backgroundOwners = new Map();
+const paintMeasureContext = createCanvas(1, 1).getContext('2d');
 const empty = Buffer.from(new Float32Array([1]).buffer);
 function radius(value, width, height) {
   return Math.max(0, Math.min(width / 2, height / 2, String(value).endsWith('%')
     ? Math.min(width, height) * parseFloat(value) / 100 : parseFloat(value) || 0));
+}
+function effectiveOpacity(element) {
+  let alpha = 1;
+  for (let ancestor = element; ancestor; ancestor = ancestor.parent) {
+    if (ancestor.style.opacity !== undefined) alpha *= Math.max(0, Math.min(1, Number(computedStyleValue(ancestor.style, 'opacity'))));
+  }
+  return alpha;
 }
 function round(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, Math.max(0, w), Math.max(0, h), r); }
 function shadow(ctx, value) {
@@ -65,13 +74,13 @@ function gpuCircularDecorations(boxes, allowed = () => true) {
     if (circleRadius < box.width / 2 - 0.01) continue;
     const shadowMatch = /^(-?[\d.]+)px\s+(-?[\d.]+)px\s+([\d.]+)px\s+(#[\da-f]{3,8})$/i.exec(style.boxShadow || '');
     if (!shadowMatch || Number(shadowMatch[1]) !== 0 || Number(shadowMatch[2]) !== 0) continue;
-    const opacity = Math.max(0, Math.min(1, Number(style.opacity ?? 1)));
+    const opacity = Math.max(0, Math.min(1, Number(computedStyleValue(style, 'opacity') ?? 1)));
     const fill = parseColor(computedStyleValue(style, 'backgroundColor'));
     const glow = parseColor(shadowMatch[4]);
     if (!fill || !glow || opacity <= 0) continue;
     let inheritedOpacity = 1;
     for (let parent = element.parent; parent; parent = parent.parent) {
-      if (parent.style.opacity !== undefined) inheritedOpacity *= Math.max(0, Math.min(1, Number(parent.style.opacity)));
+      if (parent.style.opacity !== undefined) inheritedOpacity *= Math.max(0, Math.min(1, Number(computedStyleValue(parent.style, 'opacity'))));
     }
     const alpha = opacity * inheritedOpacity, x = box.x + box.width / 2, y = box.y + box.height / 2;
     const blur = Number(shadowMatch[3]), outer = circleRadius + blur * 2.5;
@@ -148,6 +157,28 @@ function paintPadding(element) {
   return match ? Math.max(8, Math.abs(Number(match[1])) + Number(match[3]) * 3,
     Math.abs(Number(match[2])) + Number(match[3]) * 3) : 8;
 }
+function paintBounds(box, element) {
+  const pad = paintPadding(element);
+  let left = box.x - pad, top = box.y - pad;
+  let right = box.x + box.width + pad, bottom = box.y + box.height + pad;
+  if (renderedText(element)) {
+    const metrics = textMetrics(element), content = box.contentBox, style = element.style;
+    paintMeasureContext.font = metrics.style.font;
+    paintMeasureContext.letterSpacing = `${metrics.style.spacing}px`;
+    const lines = textLines(metrics, content.width);
+    const ascent = paintMeasureContext.measureText('Mg').fontBoundingBoxAscent || metrics.style.size * .8;
+    const descent = paintMeasureContext.measureText('Mg').fontBoundingBoxDescent || metrics.style.size * .2;
+    let textWidth = 0;
+    for (const line of lines) textWidth = Math.max(textWidth, paintMeasureContext.measureText(line).width);
+    if (style.textOverflow === 'ellipsis') textWidth = Math.min(textWidth, content.width);
+    const firstBaseline = content.y + (metrics.style.line - ascent - descent) / 2 + ascent;
+    left = Math.min(left, content.x - 2);
+    right = Math.max(right, content.x + textWidth + 2);
+    top = Math.min(top, firstBaseline - ascent - 2);
+    bottom = Math.max(bottom, firstBaseline + Math.max(0, lines.length - 1) * metrics.style.line + descent + 2);
+  }
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
 function mergeDirtyRegions(regions) {
   const merged = [];
   for (const source of regions) {
@@ -174,21 +205,54 @@ function mergeDirtyRegions(regions) {
   }
   return merged;
 }
+function sameElementSet(previous, current) {
+  if (previous === current) return true;
+  if (!previous || !current || previous.size !== current.size) return false;
+  for (const element of current) if (!previous.has(element)) return false;
+  return true;
+}
+function invalidateBackgroundOwners(url) {
+  for (const element of backgroundOwners.get(url) ?? []) {
+    const doc = documentState(element.document);
+    doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
+    doc.paintDirtyElements ??= new Set();
+    doc.paintDirtyElements.add(element);
+  }
+}
 function rasterizeCachedLayer(document, width, height, surface, state, key, options = {}) {
   const doc = documentState(document), boxes = documentBoxes(document);
   const generationKey = `${key}Generation`, geometryKey = `${key}Geometry`, modeKey = `${key}Mode`;
   const sizeKey = `${key}RasterSize`;
-  const full = state[`${key}Painted`] !== true || state[modeKey] !== state.mode
-    || state[sizeKey] !== `${width}x${height}`;
-  state[`${key}FullPaint`] = full;
-  state[`${key}FullReason`] = { painted: state[`${key}Painted`] !== true, mode: state[modeKey] !== state.mode, geometry: state[geometryKey] !== doc.geometryGeneration, size: state[sizeKey] !== `${width}x${height}`, currentGeometry: doc.geometryGeneration, previousGeometry: state[geometryKey] };
-  state[`${key}DirtyRegion`] = null;
   const included = box => !options.onlyElements || options.onlyElements.has(box.element);
   const includedBoxes = boxes.filter(included);
   const currentBoxMap = new Map(includedBoxes.map(box => [box.element, box]));
-  const previousBoxMap = state[`${key}BoxMap`] ?? new Map();
   const skipped = options.skipElements;
-  const dirty = full ? [] : [...doc.paintDirtyElements].filter(element => !skipped?.has(element) && (!options.onlyElements || options.onlyElements.has(element)));
+  const includedElements = new Set(currentBoxMap.keys());
+  const skippedElements = new Set(skipped ?? []);
+  const previousBoxMap = state[`${key}BoxMap`] ?? new Map();
+  const previousPaintBounds = state[`${key}PaintBounds`] ?? new Map();
+  const visibleElements = new Set(includedBoxes.filter(box => !skipped?.has(box.element)
+    && box.width > 0 && box.height > 0 && !box.element.hidden
+    && box.element.style.display !== 'none' && effectiveOpacity(box.element) > 0).map(box => box.element));
+  const previouslyVisible = state[`${key}VisibleElements`] ?? new Set();
+  const lostVisibleContent = [...previouslyVisible].some(element => !visibleElements.has(element));
+  const removedContent = [...previousBoxMap].some(([element, previous]) => {
+    const current = currentBoxMap.get(element);
+    return previous.width > 0 && previous.height > 0
+      && (!current || current.width <= 0 || current.height <= 0 || element.hidden || element.style.display === 'none');
+  });
+  const policyChanged = !sameElementSet(state[`${key}IncludedElements`], includedElements)
+    || !sameElementSet(state[`${key}SkippedElements`], skippedElements);
+  const full = state[`${key}Painted`] !== true || state[modeKey] !== state.mode
+    || state[sizeKey] !== `${width}x${height}` || policyChanged || lostVisibleContent || removedContent;
+  state[`${key}FullPaint`] = full;
+  state[`${key}FullReason`] = { painted: state[`${key}Painted`] !== true, mode: state[modeKey] !== state.mode,
+    geometry: state[geometryKey] !== doc.geometryGeneration, size: state[sizeKey] !== `${width}x${height}`,
+    layerPolicy: policyChanged, lostVisibleContent, removedContent,
+    currentGeometry: doc.geometryGeneration, previousGeometry: state[geometryKey] };
+  state[`${key}DirtyRegion`] = null;
+  const dirty = full ? [] : [...doc.paintDirtyElements]
+    .filter(element => !skipped?.has(element) && (!options.onlyElements || options.onlyElements.has(element)));
   const geometryDirty = [];
   if (!full) {
     const changed = (a, b) => !b || a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height
@@ -202,7 +266,32 @@ function rasterizeCachedLayer(document, width, height, surface, state, key, opti
     for (const element of currentBoxMap.keys()) if (!skipped?.has(element) && !previousBoxMap.has(element) && !dirty.includes(element)) dirty.push(element);
   }
   for (const box of boxes) {
-    if (included(box) && !skipped?.has(box.element) && hasActiveStyleTransition(box.element.style) && !dirty.includes(box.element)) dirty.push(box.element);
+    if (!skipped?.has(box.element) && hasActiveStyleTransition(box.element.style) && !dirty.includes(box.element)) dirty.push(box.element);
+  }
+  if (!full) {
+    const dirtySet = new Set(dirty);
+    const roots = new Set([...doc.paintDirtyElements, ...dirty]);
+    for (const root of roots) {
+      const pending = [...root.children];
+      while (pending.length) {
+        const element = pending.pop();
+        pending.push(...element.children);
+        if (skipped?.has(element) || (!currentBoxMap.has(element) && !previousBoxMap.has(element))) continue;
+        if (!dirtySet.has(element)) { dirtySet.add(element); dirty.push(element); }
+      }
+      if (!skipped?.has(root) && (currentBoxMap.has(root) || previousBoxMap.has(root)) && !dirtySet.has(root)) {
+        dirtySet.add(root); dirty.push(root);
+      }
+    }
+  }
+  const currentPaintBounds = full ? new Map() : new Map(previousPaintBounds);
+  for (const element of currentPaintBounds.keys()) {
+    if (!currentBoxMap.has(element) || skipped?.has(element)) currentPaintBounds.delete(element);
+  }
+  const paintTargets = full ? includedBoxes.map(box => box.element) : dirty;
+  for (const element of paintTargets) {
+    const box = currentBoxMap.get(element);
+    if (box && !skipped?.has(element)) currentPaintBounds.set(element, paintBounds(box, element));
   }
   state[`${key}DirtyNames`] = dirty.map(element => element.id || element.className || element.localName);
   if (!full && dirty.length === 0) {
@@ -212,18 +301,18 @@ function rasterizeCachedLayer(document, width, height, surface, state, key, opti
   }
   let dirtyRegions = [];
   if (!full) {
-    const includeRect = (box, element) => {
-      if (!box) return;
-      const pad = paintPadding(element);
-      const rect = { x: Math.max(0, box.x - pad), y: Math.max(0, box.y - pad),
-        width: Math.min(width, box.x + box.width + pad) - Math.max(0, box.x - pad),
-        height: Math.min(height, box.y + box.height + pad) - Math.max(0, box.y - pad) };
+    const includeRect = rect => {
+      if (!rect) return;
+      const right = rect.x + rect.width, bottom = rect.y + rect.height;
+      rect = { x: Math.max(0, rect.x), y: Math.max(0, rect.y),
+        width: Math.min(width, right) - Math.max(0, rect.x),
+        height: Math.min(height, bottom) - Math.max(0, rect.y) };
       if (rect.width > 0 && rect.height > 0) dirtyRegions.push(rect);
     };
-    for (const entry of geometryDirty) includeRect(entry.box, entry.element);
+    for (const entry of geometryDirty) includeRect(previousPaintBounds.get(entry.element) ?? paintBounds(entry.box, entry.element));
     for (const element of dirty) {
-      includeRect(currentBoxMap.get(element), element);
-      includeRect(previousBoxMap.get(element), element);
+      includeRect(currentPaintBounds.get(element));
+      includeRect(previousPaintBounds.get(element));
     }
     dirtyRegions = mergeDirtyRegions(dirtyRegions);
     if (!dirtyRegions.length) {
@@ -247,6 +336,10 @@ function rasterizeCachedLayer(document, width, height, surface, state, key, opti
   state[sizeKey] = `${width}x${height}`;
   state[`${key}Painted`] = true;
   state[`${key}BoxMap`] = currentBoxMap;
+  state[`${key}PaintBounds`] = currentPaintBounds;
+  state[`${key}VisibleElements`] = visibleElements;
+  state[`${key}IncludedElements`] = includedElements;
+  state[`${key}SkippedElements`] = skippedElements;
   return true;
 }
 export function rasterizeDocument(document, width, height, surface = createCanvas(width, height), options = {}) {
@@ -265,16 +358,13 @@ export function rasterizeDocument(document, width, height, surface = createCanva
     if (box.width <= 0 || box.height <= 0) continue;
     const element = box.element, style = element.style;
     if (options.dirtyRegion) {
-      const dirty = options.dirtyRegion, pad = paintPadding(element);
-      if (box.x + box.width + pad < dirty.x || box.y + box.height + pad < dirty.y
-        || box.x - pad > dirty.x + dirty.width || box.y - pad > dirty.y + dirty.height) continue;
+      const dirty = options.dirtyRegion, bounds = paintBounds(box, element);
+      if (bounds.x + bounds.width < dirty.x || bounds.y + bounds.height < dirty.y
+        || bounds.x > dirty.x + dirty.width || bounds.y > dirty.y + dirty.height) continue;
     }
     if (options.skipElements?.has(element)) continue;
     if (options.onlyElements && !options.onlyElements.has(element)) continue;
-    let alpha = 1;
-    for (let ancestor = element; ancestor; ancestor = ancestor.parent) {
-      if (ancestor.style.opacity !== undefined) alpha *= Math.max(0, Math.min(1, Number(ancestor.style.opacity)));
-    }
+    const alpha = effectiveOpacity(element);
     if (alpha <= 0) continue;
     ctx.save();
     if (box.clip) { ctx.beginPath(); ctx.rect(box.clip.x, box.clip.y, box.clip.width, box.clip.height); ctx.clip(); }
@@ -299,9 +389,17 @@ export function rasterizeDocument(document, width, height, surface = createCanva
     }
     if (style.backgroundImage?.startsWith('url(')) {
       const url = style.backgroundImage.slice(4, -1).replace(/^["']|["']$/g, '');
+      let owners = backgroundOwners.get(url);
+      if (!owners) backgroundOwners.set(url, owners = new Set());
+      owners.add(element);
       if (!backgrounds.has(url)) {
         backgrounds.set(url, null);
-        loadImage(url.startsWith('data:') && !url.slice(0, url.indexOf(',')).endsWith(';base64') ? Buffer.from(decodeURIComponent(url.slice(url.indexOf(',') + 1))) : url).then(image => { const tile = createCanvas(image.width || 180, image.height || 180); tile.getContext('2d').drawImage(image, 0, 0, tile.width, tile.height); backgrounds.set(url, tile); }).catch(error => console.error(`Background image: ${error.message}`));
+        loadImage(url.startsWith('data:') && !url.slice(0, url.indexOf(',')).endsWith(';base64') ? Buffer.from(decodeURIComponent(url.slice(url.indexOf(',') + 1))) : url).then(image => {
+          const tile = createCanvas(image.width || 180, image.height || 180);
+          tile.getContext('2d').drawImage(image, 0, 0, tile.width, tile.height);
+          backgrounds.set(url, tile);
+          invalidateBackgroundOwners(url);
+        }).catch(error => console.error(`Background image: ${error.message}`));
       }
       const image = backgrounds.get(url);
       if (image) { ctx.fillStyle = ctx.createPattern(image, 'repeat'); ctx.fillRect(box.x, box.y, box.width, box.height); }
@@ -398,7 +496,15 @@ export function documentImage(window, document) {
       state.backgroundKey = baseKey;
     }
     const boxes = documentBoxes(document), order = stackingOrder(boxes);
-    const backdrop = order.find(box => box.element.style.backdropFilter?.startsWith('blur(') && box.width > 0 && box.height > 0);
+    const backdrop = order.find(box => box.element.style.backdropFilter?.startsWith('blur(')
+      && box.width > 0 && box.height > 0 && effectiveOpacity(box.element) > 0);
+    const hasBackdrop = Boolean(backdrop);
+    if (state.layeredHasBackdrop !== hasBackdrop) {
+      state.overlayPainted = false;
+      state.preBlurPainted = false;
+      state.postBlurPainted = false;
+      state.layeredHasBackdrop = hasBackdrop;
+    }
     const backdropIndex = backdrop ? order.indexOf(backdrop) : -1;
     const fieldCanvas = canvasTriangleBuffer(layer.field.context, layer.field.box.width, layer.field.box.height);
     const decorations = !fieldCanvas ? { elements: new Set(), data: [] }
@@ -451,7 +557,8 @@ export function documentImage(window, document) {
     return { ...ordered, circles: gpuCanvas.circles, beziers: fieldCanvas?.beziers, canvasOperations: gpuCanvas.operations, ordered: true };
   }
   const boxes = documentBoxes(document), order = stackingOrder(boxes);
-  const backdrop = order.find(box => box.element.style.backdropFilter?.startsWith('blur(') && box.width > 0 && box.height > 0);
+  const backdrop = order.find(box => box.element.style.backdropFilter?.startsWith('blur(')
+    && box.width > 0 && box.height > 0 && effectiveOpacity(box.element) > 0);
   if (backdrop) {
     if (state.mode !== 'backdrop' || !state.preBlurSurface || state.preBlurSurface.width !== width || state.preBlurSurface.height !== height) {
       deleteTextures(window, state);
@@ -469,7 +576,7 @@ export function documentImage(window, document) {
     if (preChanged) uploadTexture(window, state, 'preBlurTextureId', 'preBlurSize', width, height, state.preBlurSurface.data());
     if (postChanged) uploadTexture(window, state, 'postBlurTextureId', 'postBlurSize', width, height, state.postBlurSurface.data());
     documentState(document).paintDirtyElements.clear();
-    return { list: orderedImageList([
+    return { ...orderedImageList([
       { textureId: state.preBlurTextureId, x: 0, y: 0, width, height },
       { type: 'backdrop-blur', x: backdrop.x, y: backdrop.y, width: backdrop.width, height: backdrop.height,
         radius: parseFloat(backdrop.element.style.backdropFilter.slice(5)) || 0 },

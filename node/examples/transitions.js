@@ -3,7 +3,7 @@ import { performance } from "node:perf_hooks";
 import { Document, Window, buildOrderedDisplayList } from "../index.js";
 import { computedStyleValue } from "../internal/css-transitions.js";
 import { parseColor } from "../render.js";
-import { documentBoxes, documentState, layoutDocument } from "../internal/dom-state.js";
+import { documentBoxes, documentState } from "../internal/dom-state.js";
 import { timingProgress } from "../internal/css-transitions.js";
 
 assert.equal(timingProgress("linear", 0.3), 0.3);
@@ -37,7 +37,6 @@ const cards = ["reverse", "interrupt"].map((id) => {
   document.body.appendChild(card);
   return card;
 });
-await layoutDocument(document, 720, 480);
 
 const original = "#1769aa";
 const target = "#ed6a35";
@@ -110,7 +109,8 @@ function draw() {
   if (elapsed < 200 && colorDistance(firstColor, original) > 0.05 && colorDistance(firstColor, target) > 0.05) sawConcurrentInterpolation = true;
   updateTimes.push(performance.now() - updateStart);
   const buildStart = performance.now();
-  const list = buildOrderedDisplayList(documentBoxes(document), 720, 480);
+  const size = window.size();
+  const list = buildOrderedDisplayList(documentBoxes(document), size.width, size.height);
   buildTimes.push(performance.now() - buildStart);
   const presentStart = performance.now();
   window.presentOrdered(list);

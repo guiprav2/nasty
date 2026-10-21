@@ -7,11 +7,12 @@ import { loadImage, unloadImage } from "./image-decoder.js";
 import { documentBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
 import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
-import { isPaintColorProperty, registerStyleTransitionState, startColorTransition, TransitionEvent } from "./internal/css-transitions.js";
-import { displayListElements } from "./render.js";
+import { isPaintColorProperty, registerStyleTransitionState, startColorTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
+import { buildTransformedDisplayList, displayListElements } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { textMetrics } from "./internal/text-metrics.js";
 import { documentImage } from "./internal/raster-document.js";
+import { decodeVideoFrame, getVideoAudioClock, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 
 const require = createRequire(import.meta.url);
 const packageRoot = fileURLToPath(new URL(".", import.meta.url));
@@ -32,8 +33,23 @@ const native = process.platform === "android"
   : require(nativePath);
 
 export const LayoutTree = native.LayoutTree;
+export const VideoDecoder = native.VideoDecoder;
+export const AudioDecoder = native.AudioDecoder;
+export const AudioPlayer = native.AudioPlayer;
+export const listAudioOutputs = native.listAudioOutputs;
 export { DOMRect };
 export { TransitionEvent };
+let nextVideoAudioId = 1;
+let cachedAudioOutputs = null;
+let cachedAudioOutputsAt = 0;
+function readAudioOutputs() {
+  const now = Date.now();
+  if (!cachedAudioOutputs || now - cachedAudioOutputsAt > 1000) {
+    cachedAudioOutputs = native.listAudioOutputs?.() ?? [];
+    cachedAudioOutputsAt = now;
+  }
+  return cachedAudioOutputs.map(output => ({ ...output }));
+}
 export class Window extends native.Window {
   #document = null;
   #resizable;
@@ -41,6 +57,9 @@ export class Window extends native.Window {
   #borderless;
   #dragAnywhere;
   #maximizable;
+  #vsync;
+  #audioOutputId = null;
+  #mediaStopped = false;
   constructor(options = {}) {
     const initialResizable = options.resizable ?? "both";
     if (!RESIZABLE_MODES.has(initialResizable)) {
@@ -53,6 +72,7 @@ export class Window extends native.Window {
     const initialBorderless = options.borderless ?? false;
     const initialDragAnywhere = options.dragAnywhere ?? false;
     const initialMaximizable = options.maximizable ?? false;
+    const initialVsync = options.vsync ?? true;
     const initialMaximized = options.maximized ?? false;
     if (typeof initialBorderless !== 'boolean') throw new TypeError('borderless must be a boolean');
     if (typeof initialDragAnywhere !== 'boolean' && typeof initialDragAnywhere !== 'string') throw new TypeError('dragAnywhere must be false, true, or a key name');
@@ -60,14 +80,16 @@ export class Window extends native.Window {
     for (const [name, value] of [['maximizable', initialMaximizable]]) {
       if (typeof value !== 'boolean') throw new TypeError(`${name} must be a boolean`);
     }
+    if (typeof initialVsync !== 'boolean') throw new TypeError('vsync must be a boolean');
     if (typeof initialMaximized !== 'boolean') throw new TypeError('maximized must be a boolean');
     super({ ...options, resizable: initialResizable, orientation: initialOrientation, borderless: initialBorderless,
-      dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized });
+      dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized, vsync: initialVsync });
     this.#resizable = initialResizable;
     this.#orientation = initialOrientation;
     this.#borderless = initialBorderless;
     this.#dragAnywhere = initialDragAnywhere;
     this.#maximizable = initialMaximizable;
+    this.#vsync = initialVsync;
     this.DOMRect = DOMRect;
   }
 
@@ -118,6 +140,63 @@ export class Window extends native.Window {
     super.setMaximized(value);
   }
 
+  get audioOutputs() { return readAudioOutputs(); }
+  get closed() {
+    const closed = super.closed;
+    if (closed) this.#stopMedia();
+    return closed;
+  }
+  get audioOutput() {
+    const outputs = this.audioOutputs;
+    return outputs.find(output => output.id === this.#audioOutputId)?.id
+      ?? outputs.find(output => output.isDefault)?.id
+      ?? null;
+  }
+  set audioOutput(id) {
+    const outputs = this.audioOutputs;
+    const output = id === null || id === undefined
+      ? outputs.find(candidate => candidate.isDefault)
+      : outputs.find(candidate => candidate.id === String(id));
+    if (!output) throw new RangeError(id == null ? "no default audio output device is available" : `unknown audio output device: ${id}`);
+    this.#audioOutputId = output.id;
+    if (this.#document) {
+      for (const element of documentState(this.#document).elements) {
+        if (element.localName === "video" && !element.muted) {
+          const video = elementState(element).video;
+          if (video.source) {
+            if (!video.paused && video.volume > 0) element._startVideoAudio(video.currentTime);
+          }
+        }
+      }
+    }
+  }
+
+  close() {
+    this.#stopMedia();
+    return super.close();
+  }
+
+  #stopMedia() {
+    if (this.#mediaStopped) return;
+    this.#mediaStopped = true;
+    if (this.#document) {
+      for (const element of documentState(this.#document).elements) {
+        if (element.localName !== "video") continue;
+        const video = elementState(element).video;
+        element.pause();
+        stopVideoStream(video.source);
+        stopVideoAudio(video.audioId);
+      }
+    }
+  }
+
+  get vsync() { return this.#vsync; }
+  set vsync(value) {
+    if (typeof value !== 'boolean') throw new TypeError('vsync must be a boolean');
+    super.setVsync(value);
+    this.#vsync = value;
+  }
+
   _validateDocumentMaxConstraints(style = this.#document?.body?.style, property = null, value = undefined) {
     if (!this.#maximizable || !style) return;
     const width = property === 'maxWidth' ? value : style.maxWidth;
@@ -132,11 +211,31 @@ export class Window extends native.Window {
     if (property === 'maxWidth' || property === 'maxHeight') this._validateDocumentMaxConstraints(this.#document?.body?.style, property, value);
   }
 
-  present(list) { syncDocumentTextForPresent(this, this.#document); return super.present(list); }
-  presentWithImages(list, images) { syncDocumentTextForPresent(this, this.#document); return super.presentWithImages(list, images); }
-  presentOrdered(list, canvasTriangles, canvasCircles, canvasBeziers, canvasOperations) { syncDocumentTextForPresent(this, this.#document); return super.presentOrdered(list, canvasTriangles, canvasCircles, canvasBeziers, canvasOperations); }
-  presentTransformed(list) { syncDocumentTextForPresent(this, this.#document, displayListElements(list)); return super.presentTransformed(list); }
+  present(list) {
+    syncDocumentTextForPresent(this, this.#document);
+    try { return super.present(list); }
+    catch (error) { if (super.closed) this.#stopMedia(); throw error; }
+  }
+  presentWithImages(list, images) {
+    syncDocumentTextForPresent(this, this.#document);
+    try { return super.presentWithImages(list, images); }
+    catch (error) { if (super.closed) this.#stopMedia(); throw error; }
+  }
+  presentOrdered(list, canvasTriangles, canvasCircles, canvasBeziers, canvasOperations) {
+    syncDocumentTextForPresent(this, this.#document);
+    try { return super.presentOrdered(list, canvasTriangles, canvasCircles, canvasBeziers, canvasOperations); }
+    catch (error) { if (super.closed) this.#stopMedia(); throw error; }
+  }
+  presentTransformed(list) {
+    syncDocumentTextForPresent(this, this.#document, displayListElements(list));
+    try { return super.presentTransformed(list); }
+    catch (error) { if (super.closed) this.#stopMedia(); throw error; }
+  }
   presentDocument() {
+    if (this.#document && [...documentState(this.#document).elements].some(element => element.localName === "video")) {
+      const size = this.size();
+      return this.presentTransformed(buildTransformedDisplayList(documentBoxes(this.#document), size.width, size.height));
+    }
     const frame = documentImage(this, this.#document);
     return frame.ordered ? super.presentOrdered(frame.list, frame.triangles, frame.circles, frame.beziers, frame.canvasOperations) : super.presentWithImages(frame.list, frame.images);
   }
@@ -273,6 +372,7 @@ class CSSStyleDeclaration {
         if (state.values[property] === value) return true;
         state.element._validateStyleChange(property, value);
         if (isPaintColorProperty(property)) startColorTransition(state, property, String(value));
+        else if (property === "opacity") startNumberTransition(state, property, value);
         state.values[property] = value;
         state.element._styleChanged(property);
         return true;
@@ -321,7 +421,8 @@ export class Element extends EventTarget {
     this.parent = null;
     this.children = [];
     this.attributes = new Map();
-    const state = { image: null, imageLoad: null, imageLoadState: "empty", currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null };
+    const state = { image: null, imageLoad: null, imageLoadState: "empty", currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null,
+      video: { audioId: nextVideoAudioId++, audioGeneration: 0, audioStartPromise: null, seekPending: false, paused: true, ended: false, currentTime: 0, duration: NaN, width: 0, height: 0, timer: null, token: 0, source: "", frameRequest: null, resolveFrame: null, rejectFrame: null, textureId: null, volume: 1, metadataLoaded: false, dataLoaded: false } };
     registerElementState(this, state);
     documentState(document).elements.add(this);
     this.style = new CSSStyleDeclaration(this, { ...defaultElementStyle(this.localName) });
@@ -415,8 +516,21 @@ export class Element extends EventTarget {
     value = String(value);
     this.attributes.set(name, value);
     if (name === "hidden" || name === "class") this._styleChanged();
+    if (name === "muted" && this.localName === "video") {
+      const video = elementState(this).video;
+      if (this.muted) {
+        video.audioGeneration++;
+        video.audioStartPending = false;
+        setVideoAudioVolume(video.audioId, 0, video.currentTime);
+        if (!video.paused && video.playbackClockStartedAt == null) {
+          video.playbackClockTime = video.currentTime;
+          video.playbackClockStartedAt = performance.now();
+        }
+      } else if (!video.paused) this._startVideoAudio(video.currentTime);
+    }
     if (name === "src" && this.localName === "img") this._setImageSource(value === "" ? "" : this.src);
-    else if ((name === "width" || name === "height") && this.localName === "img") this._styleChanged();
+    else if (name === "src" && this.localName === "video") this._setVideoSource(value === "" ? "" : this.src);
+    else if ((name === "width" || name === "height") && (this.localName === "img" || this.localName === "video")) this._styleChanged();
     else if ((name === "width" || name === "height") && this.localName === "canvas") {
       const dimension = Number.parseInt(value, 10);
       elementState(this)[name === "width" ? "canvasWidth" : "canvasHeight"] = Number.isFinite(dimension) ? Math.max(0, Math.min(0xffffffff, dimension)) : (name === "width" ? 300 : 150);
@@ -429,9 +543,15 @@ export class Element extends EventTarget {
     name = String(name).toLowerCase();
     this.attributes.delete(name);
     if (name === "hidden" || name === "class") this._styleChanged();
+    if (name === "muted" && this.localName === "video") {
+      const video = elementState(this).video;
+      if (!video.paused) this._startVideoAudio(video.currentTime);
+    }
     if (name === "src" && this.localName === "img") {
       this._cancelImageRequest();
-    } else if ((name === "width" || name === "height") && this.localName === "img") this._styleChanged();
+    } else if (name === "src" && this.localName === "video") {
+      this._setVideoSource("");
+    } else if ((name === "width" || name === "height") && (this.localName === "img" || this.localName === "video")) this._styleChanged();
     else if ((name === "width" || name === "height") && this.localName === "canvas") {
       elementState(this)[name === "width" ? "canvasWidth" : "canvasHeight"] = name === "width" ? 300 : 150;
       if (elementState(this).canvasContext) resetCanvasContext(elementState(this).canvasContext);
@@ -453,15 +573,228 @@ export class Element extends EventTarget {
   }
 
   get currentSrc() {
+    if (this.localName === "video") return elementState(this).video.source;
     return elementState(this).currentSrc ?? "";
   }
 
+  get paused() { return this.localName === "video" ? elementState(this).video.paused : true; }
+  get ended() { return this.localName === "video" ? elementState(this).video.ended : false; }
+  get duration() { return this.localName === "video" ? elementState(this).video.duration : NaN; }
+  get currentTime() { return this.localName === "video" ? elementState(this).video.currentTime : 0; }
+  set currentTime(value) {
+    if (this.localName !== "video") return;
+    const video = elementState(this).video;
+    video.currentTime = Math.max(0, Math.min(Number(value) || 0, Number.isFinite(video.duration) ? video.duration : Infinity));
+    video.seekPending = true;
+    if (!video.paused && video.source) {
+      video.playbackClockStartedAt = null;
+      if (!this.muted && video.volume > 0) this._startVideoAudio(video.currentTime);
+      else {
+        video.audioStartPending = false;
+        video.playbackClockTime = video.currentTime;
+        video.playbackClockStartedAt = performance.now();
+      }
+      this._startVideo();
+    }
+  }
+  get videoWidth() { return this.localName === "video" ? elementState(this).video.width : 0; }
+  get videoHeight() { return this.localName === "video" ? elementState(this).video.height : 0; }
+  get readyState() { return this.localName === "video" ? (elementState(this).video.width ? 4 : elementState(this).video.source ? 1 : 0) : 0; }
+  get autoplay() { return this.hasAttribute("autoplay"); }
+  set autoplay(value) { if (value) this.setAttribute("autoplay", ""); else this.removeAttribute("autoplay"); }
+  get loop() { return this.hasAttribute("loop"); }
+  set loop(value) { if (value) this.setAttribute("loop", ""); else this.removeAttribute("loop"); }
+  get muted() { return this.hasAttribute("muted"); }
+  set muted(value) { if (value) this.setAttribute("muted", ""); else this.removeAttribute("muted"); }
+
+  async play() {
+    if (this.localName !== "video") return;
+    const video = elementState(this).video;
+    if (!this.src) throw new Error("video has no source");
+    video.paused = false;
+    video.ended = false;
+    video.playbackClockStartedAt = null;
+    if (!this.muted && video.volume > 0) this._startVideoAudio(video.currentTime);
+    else {
+      video.audioStartPending = false;
+      video.playbackClockTime = video.currentTime;
+      video.playbackClockStartedAt = performance.now();
+    }
+    this._startVideo();
+    this.dispatchEvent(new Event("play"));
+    return video.frameRequest;
+  }
+
+  pause() {
+    if (this.localName !== "video") return;
+    const video = elementState(this).video;
+    if (video.paused) return;
+    video.paused = true;
+    video.token++;
+    if (video.timer) clearTimeout(video.timer);
+    video.timer = null;
+    stopVideoStream(video.source);
+    pauseVideoAudio(video.audioId, true);
+    this.dispatchEvent(new Event("pause"));
+  }
+
+  load() { if (this.localName === "video") this._setVideoSource(this.src); }
+
+  _startVideoAudio(time) {
+    const video = elementState(this).video, view = this.document.defaultView;
+    if (view && video.source && !this.muted && video.volume > 0) {
+      const generation = startVideoAudio(video.audioId, video.source, time, video.volume, view.audioOutput);
+      video.audioGeneration = generation;
+      video.audioStartPending = video.volume > 0;
+      video.playbackClockStartedAt = null;
+      video.audioStartPromise = waitForVideoAudioReady(video.audioId).then(ready => {
+        if (video.audioGeneration !== generation || video.paused || this.muted || video.volume <= 0) return;
+        if (ready) pauseVideoAudio(video.audioId, false);
+        video.audioStartPending = false;
+        video.playbackClockTime = time;
+        video.playbackClockStartedAt = performance.now();
+      });
+    }
+  }
+
+  _setVideoSource(source) {
+    const state = elementState(this), video = state.video;
+    video.token++;
+    if (video.timer) clearTimeout(video.timer);
+    video.timer = null;
+    stopVideoStream(video.source);
+    stopVideoAudio(video.audioId);
+    if (video.textureId !== null && this.document.defaultView) this.document.defaultView.deleteImageTexture(video.textureId);
+    video.textureId = null; video.width = video.height = 0; video.currentTime = 0; video.duration = NaN;
+    video.ended = false; video.paused = true; video.source = source;
+    video.metadataLoaded = false; video.dataLoaded = false;
+    video.seekPending = false;
+    video.image = null;
+    if (source && (this.autoplay || this.hasAttribute("autoplay"))) this.play().catch(error => this.dispatchEvent(Object.assign(new Event("error"), { error })));
+    this._styleChanged();
+  }
+
+  _startVideo() {
+    const video = elementState(this).video, token = ++video.token;
+    const seek = video.seekPending;
+    video.seekPending = false;
+    if (video.timer) clearTimeout(video.timer);
+    video.frameRequest = (async () => {
+      try {
+        if (!this.document.defaultView) throw new Error("video requires an attached window");
+        const box = this.getBoundingClientRect();
+        const maxEdge = Math.max(1, Math.ceil(Math.max(box.width, box.height)));
+        const frame = await decodeVideoFrame(video.source, video.currentTime, maxEdge, seek);
+        if (token !== video.token || video.paused) return;
+        const view = this.document.defaultView;
+        if (!view || view.closed) return;
+        if (frame.ended) {
+          video.paused = true;
+          video.ended = true;
+          stopVideoAudio(video.audioId);
+          this.dispatchEvent(new Event("ended"));
+          return;
+        }
+        if (video.audioStartPending && video.audioStartPromise) {
+          await video.audioStartPromise;
+          if (token !== video.token || video.paused) return;
+          const currentView = this.document.defaultView;
+          if (!currentView || currentView.closed) return;
+        }
+        if (!this.muted && video.volume > 0 && !video.audioStartPending) {
+          const audioClock = getVideoAudioClock(video.audioId);
+          if (audioClock) {
+            video.playbackClockTime = audioClock.time;
+            video.playbackClockStartedAt = audioClock.receivedAt;
+          }
+        }
+        const frameDuration = frame.frameDuration || 1 / 30;
+        if (!video.audioStartPending && video.playbackClockStartedAt !== null && video.playbackClockStartedAt !== undefined) {
+          const now = performance.now();
+          const expectedTime = video.playbackClockTime + (now - video.playbackClockStartedAt) / 1000;
+          if (frame.time + frameDuration * 0.5 < expectedTime) {
+            video.currentTime = expectedTime;
+            this._startVideo();
+            return;
+          }
+          const due = video.playbackClockStartedAt + (frame.time - video.playbackClockTime) * 1000;
+          if (due > now) {
+            await new Promise(resolve => setTimeout(resolve, due - now));
+            if (token !== video.token || video.paused) return;
+            const currentView = this.document.defaultView;
+            if (!currentView || currentView.closed) return;
+          }
+        }
+        video.duration = frame.duration;
+        const sourceWidth = frame.sourceWidth || frame.width;
+        const sourceHeight = frame.sourceHeight || frame.height;
+        const dimensionsChanged = video.width !== sourceWidth || video.height !== sourceHeight;
+        video.width = sourceWidth; video.height = sourceHeight;
+        if (!video.metadataLoaded) {
+          video.metadataLoaded = true;
+          this.dispatchEvent(new Event("loadedmetadata"));
+          this.dispatchEvent(new Event("durationchange"));
+        }
+        const pixels = Buffer.from(frame.pixels.buffer, frame.pixels.byteOffset, frame.pixels.byteLength);
+        if (video.textureId !== null && (video.image.width !== frame.width || video.image.height !== frame.height)) {
+          view.deleteImageTexture(video.textureId);
+          video.textureId = null;
+        }
+        if (video.textureId === null) video.textureId = view.createImageTexture(frame.width, frame.height, pixels);
+        else view.updateImageTexture(video.textureId, pixels);
+        video.image = { textureId: video.textureId, width: frame.width, height: frame.height, pixels: frame.pixels };
+        video.currentTime = frame.time;
+        if (video.playbackClockStartedAt == null) {
+          video.playbackClockTime = frame.time;
+          video.playbackClockStartedAt = performance.now();
+        }
+        if (!video.dataLoaded) {
+          if (dimensionsChanged) this._styleChanged();
+          video.dataLoaded = true;
+          this.dispatchEvent(new Event("loadeddata"));
+          this.dispatchEvent(new Event("canplay"));
+        }
+        this.dispatchEvent(new Event("timeupdate"));
+        const nextDue = video.playbackClockStartedAt + (frame.time + frameDuration - video.playbackClockTime) * 1000;
+        video.timer = setTimeout(() => {
+          if (video.currentTime >= video.duration) {
+            if (this.loop) {
+              video.currentTime = 0;
+              if (!this.muted) this._startVideoAudio(0);
+            } else { video.paused = true; video.ended = true; stopVideoAudio(video.audioId); this.dispatchEvent(new Event("ended")); return; }
+          } else video.currentTime += frameDuration;
+          this._startVideo();
+        }, Math.max(0, nextDue - performance.now()));
+      } catch (error) {
+        if (token === video.token && !video.paused && this.document.defaultView && !this.document.defaultView.closed) {
+          video.paused = true;
+          this.dispatchEvent(Object.assign(new Event("error"), { error }));
+        }
+        throw error;
+      }
+    })();
+    video.frameRequest.catch(() => {});
+    return video.frameRequest;
+  }
+
+  get volume() { return this.localName === "video" ? (elementState(this).video.volume ?? 1) : 1; }
+  set volume(value) {
+    if (this.localName !== "video") return;
+    const video = elementState(this).video;
+    video.volume = Math.max(0, Math.min(1, Number(value) || 0));
+    if (!video.paused && !this.muted && video.volume > 0) this._startVideoAudio(video.currentTime);
+    else {
+      if (video.volume <= 0) { video.audioGeneration++; video.audioStartPending = false; }
+      setVideoAudioVolume(video.audioId, this.muted ? 0 : video.volume, video.currentTime);
+    }
+  }
+
   get naturalWidth() {
-    return elementState(this).image?.width ?? 0;
+    return this.localName === "video" ? elementState(this).video.width : elementState(this).image?.width ?? 0;
   }
 
   get naturalHeight() {
-    return elementState(this).image?.height ?? 0;
+    return this.localName === "video" ? elementState(this).video.height : elementState(this).image?.height ?? 0;
   }
 
   get width() {
@@ -572,6 +905,13 @@ export class Element extends EventTarget {
       if (imageStyle.height === undefined) imageStyle.height = parseDimension(this.getAttribute("height")) ?? elementState(this).image?.height;
       return styleForTaffy(imageStyle);
     }
+    if (this.localName === "video") {
+      const video = elementState(this).video;
+      const videoStyle = { ...style };
+      if (videoStyle.width === undefined) videoStyle.width = parseDimension(this.getAttribute("width")) ?? (video.width || undefined);
+      if (videoStyle.height === undefined) videoStyle.height = parseDimension(this.getAttribute("height")) ?? (video.height || undefined);
+      return styleForTaffy(videoStyle);
+    }
     if (this.localName === "canvas") {
       const canvasStyle = { ...style };
       if (canvasStyle.width === undefined) canvasStyle.width = this.width;
@@ -610,6 +950,7 @@ export class Element extends EventTarget {
     if (index < 0) throw new Error("child not found");
     this.children.splice(index, 1);
     child.parent = null;
+    if (child.localName === "video") child.pause();
     this.#syncChildren();
     return child;
   }
@@ -637,7 +978,12 @@ export class Document extends EventTarget {
     this.body.style.display = "block";
     registerDocument(this, {
       layout: (width, height, timings) => this.#layout(width, height, timings),
-      boxes: (timings) => this.#boxes(timings),
+      boxes: (timings) => {
+        // Renderers must observe the current viewport and DOM, just like geometry
+        // getters. Keep this before the geometry cache lookup in #boxes().
+        if (documentState(this).defaultView) this.#layoutSync(timings);
+        return this.#boxes(timings);
+      },
       renderBoxes: (elements, timings) => {
         this.#layoutSync();
         return this.#boxes(timings, elements);
@@ -684,8 +1030,9 @@ export class Document extends EventTarget {
   _attachWindow(window) {
     documentState(this).defaultView = window;
     window._syncDocumentSizeConstraints();
-    for (const element of documentState(this).elements) if (element.localName === "img" && elementState(element).imageLoadState === "pending") {
-      element._beginImageLoad(element.src, window, elementState(element).imageRequest);
+    for (const element of documentState(this).elements) {
+      if (element.localName === "img" && elementState(element).imageLoadState === "pending") element._beginImageLoad(element.src, window, elementState(element).imageRequest);
+      else if (element.localName === "video" && element.autoplay && element.src) element.play().catch(() => {});
     }
   }
 
@@ -708,16 +1055,20 @@ export class Document extends EventTarget {
         timings.transfer = elapsed - result.workerMs;
         timings.workerAssembly = result.workerMs - result.computeMs;
       }
-      if (!result.stale) {
-        documentState(this).layoutSnapshot = result.boxes;
-        documentState(this).dirty = false;
-        markGeometryDirty(documentState(this));
+      const state = documentState(this);
+      // A synchronous render layout may have handled a resize while this worker
+      // request was in flight. Never let its older viewport overwrite that work.
+      if (!result.stale && state.viewport.width === width && state.viewport.height === height) {
+        state.layoutSnapshot = result.boxes;
+        state.dirty = false;
+        markGeometryDirty(state);
       }
     }
     return this.#boxes(timings);
   }
 
-  #layoutSync() {
+  #layoutSync(timings) {
+    const started = timings && performance.now();
     this.#prepareText();
     const size = documentState(this).defaultView?.size();
     const width = size?.width ?? documentState(this).viewport.width;
@@ -735,6 +1086,7 @@ export class Document extends EventTarget {
       documentState(this).dirty = false;
       markGeometryDirty(documentState(this));
     }
+    if (timings) timings.layout = performance.now() - started;
   }
 
   #boxes(timings, selectedElements = null) {
@@ -860,7 +1212,19 @@ export class Document extends EventTarget {
   }
 
   close() {
-    for (const element of documentState(this).elements) if (element.localName === "img") element._cancelImageRequest();
+    for (const element of documentState(this).elements) {
+      if (element.localName === "img") element._cancelImageRequest();
+      else if (element.localName === "video") {
+        const video = elementState(element).video;
+        element.pause();
+        stopVideoStream(video.source);
+        stopVideoAudio(video.audioId);
+        if (video.textureId !== null && documentState(this).defaultView) {
+          documentState(this).defaultView.deleteImageTexture(video.textureId);
+          video.textureId = null;
+        }
+      }
+    }
     if (documentState(this).defaultView) {
       documentState(this).defaultView.document = null;
       documentState(this).defaultView = null;
