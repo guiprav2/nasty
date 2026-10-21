@@ -22,7 +22,19 @@ export function registerDocument(document, internals) {
 export function layoutDocument(document, width, height, timings) {
   const internals = documents.get(document);
   if (!internals) throw new TypeError("document is not managed by Nasty");
-  return internals.layout(width, height, timings);
+  const state = documentData.get(document);
+  if (!state.dirty && state.layoutSnapshot && state.viewport.width === width && state.viewport.height === height) {
+    return internals.boxes(timings);
+  }
+  const size = `${width}x${height}`;
+  if (state.layoutPending && state.layoutPendingSize === size) return state.layoutPending;
+  const pending = Promise.resolve(internals.layout(width, height, timings));
+  state.layoutPendingSize = size;
+  state.layoutPending = pending.finally(() => {
+    if (state.layoutPending === tracked) { state.layoutPending = null; state.layoutPendingSize = null; }
+  });
+  const tracked = state.layoutPending;
+  return tracked;
 }
 
 export function documentBoxes(document, timings) {

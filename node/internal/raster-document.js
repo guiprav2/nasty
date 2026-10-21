@@ -1,11 +1,12 @@
 import { createCanvas, loadImage } from '@napi-rs/canvas';
-import { documentBoxes, elementState } from './dom-state.js';
-import { canvasSurface, imageSurface } from '../canvas-2d.js';
+import { documentBoxes, documentState, elementState } from './dom-state.js';
+import { canvasSurface, canvasTriangleBuffer, imageSurface } from '../canvas-2d.js';
 import { textMetrics, textLines, inherited } from './text-metrics.js';
-import { computedStyleValue } from './css-transitions.js';
+import { computedStyleValue, hasActiveStyleTransition } from './css-transitions.js';
 import { renderedText } from './nerd-icon.js';
+import { parseColor } from '../render.js';
 const windows = new WeakMap();
-export const paintProfile = new Map();
+const stackingOrders = new WeakMap();
 const backgrounds = new Map();
 const empty = Buffer.from(new Float32Array([1]).buffer);
 function radius(value, width, height) {
@@ -20,6 +21,8 @@ function shadow(ctx, value) {
   ctx.shadowBlur = Number(match[3]); ctx.shadowColor = match[4]; return true;
 }
 function stackingOrder(boxes) {
+  const cached = stackingOrders.get(boxes);
+  if (cached) return cached;
   const byElement = new Map(boxes.map(box => [box.element, box]));
   const order = [];
   function visit(box) {
@@ -29,29 +32,257 @@ function stackingOrder(boxes) {
     children.sort((a, b) => (Number(a.element.style.zIndex) || 0) - (Number(b.element.style.zIndex) || 0));
     for (const child of children) visit(child);
   }
-  visit(boxes[0]); return order;
+  visit(boxes[0]); stackingOrders.set(boxes, order); return order;
 }
-export function rasterizeDocument(document, width, height, surface = createCanvas(width, height)) {
+function canvasLayer(document, width, height) {
+  const boxes = documentBoxes(document), body = document.body;
+  const order = stackingOrder(boxes), bodyBox = boxes.find(box => box.element === body);
+  if (!bodyBox || order.length < 2 || order[0].element !== body) return null;
+  const bodyStyle = body.style;
+  if (bodyStyle.backgroundImage || bodyStyle.transform || bodyStyle.opacity !== undefined) return null;
+  const fieldBox = order[1], fieldElement = fieldBox.element, fieldStyle = fieldElement.style;
+  const field = elementState(fieldElement);
+  const fixedViewportCanvas = fieldStyle.position === 'fixed' && Number(fieldStyle.top) === 0 && Number(fieldStyle.left) === 0
+    && Math.abs(parseFloat(fieldStyle.width) - width) < 0.01 && Math.abs(parseFloat(fieldStyle.height) - height) < 0.01
+    && fieldElement.width >= width && fieldElement.height >= height;
+  const content = fixedViewportCanvas ? { x: 0, y: 0, width, height } : fieldBox.contentBox;
+  if (!field.canvasContext || fieldElement.localName !== 'canvas' || fieldStyle.display === 'none'
+    || !['fixed', 'absolute'].includes(fieldStyle.position) || (Number(fieldStyle.zIndex) || 0) !== 0
+    || Math.abs(content.x) > 0.01 || Math.abs(content.y) > 0.01
+    || Math.abs(content.width - width) > 0.01 || Math.abs(content.height - height) > 0.01
+    || fieldStyle.backgroundImage || fieldStyle.backgroundColor !== 'transparent'
+    || fieldBox.border.top || fieldBox.border.right || fieldBox.border.bottom || fieldBox.border.left
+    || fieldStyle.transform || fieldStyle.opacity !== undefined) return null;
+  return { boxes, bodyBox, field: { element: fieldElement, box: content, surface: canvasSurface(field.canvasContext, false), context: field.canvasContext },
+    color: computedStyleValue(bodyStyle, 'backgroundColor') || 'transparent' };
+}
+function gpuCircularDecorations(boxes, allowed = () => true) {
+  const elements = [], data = [];
+  for (const box of boxes) {
+    const element = box.element, style = element.style;
+    if (!allowed(element) || element.localName !== 'i' || element.children.length || box.width <= 0 || box.width !== box.height) continue;
+    const circleRadius = radius(style.borderRadius, box.width, box.height);
+    if (circleRadius < box.width / 2 - 0.01) continue;
+    const shadowMatch = /^(-?[\d.]+)px\s+(-?[\d.]+)px\s+([\d.]+)px\s+(#[\da-f]{3,8})$/i.exec(style.boxShadow || '');
+    if (!shadowMatch || Number(shadowMatch[1]) !== 0 || Number(shadowMatch[2]) !== 0) continue;
+    const opacity = Math.max(0, Math.min(1, Number(style.opacity ?? 1)));
+    const fill = parseColor(computedStyleValue(style, 'backgroundColor'));
+    const glow = parseColor(shadowMatch[4]);
+    if (!fill || !glow || opacity <= 0) continue;
+    let inheritedOpacity = 1;
+    for (let parent = element.parent; parent; parent = parent.parent) {
+      if (parent.style.opacity !== undefined) inheritedOpacity *= Math.max(0, Math.min(1, Number(parent.style.opacity)));
+    }
+    const alpha = opacity * inheritedOpacity, x = box.x + box.width / 2, y = box.y + box.height / 2;
+    const blur = Number(shadowMatch[3]), outer = circleRadius + blur * 2.5;
+    data.push(x, y, outer, -1, x, y, 0, outer,
+      glow[0], glow[1], glow[2], glow[3] * alpha, glow[0], glow[1], glow[2], 0);
+    data.push(x, y, circleRadius, -1, x, y, 0, 1,
+      fill[0], fill[1], fill[2], fill[3] * alpha, fill[0], fill[1], fill[2], fill[3] * alpha);
+    elements.push(element);
+  }
+  return { elements: new Set(elements), data };
+}
+function appendGpuCircles(canvas, additions) {
+  if (!canvas || !additions.length) return { circles: canvas?.circles, operations: canvas?.operations };
+  const oldCircles = new Float32Array(canvas.circles.buffer, canvas.circles.byteOffset, canvas.circles.byteLength / 4);
+  const circles = new Float32Array(oldCircles.length + additions.length);
+  circles.set(oldCircles); circles.set(additions, oldCircles.length);
+  const oldOperations = new Float32Array(canvas.operations.buffer, canvas.operations.byteOffset, canvas.operations.byteLength / 4);
+  const oldCount = oldCircles.length / 16, addCount = additions.length / 16;
+  let operations;
+  if (oldOperations.length >= 3 && oldOperations.at(-3) === 1 && oldOperations.at(-2) + oldOperations.at(-1) === oldCount) {
+    operations = new Float32Array(oldOperations);
+    operations[operations.length - 1] += addCount;
+  } else {
+    operations = new Float32Array(oldOperations.length + 3);
+    operations.set(oldOperations); operations.set([1, oldCount, addCount], oldOperations.length);
+  }
+  return { circles: Buffer.from(circles.buffer), operations: Buffer.from(operations.buffer) };
+}
+function deleteTextures(window, state) {
+  for (const key of ['textureId', 'baseTextureId', 'fieldTextureId', 'overlayTextureId', 'preBlurTextureId', 'postBlurTextureId']) {
+    if (state[key] !== null && state[key] !== undefined) window.deleteImageTexture(state[key]);
+  }
+}
+function uploadTexture(window, state, textureKey, sizeKey, width, height, pixels) {
+  const previous = state[sizeKey];
+  if (state[textureKey] === null || previous?.width !== width || previous?.height !== height) {
+    if (state[textureKey] !== null) window.deleteImageTexture(state[textureKey]);
+    state[textureKey] = window.createImageTexture(width, height, pixels);
+    state[sizeKey] = { width, height };
+  } else {
+    window.updateImageTexture(state[textureKey], pixels);
+  }
+}
+function uploadTextureRegion(window, state, textureKey, sizeKey, width, height, surface, regions) {
+  const previous = state[sizeKey];
+  const layerKey = textureKey.slice(0, -'TextureId'.length);
+  if (state[textureKey] === null || previous?.width !== width || previous?.height !== height || state[`${layerKey}FullPaint`]) {
+    uploadTexture(window, state, textureKey, sizeKey, width, height, surface.data());
+    return;
+  }
+  if (!regions?.length) return;
+  for (const region of regions) {
+    const x = Math.max(0, Math.floor(region.x)), y = Math.max(0, Math.floor(region.y));
+    const right = Math.min(width, Math.ceil(region.x + region.width)), bottom = Math.min(height, Math.ceil(region.y + region.height));
+    const patchWidth = right - x, patchHeight = bottom - y;
+    if (patchWidth <= 0 || patchHeight <= 0) continue;
+    const data = surface.getContext('2d').getImageData(x, y, patchWidth, patchHeight).data;
+    window.updateImageTextureRegion(state[textureKey], x, y, patchWidth, patchHeight,
+      Buffer.from(data.buffer, data.byteOffset, data.byteLength));
+  }
+}
+function orderedImageList(images, canvas = null) {
+  const values = [2, images.length];
+  for (const image of images) {
+    if (image.type === 'canvas-triangles') values.push(3, 0, canvas.length / 24, image.x, image.y, image.width, image.height, 0, 0, 0);
+    else if (image.type === 'backdrop-blur') values.push(2, image.x, image.y, image.width, image.height, image.radius, 0, 0, 0, 0);
+    else values.push(1, image.textureId, image.x, image.y, image.width, image.height,
+      image.clipX ?? 0, image.clipY ?? 0, image.clipWidth ?? image.width, image.clipHeight ?? image.height);
+  }
+  return { list: Buffer.from(new Float32Array(values).buffer), triangles: canvas };
+}
+function paintPadding(element) {
+  const match = /^(-?[\d.]+)px\s+(-?[\d.]+)px\s+([\d.]+)px/.exec(element.style.boxShadow || '');
+  return match ? Math.max(8, Math.abs(Number(match[1])) + Number(match[3]) * 3,
+    Math.abs(Number(match[2])) + Number(match[3]) * 3) : 8;
+}
+function mergeDirtyRegions(regions) {
+  const merged = [];
+  for (const source of regions) {
+    let rect = { ...source }, changed = true;
+    while (changed) {
+      changed = false;
+      for (let index = merged.length - 1; index >= 0; index--) {
+        const other = merged[index];
+        if (rect.x > other.x + other.width || other.x > rect.x + rect.width
+          || rect.y > other.y + other.height || other.y > rect.y + rect.height) continue;
+        const left = Math.min(rect.x, other.x), top = Math.min(rect.y, other.y);
+        const right = Math.max(rect.x + rect.width, other.x + other.width);
+        const bottom = Math.max(rect.y + rect.height, other.y + other.height);
+        rect = { x: left, y: top, width: right - left, height: bottom - top };
+        merged.splice(index, 1); changed = true;
+      }
+    }
+    merged.push(rect);
+  }
+  if (merged.length > 16) {
+    const left = Math.min(...merged.map(rect => rect.x)), top = Math.min(...merged.map(rect => rect.y));
+    const right = Math.max(...merged.map(rect => rect.x + rect.width)), bottom = Math.max(...merged.map(rect => rect.y + rect.height));
+    return [{ x: left, y: top, width: right - left, height: bottom - top }];
+  }
+  return merged;
+}
+function rasterizeCachedLayer(document, width, height, surface, state, key, options = {}) {
+  const doc = documentState(document), boxes = documentBoxes(document);
+  const generationKey = `${key}Generation`, geometryKey = `${key}Geometry`, modeKey = `${key}Mode`;
+  const sizeKey = `${key}RasterSize`;
+  const full = state[`${key}Painted`] !== true || state[modeKey] !== state.mode
+    || state[sizeKey] !== `${width}x${height}`;
+  state[`${key}FullPaint`] = full;
+  state[`${key}FullReason`] = { painted: state[`${key}Painted`] !== true, mode: state[modeKey] !== state.mode, geometry: state[geometryKey] !== doc.geometryGeneration, size: state[sizeKey] !== `${width}x${height}`, currentGeometry: doc.geometryGeneration, previousGeometry: state[geometryKey] };
+  state[`${key}DirtyRegion`] = null;
+  const included = box => !options.onlyElements || options.onlyElements.has(box.element);
+  const includedBoxes = boxes.filter(included);
+  const currentBoxMap = new Map(includedBoxes.map(box => [box.element, box]));
+  const previousBoxMap = state[`${key}BoxMap`] ?? new Map();
+  const skipped = options.skipElements;
+  const dirty = full ? [] : [...doc.paintDirtyElements].filter(element => !skipped?.has(element) && (!options.onlyElements || options.onlyElements.has(element)));
+  const geometryDirty = [];
+  if (!full) {
+    const changed = (a, b) => !b || a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height
+      || a.contentBox.x !== b.contentBox.x || a.contentBox.y !== b.contentBox.y
+      || a.contentBox.width !== b.contentBox.width || a.contentBox.height !== b.contentBox.height;
+    for (const [element, previous] of previousBoxMap) {
+      if (skipped?.has(element)) continue;
+      const current = currentBoxMap.get(element);
+      if (changed(previous, current)) { geometryDirty.push({ element, box: previous }); if (current && !dirty.includes(element)) dirty.push(element); }
+    }
+    for (const element of currentBoxMap.keys()) if (!skipped?.has(element) && !previousBoxMap.has(element) && !dirty.includes(element)) dirty.push(element);
+  }
+  for (const box of boxes) {
+    if (included(box) && !skipped?.has(box.element) && hasActiveStyleTransition(box.element.style) && !dirty.includes(box.element)) dirty.push(box.element);
+  }
+  state[`${key}DirtyNames`] = dirty.map(element => element.id || element.className || element.localName);
+  if (!full && dirty.length === 0) {
+    state[geometryKey] = doc.geometryGeneration;
+    state[`${key}BoxMap`] = currentBoxMap;
+    return false;
+  }
+  let dirtyRegions = [];
+  if (!full) {
+    const includeRect = (box, element) => {
+      if (!box) return;
+      const pad = paintPadding(element);
+      const rect = { x: Math.max(0, box.x - pad), y: Math.max(0, box.y - pad),
+        width: Math.min(width, box.x + box.width + pad) - Math.max(0, box.x - pad),
+        height: Math.min(height, box.y + box.height + pad) - Math.max(0, box.y - pad) };
+      if (rect.width > 0 && rect.height > 0) dirtyRegions.push(rect);
+    };
+    for (const entry of geometryDirty) includeRect(entry.box, entry.element);
+    for (const element of dirty) {
+      includeRect(currentBoxMap.get(element), element);
+      includeRect(previousBoxMap.get(element), element);
+    }
+    dirtyRegions = mergeDirtyRegions(dirtyRegions);
+    if (!dirtyRegions.length) {
+      state[geometryKey] = doc.geometryGeneration;
+      state[`${key}BoxMap`] = currentBoxMap;
+      return false;
+    }
+  }
+  if (full) dirtyRegions = [{ x: 0, y: 0, width, height }];
+  state[`${key}DirtyRegions`] = dirtyRegions;
+  state[`${key}DirtyRegion`] = dirtyRegions.length ? dirtyRegions.reduce((a, b) => {
+    const left = Math.min(a.x, b.x), top = Math.min(a.y, b.y);
+    const right = Math.max(a.x + a.width, b.x + b.width), bottom = Math.max(a.y + a.height, b.y + b.height);
+    return { x: left, y: top, width: right - left, height: bottom - top };
+  }) : null;
+  if (full) rasterizeDocument(document, width, height, surface, options);
+  else for (const dirtyRegion of dirtyRegions) rasterizeDocument(document, width, height, surface, { ...options, dirtyRegion });
+  state[generationKey] = doc.paintGeneration;
+  state[geometryKey] = doc.geometryGeneration;
+  state[modeKey] = state.mode;
+  state[sizeKey] = `${width}x${height}`;
+  state[`${key}Painted`] = true;
+  state[`${key}BoxMap`] = currentBoxMap;
+  return true;
+}
+export function rasterizeDocument(document, width, height, surface = createCanvas(width, height), options = {}) {
   if (surface.width !== width) surface.width = width;
   if (surface.height !== height) surface.height = height;
   const ctx = surface.getContext('2d');
-  ctx.clearRect(0, 0, width, height);
+  if (options.dirtyRegion) {
+    const dirty = options.dirtyRegion;
+    ctx.clearRect(dirty.x, dirty.y, dirty.width, dirty.height);
+    ctx.save(); ctx.beginPath(); ctx.rect(dirty.x, dirty.y, dirty.width, dirty.height); ctx.clip();
+  } else ctx.clearRect(0, 0, width, height);
   const boxes = documentBoxes(document);
   const documentBox = boxes.find(box => box.element === document.body);
   const documentRadius = documentBox ? radius(document.body.style.borderRadius, documentBox.width, documentBox.height) : 0;
   for (const box of stackingOrder(boxes)) {
     if (box.width <= 0 || box.height <= 0) continue;
     const element = box.element, style = element.style;
-    const elementStarted = performance.now();
+    if (options.dirtyRegion) {
+      const dirty = options.dirtyRegion, pad = paintPadding(element);
+      if (box.x + box.width + pad < dirty.x || box.y + box.height + pad < dirty.y
+        || box.x - pad > dirty.x + dirty.width || box.y - pad > dirty.y + dirty.height) continue;
+    }
+    if (options.skipElements?.has(element)) continue;
+    if (options.onlyElements && !options.onlyElements.has(element)) continue;
+    let alpha = 1;
+    for (let ancestor = element; ancestor; ancestor = ancestor.parent) {
+      if (ancestor.style.opacity !== undefined) alpha *= Math.max(0, Math.min(1, Number(ancestor.style.opacity)));
+    }
+    if (alpha <= 0) continue;
     ctx.save();
     if (box.clip) { ctx.beginPath(); ctx.rect(box.clip.x, box.clip.y, box.clip.width, box.clip.height); ctx.clip(); }
     if (documentRadius && element !== document.body && documentBox) {
       round(ctx, documentBox.x, documentBox.y, documentBox.width, documentBox.height, documentRadius);
       ctx.clip();
     }
-    for (let ancestor = element; ancestor; ancestor = ancestor.parent) {
-      if (ancestor.style.opacity !== undefined) ctx.globalAlpha *= Math.max(0, Math.min(1, Number(ancestor.style.opacity)));
-    }
+    ctx.globalAlpha = alpha;
     const transform = style.transform;
     if (transform && transform !== 'none') {
       const offset = /translate(?:X|Y)?\(([^)]+)\)/.exec(transform);
@@ -61,19 +292,8 @@ export function rasterizeDocument(document, width, height, surface = createCanva
       }
     }
     const r = radius(style.borderRadius, box.width, box.height);
-    if (style.backdropFilter?.startsWith('blur(')) {
-      const blur = parseFloat(style.backdropFilter.slice(5));
-      const x = Math.max(0, Math.floor(box.x - blur * 2)), y = Math.max(0, Math.floor(box.y - blur * 2));
-      const w = Math.max(1, Math.min(width - x, Math.ceil(box.width + blur * 4)));
-      const h = Math.max(1, Math.min(height - y, Math.ceil(box.height + blur * 4)));
-      if (x < width && y < height) {
-        const crop = createCanvas(w, h); crop.getContext('2d').putImageData(ctx.getImageData(x, y, w, h), 0, 0);
-        ctx.save(); round(ctx, box.x, box.y, box.width, box.height, r); ctx.clip(); ctx.filter = `blur(${blur}px)`;
-        ctx.drawImage(crop, x, y); ctx.restore();
-      }
-    }
     const backgroundColor = computedStyleValue(style, 'backgroundColor');
-    if (backgroundColor && backgroundColor !== 'transparent') {
+    if (!(options.skipBodyBackground && element === document.body) && backgroundColor && backgroundColor !== 'transparent') {
       ctx.save(); shadow(ctx, style.boxShadow); ctx.fillStyle = backgroundColor;
       round(ctx, box.x, box.y, box.width, box.height, r); ctx.fill(); ctx.restore();
     }
@@ -136,25 +356,153 @@ export function rasterizeDocument(document, width, height, surface = createCanva
       });
     }
     ctx.restore();
-    if (process.env.NASTY_RAINBOW_FRAMES) { const key = element.id || element.className || element.localName; paintProfile.set(key, (paintProfile.get(key) || 0) + performance.now() - elementStarted); }
   }
+  if (options.dirtyRegion) ctx.restore();
   return surface;
 }
-export const rasterTimings = new WeakMap();
 export function documentImage(window, document) {
-  const started = performance.now();
   const { width, height } = window.size();
   let state = windows.get(window);
-  if (!state || state.surface.width !== width || state.surface.height !== height) {
-    if (state) window.deleteImageTexture(state.textureId);
-    state = { surface: createCanvas(width, height), textureId: null }; windows.set(window, state);
+  if (!state) {
+    state = { mode: null, surface: null, textureId: null, baseTextureId: null, fieldTextureId: null, overlayTextureId: null,
+      preBlurTextureId: null, postBlurTextureId: null,
+      baseSize: null, fieldSize: null, overlaySize: null, backgroundKey: null };
+    windows.set(window, state);
   }
-  rasterizeDocument(document, width, height, state.surface);
-  const painted = performance.now();
-  const pixels = state.surface.data();
-  const copied = performance.now();
-  if (state.textureId === null) state.textureId = window.createImageTexture(width, height, pixels);
-  else window.updateImageTexture(state.textureId, pixels);
-  rasterTimings.set(window, { paint: painted - started, copy: copied - painted, upload: performance.now() - copied });
+  if (state.mode !== 'layered' && state.surface && (state.surface.width !== width || state.surface.height !== height)) {
+    deleteTextures(window, state);
+    state.textureId = state.baseTextureId = state.fieldTextureId = state.overlayTextureId = state.preBlurTextureId = state.postBlurTextureId = null;
+    state.baseSize = state.fieldSize = state.overlaySize = null;
+  }
+  const layer = canvasLayer(document, width, height);
+  if (layer) {
+    if (state.mode !== 'layered' || !state.surface || state.surface.width !== width || state.surface.height !== height) {
+      deleteTextures(window, state);
+      state.surface = createCanvas(width, height);
+      state.baseSurface = createCanvas(width, height);
+      state.mode = 'layered';
+      state.textureId = state.baseTextureId = state.fieldTextureId = state.overlayTextureId = state.preBlurTextureId = state.postBlurTextureId = null;
+      state.baseSize = state.fieldSize = state.overlaySize = null;
+      state.backgroundKey = null;
+    }
+    const baseKey = `${width}:${height}:${layer.color}:${document.body.style.borderRadius || ''}`;
+    const baseDirty = state.backgroundKey !== baseKey;
+    if (baseDirty) {
+      const baseContext = state.baseSurface.getContext('2d');
+      baseContext.clearRect(0, 0, width, height);
+      baseContext.fillStyle = layer.color;
+      const bounds = layer.bodyBox;
+      round(baseContext, bounds.x, bounds.y, bounds.width, bounds.height,
+        radius(document.body.style.borderRadius, bounds.width, bounds.height));
+      baseContext.fill();
+      state.backgroundKey = baseKey;
+    }
+    const boxes = documentBoxes(document), order = stackingOrder(boxes);
+    const backdrop = order.find(box => box.element.style.backdropFilter?.startsWith('blur(') && box.width > 0 && box.height > 0);
+    const backdropIndex = backdrop ? order.indexOf(backdrop) : -1;
+    const fieldCanvas = canvasTriangleBuffer(layer.field.context, layer.field.box.width, layer.field.box.height);
+    const decorations = !fieldCanvas ? { elements: new Set(), data: [] }
+      : gpuCircularDecorations(boxes, element => !backdrop || order.indexOf(element) < backdropIndex);
+    const gpuCanvas = appendGpuCircles(fieldCanvas, decorations.data);
+    const fieldTriangles = fieldCanvas?.triangles;
+    const skipElements = new Set([layer.field.element, ...decorations.elements]);
+    if (backdrop) {
+      if (!state.preBlurSurface) state.preBlurSurface = createCanvas(width, height);
+      if (!state.postBlurSurface) state.postBlurSurface = createCanvas(width, height);
+      const before = new Set(order.slice(0, backdropIndex).map(box => box.element));
+      const after = new Set(order.slice(backdropIndex).map(box => box.element));
+      const preChanged = rasterizeCachedLayer(document, width, height, state.preBlurSurface, state, 'preBlur', {
+        skipElements, onlyElements: before, skipBodyBackground: true, skipBackdropFilter: true,
+      });
+      const postChanged = rasterizeCachedLayer(document, width, height, state.postBlurSurface, state, 'postBlur', {
+        skipElements, onlyElements: after, skipBodyBackground: true, skipBackdropFilter: true,
+      });
+      state.preBlurChanged = preChanged; state.postBlurChanged = postChanged;
+    } else {
+      state.overlayChanged = rasterizeCachedLayer(document, width, height, state.surface, state, 'overlay', {
+        skipElements, skipBodyBackground: true, skipBackdropFilter: true,
+      });
+    }
+    const basePixels = baseDirty || !state.baseSize ? state.baseSurface.data() : null;
+    const fieldPixels = fieldTriangles ? null : layer.field.surface.data();
+    if (basePixels) uploadTexture(window, state, 'baseTextureId', 'baseSize', width, height, basePixels);
+    const images = [
+      { textureId: state.baseTextureId, x: 0, y: 0, width, height },
+      ...(fieldTriangles ? [{ type: 'canvas-triangles', x: layer.field.box.x, y: layer.field.box.y,
+        width: layer.field.box.width, height: layer.field.box.height }] : [{ textureId: state.fieldTextureId, x: layer.field.box.x, y: layer.field.box.y,
+        width: layer.field.box.width, height: layer.field.box.height }]),
+    ];
+    if (backdrop) {
+      if (state.preBlurChanged) uploadTextureRegion(window, state, 'preBlurTextureId', 'preBlurSize', width, height, state.preBlurSurface, state.preBlurDirtyRegions);
+      if (state.postBlurChanged) uploadTextureRegion(window, state, 'postBlurTextureId', 'postBlurSize', width, height, state.postBlurSurface, state.postBlurDirtyRegions);
+      images.push({ textureId: state.preBlurTextureId, x: 0, y: 0, width, height });
+      images.push({ type: 'backdrop-blur', x: backdrop.x, y: backdrop.y, width: backdrop.width,
+        height: backdrop.height, radius: parseFloat(backdrop.element.style.backdropFilter.slice(5)) || 0 });
+      images.push({ textureId: state.postBlurTextureId, x: 0, y: 0, width, height });
+    } else {
+      if (state.overlayChanged) {
+        uploadTextureRegion(window, state, 'overlayTextureId', 'overlaySize', width, height, state.surface, state.overlayDirtyRegions);
+      }
+      images.push({ textureId: state.overlayTextureId, x: 0, y: 0, width, height });
+    }
+    documentState(document).paintDirtyElements.clear();
+    state.layer = layer;
+    const ordered = orderedImageList(images, fieldTriangles);
+    return { ...ordered, circles: gpuCanvas.circles, beziers: fieldCanvas?.beziers, canvasOperations: gpuCanvas.operations, ordered: true };
+  }
+  const boxes = documentBoxes(document), order = stackingOrder(boxes);
+  const backdrop = order.find(box => box.element.style.backdropFilter?.startsWith('blur(') && box.width > 0 && box.height > 0);
+  if (backdrop) {
+    if (state.mode !== 'backdrop' || !state.preBlurSurface || state.preBlurSurface.width !== width || state.preBlurSurface.height !== height) {
+      deleteTextures(window, state);
+      state.mode = 'backdrop';
+      state.preBlurSurface = createCanvas(width, height);
+      state.postBlurSurface = createCanvas(width, height);
+      state.preBlurTextureId = state.postBlurTextureId = null;
+      state.preBlurSize = state.postBlurSize = null;
+    }
+    const backdropIndex = order.indexOf(backdrop);
+    const preChanged = rasterizeCachedLayer(document, width, height, state.preBlurSurface, state, 'preBlur',
+      { onlyElements: new Set(order.slice(0, backdropIndex).map(box => box.element)) });
+    const postChanged = rasterizeCachedLayer(document, width, height, state.postBlurSurface, state, 'postBlur',
+      { onlyElements: new Set(order.slice(backdropIndex).map(box => box.element)) });
+    if (preChanged) uploadTexture(window, state, 'preBlurTextureId', 'preBlurSize', width, height, state.preBlurSurface.data());
+    if (postChanged) uploadTexture(window, state, 'postBlurTextureId', 'postBlurSize', width, height, state.postBlurSurface.data());
+    documentState(document).paintDirtyElements.clear();
+    return { list: orderedImageList([
+      { textureId: state.preBlurTextureId, x: 0, y: 0, width, height },
+      { type: 'backdrop-blur', x: backdrop.x, y: backdrop.y, width: backdrop.width, height: backdrop.height,
+        radius: parseFloat(backdrop.element.style.backdropFilter.slice(5)) || 0 },
+      { textureId: state.postBlurTextureId, x: 0, y: 0, width, height },
+    ]), ordered: true };
+  }
+  if (state.mode === 'layered' || state.mode === 'backdrop') {
+    deleteTextures(window, state);
+    state.textureId = state.baseTextureId = state.fieldTextureId = state.overlayTextureId = state.preBlurTextureId = state.postBlurTextureId = null;
+    state.baseSize = state.fieldSize = state.overlaySize = null;
+    state.backgroundKey = null;
+    state.mode = null;
+  }
+  if (!state.surface || state.surface.width !== width || state.surface.height !== height) {
+    state.surface = createCanvas(width, height);
+    state.textureId = null;
+  }
+  const changed = rasterizeCachedLayer(document, width, height, state.surface, state, 'full');
+  if (changed) uploadTexture(window, state, 'textureId', 'size', width, height, state.surface.data());
+  documentState(document).paintDirtyElements.clear();
   return { list: empty, images: [{ textureId: state.textureId, x: 0, y: 0, width, height }] };
+}
+export function documentSnapshot(window) {
+  const state = windows.get(window);
+  if (!state) return null;
+  if (state.mode !== 'layered') return state.surface;
+  const { width, height } = state.surface;
+  const snapshot = createCanvas(width, height), context = snapshot.getContext('2d');
+  context.drawImage(state.baseSurface, 0, 0);
+  const field = state.layer.field;
+  context.drawImage(field.surface, 0, 0, field.surface.width, field.surface.height,
+    field.box.x, field.box.y, field.box.width, field.box.height);
+  if (state.preBlurSurface) context.drawImage(state.preBlurSurface, 0, 0);
+  context.drawImage(state.surface, 0, 0);
+  return snapshot;
 }

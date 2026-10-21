@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use taffy::prelude::*;
 use taffy::tree::TaffyError;
+use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent as OsWindowEvent};
@@ -591,6 +592,13 @@ struct GpuImage {
 enum DrawOrder {
     Solids(std::ops::Range<u32>),
     Triangles(std::ops::Range<u32>),
+    CanvasProgram {
+        commands: Vec<CanvasCommand>,
+        clip_x: f64,
+        clip_y: f64,
+        clip_width: f64,
+        clip_height: f64,
+    },
     CanvasTriangles {
         range: std::ops::Range<u32>,
         clip_x: f64,
@@ -599,6 +607,150 @@ enum DrawOrder {
         clip_height: f64,
     },
     Image(usize),
+    BackdropBlur { x: f32, y: f32, width: f32, height: f32, radius: f32 },
+}
+
+enum CanvasCommand {
+    Triangles(std::ops::Range<u32>),
+    Circles(std::ops::Range<u32>),
+    Beziers(std::ops::Range<u32>),
+}
+
+struct BackdropResources {
+    source: wgpu::Texture,
+    small: wgpu::Texture,
+    horizontal: wgpu::Texture,
+    blurred: wgpu::Texture,
+    downsample_bind: wgpu::BindGroup,
+    horizontal_bind: wgpu::BindGroup,
+    vertical_bind: wgpu::BindGroup,
+    composite_bind: wgpu::BindGroup,
+    horizontal_params: wgpu::Buffer,
+    vertical_params: wgpu::Buffer,
+    downsample_pipeline: wgpu::RenderPipeline,
+    blur_pipeline: wgpu::RenderPipeline,
+    composite_pipeline: wgpu::RenderPipeline,
+    width: u32,
+    height: u32,
+    small_width: u32,
+    small_height: u32,
+}
+
+impl BackdropResources {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> Self {
+        let small_width = (width / 4).max(1);
+        let small_height = (height / 4).max(1);
+        let make_texture = |label, width, height, usage| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        });
+        let sampled_target = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let source = make_texture("Nasty backdrop source", width, height,
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING);
+        let small = make_texture("Nasty backdrop downsample", small_width, small_height, sampled_target);
+        let horizontal = make_texture("Nasty backdrop horizontal blur", small_width, small_height, sampled_target);
+        let blurred = make_texture("Nasty backdrop vertical blur", small_width, small_height, sampled_target);
+        let source_view = source.create_view(&Default::default());
+        let small_view = small.create_view(&Default::default());
+        let horizontal_view = horizontal.create_view(&Default::default());
+        let blurred_view = blurred.create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Nasty backdrop sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Nasty backdrop bindings"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let make_params = |x: f32, y: f32| device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Nasty backdrop blur direction"),
+            contents: bytemuck::cast_slice(&[x, y, 1.0, 0.0]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let horizontal_params = make_params(1.0, 0.0);
+        let vertical_params = make_params(0.0, 1.0);
+        let make_bind = |view: &wgpu::TextureView, params: Option<&wgpu::Buffer>| {
+            let mut entries = vec![
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ];
+            if let Some(params) = params { entries.push(wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() }); }
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Nasty backdrop bind group"), layout: &layout, entries: &entries })
+        };
+        let simple_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Nasty backdrop sampling bindings"), entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let make_simple_bind = |view: &wgpu::TextureView| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Nasty backdrop sampling bind"), layout: &simple_layout, entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        let shader_source = r#"
+            struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+            @vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
+                var p = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
+                var o: Out; o.position = vec4(p[i],0.0,1.0); o.uv = vec2((p[i].x+1.0)*0.5, (1.0-p[i].y)*0.5); return o;
+            }
+        "#;
+        let make_pipeline = |label: &'static str, fragment: String, bind_layout: &wgpu::BindGroupLayout| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(fragment.into()) });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bind_layout], push_constant_ranges: &[] });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label), layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+                multiview: None, cache: None,
+            })
+        };
+        let simple_shader = format!("{shader_source}\n@group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler; @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{ return textureSample(tex,samp,i.uv); }}");
+        let blur_shader = format!("{shader_source}
+            @group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler;
+            @group(0) @binding(2) var<uniform> params: vec4<f32>;
+            @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{
+                let d = params.xy / vec2<f32>(textureDimensions(tex)) * max(params.z, 0.5);
+                var c = textureSample(tex,samp,i.uv) * 0.227027;
+                c += textureSample(tex,samp,i.uv + d*1.0) * 0.1945946; c += textureSample(tex,samp,i.uv - d*1.0) * 0.1945946;
+                c += textureSample(tex,samp,i.uv + d*2.0) * 0.1216216; c += textureSample(tex,samp,i.uv - d*2.0) * 0.1216216;
+                c += textureSample(tex,samp,i.uv + d*3.0) * 0.0702703; c += textureSample(tex,samp,i.uv - d*3.0) * 0.0702703;
+                return c;
+            }}");
+        let downsample_pipeline = make_pipeline("Nasty backdrop downsample pipeline", simple_shader.clone(), &simple_layout);
+        let composite_pipeline = make_pipeline("Nasty backdrop composite pipeline", simple_shader, &simple_layout);
+        let blur_pipeline = make_pipeline("Nasty backdrop blur pipeline", blur_shader, &layout);
+        Self { source, small, horizontal, blurred,
+            downsample_bind: make_simple_bind(&source_view),
+            horizontal_bind: make_bind(&small_view, Some(&horizontal_params)),
+            vertical_bind: make_bind(&horizontal_view, Some(&vertical_params)),
+            composite_bind: make_simple_bind(&blurred_view), horizontal_params, vertical_params,
+            downsample_pipeline, blur_pipeline, composite_pipeline, width, height, small_width, small_height }
+    }
 }
 
 #[napi(object)]
@@ -842,6 +994,11 @@ struct Renderer {
     alpha_modes: Vec<wgpu::CompositeAlphaMode>,
     transparent: bool,
     pipeline: wgpu::RenderPipeline,
+    canvas_pipeline: wgpu::RenderPipeline,
+    canvas_viewport_bind_group: wgpu::BindGroup,
+    canvas_viewport_buffer: wgpu::Buffer,
+    canvas_circle_pipeline: wgpu::RenderPipeline,
+    canvas_bezier_pipeline: wgpu::RenderPipeline,
     image_pipeline: wgpu::RenderPipeline,
     image_bind_group_layout: wgpu::BindGroupLayout,
     images: std::collections::HashMap<u32, GpuImage>,
@@ -850,6 +1007,12 @@ struct Renderer {
     image_vertex_capacity: usize,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
+    canvas_vertex_buffer: wgpu::Buffer,
+    canvas_vertex_capacity: usize,
+    canvas_circle_vertex_buffer: wgpu::Buffer,
+    canvas_circle_vertex_capacity: usize,
+    canvas_bezier_vertex_buffer: wgpu::Buffer,
+    canvas_bezier_vertex_capacity: usize,
     text_runtime: Option<TextRuntime>,
     worker_runtime: Option<TextRuntime>,
     text_worker: Sender<TextWorkerMessage>,
@@ -860,6 +1023,8 @@ struct Renderer {
     adapter_name: String,
     format_name: String,
     present_mode_name: String,
+    backdrop: BackdropResources,
+    surface_copy_src: bool,
 }
 
 struct PositionedText {
@@ -1595,6 +1760,7 @@ impl Renderer {
         }));
 
         let capabilities = surface.get_capabilities(&adapter);
+        let surface_copy_src = capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC);
         let format = capabilities
             .formats
             .iter()
@@ -1626,7 +1792,8 @@ impl Renderer {
             .ok_or_else(|| "GPU surface has no alpha modes".to_string())?;
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | if surface_copy_src { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() },
             format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -1685,7 +1852,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[vertex_layout],
+                buffers: &[vertex_layout.clone()],
             },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -1698,6 +1865,226 @@ impl Renderer {
             }),
             multiview: None,
             cache: None,
+        });
+        let canvas_viewport_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Nasty canvas viewport binding"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: std::num::NonZeroU64::new(8),
+                },
+                count: None,
+            }],
+        });
+        let canvas_viewport_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Nasty canvas viewport"),
+            contents: bytemuck::cast_slice(&[config.width as f32, config.height as f32]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let canvas_viewport_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Nasty canvas viewport bind group"),
+            layout: &canvas_viewport_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: canvas_viewport_buffer.as_entire_binding() }],
+        });
+        let canvas_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty canvas pixel-coordinate shader"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                struct Viewport { size: vec2<f32> };
+                @group(0) @binding(0) var<uniform> viewport: Viewport;
+                struct VertexInput {
+                    @location(0) position: vec2<f32>,
+                    @location(1) color: vec4<f32>,
+                };
+                struct VertexOutput {
+                    @builtin(position) position: vec4<f32>,
+                    @location(0) color: vec4<f32>,
+                };
+                @vertex fn vs_main(input: VertexInput) -> VertexOutput {
+                    var output: VertexOutput;
+                    let x = input.position.x / viewport.size.x * 2.0 - 1.0;
+                    let y = 1.0 - input.position.y / viewport.size.y * 2.0;
+                    output.position = vec4<f32>(x, y, 0.0, 1.0);
+                    output.color = input.color;
+                    return output;
+                }
+                @fragment fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+                    return input.color;
+                }
+            "#.into()),
+        });
+        let canvas_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Nasty canvas pipeline layout"),
+            bind_group_layouts: &[&canvas_viewport_layout],
+            push_constant_ranges: &[],
+        });
+        let canvas_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Nasty canvas pixel-coordinate pipeline"),
+            layout: Some(&canvas_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &canvas_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[vertex_layout],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &canvas_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let canvas_circle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty canvas radial circle shader"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                struct Viewport { size: vec2<f32> };
+                @group(0) @binding(0) var<uniform> viewport: Viewport;
+                struct CircleInput {
+                    @location(0) center: vec2<f32>,
+                    @location(1) outer_radius: f32,
+                    @location(2) inner_radius: f32,
+                    @location(3) gradient_center: vec2<f32>,
+                    @location(4) gradient_radii: vec2<f32>,
+                    @location(5) inner_color: vec4<f32>,
+                    @location(6) outer_color: vec4<f32>,
+                };
+                struct CircleOutput {
+                    @builtin(position) position: vec4<f32>,
+                    @location(0) local: vec2<f32>,
+                    @location(1) center: vec2<f32>,
+                    @location(2) inner_radius: f32,
+                    @location(3) outer_radius: f32,
+                    @location(4) gradient_center: vec2<f32>,
+                    @location(5) gradient_radii: vec2<f32>,
+                    @location(6) inner_color: vec4<f32>,
+                    @location(7) outer_color: vec4<f32>,
+                };
+                @vertex fn vs_main(input: CircleInput, @builtin(vertex_index) vertex_index: u32) -> CircleOutput {
+                    let corners = array<vec2<f32>, 6>(
+                        vec2<f32>(-1.0,-1.0), vec2<f32>(1.0,-1.0), vec2<f32>(-1.0,1.0),
+                        vec2<f32>(-1.0,1.0), vec2<f32>(1.0,-1.0), vec2<f32>(1.0,1.0));
+                    let local = corners[vertex_index] * input.outer_radius;
+                    let point = input.center + local;
+                    var output: CircleOutput;
+                    output.position = vec4<f32>(point.x / viewport.size.x * 2.0 - 1.0,
+                        1.0 - point.y / viewport.size.y * 2.0, 0.0, 1.0);
+                    output.local = local;
+                    output.center = input.center;
+                    output.inner_radius = input.inner_radius;
+                    output.outer_radius = input.outer_radius;
+                    output.gradient_center = input.gradient_center;
+                    output.gradient_radii = input.gradient_radii;
+                    output.inner_color = input.inner_color;
+                    output.outer_color = input.outer_color;
+                    return output;
+                }
+                @fragment fn fs_main(input: CircleOutput) -> @location(0) vec4<f32> {
+                    let circle_distance = length(input.local);
+                    if (circle_distance > input.outer_radius || (input.inner_radius >= 0.0 && circle_distance < input.inner_radius)) { discard; }
+                    let gradient_distance = length(input.center + input.local - input.gradient_center);
+                    let t = clamp((gradient_distance - input.gradient_radii.x) / max(0.0001, input.gradient_radii.y - input.gradient_radii.x), 0.0, 1.0);
+                    return mix(input.inner_color, input.outer_color, t);
+                }
+            "#.into()),
+        });
+        const CIRCLE_ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
+            0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x2,
+            4 => Float32x2, 5 => Float32x4, 6 => Float32x4
+        ];
+        let circle_layout = wgpu::VertexBufferLayout {
+            array_stride: 16 * std::mem::size_of::<f32>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &CIRCLE_ATTRIBUTES,
+        };
+        let canvas_circle_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Nasty canvas radial circle pipeline"),
+            layout: Some(&canvas_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &canvas_circle_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[circle_layout],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &canvas_circle_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let canvas_bezier_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty canvas bezier stroke shader"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                struct Viewport { size: vec2<f32> };
+                @group(0) @binding(0) var<uniform> viewport: Viewport;
+                struct BezierInput {
+                    @location(0) p0: vec2<f32>, @location(1) p1: vec2<f32>,
+                    @location(2) p2: vec2<f32>, @location(3) p3: vec2<f32>,
+                    @location(4) half_width: f32, @location(5) color: vec4<f32>,
+                };
+                struct BezierOutput {
+                    @builtin(position) position: vec4<f32>,
+                    @location(0) color: vec4<f32>,
+                };
+                fn curve(input: BezierInput, t: f32) -> vec2<f32> {
+                    let s = 1.0 - t;
+                    return input.p0 * (s*s*s) + input.p1 * (3.0*s*s*t)
+                        + input.p2 * (3.0*s*t*t) + input.p3 * (t*t*t);
+                }
+                @vertex fn vs_main(input: BezierInput, @builtin(vertex_index) vertex_index: u32) -> BezierOutput {
+                    let segment = vertex_index / 6u;
+                    let corner = vertex_index % 6u;
+                    let a = curve(input, f32(segment) / 16.0);
+                    let b = curve(input, f32(segment + 1u) / 16.0);
+                    let direction = b - a;
+                    let normal = select(vec2<f32>(0.0, input.half_width), normalize(vec2<f32>(-direction.y, direction.x)) * input.half_width, dot(direction, direction) > 0.000001);
+                    var point = a + normal;
+                    switch corner {
+                        case 1u, 4u: { point = a - normal; }
+                        case 2u, 3u: { point = b + normal; }
+                        case 5u: { point = b - normal; }
+                        default: {}
+                    }
+                    var output: BezierOutput;
+                    output.position = vec4<f32>(point.x / viewport.size.x * 2.0 - 1.0,
+                        1.0 - point.y / viewport.size.y * 2.0, 0.0, 1.0);
+                    output.color = input.color;
+                    return output;
+                }
+                @fragment fn fs_main(input: BezierOutput) -> @location(0) vec4<f32> { return input.color; }
+            "#.into()),
+        });
+        const BEZIER_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+            0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2,
+            4 => Float32, 5 => Float32x4
+        ];
+        let bezier_layout = wgpu::VertexBufferLayout {
+            array_stride: 13 * std::mem::size_of::<f32>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &BEZIER_ATTRIBUTES,
+        };
+        let canvas_bezier_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Nasty canvas bezier stroke pipeline"),
+            layout: Some(&canvas_pipeline_layout),
+            vertex: wgpu::VertexState { module: &canvas_bezier_shader, entry_point: Some("vs_main"),
+                compilation_options: Default::default(), buffers: &[bezier_layout] },
+            primitive: wgpu::PrimitiveState::default(), depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState { module: &canvas_bezier_shader, entry_point: Some("fs_main"),
+                compilation_options: Default::default(), targets: &targets }),
+            multiview: None, cache: None,
         });
         let image_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1789,6 +2176,25 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let canvas_vertex_capacity = 4 * 1024 * 1024;
+        let canvas_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nasty canvas triangle vertices"),
+            size: canvas_vertex_capacity as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let canvas_circle_vertex_capacity = 64 * 1024;
+        let canvas_circle_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nasty canvas radial circle instances"),
+            size: canvas_circle_vertex_capacity as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let canvas_bezier_vertex_capacity = 64 * 1024;
+        let canvas_bezier_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nasty canvas bezier instances"), size: canvas_bezier_vertex_capacity as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
         // Create the first staging upload before the animation loop without
         // waiting for the GPU; the first real frame flushes this queued upload.
         let warmup_data = vec![0_u8; vertex_capacity];
@@ -1835,6 +2241,7 @@ impl Renderer {
             })
             .map_err(|error| format!("start text worker: {error}"))?;
 
+        let backdrop = BackdropResources::new(&device, format, config.width, config.height);
         Ok(Self {
             surface,
             device,
@@ -1843,6 +2250,11 @@ impl Renderer {
             alpha_modes: capabilities.alpha_modes.clone(),
             transparent,
             pipeline,
+            canvas_pipeline,
+            canvas_viewport_bind_group,
+            canvas_viewport_buffer,
+            canvas_circle_pipeline,
+            canvas_bezier_pipeline,
             image_pipeline,
             image_bind_group_layout,
             images: std::collections::HashMap::new(),
@@ -1851,6 +2263,12 @@ impl Renderer {
             image_vertex_capacity,
             vertex_buffer,
             vertex_capacity,
+            canvas_vertex_buffer,
+            canvas_vertex_capacity,
+            canvas_circle_vertex_buffer,
+            canvas_circle_vertex_capacity,
+            canvas_bezier_vertex_buffer,
+            canvas_bezier_vertex_capacity,
             text_runtime: Some(text_runtime),
             worker_runtime: Some(worker_runtime),
             text_worker,
@@ -1861,6 +2279,8 @@ impl Renderer {
             adapter_name,
             format_name,
             present_mode_name,
+            backdrop,
+            surface_copy_src,
         })
     }
 
@@ -1952,7 +2372,10 @@ impl Renderer {
         }
         self.config.width = width;
         self.config.height = height;
+        self.queue.write_buffer(&self.canvas_viewport_buffer, 0,
+            bytemuck::cast_slice(&[width as f32, height as f32]));
         self.surface.configure(&self.device, &self.config);
+        self.backdrop = BackdropResources::new(&self.device, self.config.format, width, height);
         if let Some(runtime) = self.text_runtime.as_mut() {
             runtime
                 .text_viewport
@@ -1977,6 +2400,8 @@ impl Renderer {
         window: &OsWindow,
         list: &[f32],
         triangles: &[f32],
+        circles: &[f32],
+        beziers: &[f32],
         image_draws: &[ImageDraw],
         draw_order: &[DrawOrder],
     ) -> std::result::Result<RenderTimings, String> {
@@ -1985,6 +2410,7 @@ impl Renderer {
         let mut vertices = Vec::with_capacity((list.len() / 8) * 6);
         let width = self.config.width as f32;
         let height = self.config.height as f32;
+        let canvas_direct = draw_order.iter().any(|command| matches!(command, DrawOrder::CanvasProgram { .. }));
         for quad in list.chunks_exact(8) {
             let [x, y, w, h, r, g, b, a] = [
                 quad[0], quad[1], quad[2], quad[3], quad[4], quad[5], quad[6], quad[7],
@@ -2022,13 +2448,53 @@ impl Renderer {
             ]);
         }
         let triangle_vertex_offset = vertices.len() as u32;
-        for vertex in triangles.chunks_exact(6) {
-            let x = vertex[0] / width * 2.0 - 1.0;
-            let y = 1.0 - vertex[1] / height * 2.0;
-            vertices.push(Vertex {
-                position: [x, y],
-                color: [vertex[2], vertex[3], vertex[4], vertex[5]],
-            });
+        if canvas_direct {
+            let bytes = std::mem::size_of_val(triangles);
+            if bytes > self.canvas_vertex_capacity {
+                self.canvas_vertex_capacity = bytes.next_power_of_two();
+                self.canvas_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Nasty canvas triangle vertices"),
+                    size: self.canvas_vertex_capacity as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if !triangles.is_empty() {
+                self.queue.write_buffer(&self.canvas_vertex_buffer, 0, bytemuck::cast_slice(triangles));
+            }
+            let circle_bytes = std::mem::size_of_val(circles);
+            if circle_bytes > self.canvas_circle_vertex_capacity {
+                self.canvas_circle_vertex_capacity = circle_bytes.next_power_of_two();
+                self.canvas_circle_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Nasty canvas radial circle instances"),
+                    size: self.canvas_circle_vertex_capacity as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if !circles.is_empty() {
+                self.queue.write_buffer(&self.canvas_circle_vertex_buffer, 0, bytemuck::cast_slice(circles));
+            }
+            let bezier_bytes = std::mem::size_of_val(beziers);
+            if bezier_bytes > self.canvas_bezier_vertex_capacity {
+                self.canvas_bezier_vertex_capacity = bezier_bytes.next_power_of_two();
+                self.canvas_bezier_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Nasty canvas bezier instances"), size: self.canvas_bezier_vertex_capacity as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+                });
+            }
+            if !beziers.is_empty() {
+                self.queue.write_buffer(&self.canvas_bezier_vertex_buffer, 0, bytemuck::cast_slice(beziers));
+            }
+        } else {
+            for vertex in triangles.chunks_exact(6) {
+                let x = vertex[0] / width * 2.0 - 1.0;
+                let y = 1.0 - vertex[1] / height * 2.0;
+                vertices.push(Vertex {
+                    position: [x, y],
+                    color: [vertex[2], vertex[3], vertex[4], vertex[5]],
+                });
+            }
         }
         let bytes = bytemuck::cast_slice(&vertices);
         if bytes.len() > self.vertex_capacity {
@@ -2225,112 +2691,156 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Nasty frame encoder"),
             });
-        {
-            let attachments = [Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(if self.transparent {
+        if draw_order.iter().any(|command| matches!(command, DrawOrder::BackdropBlur { .. })) {
+            {
+                let attachments = [Some(wgpu::RenderPassColorAttachment {
+                    view: &view, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(if self.transparent {
                         wgpu::Color::TRANSPARENT
-                    } else {
-                        wgpu::Color { r: 0.035, g: 0.047, b: 0.078, a: 1.0 }
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Nasty display list pass"),
-                color_attachments: &attachments,
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            if draw_order.is_empty() {
-                if !vertices.is_empty() {
-                    pass.set_pipeline(&self.pipeline);
-                    pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                    pass.draw(0..vertices.len() as u32, 0..1);
+                    } else { wgpu::Color { r: 0.035, g: 0.047, b: 0.078, a: 1.0 } }), store: wgpu::StoreOp::Store },
+                })];
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Nasty backdrop frame clear"), color_attachments: &attachments,
+                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                });
+            }
+            for command in draw_order {
+                if let DrawOrder::BackdropBlur { x, y, width, height, radius } = command {
+                    if !self.surface_copy_src {
+                        return Err("GPU surface does not support copy-out required for backdrop-filter".into());
+                    }
+                    self.encode_backdrop_blur(&mut encoder, &frame.texture, *x, *y, *width, *height, *radius)?;
+                    continue;
                 }
-                for batch in image_batches.iter().flatten() {
-                    let (texture_id, range, x, y, w, h) = batch;
-                    pass.set_pipeline(&self.image_pipeline);
-                    pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
-                    pass.set_scissor_rect(*x, *y, *w, *h);
-                    let image = &self.images[texture_id];
-                    pass.set_bind_group(0, &image.bind_group, &[]);
-                    pass.draw(range.clone(), 0..1);
-                }
-                pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
-            } else {
-                for command in draw_order {
-                    match command {
-                        DrawOrder::Solids(range) => {
-                            pass.set_pipeline(&self.pipeline);
-                            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
-                            pass.draw(range.clone(), 0..1);
-                        }
-                        DrawOrder::Triangles(range) => {
-                            pass.set_pipeline(&self.pipeline);
-                            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
-                            pass.draw(
-                                (triangle_vertex_offset + range.start)
-                                    ..(triangle_vertex_offset + range.end),
-                                0..1,
-                            );
-                        }
-                        DrawOrder::CanvasTriangles {
-                            range,
-                            clip_x,
-                            clip_y,
-                            clip_width,
-                            clip_height,
-                        } => {
-                            let left = clip_x.floor().clamp(0.0, width as f64) as u32;
-                            let top = clip_y.floor().clamp(0.0, height as f64) as u32;
-                            let right = (*clip_x + *clip_width).ceil().clamp(0.0, width as f64) as u32;
-                            let bottom = (*clip_y + *clip_height).ceil().clamp(0.0, height as f64) as u32;
-                            if right <= left || bottom <= top {
-                                continue;
+                let attachments = [Some(wgpu::RenderPassColorAttachment {
+                    view: &view, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Nasty ordered display command"), color_attachments: &attachments,
+                    depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+                });
+                match command {
+                    DrawOrder::Solids(range) => {
+                        pass.set_pipeline(&self.pipeline); pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                        pass.draw(range.clone(), 0..1);
+                    }
+                    DrawOrder::Triangles(range) => {
+                        pass.set_pipeline(&self.pipeline); pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                        pass.draw((triangle_vertex_offset + range.start)..(triangle_vertex_offset + range.end), 0..1);
+                    }
+                    DrawOrder::CanvasProgram { commands, clip_x, clip_y, clip_width, clip_height } => {
+                        let left = clip_x.floor().clamp(0.0, width as f64) as u32;
+                        let top = clip_y.floor().clamp(0.0, height as f64) as u32;
+                        let right = (*clip_x + *clip_width).ceil().clamp(0.0, width as f64) as u32;
+                        let bottom = (*clip_y + *clip_height).ceil().clamp(0.0, height as f64) as u32;
+                        if right > left && bottom > top {
+                            pass.set_scissor_rect(left, top, right-left, bottom-top);
+                            for primitive in commands {
+                                match primitive {
+                                    CanvasCommand::Triangles(range) if !range.is_empty() => {
+                                        pass.set_pipeline(&self.canvas_pipeline);
+                                        pass.set_bind_group(0, &self.canvas_viewport_bind_group, &[]);
+                                        pass.set_vertex_buffer(0, self.canvas_vertex_buffer.slice(..));
+                                        pass.draw(range.clone(), 0..1);
+                                    }
+                                    CanvasCommand::Circles(range) if !range.is_empty() => {
+                                        pass.set_pipeline(&self.canvas_circle_pipeline);
+                                        pass.set_bind_group(0, &self.canvas_viewport_bind_group, &[]);
+                                        pass.set_vertex_buffer(0, self.canvas_circle_vertex_buffer.slice(..));
+                                        pass.draw(0..6, range.clone());
+                                    }
+                                    CanvasCommand::Beziers(range) if !range.is_empty() => {
+                                        pass.set_pipeline(&self.canvas_bezier_pipeline);
+                                        pass.set_bind_group(0, &self.canvas_viewport_bind_group, &[]);
+                                        pass.set_vertex_buffer(0, self.canvas_bezier_vertex_buffer.slice(..));
+                                        pass.draw(0..96, range.clone());
+                                    }
+                                    _ => {}
+                                }
                             }
-                            pass.set_pipeline(&self.pipeline);
-                            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                            pass.set_scissor_rect(left, top, right - left, bottom - top);
-                            pass.draw(
-                                (triangle_vertex_offset + range.start)
-                                    ..(triangle_vertex_offset + range.end),
-                                0..1,
-                            );
-                            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                         }
-                        DrawOrder::Image(index) => {
-                            let Some((texture_id, range, x, y, w, h)) =
-                                image_batches.get(*index).and_then(Option::as_ref)
-                            else {
-                                continue;
-                            };
-                            pass.set_pipeline(&self.image_pipeline);
-                            pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
-                            pass.set_scissor_rect(*x, *y, *w, *h);
-                            let image = &self.images[texture_id];
-                            pass.set_bind_group(0, &image.bind_group, &[]);
+                    }
+                    DrawOrder::CanvasTriangles { range, clip_x, clip_y, clip_width, clip_height } => {
+                        let left = clip_x.floor().clamp(0.0, width as f64) as u32;
+                        let top = clip_y.floor().clamp(0.0, height as f64) as u32;
+                        let right = (*clip_x + *clip_width).ceil().clamp(0.0, width as f64) as u32;
+                        let bottom = (*clip_y + *clip_height).ceil().clamp(0.0, height as f64) as u32;
+                        if right > left && bottom > top {
+                            pass.set_pipeline(&self.canvas_pipeline); pass.set_bind_group(0, &self.canvas_viewport_bind_group, &[]);
+                            pass.set_vertex_buffer(0, self.canvas_vertex_buffer.slice(..));
+                            pass.set_scissor_rect(left, top, right-left, bottom-top);
                             pass.draw(range.clone(), 0..1);
                         }
                     }
+                    DrawOrder::Image(index) => if let Some((texture_id, range, x, y, w, h)) = image_batches.get(*index).and_then(Option::as_ref) {
+                        pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
+                        pass.set_scissor_rect(*x, *y, *w, *h);
+                        pass.set_bind_group(0, &self.images[texture_id].bind_group, &[]); pass.draw(range.clone(), 0..1);
+                    },
+                    DrawOrder::BackdropBlur { .. } => unreachable!(),
                 }
-                pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
             }
-            if let Some(runtime) = self
-                .text_runtime
-                .as_ref()
-                .filter(|runtime| !runtime.text_buffers.is_empty())
-            {
+            if let Some(runtime) = self.text_runtime.as_ref().filter(|runtime| !runtime.text_buffers.is_empty()) {
                 if let Some(text_renderer) = runtime.text_renderer.as_ref() {
-                    text_renderer
-                        .render(&runtime.text_atlas, &runtime.text_viewport, &mut pass)
+                    let attachments = [Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })];
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty text pass"),
+                        color_attachments: &attachments, depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+                    text_renderer.render(&runtime.text_atlas, &runtime.text_viewport, &mut pass)
                         .map_err(|error| format!("render text: {error}"))?;
                 }
+            }
+        } else {
+            let attachments = [Some(wgpu::RenderPassColorAttachment {
+                view: &view, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(if self.transparent {
+                    wgpu::Color::TRANSPARENT
+                } else { wgpu::Color { r: 0.035, g: 0.047, b: 0.078, a: 1.0 } }), store: wgpu::StoreOp::Store },
+            })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty display list pass"),
+                color_attachments: &attachments, depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+            if draw_order.is_empty() {
+                if !vertices.is_empty() { pass.set_pipeline(&self.pipeline); pass.set_vertex_buffer(0, self.vertex_buffer.slice(..)); pass.draw(0..vertices.len() as u32, 0..1); }
+                for batch in image_batches.iter().flatten() {
+                    let (texture_id, range, x, y, w, h) = batch;
+                    pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
+                    pass.set_scissor_rect(*x, *y, *w, *h); pass.set_bind_group(0, &self.images[texture_id].bind_group, &[]); pass.draw(range.clone(), 0..1);
+                }
+            } else {
+                for command in draw_order {
+                    match command {
+                        DrawOrder::Solids(range) => { pass.set_pipeline(&self.pipeline); pass.set_vertex_buffer(0, self.vertex_buffer.slice(..)); pass.draw(range.clone(), 0..1); }
+                        DrawOrder::Triangles(range) => { pass.set_pipeline(&self.pipeline); pass.set_vertex_buffer(0, self.vertex_buffer.slice(..)); pass.draw((triangle_vertex_offset + range.start)..(triangle_vertex_offset + range.end), 0..1); }
+                        DrawOrder::CanvasProgram { commands, clip_x, clip_y, clip_width, clip_height } => {
+                            let left=clip_x.floor().clamp(0.0,width as f64) as u32; let top=clip_y.floor().clamp(0.0,height as f64) as u32;
+                            let right=(*clip_x+*clip_width).ceil().clamp(0.0,width as f64) as u32; let bottom=(*clip_y+*clip_height).ceil().clamp(0.0,height as f64) as u32;
+                            if right>left && bottom>top {
+                                pass.set_scissor_rect(left,top,right-left,bottom-top);
+                                for primitive in commands {
+                                    match primitive {
+                                        CanvasCommand::Triangles(range) if !range.is_empty() => { pass.set_pipeline(&self.canvas_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_vertex_buffer.slice(..)); pass.draw(range.clone(),0..1); }
+                                        CanvasCommand::Circles(range) if !range.is_empty() => { pass.set_pipeline(&self.canvas_circle_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_circle_vertex_buffer.slice(..)); pass.draw(0..6,range.clone()); }
+                                        CanvasCommand::Beziers(range) if !range.is_empty() => { pass.set_pipeline(&self.canvas_bezier_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_bezier_vertex_buffer.slice(..)); pass.draw(0..96,range.clone()); }
+                                        _ => {}
+                                    }
+                                }
+                                pass.set_scissor_rect(0,0,self.config.width,self.config.height);
+                            }
+                        }
+                        DrawOrder::CanvasTriangles { range, clip_x, clip_y, clip_width, clip_height } => {
+                            let left=clip_x.floor().clamp(0.0,width as f64) as u32; let top=clip_y.floor().clamp(0.0,height as f64) as u32;
+                            let right=(*clip_x+*clip_width).ceil().clamp(0.0,width as f64) as u32; let bottom=(*clip_y+*clip_height).ceil().clamp(0.0,height as f64) as u32;
+                            if right>left && bottom>top { pass.set_pipeline(&self.canvas_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_vertex_buffer.slice(..)); pass.set_scissor_rect(left,top,right-left,bottom-top); pass.draw(range.clone(),0..1); pass.set_scissor_rect(0,0,self.config.width,self.config.height); }
+                        }
+                        DrawOrder::Image(index) => if let Some((texture_id,range,x,y,w,h))=image_batches.get(*index).and_then(Option::as_ref) { pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0,self.image_vertex_buffer.slice(..)); pass.set_scissor_rect(*x,*y,*w,*h); pass.set_bind_group(0,&self.images[texture_id].bind_group,&[]); pass.draw(range.clone(),0..1); },
+                        DrawOrder::BackdropBlur { .. } => unreachable!(),
+                    }
+                }
+            }
+            pass.set_scissor_rect(0,0,self.config.width,self.config.height);
+            if let Some(runtime) = self.text_runtime.as_ref().filter(|runtime| !runtime.text_buffers.is_empty()) {
+                if let Some(text_renderer) = runtime.text_renderer.as_ref() { text_renderer.render(&runtime.text_atlas,&runtime.text_viewport,&mut pass).map_err(|error|format!("render text: {error}"))?; }
             }
         }
         let submit_started = Instant::now();
@@ -2346,6 +2856,55 @@ impl Renderer {
             submit_ms,
             present_ms,
         })
+    }
+
+    fn encode_backdrop_blur(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        surface: &wgpu::Texture,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: f32,
+    ) -> std::result::Result<(), String> {
+        if width <= 0.0 || height <= 0.0 { return Ok(()); }
+        let resources = &self.backdrop;
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: surface, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &resources.source, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: resources.width, height: resources.height, depth_or_array_layers: 1 },
+        );
+        let sigma = (radius.max(0.0) / 12.0).max(0.5);
+        self.queue.write_buffer(&resources.horizontal_params, 0, bytemuck::cast_slice(&[1.0_f32, 0.0, sigma, 0.0]));
+        self.queue.write_buffer(&resources.vertical_params, 0, bytemuck::cast_slice(&[0.0_f32, 1.0, sigma, 0.0]));
+        for (label, texture, pipeline, bind_group, w, h) in [
+            ("Nasty backdrop downsample", &resources.small, &resources.downsample_pipeline, &resources.downsample_bind, resources.small_width, resources.small_height),
+            ("Nasty backdrop horizontal", &resources.horizontal, &resources.blur_pipeline, &resources.horizontal_bind, resources.small_width, resources.small_height),
+            ("Nasty backdrop vertical", &resources.blurred, &resources.blur_pipeline, &resources.vertical_bind, resources.small_width, resources.small_height),
+        ] {
+            let target = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let attachments = [Some(wgpu::RenderPassColorAttachment { view: &target, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some(label), color_attachments: &attachments,
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            pass.set_pipeline(pipeline); pass.set_bind_group(0, bind_group, &[]); pass.draw(0..3, 0..1);
+        }
+        let left = x.floor().clamp(0.0, self.config.width as f32) as u32;
+        let top = y.floor().clamp(0.0, self.config.height as f32) as u32;
+        let right = (x + width).ceil().clamp(0.0, self.config.width as f32) as u32;
+        let bottom = (y + height).ceil().clamp(0.0, self.config.height as f32) as u32;
+        if right > left && bottom > top {
+            let surface_view = surface.create_view(&wgpu::TextureViewDescriptor::default());
+            let attachments = [Some(wgpu::RenderPassColorAttachment { view: &surface_view, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty backdrop composite"), color_attachments: &attachments,
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+            pass.set_scissor_rect(left, top, right-left, bottom-top);
+            pass.set_pipeline(&resources.composite_pipeline); pass.set_bind_group(0, &resources.composite_bind, &[]); pass.draw(0..3, 0..1);
+        }
+        Ok(())
     }
 
     fn request_text_runs(
@@ -2997,6 +3556,8 @@ struct WindowApp {
     modifiers: ModifiersState,
     display_list: Vec<f32>,
     display_triangles: Vec<f32>,
+    display_circles: Vec<f32>,
+    display_beziers: Vec<f32>,
     image_draws: Vec<ImageDraw>,
     draw_order: Vec<DrawOrder>,
     render_pending: bool,
@@ -3288,6 +3849,8 @@ impl ApplicationHandler for WindowApp {
                     window,
                     &self.display_list,
                     &self.display_triangles,
+                    &self.display_circles,
+                    &self.display_beziers,
                     &self.image_draws,
                     &self.draw_order,
                 ) {
@@ -4009,6 +4572,34 @@ impl Window {
         Ok(())
     }
 
+    #[napi(js_name = "updateImageTextureRegion")]
+    pub fn update_image_texture_region(
+        &mut self,
+        texture_id: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        pixels: Buffer,
+    ) -> Result<()> {
+        let renderer = self.app.renderer.as_ref().ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        let image = renderer.images.get(&texture_id).ok_or_else(|| Error::new(Status::InvalidArg, "unknown image texture"))?;
+        if width == 0 || height == 0 || x.checked_add(width).is_none_or(|right| right > image.width)
+            || y.checked_add(height).is_none_or(|bottom| bottom > image.height)
+            || pixels.len() != width as usize * height as usize * 4
+        {
+            return Err(Error::new(Status::InvalidArg, "image region is outside the texture or has an invalid byte length"));
+        }
+        renderer.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &image._texture, mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+            pixels.as_ref(),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        Ok(())
+    }
+
     #[napi(js_name = "presentWithImages")]
     pub fn present_with_images(
         &mut self,
@@ -4019,12 +4610,38 @@ impl Window {
     }
 
     #[napi(js_name = "presentOrdered")]
-    pub fn present_ordered(&mut self, display_list: Buffer) -> Result<PresentStats> {
+    pub fn present_ordered(
+        &mut self,
+        display_list: Buffer,
+        canvas_triangles: Option<Buffer>,
+        canvas_circles: Option<Buffer>,
+        canvas_beziers: Option<Buffer>,
+        canvas_operations: Option<Buffer>,
+    ) -> Result<PresentStats> {
+        let input_started = Instant::now();
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
-        let (quads, images, order) = parse_ordered_display_list(display_list.as_ref())?;
-        self.present_parsed(quads, Vec::new(), images, order)
+        let triangles = canvas_triangles.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        let circles = canvas_circles.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        let beziers = canvas_beziers.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        let operations = canvas_operations.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        if canvas_triangles.as_ref().is_some_and(|buffer| buffer.len() % 24 != 0) {
+            return Err(Error::new(Status::InvalidArg, "canvas triangle buffer must contain complete vertices"));
+        }
+        if circles.len() % 16 != 0 || circles.iter().any(|value| !value.is_finite())
+            || beziers.len() % 13 != 0 || beziers.iter().any(|value| !value.is_finite())
+            || operations.len() % 3 != 0 || operations.iter().any(|value| !value.is_finite())
+        {
+            return Err(Error::new(Status::InvalidArg, "canvas circle or operation buffer is malformed"));
+        }
+        if triangles.iter().any(|value| !value.is_finite()) {
+            return Err(Error::new(Status::InvalidArg, "canvas triangle vertices must be finite"));
+        }
+        let (quads, images, order) = parse_ordered_display_list(display_list.as_ref(), (triangles.len() / 6) as u32, (circles.len() / 16) as u32, (beziers.len() / 13) as u32, &operations)?;
+        let mut stats = self.present_parsed(quads, triangles, circles, beziers, images, order)?;
+        stats.input_ms = input_started.elapsed().as_secs_f64() * 1000.0 - stats.event_loop_ms;
+        Ok(stats)
     }
 
     #[napi(js_name = "presentTransformed")]
@@ -4033,8 +4650,18 @@ impl Window {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
         let (triangles, images, order) = parse_transformed_display_list(display_list.as_ref())?;
-        self.present_parsed(Vec::new(), triangles, images, order)
+        self.present_parsed(Vec::new(), triangles, Vec::new(), Vec::new(), images, order)
     }
+}
+
+fn copy_f32_buffer(bytes: &[u8]) -> Vec<f32> {
+    #[cfg(target_endian = "little")]
+    if let Ok(values) = bytemuck::try_cast_slice::<u8, f32>(bytes) {
+        return values.to_vec();
+    }
+    bytes.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
 }
 
 impl Window {
@@ -4047,18 +4674,23 @@ impl Window {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
         let list = parse_display_list(display_list.as_ref())?;
-        self.present_parsed(list, Vec::new(), images, Vec::new())
+        self.present_parsed(list, Vec::new(), Vec::new(), Vec::new(), images, Vec::new())
     }
 
     fn present_parsed(
         &mut self,
         list: Vec<f32>,
         triangles: Vec<f32>,
+        circles: Vec<f32>,
+        beziers: Vec<f32>,
         images: Vec<ImageDraw>,
         order: Vec<DrawOrder>,
     ) -> Result<PresentStats> {
+        let event_loop_started = Instant::now();
         self.app.display_list = list;
         self.app.display_triangles = triangles;
+        self.app.display_circles = circles;
+        self.app.display_beziers = beziers;
         self.app.image_draws = images;
         self.app.draw_order = order;
         self.app.render_pending = true;
@@ -4082,6 +4714,8 @@ impl Window {
             acquire_ms: self.app.last_acquire_ms,
             submit_ms: self.app.last_submit_ms,
             present_ms: self.app.last_present_ms,
+            input_ms: 0.0,
+            event_loop_ms: event_loop_started.elapsed().as_secs_f64() * 1000.0,
         })
     }
 }
@@ -4142,7 +4776,7 @@ fn parse_display_list(bytes: &[u8]) -> Result<Vec<f32>> {
     Ok(values[1..].to_vec())
 }
 
-fn parse_ordered_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<ImageDraw>, Vec<DrawOrder>)> {
+fn parse_ordered_display_list(bytes: &[u8], canvas_vertex_count: u32, canvas_circle_count: u32, canvas_bezier_count: u32, canvas_operations: &[f32]) -> Result<(Vec<f32>, Vec<ImageDraw>, Vec<DrawOrder>)> {
     if bytes.len() < 8 || bytes.len() % 4 != 0 {
         return Err(Error::new(
             Status::InvalidArg,
@@ -4230,6 +4864,33 @@ fn parse_ordered_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<ImageDraw>,
                 });
                 order.push(DrawOrder::Image(image_index));
             }
+            2.0 => {
+                if record[3] < 0.0 || record[4] < 0.0 || record[5] < 0.0 {
+                    return Err(Error::new(Status::InvalidArg, "backdrop blur has invalid bounds or radius"));
+                }
+                order.push(DrawOrder::BackdropBlur {
+                    x: record[1], y: record[2], width: record[3], height: record[4], radius: record[5],
+                });
+            }
+            3.0 => {
+                let start = record[1];
+                let count = record[2];
+                if start < 0.0 || count < 0.0 || start.fract() != 0.0 || count.fract() != 0.0
+                    || start + count > canvas_vertex_count as f32 || (count as u32) % 3 != 0
+                    || record[5] < 0.0 || record[6] < 0.0
+                {
+                    return Err(Error::new(Status::InvalidArg, "canvas triangle command has invalid range or clip"));
+                }
+                let fallback = (start as u32)..((start + count) as u32);
+                let commands = parse_canvas_operations(canvas_operations, canvas_vertex_count, canvas_circle_count, canvas_bezier_count, fallback)?;
+                order.push(DrawOrder::CanvasProgram {
+                    commands,
+                    clip_x: record[3] as f64,
+                    clip_y: record[4] as f64,
+                    clip_width: record[5] as f64,
+                    clip_height: record[6] as f64,
+                });
+            }
             _ => {
                 return Err(Error::new(
                     Status::InvalidArg,
@@ -4239,6 +4900,32 @@ fn parse_ordered_display_list(bytes: &[u8]) -> Result<(Vec<f32>, Vec<ImageDraw>,
         }
     }
     Ok((quads, images, order))
+}
+
+fn parse_canvas_operations(values: &[f32], triangle_vertex_count: u32, circle_count: u32, bezier_count: u32,
+    fallback: std::ops::Range<u32>) -> Result<Vec<CanvasCommand>> {
+    if values.is_empty() {
+        return Ok(if fallback.is_empty() { Vec::new() } else { vec![CanvasCommand::Triangles(fallback)] });
+    }
+    if values.len() % 3 != 0 { return Err(Error::new(Status::InvalidArg, "canvas operation buffer must contain complete records")); }
+    let mut commands = Vec::with_capacity(values.len() / 3);
+    for record in values.chunks_exact(3) {
+        let [kind, start, count] = [record[0], record[1], record[2]];
+        if [kind, start, count].iter().any(|value| !value.is_finite() || value.fract() != 0.0)
+            || start < 0.0 || count < 0.0
+        { return Err(Error::new(Status::InvalidArg, "canvas operation has an invalid range")); }
+        let start = start as u32; let count = count as u32;
+        match kind as u32 {
+            0 if start.checked_add(count).is_some_and(|end| end <= triangle_vertex_count) && count % 3 == 0 =>
+                commands.push(CanvasCommand::Triangles(start..start + count)),
+            1 if start.checked_add(count).is_some_and(|end| end <= circle_count) =>
+                commands.push(CanvasCommand::Circles(start..start + count)),
+            2 if start.checked_add(count).is_some_and(|end| end <= bezier_count) =>
+                commands.push(CanvasCommand::Beziers(start..start + count)),
+            _ => return Err(Error::new(Status::InvalidArg, "canvas operation references an invalid primitive range")),
+        }
+    }
+    Ok(commands)
 }
 
 fn parse_transformed_display_list(

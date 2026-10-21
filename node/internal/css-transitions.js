@@ -29,6 +29,10 @@ export function computedStyleValue(style, property) {
     : style[property];
 }
 
+export function hasActiveStyleTransition(style) {
+  return (styleTransitionStates.get(style)?.transitions.size ?? 0) > 0;
+}
+
 const kebab = (name) => name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
 const sameColor = (a, b) => a.every((value, i) => Math.abs(value - b[i]) < 1e-6);
 const distance = (a, b) => Math.hypot(...a.map((value, i) => value - b[i]));

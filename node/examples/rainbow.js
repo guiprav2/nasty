@@ -1,9 +1,9 @@
 // Native host for Rainbow. UI construction uses createElement + inline styles;
 // the application code follows the original's process graph and interactions.
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile, execFileSync, spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import os from 'node:os';
 import vm from 'node:vm';
 import { createInterface } from 'node:readline';
@@ -12,8 +12,8 @@ import { Command, InvalidArgumentError } from 'commander';
 import { Window, Document, closeImageDecoder } from '../index.js';
 import { documentState, documentBoxes, layoutDocument } from '../internal/dom-state.js';
 import { inherited } from '../internal/text-metrics.js';
-import { rasterizeDocument, rasterTimings, paintProfile } from '../internal/raster-document.js';
 import { createRainbowUI } from './rainbow/ui.js';
+import { ProcessSampler } from './rainbow/process-sampler.js';
 
 function parseUsageScale(value) {
   const multiplier = Number(value);
@@ -92,8 +92,10 @@ function traceCommandLine(proc) {
   if (appendTraceLine(commandLine)) tracedCommandLines.set(proc.pid, proc.commandLine);
 }
 
-let previousSamples = new Map();
 let cachedProcessPids = null;
+const processSampler = new ProcessSampler();
+let resolveInitialProcessSnapshot;
+const initialProcessSnapshotReady = new Promise(resolve => { resolveInitialProcessSnapshot = resolve; });
 let stopped = false;
 let procConnector = null, procConnectorRetry = null, processRefreshTimer = null, lastEventSnapshotAt = 0;
 const pendingProcEvents = new Map();
@@ -101,7 +103,6 @@ let windowEvents = null, structureEvents = null;
 let fallbackRefreshTimer = null, windowRefreshTimer = null, windowRefreshQueued = false;
 let cachedWindows = [], latestProcesses = [], latestProcessSnapshot = null, windowSignature = null;
 const directStreams = new Set();
-const ticksPerSecond = (() => { try { return Number(execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8', timeout: 500 })) || 100; } catch { return 100; } })();
 const windowCaptures = new Map();
 let requestedWindowIds = new Set();
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -158,132 +159,6 @@ function startProcConnector() {
   });
 }
 
-function readProcessRecord(pid) {
-  try {
-    const base = `/proc/${pid}`;
-    const argv = fs.readFileSync(`${base}/cmdline`).toString().split('\0').filter(Boolean);
-    const stat = fs.readFileSync(`${base}/stat`, 'utf8');
-    const end = stat.lastIndexOf(')');
-    if (end < 0) return null;
-    const fields = stat.slice(end + 2).split(' ');
-    const comm = stat.slice(stat.indexOf('(') + 1, end);
-    let rssBytes = 0, readBytes = 0, writeBytes = 0;
-    try { rssBytes = Number(fs.readFileSync(`${base}/status`, 'utf8').match(/^VmRSS:\s+(\d+)\s+kB/m)?.[1]) * 1024 || 0; } catch { /* Optional process metric. */ }
-    try {
-      const io = fs.readFileSync(`${base}/io`, 'utf8');
-      readBytes = Number(io.match(/^read_bytes:\s+(\d+)/m)?.[1]) || 0;
-      writeBytes = Number(io.match(/^write_bytes:\s+(\d+)/m)?.[1]) || 0;
-    } catch { /* Process I/O counters may be restricted. */ }
-    const executable = argv[0] || comm;
-    const label = [path.basename(executable), ...argv.slice(1).map(arg => {
-      if (/^\d+$/.test(arg) || /^\/(tmp|run|var\/tmp)\//.test(arg)) return '…';
-      return arg.length > 100 ? `${arg.slice(0, 96)}…` : arg;
-    })].join(' ');
-    return { pid, ppid: Number(fields[1]) || 0, name: comm, executable: path.basename(executable), label: label || comm,
-      commandLine: argv.join(' ') || comm, cpuTicks: Number(fields[11]) + Number(fields[12]), rssBytes, readBytes, writeBytes };
-  } catch { return null; }
-}
-
-function readProcesses(refreshProcessList = true) {
-  if (process.platform !== 'linux') return { processes: [], platform: process.platform, error: 'Live process discovery currently requires Linux (/proc).' };
-  let entries;
-  try {
-    if (refreshProcessList || cachedProcessPids === null) cachedProcessPids = fs.readdirSync('/proc').filter(name => /^\d+$/.test(name));
-    entries = cachedProcessPids;
-  }
-  catch (error) { return { processes: [], platform: process.platform, error: error.message }; }
-  const sampledAt = Date.now();
-  let systemMemoryBytes = 0;
-  try { systemMemoryBytes = Number(fs.readFileSync('/proc/meminfo', 'utf8').match(/^MemTotal:\s+(\d+)\s+kB/m)?.[1]) * 1024 || 0; } catch { /* Optional metric. */ }
-  const processes = [];
-  for (const entry of entries) {
-    const proc = readProcessRecord(Number(entry));
-    if (proc) processes.push(proc);
-  }
-  // Keep Rainbow (and any helpers it launches) out of its own process tree.
-  const byPid = new Map(processes.map(proc => [proc.pid, proc]));
-  const excluded = new Set([process.pid]);
-  for (const proc of processes) {
-    let parent = proc.ppid;
-    const visited = new Set();
-    while (parent && !visited.has(parent)) {
-      if (parent === process.pid || excluded.has(parent)) { excluded.add(proc.pid); break; }
-      visited.add(parent);
-      parent = byPid.get(parent)?.ppid || 0;
-    }
-  }
-  const visible = processes.filter(proc => !excluded.has(proc.pid));
-  // Command tracing covers the full process set, independently of the graph's --net-only filter.
-  for (const proc of visible) traceCommandLine(proc);
-  const socketOwners = new Map();
-  for (const proc of visible) {
-    try {
-      for (const fd of fs.readdirSync(`/proc/${proc.pid}/fd`)) {
-        const match = /^socket:\[(\d+)\]$/.exec(fs.readlinkSync(`/proc/${proc.pid}/fd/${fd}`));
-        if (match) {
-          const owners = socketOwners.get(match[1]) || [];
-          owners.push(proc.pid); socketOwners.set(match[1], owners);
-        }
-      }
-    } catch { /* Process or descriptors disappeared while sampling. */ }
-  }
-  const socketCounts = new Map(), active = new Set();
-  for (const table of ['tcp', 'tcp6', 'udp', 'udp6']) {
-    try {
-      const rows = fs.readFileSync(`/proc/net/${table}`, 'utf8').trim().split('\n').slice(1);
-      for (const row of rows) {
-        const fields = row.trim().split(/\s+/);
-        const local = fields[1], remote = fields[2], state = fields[3], inode = fields[9];
-        const tcpLive = table.startsWith('tcp') && ['01', '02', '03', '04', '05', '06', '0A'].includes(state);
-        const udpOpen = table.startsWith('udp') && Number.parseInt((local || '').split(':').at(-1), 16) > 0;
-        if (!tcpLive && !udpOpen) continue;
-        for (const pid of socketOwners.get(inode) || []) {
-          active.add(pid); socketCounts.set(pid, (socketCounts.get(pid) || 0) + 1);
-        }
-      }
-    } catch { /* Network namespace may not expose this table. */ }
-  }
-  const networkBytes = new Map();
-  let networkRatesAvailable = false;
-  try {
-    const lines = execFileSync('ss', ['-tinpH'], { encoding: 'utf8', timeout: 1200, maxBuffer: 4 * 1024 * 1024 }).split('\n');
-    networkRatesAvailable = true;
-    let owners = [];
-    for (const line of lines) {
-      if (/^\S+\s+\d+\s+\d+\s/.test(line)) owners = [...line.matchAll(/pid=(\d+)/g)].map(match => Number(match[1]));
-      const sent = Number(line.match(/\bbytes_sent:(\d+)/)?.[1]);
-      const received = Number(line.match(/\bbytes_received:(\d+)/)?.[1]);
-      if (!Number.isFinite(sent) || !Number.isFinite(received)) continue;
-      for (const pid of owners) {
-        const totals = networkBytes.get(pid) || { sent: 0, received: 0 };
-        totals.sent += sent; totals.received += received; networkBytes.set(pid, totals);
-      }
-    }
-  } catch { /* ss is optional; socket counts and other metrics remain available. */ }
-  const alive = new Set();
-  const enriched = visible.map(proc => {
-    const prior = previousSamples.get(proc.pid), seconds = prior ? Math.max(.001, (sampledAt - prior.sampledAt) / 1000) : 0;
-    const traffic = networkBytes.get(proc.pid) || { sent: 0, received: 0 };
-    proc.cpuPercent = seconds ? Math.max(0, (proc.cpuTicks - prior.cpuTicks) / ticksPerSecond / seconds * 100) : 0;
-    proc.memoryPercent = systemMemoryBytes ? proc.rssBytes / systemMemoryBytes * 100 : 0;
-    proc.diskReadBps = seconds ? Math.max(0, (proc.readBytes - prior.readBytes) / seconds) : 0;
-    proc.diskWriteBps = seconds ? Math.max(0, (proc.writeBytes - prior.writeBytes) / seconds) : 0;
-    proc.networkUpBps = seconds ? Math.max(0, (traffic.sent - prior.networkSent) / seconds) : 0;
-    proc.networkDownBps = seconds ? Math.max(0, (traffic.received - prior.networkReceived) / seconds) : 0;
-    proc.networkRatesAvailable = networkRatesAvailable;
-    proc.sockets = socketCounts.get(proc.pid) || 0;
-    alive.add(proc.pid);
-    previousSamples.set(proc.pid, { sampledAt, cpuTicks: proc.cpuTicks, readBytes: proc.readBytes, writeBytes: proc.writeBytes,
-      networkSent: traffic.sent, networkReceived: traffic.received });
-    delete proc.cpuTicks; delete proc.readBytes; delete proc.writeBytes;
-    return proc;
-  });
-  for (const pid of previousSamples.keys()) if (!alive.has(pid)) previousSamples.delete(pid);
-  const filtered = netOnly ? enriched.filter(proc => active.has(proc.pid)) : enriched;
-  return { processes: filtered, platform: process.platform, sampledAt, systemMemoryBytes, cpuCount: os.cpus().length, netOnly };
-}
-
-
 function run(command, args) {
   return new Promise((resolve, reject) => execFile(command, args, { encoding: 'utf8', timeout: 2500, maxBuffer: 1024 * 1024 }, (error, stdout) => error ? reject(error) : resolve(stdout)));
 }
@@ -291,20 +166,26 @@ function run(command, args) {
 async function readWindows() {
   if (process.platform !== 'linux' || !process.env.DISPLAY) return [];
   try {
-    const ids = (await run('xdotool', ['search', '--onlyvisible', '--name', '.'])).trim().split(/\s+/).filter(id => /^\d+$/.test(id));
+    const [searchResult, tree] = await Promise.all([
+      run('xdotool', ['search', '--onlyvisible', '--name', '.']),
+      run('xwininfo', ['-root', '-tree']),
+    ]);
+    const geometryById = new Map();
+    for (const line of tree.split('\n')) {
+      const match = /^\s*(0x[\da-f]+)\s+"(.*)"\s*:\s*\(.*\)\s+(\d+)x(\d+)([+-]\d+)([+-]\d+)\s+/i.exec(line);
+      if (match) geometryById.set(Number.parseInt(match[1], 16), {
+        title: match[2], x: Number(match[5]), y: Number(match[6]), width: Number(match[3]), height: Number(match[4]),
+      });
+    }
+    const ids = searchResult.trim().split(/\s+/).filter(id => /^\d+$/.test(id));
     const windows = await Promise.all(ids.map(async id => {
       try {
-        const [pidText, title, geometry] = await Promise.all([
-          run('xdotool', ['getwindowpid', id]),
-          run('xdotool', ['getwindowname', id]),
-          run('xdotool', ['getwindowgeometry', '--shell', id])
-        ]);
+        const info = geometryById.get(Number(id));
+        if (!info) return null;
+        const pidText = await run('xdotool', ['getwindowpid', id]);
         const pid = Number(pidText.trim());
-        const fields = Object.fromEntries(geometry.trim().split('\n').map(line => line.split('=')));
-        const x = Number(fields.X), y = Number(fields.Y);
-        const width = Number(fields.WIDTH), height = Number(fields.HEIGHT);
-        if (!pid || pid === process.pid || !title.trim() || width < 80 || height < 60) return null;
-        return { id, pid, title: title.trim().slice(0, 180), x, y, width, height };
+        if (!pid || pid === process.pid || !info.title.trim() || info.width < 80 || info.height < 60) return null;
+        return { id, pid, ...info, title: info.title.trim().slice(0, 180) };
       } catch { return null; }
     }));
     return windows.filter(Boolean).sort((a, b) => Number(a.id) - Number(b.id));
@@ -404,67 +285,41 @@ function scheduleWindowFallback() {
 scheduleWindowFallback();
 function emitStream(url, data) {
   const route = new URL(url, 'http://nasty.local').pathname.slice(1);
-  for (const stream of directStreams) if (stream.route === route && typeof stream.onmessage === 'function') stream.onmessage({ data: JSON.stringify(data) });
+  const serialized = JSON.stringify(data);
+  for (const stream of directStreams) if (stream.route === route && typeof stream.onmessage === 'function') stream.onmessage({ data: serialized });
 }
-function publishProcessSnapshot(refreshProcessList = false) {
-  const data = readProcesses(refreshProcessList);
+async function collectProcessSnapshot(refreshProcessList = false) {
+  const data = await processSampler.sample(refreshProcessList, netOnly);
+  cachedProcessPids = data.pids;
+  for (const proc of data.commands || []) traceCommandLine(proc);
+  delete data.pids;
+  delete data.commands;
+  return data;
+}
+async function publishProcessSnapshot(refreshProcessList = false) {
+  const data = await collectProcessSnapshot(refreshProcessList);
   latestProcesses = data.processes;
   latestProcessSnapshot = data;
   emitStream('/processes', data);
-}
-function isRainbowDescendant(proc) {
-  let parent = proc.ppid;
-  const visited = new Set();
-  while (parent && !visited.has(parent)) {
-    if (parent === process.pid) return true;
-    visited.add(parent);
-    parent = readProcessRecord(parent)?.ppid || 0;
-  }
-  return false;
 }
 function publishProcessEvents(changes, retry = 0) {
   if (!latestProcessSnapshot || !Array.isArray(cachedProcessPids)) {
     publishProcessSnapshot(true);
     return;
   }
-  const byPid = new Map(latestProcesses.map(proc => [proc.pid, proc]));
-  const pids = new Set(cachedProcessPids);
-  const notReady = [];
-  const systemMemoryBytes = latestProcessSnapshot.systemMemoryBytes;
-  for (const [pid, type] of changes) {
-    if (type === 'exit') {
-      byPid.delete(pid);
-      pids.delete(String(pid));
-      previousSamples.delete(pid);
-      observedCommandLines.delete(pid);
-      tracedCommandLines.delete(pid);
-      continue;
+  processSampler.events(changes, netOnly).then(result => {
+    if (stopped) return;
+    if (result.needsSample) { publishProcessSnapshot(true); return; }
+    cachedProcessPids = result.pids;
+    for (const command of result.commands) traceCommandLine(command);
+    for (const [pid, type] of changes) if (type === 'exit') {
+      observedCommandLines.delete(pid); tracedCommandLines.delete(pid);
     }
-    const raw = readProcessRecord(pid);
-    if (!raw) { if (retry < 3) notReady.push([pid, type]); continue; }
-    if (type === 'exec') traceCommandLine(raw);
-    pids.add(String(pid));
-    if (isRainbowDescendant(raw)) { byPid.delete(pid); continue; }
-    if (netOnly) continue; // Socket ownership is refreshed with the metric sample.
-    const previous = byPid.get(pid);
-    byPid.set(pid, {
-      pid: raw.pid, ppid: raw.ppid, name: raw.name, executable: raw.executable, label: raw.label, commandLine: raw.commandLine,
-      rssBytes: raw.rssBytes,
-      cpuPercent: previous?.cpuPercent || 0,
-      memoryPercent: systemMemoryBytes ? raw.rssBytes / systemMemoryBytes * 100 : 0,
-      diskReadBps: previous?.diskReadBps || 0,
-      diskWriteBps: previous?.diskWriteBps || 0,
-      networkUpBps: previous?.networkUpBps || 0,
-      networkDownBps: previous?.networkDownBps || 0,
-      networkRatesAvailable: previous?.networkRatesAvailable || false,
-      sockets: previous?.sockets || 0,
-    });
-  }
-  cachedProcessPids = [...pids];
-  latestProcesses = [...byPid.values()];
-  latestProcessSnapshot = { ...latestProcessSnapshot, sampledAt: Date.now(), processes: latestProcesses };
-  emitStream('/processes', latestProcessSnapshot);
-  if (notReady.length && !stopped) setTimeout(() => publishProcessEvents(notReady, retry + 1), 50 * (retry + 1)).unref();
+    latestProcessSnapshot = result.snapshot;
+    latestProcesses = result.snapshot.processes;
+    if (result.changed) emitStream('/processes', latestProcessSnapshot);
+    if (result.notReady.length && retry < 3) setTimeout(() => publishProcessEvents(result.notReady, retry + 1), 50 * (retry + 1)).unref();
+  }).catch(error => { if (!stopped) console.error(`Rainbow: process events failed: ${error.message}`); });
 }
 class DirectEventSource {
   constructor(url) {
@@ -472,13 +327,19 @@ class DirectEventSource {
     this.closed = false;
     directStreams.add(this);
     if (this.route === 'processes') {
-      const sample = refresh => {
+      const sample = async refresh => {
         if (this.closed) return;
-        const data = readProcesses(refresh || !procConnector);
-        for (const proc of data.processes) traceCommandLine(proc);
-        latestProcesses = data.processes;
-        latestProcessSnapshot = data;
-        this.onmessage?.({ data: JSON.stringify(data) });
+        try {
+          const data = await collectProcessSnapshot(refresh || !procConnector);
+          if (this.closed) return;
+          latestProcesses = data.processes;
+          latestProcessSnapshot = data;
+          this.onmessage?.({ data: JSON.stringify(data) });
+          resolveInitialProcessSnapshot();
+        } catch (error) {
+          resolveInitialProcessSnapshot();
+          if (!this.closed) console.error(`Rainbow: process sampling failed: ${error.message}`);
+        }
       };
       queueMicrotask(() => sample(true));
       this.timer = setInterval(() => sample(false), 2000);
@@ -504,7 +365,7 @@ events.addEventListener('message', event => {
   requestedWindowIds = new Set(event.data.windowIds.map(String));
   syncWindowCaptures();
 });
-let nextFrame = 0, shown = false, count = 0, pointer = { x: 0, y: 0 }, lastTarget = null, shiftDown = false;
+let nextFrame = 0, shown = false, pointer = { x: 0, y: 0 }, lastTarget = null, shiftDown = false;
 const actionKeysDown = new Set();
 let pointerDownTarget = null;
 const browser = {
@@ -534,8 +395,6 @@ const browser = {
 browser.window = browser; browser.self = browser;
 const source = await readFile(new URL('./rainbow/app.js', import.meta.url), 'utf8');
 vm.runInNewContext(source, browser, { filename: 'rainbow/app.js' });
-const limit = Number(process.env.NASTY_RAINBOW_FRAMES || 0);
-const elapsed = [], phases = [], started = performance.now();
 function pointerEvent(target, type, button = 0, extra = {}) {
   if (!target) return;
   const event = new Event(type, { bubbles: true, cancelable: true });
@@ -615,6 +474,7 @@ async function close() {
   windowEvents?.kill(); structureEvents?.kill();
   clearTimeout(procConnectorRetry); clearTimeout(processRefreshTimer);
   procConnector?.kill('SIGTERM'); procConnector = null;
+  await processSampler.close();
   for (const capture of windowCaptures.values()) capture.child.kill();
   clearTimeout(fallbackRefreshTimer); clearTimeout(windowRefreshTimer);
   await document.close(); window.close(); await closeImageDecoder();
@@ -622,28 +482,31 @@ async function close() {
 async function frame() {
   if (stopped) return;
   if (window.closed) { await close(); return; }
-  const start = performance.now(); dispatch();
+  const start = performance.now();
+  dispatch();
   if (window.closed) { await close(); return; }
-  const dispatched = performance.now();
   const callbacks = [...frames.values()]; frames.clear();
   for (const callback of callbacks) callback(start);
-  const drawn = performance.now();
   ui.update(start);
-  await layoutDocument(document, viewport.width, viewport.height);
-  const laidOut = performance.now();
-  const result = window.presentDocument();
-  ui.setMaximized(window.maximized);
-  if (limit) phases.push({ dispatch: dispatched - start, draw: drawn - dispatched, layout: laidOut - drawn, ...rasterTimings.get(window), native: result.nativeRenderMs });
-  if (!shown) { window.show(); shown = true; }
-  elapsed.push(performance.now() - start); count++;
-  if (limit && count >= limit) {
-    if (process.env.NASTY_RAINBOW_CAPTURE) {
-      const surface = rasterizeDocument(document, viewport.width, viewport.height);
-      await writeFile(process.env.NASTY_RAINBOW_CAPTURE, await surface.encode('png'));
-    }
-    await close(); return;
+  const layoutResult = layoutDocument(document, viewport.width, viewport.height);
+  if (layoutResult?.then) {
+    if (!documentState(document).layoutSnapshot) await layoutResult;
+    else layoutResult.catch(fail);
   }
-  setTimeout(() => frame().catch(fail), Math.max(0, 1000 / 60 - (performance.now() - start)));
+  window.presentDocument();
+  ui.setMaximized(window.maximized);
+  if (!shown) { window.show(); shown = true; }
+  const deadline = start + 1000 / 60 - 1.25;
+  const remaining = deadline - performance.now();
+  if (remaining > 1.5) {
+    setTimeout(() => {
+      while (performance.now() < deadline) {}
+      frame().catch(fail);
+    }, remaining - 1.5);
+  } else {
+    while (performance.now() < deadline) {}
+    setImmediate(() => frame().catch(fail));
+  }
 }
 async function fail(error) { console.error(error); await close(); process.exitCode = 1; }
 process.once('SIGINT', () => close()); process.once('SIGTERM', () => close());
@@ -654,4 +517,5 @@ process.once('exit', () => {
   for (const capture of windowCaptures.values()) capture.child.kill();
   clearTimeout(fallbackRefreshTimer); clearTimeout(windowRefreshTimer);
 });
+await initialProcessSnapshotReady;
 frame().catch(fail);

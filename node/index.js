@@ -15,12 +15,13 @@ import { documentImage } from "./internal/raster-document.js";
 
 const require = createRequire(import.meta.url);
 const packageRoot = fileURLToPath(new URL(".", import.meta.url));
+const releaseNativePath = join(packageRoot, "native/release/nasty.node");
 const nativePath = process.env.NASTY_NATIVE_PATH
   ?? (process.platform === "android"
     ? join(packageRoot, "native/android-arm64/nasty.node")
-    : join(packageRoot, "native/debug/nasty.node"));
+    : existsSync(releaseNativePath) ? releaseNativePath : join(packageRoot, "native/debug/nasty.node"));
 if (!existsSync(nativePath)) {
-  throw new Error(`Nasty native addon not found at ${nativePath}; build it with npm run build:debug or npm run build:android-arm64`);
+  throw new Error(`Nasty native addon not found at ${nativePath}; build it with npm run build:release, npm run build:debug, or npm run build:android-arm64`);
 }
 const native = process.platform === "android"
   ? (() => {
@@ -133,11 +134,11 @@ export class Window extends native.Window {
 
   present(list) { syncDocumentTextForPresent(this, this.#document); return super.present(list); }
   presentWithImages(list, images) { syncDocumentTextForPresent(this, this.#document); return super.presentWithImages(list, images); }
-  presentOrdered(list) { syncDocumentTextForPresent(this, this.#document); return super.presentOrdered(list); }
+  presentOrdered(list, canvasTriangles, canvasCircles, canvasBeziers, canvasOperations) { syncDocumentTextForPresent(this, this.#document); return super.presentOrdered(list, canvasTriangles, canvasCircles, canvasBeziers, canvasOperations); }
   presentTransformed(list) { syncDocumentTextForPresent(this, this.#document, displayListElements(list)); return super.presentTransformed(list); }
   presentDocument() {
     const frame = documentImage(this, this.#document);
-    return super.presentWithImages(frame.list, frame.images);
+    return frame.ordered ? super.presentOrdered(frame.list, frame.triangles, frame.circles, frame.beziers, frame.canvasOperations) : super.presentWithImages(frame.list, frame.images);
   }
 
   get document() {
@@ -239,6 +240,21 @@ function markGeometryDirty(document) {
   document.geometryDirty = true;
   document.geometryGeneration = (document.geometryGeneration ?? 0) + 1;
 }
+
+// Keep this in sync with the properties consumed by styleForTaffy() and
+// textMetrics(). Paint-only changes should not send the whole tree to the
+// layout worker on every animation frame.
+const LAYOUT_STYLE_PROPERTIES = new Set([
+  "display", "position", "width", "height", "minWidth", "minHeight", "maxWidth", "maxHeight",
+  "top", "right", "bottom", "left", "inset", "flex", "flexBasis", "flexGrow", "flexShrink",
+  "direction", "flexDirection", "flexWrap", "alignItems", "alignSelf", "alignContent", "justifyContent", "justifySelf",
+  "gap", "rowGap", "columnGap", "padding", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft",
+  "margin", "marginTop", "marginRight", "marginBottom", "marginLeft", "borderWidth", "borderStyle",
+  "borderTopStyle", "borderRightStyle", "borderBottomStyle", "borderLeftStyle", "borderTopWidth",
+  "borderRightWidth", "borderBottomWidth", "borderLeftWidth", "overflow", "boxSizing", "aspectRatio",
+  "font", "fontFamily", "fontSize", "fontStyle", "fontWeight", "lineHeight", "letterSpacing", "whiteSpace",
+  "textAlign", "textOverflow", "textTransform",
+]);
 
 const styleData = new WeakMap();
 class CSSStyleDeclaration {
@@ -531,8 +547,11 @@ export class Element extends EventTarget {
   }
 
   _styleChanged(property) {
-    if (isPaintColorProperty(property) || property === "opacity" || property === "transition" || property === "transform" || property === "transformOrigin" || property === "zIndex" || property === "borderRadius" || property === "fontWeight" || property === "letterSpacing" || property === "pointerEvents" || property === "cursor") return;
     const doc = documentState(this.document);
+    doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
+    doc.paintDirtyElements ??= new Set();
+    doc.paintDirtyElements.add(this);
+    if (property !== undefined && !LAYOUT_STYLE_PROPERTIES.has(property)) return;
     doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
     doc.dirty = true;
     markGeometryDirty(doc);
@@ -613,7 +632,7 @@ export class Element extends EventTarget {
 export class Document extends EventTarget {
   constructor() {
     super();
-    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
+    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
     this.body = new Element(this, "body");
     this.body.style.display = "block";
     registerDocument(this, {

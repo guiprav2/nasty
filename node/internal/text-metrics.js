@@ -46,9 +46,14 @@ export function textMetrics(element) {
   const style = textStyle(element);
   let text = renderedText(element);
   if (!nerdIcon(element) && inherited(element, 'textTransform', '') === 'uppercase') text = text.toUpperCase();
-  const key = JSON.stringify([text, style]);
+  // Color affects paint only. Keeping it out of the measurement key prevents
+  // animated text colors from invalidating Taffy's layout tree.
+  const key = JSON.stringify([text, style.size, style.spacing, style.line, style.font, style.wrap]);
   const state = elementState(element);
-  if (state.textMetrics?.key === key) return state.textMetrics;
+  if (state.textMetrics?.key === key) {
+    state.textMetrics.style.color = style.color;
+    return state.textMetrics;
+  }
   context.font = style.font; context.letterSpacing = `${style.spacing}px`;
   const preserve = ['pre', 'pre-wrap', 'pre-line'].includes(inherited(element, 'whiteSpace', 'normal'));
   text = preserve ? text : text.replace(/\s+/g, ' ').trim();
