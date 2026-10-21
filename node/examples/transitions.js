@@ -17,23 +17,13 @@ const frameLimit = Number(process.env.NASTY_TRANSITION_FRAMES ?? 180);
 const window = new Window({ resizable: "none", title: "Nasty CSS transitions", width: 720, height: 480 });
 const document = new Document();
 window.document = document;
-document.body.style.display = "flex";
-document.body.style.justifyContent = "center";
-document.body.style.alignItems = "center";
-document.body.style.gap = 24;
+document.body.className = "flex justify-center items-center gap-6";
+const cardClasses = (background, border) => `w-[210px] h-[170px] border-[8px] border-solid bg-[${background}] border-[${border}] [transition:all_900ms_cubic-bezier(.42,_0,_0.58,_1),_border-color_600ms_steps(6,_end)]`;
 
 const cards = ["reverse", "interrupt"].map((id) => {
   const card = document.createElement("div");
   card.id = id;
-  Object.assign(card.style, {
-    width: 210,
-    height: 170,
-    borderWidth: 8,
-    borderStyle: "solid",
-    backgroundColor: "#1769aa",
-    borderColor: "#17202a",
-    transition: "all 900ms cubic-bezier(.42, 0, .58, 1), border-color 600ms steps(6, end)",
-  });
+  card.className = cardClasses("#1769aa", "#17202a");
   document.body.appendChild(card);
   return card;
 });
@@ -46,8 +36,8 @@ cards.forEach((card, index) => card.addEventListener("transitionend", (event) =>
 }));
 const start = performance.now();
 for (const card of cards) {
-  card.style.backgroundColor = target;
-  card.style.borderColor = "#00d8ff";
+  card.className = cardClasses(target, "#17202a");
+  card.className = cardClasses(target, "#00d8ff");
 }
 
 const refreshHz = window.refreshRate() || 60;
@@ -75,8 +65,10 @@ function colorDistance(a, b) {
 
 function retarget(card, property, value) {
   const before = computedStyleValue(card.style, property);
-  card.style[property] = value;
-  assert.equal(card.style[property], value, "inline style should expose the authored transition target");
+  const background = property === "backgroundColor" ? value : card.style.backgroundColor;
+  const border = property === "borderColor" ? value : card.style.borderColor;
+  card.className = cardClasses(background, border);
+  assert.equal(card.style[property], value, "read-only CSSOM should expose the utility-class transition target");
   const after = computedStyleValue(card.style, property);
   assert.ok(colorDistance(before, after) < 0.02, `${property} retarget should not jump`);
 }

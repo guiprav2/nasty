@@ -37,35 +37,21 @@ const emptySourceImage = document.createElement("img");
 emptySourceImage.src = "";
 assert.equal(emptySourceImage.complete, true, "an img with an empty src is complete");
 await assert.rejects(emptySourceImage.decode(), { name: "EncodingError" });
-Object.assign(document.body.style, {
-  display: "flex", direction: "row", justifyContent: "center", alignItems: "center", gap: 20,
-  backgroundColor: "#101827",
-});
+document.body.className = "flex flex-row justify-center items-center gap-5 bg-[#101827]";
 const scroller = document.createElement("div");
-Object.assign(scroller.style, {
-  width: 360, height: 240, overflow: "auto", borderWidth: 2,
-  borderStyle: "solid", borderColor: "#f59e0b", backgroundColor: "#26364f",
-});
+scroller.className = "w-[360px] h-[240px] overflow-auto border-2 border-solid border-[#f59e0b] bg-[#26364f]";
 const image = document.createElement("img");
-Object.assign(image.style, {
-  width: 440, height: 280, flexShrink: 0,
-  padding: 18, borderWidth: 5, borderStyle: "solid", borderColor: "#a78bfa",
-  backgroundColor: "#26364f",
-});
+const imageClasses = width => `w-[${width}px] h-[280px] shrink-0 p-[18px] border-[5px] border-solid border-[#a78bfa] bg-[#26364f]`;
+image.className = imageClasses(440);
 scroller.appendChild(image);
 document.body.appendChild(scroller);
 const secondImage = document.createElement("img");
-Object.assign(secondImage.style, {
-  padding: 8, borderWidth: 2,
-  borderStyle: "solid", borderColor: "#34d399", overflow: "hidden",
-});
+secondImage.className = "p-2 border-2 border-solid border-[#34d399] overflow-hidden";
 secondImage.width = 220;
 secondImage.height = 180;
 document.body.appendChild(secondImage);
 const overlay = document.createElement("div");
-Object.assign(overlay.style, {
-  width: 80, height: 60, marginLeft: -90, backgroundColor: "#f43f5e",
-});
+overlay.className = "w-[80px] h-[60px] ml-[-90px] bg-[#f43f5e]";
 document.body.appendChild(overlay);
 
 image.src = relative(process.cwd(), fixturePath);
@@ -95,7 +81,7 @@ const [pngDecodeMs, jpegDecodeMs] = await Promise.all([pngDecoded, jpegDecoded])
 await Promise.all([dataImage.decode(), httpImage.decode()]);
 await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 documentBoxes(document);
-image.style.width = 450;
+image.className = imageClasses(450);
 const flushStart = performance.now();
 const flushedRect = image.getBoundingClientRect();
 const dirtyFlushMs = performance.now() - flushStart;
@@ -104,7 +90,7 @@ assert.equal(flushedRect.width, 450, "getBoundingClientRect flushes current styl
 const cacheStart = performance.now();
 image.getBoundingClientRect();
 const cachedReadMs = performance.now() - cacheStart;
-image.style.width = 440;
+image.className = imageClasses(440);
 await assert.rejects(failedImage.decode(), { name: "EncodingError" });
 await errorEvent;
 assert.equal(failedImage.complete, true, "a failed image request is complete");

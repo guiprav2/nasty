@@ -102,60 +102,80 @@ export function syncDocumentText(window, document, selectedElements = null) {
     state.paintRuns = state.pending.runs;
     state.parked = state.pending.parked;
     state.shapeGeneration = state.pending.shapeGeneration;
+    state.shapeViewportWidth = state.pending.viewportWidth;
+    state.shapeViewportHeight = state.pending.viewportHeight;
     state.pending = null;
   }
-  if (!state) windows.set(window, state = { shape: null, shapeGeneration: -1, elements: [], elementIndices: new Map(), paintRuns: null, parked: new Set(), pending: null });
+  if (!state) windows.set(window, state = { shape: null, shapeGeneration: -1, shapeViewportWidth: null, shapeViewportHeight: null, elements: [], elementIndices: new Map(), paintRuns: null, parked: new Set(), pending: null });
   const geometryGeneration = document ? documentState(document).geometryGeneration : -1;
-  if (selectedElements && state.shape && state.paintRuns && !state.pending) {
+  if (state.shape && state.paintRuns) {
     const entries = document ? textEntries(document, selectedElements) : [];
-    details.mode = "selected-placement";
+    const allEntries = document && selectedElements ? textEntries(document) : entries;
+    details.mode = selectedElements ? "selected-placement" : "full-document-placement";
     details.visibleRuns = entries.length;
     const previousRuns = state.paintRuns;
     const runs = previousRuns.slice();
     const parked = new Set(state.parked);
     const activeIndices = new Set();
+    const viewport = document ? documentState(document).viewport : { width: 0, height: 0 };
+    const viewportChanged = state.shapeViewportWidth !== viewport.width || state.shapeViewportHeight !== viewport.height;
     let needsReshape = false;
-    const allowProjectedWidthChange = state.shapeGeneration === geometryGeneration;
     for (const { element, run } of entries) {
       const index = state.elementIndices.get(element);
-      if (index === undefined || !sameShape(runs[index], run, allowProjectedWidthChange)) {
-        details.shapeMismatch = {
-          tag: element.tagName,
-          text: run.text.slice(0, 48),
-          missing: index === undefined,
-          allowProjectedWidthChange,
-          previous: index === undefined ? null : {
-            width: runs[index].width,
-            fontSize: runs[index].fontSize,
-            lineHeight: runs[index].lineHeight,
-            fontFamily: runs[index].fontFamily,
-            wrap: runs[index].wrap,
-            text: runs[index].text.slice(0, 48),
-          },
-          next: { width: run.width, fontSize: run.fontSize, lineHeight: run.lineHeight, fontFamily: run.fontFamily, wrap: run.wrap, text: run.text.slice(0, 48) },
-        };
+      if (index === undefined) {
         needsReshape = true;
-        break;
+        continue;
       }
-      runs[index] = allowProjectedWidthChange ? { ...run, width: runs[index].width } : run;
+      const shaped = runs[index];
+      const contentChanged = !sameShape(shaped, run, true);
+      const widthChanged = shaped.width !== run.width;
+      if (contentChanged || (widthChanged && viewportChanged)) needsReshape = true;
+      // Move the currently prepared glyphs with the layout while a replacement
+      // shape is pending. Keep its shaping fields until the new buffers are ready.
+      runs[index] = {
+        ...run,
+        text: shaped.text,
+        width: shaped.width,
+        fontSize: shaped.fontSize,
+        lineHeight: shaped.lineHeight,
+        fontFamily: shaped.fontFamily,
+        fontWeight: shaped.fontWeight,
+        wrap: shaped.wrap,
+      };
       activeIndices.add(index);
       parked.delete(index);
     }
-    if (!needsReshape) {
-      for (let index = 0; index < runs.length; index++) {
-        if (!activeIndices.has(index) && !parked.has(index)) {
-          runs[index] = parkRun(runs[index]);
-          parked.add(index);
-        }
+    for (let index = 0; index < runs.length; index++) {
+      if (!activeIndices.has(index) && !parked.has(index)) {
+        runs[index] = parkRun(runs[index]);
+        parked.add(index);
       }
-      const changed = runs.flatMap((run, index) => placementChanged(previousRuns[index], run) ? [index] : []);
-      details.changedRuns = changed.length;
-      if (changed.length) sendPlacements(window, runs, changed);
-      state.paintRuns = runs;
-      state.parked = parked;
-      return;
     }
-    details.mode = "selected-shape-mismatch";
+    const changed = runs.flatMap((run, index) => placementChanged(previousRuns[index], run) ? [index] : []);
+    details.changedRuns = changed.length;
+    if (changed.length) sendPlacements(window, runs, changed);
+    state.paintRuns = runs;
+    state.parked = parked;
+    state.shapeGeneration = geometryGeneration;
+    if (needsReshape && !state.pending) {
+      const shape = textShape(allEntries.map(({ run }) => run));
+      if (shape !== state.shape) {
+        const preparedRuns = prewarmRuns(allEntries.map(({ run }) => run), document);
+        details.mode = "resize-reshape";
+        details.reshaped = true;
+        window.requestTextRuns(preparedRuns, fontsForRuns(preparedRuns));
+        state.pending = {
+          shape,
+          elements: allEntries.map(({ element }) => element),
+          runs: preparedRuns,
+          parked: new Set(),
+          shapeGeneration: geometryGeneration,
+          viewportWidth: viewport.width,
+          viewportHeight: viewport.height,
+        };
+      }
+    }
+    return;
   }
   const entries = document ? textEntries(document) : [];
   details.fullRuns = entries.length;
@@ -180,7 +200,9 @@ export function syncDocumentText(window, document, selectedElements = null) {
       // All glyphs are prepared at a visible origin before the run set becomes
       // active. The next present applies the live camera positions and parks
       // unrelated runs without rasterizing a slide's first glyphs mid-pan.
-      state.pending = { shape, elements: entries.map(({ element }) => element), runs: preparedRuns, parked: new Set(), shapeGeneration: geometryGeneration };
+      const viewport = document ? documentState(document).viewport : { width: 0, height: 0 };
+      state.pending = { shape, elements: entries.map(({ element }) => element), runs: preparedRuns, parked: new Set(),
+        shapeGeneration: geometryGeneration, viewportWidth: viewport.width, viewportHeight: viewport.height };
     }
     return;
   }
@@ -193,6 +215,10 @@ export function syncDocumentText(window, document, selectedElements = null) {
   state.paintRuns = runs;
   state.parked = parked;
   state.shapeGeneration = geometryGeneration;
+  if (document) {
+    state.shapeViewportWidth = documentState(document).viewport.width;
+    state.shapeViewportHeight = documentState(document).viewport.height;
+  }
   state.elements = entries.map(({ element }) => element);
   state.elementIndices = new Map(state.elements.map((element, index) => [element, index]));
 }

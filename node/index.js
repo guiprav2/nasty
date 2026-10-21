@@ -12,6 +12,7 @@ import { buildTransformedDisplayList, displayListElements } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { textMetrics } from "./internal/text-metrics.js";
 import { documentImage } from "./internal/raster-document.js";
+import { resolveTailwind } from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 
 const require = createRequire(import.meta.url);
@@ -356,9 +357,39 @@ const LAYOUT_STYLE_PROPERTIES = new Set([
 ]);
 
 const styleData = new WeakMap();
+function refreshStyleValues(state) {
+  const next = { ...state.baseValues, ...state.hostValues, ...state.classValues };
+  const keys = new Set([...Object.keys(state.values), ...Object.keys(next)]);
+  const changed = new Set();
+  // Transition rules need to be visible before color or opacity targets change.
+  if (next.transition !== undefined) state.values.transition = next.transition;
+  for (const property of keys) {
+    const before = state.values[property], after = next[property];
+    if (Object.is(before, after)) continue;
+    changed.add(property);
+    if (after !== undefined) {
+      state.element._validateStyleChange(property, after);
+      if (isPaintColorProperty(property)) startColorTransition(state, property, String(after));
+      else if (property === "opacity") startNumberTransition(state, property, after);
+      state.values[property] = after;
+    } else {
+      state.transitions.delete(property);
+      delete state.values[property];
+    }
+  }
+  return changed;
+}
+
+function setHostStyle(element, values) {
+  const state = styleData.get(element.style);
+  state.hostValues = { ...values };
+  const changed = refreshStyleValues(state);
+  if (changed.size) element._styleChanged();
+}
+
 class CSSStyleDeclaration {
   constructor(element, initial) {
-    const state = { element, values: initial, transitions: new Map() };
+    const state = { element, values: initial, baseValues: initial, hostValues: {}, classValues: {}, transitions: new Map() };
     styleData.set(this, state);
     const proxy = new Proxy(this, {
       get: (target, property, receiver) => {
@@ -368,18 +399,13 @@ class CSSStyleDeclaration {
         return Reflect.get(target, property, receiver);
       },
       set: (target, property, value, receiver) => {
-        if (typeof property !== "string" || property in target) return Reflect.set(target, property, value, receiver);
-        if (state.values[property] === value) return true;
-        state.element._validateStyleChange(property, value);
-        if (isPaintColorProperty(property)) startColorTransition(state, property, String(value));
-        else if (property === "opacity") startNumberTransition(state, property, value);
-        state.values[property] = value;
-        state.element._styleChanged(property);
-        return true;
+        throw new TypeError("element.style is read-only; use Tailwind utility classes");
       },
+      deleteProperty: () => { throw new TypeError("element.style is read-only; use Tailwind utility classes"); },
+      defineProperty: () => { throw new TypeError("element.style is read-only; use Tailwind utility classes"); },
       ownKeys: () => Reflect.ownKeys(state.values),
       getOwnPropertyDescriptor: (target, property) => Object.hasOwn(state.values, property)
-        ? { configurable: true, enumerable: true, writable: true, value: state.values[property] }
+        ? { configurable: true, enumerable: true, writable: false, value: state.values[property] }
         : Reflect.getOwnPropertyDescriptor(target, property),
     });
     styleData.set(proxy, state);
@@ -388,8 +414,7 @@ class CSSStyleDeclaration {
   }
 
   setProperty(property, value) {
-    const name = property.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
-    this[name] = value;
+    throw new TypeError("element.style is read-only; use Tailwind utility classes");
   }
 
   getPropertyValue(property) {
@@ -399,15 +424,7 @@ class CSSStyleDeclaration {
   }
 
   removeProperty(property) {
-    const name = property.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
-    const previous = this.getPropertyValue(property);
-    const state = styleData.get(this);
-    if (Object.hasOwn(state.values, name)) {
-      state.transitions.delete(name);
-      delete state.values[name];
-      state.element._styleChanged(name);
-    }
-    return previous;
+    throw new TypeError("element.style is read-only; use Tailwind utility classes");
   }
 }
 
@@ -425,7 +442,7 @@ export class Element extends EventTarget {
       video: { audioId: nextVideoAudioId++, audioGeneration: 0, audioStartPromise: null, seekPending: false, paused: true, ended: false, currentTime: 0, duration: NaN, width: 0, height: 0, timer: null, token: 0, source: "", frameRequest: null, resolveFrame: null, rejectFrame: null, textureId: null, volume: 1, metadataLoaded: false, dataLoaded: false } };
     registerElementState(this, state);
     documentState(document).elements.add(this);
-    this.style = new CSSStyleDeclaration(this, { ...defaultElementStyle(this.localName) });
+    Object.defineProperty(this, "style", { value: new CSSStyleDeclaration(this, { ...defaultElementStyle(this.localName) }), enumerable: true });
     this.scrollLeft = 0;
     this.scrollTop = 0;
     state.handle = documentState(document).layoutTree.createNode(this._taffyStyle());
@@ -514,8 +531,18 @@ export class Element extends EventTarget {
   setAttribute(name, value) {
     name = String(name).toLowerCase();
     value = String(value);
+    const oldValue = this.attributes.get(name);
+    if (name === "class" && oldValue === value) return;
     this.attributes.set(name, value);
-    if (name === "hidden" || name === "class") this._styleChanged();
+    if (name === "class") {
+      const width = documentState(this.document).viewport.width;
+      const state = styleData.get(this.style);
+      state.hasResponsiveUtilities = /(?:^|\s)(?:sm|md|lg|xl|2xl):/.test(value);
+      const styles = resolveTailwind(value, width);
+      state.classValues = styles;
+      const changed = refreshStyleValues(state);
+      this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
+    } else if (name === "hidden") this._styleChanged();
     if (name === "muted" && this.localName === "video") {
       const video = elementState(this).video;
       if (this.muted) {
@@ -541,8 +568,15 @@ export class Element extends EventTarget {
 
   removeAttribute(name) {
     name = String(name).toLowerCase();
+    if (name === "class" && !this.attributes.has(name)) return;
     this.attributes.delete(name);
-    if (name === "hidden" || name === "class") this._styleChanged();
+    if (name === "class") {
+      const state = styleData.get(this.style);
+      state.hasResponsiveUtilities = false;
+      state.classValues = {};
+      const changed = refreshStyleValues(state);
+      this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
+    } else if (name === "hidden") this._styleChanged();
     if (name === "muted" && this.localName === "video") {
       const video = elementState(this).video;
       if (!video.paused) this._startVideoAudio(video.currentTime);
@@ -897,6 +931,32 @@ export class Element extends EventTarget {
     }
   }
 
+  _refreshTailwind(width) {
+    const state = styleData.get(this.style);
+    if (!state.hasResponsiveUtilities) return false;
+    const next = resolveTailwind(this.className, width);
+    if (Object.keys(next).length === Object.keys(state.classValues).length
+      && Object.keys(next).every(key => Object.is(next[key], state.classValues[key]))) return false;
+    state.classValues = next;
+    const changed = refreshStyleValues(state);
+    if (changed.size) this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
+    return changed.size > 0;
+  }
+
+  _setTailwindUtilityStyles(className, baseClassName, utilityValues) {
+    const state = styleData.get(this.style);
+    const width = documentState(this.document).viewport.width;
+    const next = { ...resolveTailwind(baseClassName, width), ...utilityValues };
+    const same = Object.keys(next).length === Object.keys(state.classValues).length
+      && Object.keys(next).every(key => Object.is(next[key], state.classValues[key]));
+    if (this.className === className && same) return;
+    this.attributes.set("class", className);
+    state.hasResponsiveUtilities = /(?:^|\s)(?:sm|md|lg|xl|2xl):/.test(baseClassName);
+    state.classValues = next;
+    const changed = refreshStyleValues(state);
+    this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
+  }
+
   _taffyStyle() {
     const style = { ...styleData.get(this.style).values, ...(this.hidden && { display: "none" }) };
     if (this.localName === "img") {
@@ -975,7 +1035,6 @@ export class Document extends EventTarget {
     super();
     registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
     this.body = new Element(this, "body");
-    this.body.style.display = "block";
     registerDocument(this, {
       layout: (width, height, timings) => this.#layout(width, height, timings),
       boxes: (timings) => {
@@ -1017,7 +1076,7 @@ export class Document extends EventTarget {
     const doc = documentState(this);
     for (const element of doc.elements) {
       const state = elementState(element);
-      if (!state.text && !element.classList.contains("nf")) continue;
+      if (!state.text) continue;
       const metrics = textMetrics(element);
       if (state.sentTextMetrics === metrics.key) continue;
       state.sentTextMetrics = metrics.key;
@@ -1043,8 +1102,8 @@ export class Document extends EventTarget {
     }
     if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height) {
       documentState(this).viewport = { width, height };
-      this.body.style.width = width;
-      this.body.style.height = height;
+      setHostStyle(this.body, { width, height });
+      for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(width);
     }
     if (documentState(this).dirty || !documentState(this).layoutSnapshot) {
       const start = performance.now();
@@ -1076,9 +1135,9 @@ export class Document extends EventTarget {
     if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height) {
       documentState(this).viewport = { width, height };
       if (documentState(this).defaultView) {
-        this.body.style.width = width;
-        this.body.style.height = height;
+        setHostStyle(this.body, { width, height });
       }
+      for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(width);
     }
     if (documentState(this).dirty || !documentState(this).layoutSnapshot) {
       const result = documentState(this).layoutTree.layoutSync(width, height, elementState(this.body).handle);

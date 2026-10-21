@@ -6,24 +6,24 @@ import { Document } from "../index.js";
 import { documentBoxes, layoutDocument } from "../internal/dom-state.js";
 
 const doc = new Document();
-const element = (owner, id, style = {}) => {
+const element = (owner, id, classes = "") => {
   const result = owner.createElement("div");
   result.id = id;
-  Object.assign(result.style, style);
+  result.className = classes;
   return result;
 };
-Object.assign(doc.body.style, { display: "flex", direction: "column", gap: 16, padding: 24 });
-const heading = element(doc, "heading", { widthPercent: 1, height: 64 });
-const grid = element(doc, "grid", { display: "flex", direction: "column", gap: 8, flexGrow: 1 });
+doc.body.className = "flex flex-col gap-4 p-6";
+const heading = element(doc, "heading", "w-full h-16");
+const grid = element(doc, "grid", "flex flex-col gap-2 grow");
 doc.body.appendChild(heading);
 doc.body.appendChild(grid);
 const cards = [];
 for (let rowIndex = 0; rowIndex < 8; rowIndex++) {
-  const row = element(doc, `row-${rowIndex}`, { display: "flex", direction: "row", gap: 8 });
+  const row = element(doc, `row-${rowIndex}`, "flex flex-row gap-2");
   grid.appendChild(row);
   for (let column = 0; column < 10; column++) {
     const index = rowIndex * 10 + column;
-    const card = element(doc, `card-${index}`, { width: 60, height: 14, flexShrink: 0 });
+    const card = element(doc, `card-${index}`, "w-[60px] h-[14px] shrink-0");
     cards.push(card);
     row.appendChild(card);
   }
@@ -39,10 +39,10 @@ assert.equal(byName("card-1").x, 92);
 assert.equal(byName("card-10").y, 126);
 
 const scrollDoc = new Document();
-const scroller = element(scrollDoc, "scroller", { display: "flex", direction: "column", width: 100, height: 40, overflow: "auto" });
+const scroller = element(scrollDoc, "scroller", "flex flex-col w-[100px] h-[40px] overflow-auto");
 scrollDoc.body.appendChild(scroller);
 for (let index = 0; index < 4; index++) {
-  scroller.appendChild(element(scrollDoc, `item-${index}`, { width: 100, height: 30, flexShrink: 0 }));
+  scroller.appendChild(element(scrollDoc, `item-${index}`, "w-[100px] h-[30px] shrink-0"));
 }
 let scrollBoxes = await layoutDocument(scrollDoc, 100, 100);
 assert.equal(scroller.scrollTop, 0);
@@ -80,7 +80,7 @@ const samples = [];
 const phases = { style: [], compute: [], workerAssembly: [], transfer: [], assembly: [] };
 for (let frame = 0; frame < 360; frame++) {
   const start = performance.now();
-  Object.assign(cards[0].style, { width: 60 + (frame % 2), height: 14, flexShrink: 0 });
+  cards[0].className = `w-[${60 + (frame % 2)}px] h-[14px] shrink-0`;
   const styleEnd = performance.now();
   const timings = {};
   boxes = await layoutDocument(doc, 800, 300, timings);

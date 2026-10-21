@@ -1,4 +1,4 @@
-// Native host for Rainbow. UI construction uses createElement + inline styles;
+// Native host for Rainbow. UI construction uses createElement + Tailwind utility classes;
 // the application code follows the original's process graph and interactions.
 import { readFile } from 'node:fs/promises';
 import fs from 'node:fs';

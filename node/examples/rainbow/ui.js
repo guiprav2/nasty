@@ -1,14 +1,22 @@
-// Direct createElement/inline-style port of ../rainbow/index.html and style.css.
+import { setTailwindStyles } from "../../tailwind.js";
+import { nerdGlyphs } from "../../internal/nerd-glyphs.js";
+// Direct createElement/Tailwind utility port of ../rainbow/index.html and style.css.
 // Inline text containers use flex where Nasty has no inline formatting context.
 export function createRainbowUI(document) {
   const mono = "'SFMono-Regular', Consolas, 'Liberation Mono', monospace";
   const sans = 'Inter, ui-sans-serif, system-ui, sans-serif';
   const line = 'rgba(211,218,255,.14)';
-  const style = (node, values) => Object.assign(node.style, values);
+  const style = (node, values) => setTailwindStyles(node, values);
   function el(parent, tag, className = '', text = '', values = {}, id = '') {
     const node = document.createElement(tag);
-    if (className) node.className = className;
+    const classes = className.split(/\s+/).filter(Boolean);
+    const iconClass = classes.find(name => name.startsWith('nf-'));
+    if (className) node.className = classes.filter(name => name !== 'nf' && !name.startsWith('nf-')).join(' ');
     if (id) node.id = id;
+    if (!text && classes.includes('nf') && iconClass) {
+      text = nerdGlyphs.get(iconClass) ?? '';
+      values = { ...values, fontFamily: 'Nerd Symbols' };
+    }
     if (text) node.textContent = text;
     style(node, values); parent.appendChild(node); return node;
   }
@@ -43,8 +51,8 @@ export function createRainbowUI(document) {
     maximized = Boolean(maximized);
     if (maximizedState === maximized) return;
     maximizedState = maximized;
-    maximizeGlyph.className = `nf nf-md-window-${maximized ? 'restore' : 'maximize'}`;
-    maximizeGlyph.style.top = maximized ? -0.33 : 0;
+    maximizeGlyph.textContent = nerdGlyphs.get(`nf-md-window-${maximized ? 'restore' : 'maximize'}`) ?? '';
+    setTailwindStyles(maximizeGlyph, { top: maximized ? -0.33 : 0 });
     maximizeButton.setAttribute('aria-label', `${maximized ? 'Restore' : 'Maximize'} window`);
     maximizeButton.setAttribute('title', `${maximized ? 'Restore' : 'Maximize'} window`);
   }
@@ -120,7 +128,7 @@ export function createRainbowUI(document) {
     const onExpired = recentExpiryCallback;
     recentExpiryCallback = null;
     onExpired?.();
-    if (windowList.hidden && activitySection.hidden) stack.style.opacity = 0;
+    if (windowList.hidden && activitySection.hidden) setTailwindStyles(stack, { opacity: 0 });
   });
   stack.addEventListener('transitionend', event => {
     if (event.target === stack && event.propertyName === 'opacity' && Number(stack.style.opacity) === 0
@@ -130,11 +138,11 @@ export function createRainbowUI(document) {
     clearTimeout(recentClearTimer);
     recentExpiryCallback = onExpired;
     stack.hidden = false;
-    stack.style.opacity = 1;
+    setTailwindStyles(stack, { opacity: 1 });
     activitySection.hidden = false;
-    activitySection.style.opacity = 1;
+    setTailwindStyles(activitySection, { opacity: 1 });
     recentClearTimer = setTimeout(() => {
-      activitySection.style.opacity = 0;
+      setTailwindStyles(activitySection, { opacity: 0 });
       recentClearTimer = null;
     }, 2000);
   }
@@ -142,7 +150,7 @@ export function createRainbowUI(document) {
     clearTimeout(recentClearTimer); recentClearTimer = null; recentExpiryCallback = null;
     recentList.replaceChildren();
     activitySection.hidden = true;
-    if (windowList.hidden) { stack.style.opacity = 0; stack.hidden = true; }
+    if (windowList.hidden) { setTailwindStyles(stack, { opacity: 0 }); stack.hidden = true; }
   }
   function resize(width, height) {
     const mobile = width <= 700, inset = mobile ? 22 : 32;
@@ -150,21 +158,21 @@ export function createRainbowUI(document) {
     style(traceMark, { fontSize: traceSize, left: width * .5 - traceSize * .18, top: height * .5 - traceSize * .4 });
     style(shell, { minHeight: height, paddingTop: mobile ? 22 : 30, paddingBottom: mobile ? 20 : 24, paddingLeft: inset, paddingRight: inset });
     style(intro, { marginTop: mobile ? 52 : Math.max(38, Math.min(88, height * .07)) });
-    heading.style.fontSize = Math.max(43, Math.min(78, width * .062));
-    lede.style.fontSize = mobile ? 13 : 14;
+    setTailwindStyles(heading, { fontSize: Math.max(43, Math.min(78, width * .062)) });
+    setTailwindStyles(lede, { fontSize: mobile ? 13 : 14 });
     style(hud, { left: inset, right: inset, bottom: mobile ? 125 : 124 });
     style(hint, { maxWidth: mobile ? 210 : width, lineHeight: mobile ? '1.6' : 'normal' });
     style(legend, { left: inset, right: inset, bottom: mobile ? 76 : 77, gap: mobile ? 11 : 22, flexWrap: mobile ? 'wrap' : 'nowrap' });
     style(legendNote, { marginLeft: mobile ? 0 : 'auto', width: mobile ? '100%' : 'auto' });
     style(footer, { left: inset, right: inset, bottom: mobile ? 22 : 27, fontSize: mobile ? 7 : 8 });
     style(live, { fontSize: mobile ? 8 : 10, gap: mobile ? 6 : 10 });
-    tooltip.style.maxWidth = Math.min(420, width * .75);
+    setTailwindStyles(tooltip, { maxWidth: Math.min(420, width * .75) });
     style(stack, { right: mobile ? 14 : width * .05, top: mobile ? 'auto' : 112, bottom: mobile ? 150 : 'auto', width: mobile ? Math.min(220, width * .55) : Math.min(280, width * .27), maxHeight: mobile ? height * .42 : height - 250 });
-    notice.style.left = width * .5;
+    setTailwindStyles(notice, { left: width * .5 });
   }
   function setTracingEnabled(enabled) {
     style(body, { backgroundColor: enabled ? '#220b13' : '#080a12' });
-    traceMark.style.color = enabled ? 'rgba(255,100,123,.11)' : 'rgba(255,100,123,0)';
+    setTailwindStyles(traceMark, { color: enabled ? 'rgba(255,100,123,.11)' : 'rgba(255,100,123,0)' });
   }
   function update(time) {
     const offline = live.classList.contains('offline');

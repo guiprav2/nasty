@@ -13,28 +13,22 @@ const window = new Window({ title: "Nasty video", width: 960, height: 600, resiz
 const document = new Document();
 window.document = document;
 
-Object.assign(document.body.style, {
-  display: "flex", flexDirection: "column",
-  padding: 18, gap: 12, backgroundColor: "#10151f",
-});
+document.body.className = "max-w-[800px] max-h-[600px] flex flex-col p-[18px] gap-3 bg-[#10151f]";
 
 const heading = document.createElement("div");
 heading.textContent = "Video player";
-Object.assign(heading.style, { color: "#f4f7ff", fontSize: 22, lineHeight: 28, flexShrink: 0 });
+heading.className = "text-[#f4f7ff] text-[22px] leading-[28px] shrink-0";
 document.body.appendChild(heading);
 
 const video = document.createElement("video");
 video.src = source;
 video.autoplay = true;
 video.muted = false;
-Object.assign(video.style, {
-  width: "100%", height: "100%", flex: "1", minHeight: 0,
-  backgroundColor: "#000000",
-});
+video.className = "w-full h-full flex-1 min-h-0 bg-black";
 document.body.appendChild(video);
 
 const status = document.createElement("div");
-Object.assign(status.style, { color: "#b9c7dc", fontSize: 14, lineHeight: 20, flexShrink: 0 });
+status.className = "text-[#b9c7dc] text-sm leading-[20px] shrink-0";
 document.body.appendChild(status);
 
 video.addEventListener("error", event => {

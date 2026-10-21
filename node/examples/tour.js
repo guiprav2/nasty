@@ -1,3 +1,4 @@
+import { setTailwindStyles } from "../tailwind.js";
 // Browser-native promo tour; uses only DOM, CSSOM, and animation-frame APIs.
 // 1 = twice the original duration; 0.5 = original pace; 2 = slower still.
 if (typeof document === "undefined") {
@@ -75,7 +76,7 @@ function vertical(parent, styles = {}) {
 function setCamera(col, row) {
   cameraCol = col;
   cameraRow = row;
-  canvas.style.transform = `translate(${cssPixel(sceneOffsetX)}, ${cssPixel(sceneOffsetY)}) scale(${renderScale}) translate(${cssPixel(-col * layoutWidth)}, ${cssPixel(-row * layoutHeight)})`;
+  setTailwindStyles(canvas, { transform: `translate(${cssPixel(sceneOffsetX)}, ${cssPixel(sceneOffsetY)}) scale(${renderScale}) translate(${cssPixel(-col * layoutWidth)}, ${cssPixel(-row * layoutHeight)})` });
 }
 window.addEventListener("resize", () => {
   width = window.innerWidth;
@@ -247,7 +248,7 @@ function lazyFontArt(stage) {
   const glyphs = horizontal(panel, { alignItems: "center", gap: 5, height: 8 });
   for (let i = 0; i < 18; i++) {
     const glyph = box(glyphs, { width: i < 12 ? 9 : 5, height: 5, backgroundColor: i < 12 ? theme.cyan : "#405671" });
-    if (i >= 12) glyph.style.opacity = 0.38;
+    if (i >= 12) setTailwindStyles(glyph, { opacity: 0.38 });
   }
 }
 
@@ -591,7 +592,7 @@ function framePacingArt(stage) {
 }
 
 for (const groups of motionBySlide.values()) for (const group of groups) for (const { element } of group.entries) {
-  element.style.transition = "none";
+  setTailwindStyles(element, { transition: "none" });
 }
 const floatingArtwork = slides.map((slide, index) => ({
   entry: motionBySlide.get(slide)?.find((group) => group.kind === "art")?.entries[0],
@@ -605,7 +606,7 @@ if (floatingArtwork.some((artwork) => !artwork.entry)) {
   throw new Error("every tour slide must define a top-level artwork group");
 }
 for (const [index, slide] of slides.entries()) {
-  slide.cell.style.opacity = index === 0 ? "1" : "0";
+  setTailwindStyles(slide.cell, { opacity: index === 0 ? "1" : "0" });
 }
 setCamera(0, 0);
 await document.fonts?.ready;
@@ -654,7 +655,7 @@ window.addEventListener("keydown", (event) => {
 });
 
 function setElementTransform(entry, transform) {
-  entry.element.style.transform = transform || "none";
+  setTailwindStyles(entry.element, { transform: transform || "none" });
 }
 function easeInOut(t) {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -782,15 +783,15 @@ function draw(now) {
     const amount = easeInOut(t);
     const { from, to } = activeTransition;
     setCamera(from.col + (to.col - from.col) * amount, from.row + (to.row - from.row) * amount);
-    from.cell.style.opacity = String(1 - amount);
-    to.cell.style.opacity = String(amount);
+    setTailwindStyles(from.cell, { opacity: String(1 - amount) });
+    setTailwindStyles(to.cell, { opacity: String(amount) });
     if (t === 1) {
       completedTransition = activeTransition;
       slideIndex = nextSlideIndex;
       document.body.setAttribute("data-tour-perf-stage", `hold:${String(slideIndex).padStart(2, "0")}`);
       setCamera(to.col, to.row);
-      from.cell.style.opacity = "0";
-      to.cell.style.opacity = "1";
+      setTailwindStyles(from.cell, { opacity: "0" });
+      setTailwindStyles(to.cell, { opacity: "1" });
       completedTransitions++;
       sceneChanged = true;
       console.log(`show slide ${String(nextSlideIndex).padStart(2, "0")}`);

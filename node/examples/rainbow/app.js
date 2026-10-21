@@ -45,10 +45,14 @@ function familyOf(proc) {
   const words = text.split(/\s+/).filter((word, i) => i > 0 && !/^(-{1,2})?\d/.test(word) && !word.includes('/') && word.length < 32).slice(0, 2);
   return `${base} ${words.join(' ')}`.trim();
 }
+function setUtility(element, property, value) {
+  const token = `[${property.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}:${String(value).replace(/\s+/g, '_')}]`;
+  element.className = [...element.className.split(/\s+/).filter(name => name && !name.startsWith(`[${property.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}:`)), token].join(' ');
+}
 function hueFor(key) { return hash(key) % 360; }
 function resize() {
   dpr = Math.min(devicePixelRatio || 1, 2); width = innerWidth; height = innerHeight;
-  canvas.width = width*dpr; canvas.height = height*dpr; canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+  canvas.width = width*dpr; canvas.height = height*dpr; canvas.className = `[width:${width}px] [height:${height}px]`;
   ctx.setTransform(dpr,0,0,dpr,0,0);
   if (nodes.length) placeNodes();
 }
@@ -166,7 +170,7 @@ function update(data) {
       const line = document.createElement('div');
       line.textContent = item.commandLine;
       line.setAttribute('title', item.commandLine);
-      Object.assign(line.style, { color: '#d8d3e5', fontFamily: "'SFMono-Regular', Consolas, 'Liberation Mono', monospace", fontSize: 9, lineHeight: '1.45', whiteSpace: 'nowrap' });
+      line.className = "text-[#d8d3e5] [font-family:'SFMono-Regular',_Consolas,_'Liberation_Mono',_monospace] text-[9px] [line-height:1.45] whitespace-nowrap";
       return line;
     }));
   }
@@ -209,9 +213,9 @@ function drawWindowSnapshots() {
   stack.hidden = associated.length === 0 && document.querySelector('#recent-command-section').hidden;
   if (associated.length) {
     stack.hidden = false;
-    stack.style.opacity = 1;
+    setUtility(stack, 'opacity', 1);
   } else if (document.querySelector('#recent-command-section').hidden) {
-    stack.style.opacity = 0;
+    setUtility(stack, 'opacity', 0);
   }
   document.querySelector('#windows-rule').hidden = associated.length === 0 || document.querySelector('#recent-command-section').hidden;
   document.querySelector('#window-head').hidden = associated.length === 0;
@@ -309,11 +313,11 @@ function fitGraph() {
 
 function positionCard(card,x,y){
   const tw=card.offsetWidth,th=card.offsetHeight;
-  card.style.left=`${Math.max(12,Math.min(innerWidth-tw-12,x+16))}px`;
-  card.style.top=`${Math.max(12,Math.min(innerHeight-th-12,y+16))}px`;
+  setUtility(card, 'left', `${Math.max(12,Math.min(innerWidth-tw-12,x+16))}px`);
+  setUtility(card, 'top', `${Math.max(12,Math.min(innerHeight-th-12,y+16))}px`);
 }
 function drawHoverCard(node){
-  tooltip.style.display='block';
+  tooltip.className = `${tooltip.className.replace(/\b(hidden|block)\b/g, '').trim()} block`;
   const setText = (selector, value) => { const element = tooltip.querySelector(selector); if (element.textContent !== value) element.textContent = value; };
   setText('.tip-family', node.family);
   setText('strong', node.label);
@@ -341,11 +345,11 @@ function animateMetricColors(time) {
     const from = intensity < .55 ? low : middle, to = intensity < .55 ? middle : high;
     const amount = intensity < .55 ? intensity / .55 : (intensity - .55) / .45;
     const rgb = from.map((channel, index) => Math.round(channel + (to[index] - channel) * amount));
-    tooltip.querySelector(`#tip-${key}`).style.color = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+    setUtility(tooltip.querySelector(`#tip-${key}`), 'color', `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`);
   }
 }
 function hideCard(){
-  tooltip.style.display='none';
+  tooltip.className = `${tooltip.className.replace(/\b(hidden|block)\b/g, '').trim()} hidden`;
 }
 function draw(t) {
   ctx.clearRect(0,0,width,height);
@@ -411,7 +415,7 @@ function inspect(x,y) {
 canvas.addEventListener('pointerdown',e=>{
   if(e.button!==undefined&&e.button!==0)return;
   dragging={id:e.pointerId,x:e.clientX,y:e.clientY};
-  canvas.style.cursor='grabbing';canvas.setPointerCapture(e.pointerId);
+  setUtility(canvas, 'cursor', 'grabbing');canvas.setPointerCapture(e.pointerId);
 });
 canvas.addEventListener('pointermove',e=>{
   if(dragging&&dragging.id===e.pointerId){
@@ -421,11 +425,11 @@ canvas.addEventListener('pointermove',e=>{
     userAdjustedView = true;
     dragging.x=e.clientX;dragging.y=e.clientY;return;
   }
-  inspect(e.clientX,e.clientY);canvas.style.cursor=hover?'pointer':'grab';
+  inspect(e.clientX,e.clientY);setUtility(canvas, 'cursor', hover?'pointer':'grab');
 });
-const endDrag=e=>{if(dragging&&dragging.id===e.pointerId){dragging=null;canvas.style.cursor='grab';}};
+const endDrag=e=>{if(dragging&&dragging.id===e.pointerId){dragging=null;setUtility(canvas, 'cursor', 'grab');}};
 canvas.addEventListener('pointerup',endDrag);canvas.addEventListener('pointercancel',endDrag);
-canvas.addEventListener('pointerleave',()=>{if(!dragging){hover=null;drawWindowSnapshots();canvas.style.cursor='grab';hideCard();}});
+canvas.addEventListener('pointerleave',()=>{if(!dragging){hover=null;drawWindowSnapshots();setUtility(canvas, 'cursor', 'grab');hideCard();}});
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
   const factor = Math.exp(-e.deltaY * .001);

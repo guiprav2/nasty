@@ -5,49 +5,26 @@ import { documentBoxes } from "../internal/dom-state.js";
 const window = new Window({ resizable: "none", title: "Nasty box model", width: 720, height: 480 });
 const doc = new Document();
 window.document = doc;
-const element = (id, style = {}) => {
+const element = (id, classes = "") => {
   const result = doc.createElement("div");
   result.id = id;
-  Object.assign(result.style, style);
+  result.className = classes;
   return result;
 };
-Object.assign(doc.body.style, {
-  display: "flex", direction: "column", width: 720, height: 480,
-  padding: 20, gap: 16, backgroundColor: "#111827",
-});
-const card = element("card", {
-  width: 280, height: 150,
-  padding: 12, paddingLeft: 18,
-  borderWidth: 3, borderTopWidth: 5,
-  margin: 8, marginLeft: 14,
-  backgroundColor: "#1d3557", borderStyle: "solid", borderColor: "#60a5fa",
-});
-const cardContent = element("card-content", {
-  width: 100, height: 36, backgroundColor: "#2a9d8f",
-});
+doc.body.className = "flex flex-col w-[720px] h-[480px] p-5 gap-4 bg-[#111827]";
+const card = element("card", "w-[280px] h-[150px] p-3 pl-[18px] border-[3px] border-solid border-t-[5px] m-2 ml-[14px] bg-[#1d3557] border-[#60a5fa]");
+const cardContent = element("card-content", "w-[100px] h-[36px] bg-[#2a9d8f]");
 card.appendChild(cardContent);
-const row = element("auto-margin-row", {
-  display: "flex", direction: "row", width: 240, height: 44,
-  padding: 6, borderWidth: 2, borderStyle: "solid", backgroundColor: "#202a44",
-});
-const left = element("left", { width: 50, height: 24, backgroundColor: "#e9c46a" });
-const right = element("right", { width: 50, height: 24, marginLeft: "auto", backgroundColor: "#f4a261" });
+const row = element("auto-margin-row", "flex flex-row w-[240px] h-[44px] p-[6px] border-2 border-solid bg-[#202a44]");
+const left = element("left", "w-[50px] h-[24px] bg-[#e9c46a]");
+const right = element("right", "w-[50px] h-[24px] ml-auto bg-[#f4a261]");
 row.appendChild(left);
 row.appendChild(right);
-const scroller = element("padded-overflow", {
-  width: 280, height: 96, padding: 10, borderWidth: 4, overflow: "auto",
-  backgroundColor: "#252f47", borderColor: "#a78bfa", borderStyle: "solid",
-});
-const overflowingChild = element("overflowing-child", {
-  width: 360, height: 36, flexShrink: 0, backgroundColor: "#e76f51",
-});
+const scroller = element("padded-overflow", "w-[280px] h-[96px] p-[10px] border-4 overflow-auto bg-[#252f47] border-[#a78bfa] border-solid");
+const overflowingChild = element("overflowing-child", "w-[360px] h-[36px] shrink-0 bg-[#e76f51]");
 scroller.appendChild(overflowingChild);
-const negativeMargin = element("negative-margin", {
-  width: 80, height: 24, marginLeft: -8, backgroundColor: "#c084fc",
-});
-const noBorderStyle = element("border-width-with-none-style", {
-  width: 80, height: 24, borderWidth: 5, backgroundColor: "#475569",
-});
+const negativeMargin = element("negative-margin", "w-[80px] h-[24px] ml-[-8px] bg-[#c084fc]");
+const noBorderStyle = element("border-width-with-none-style", "w-[80px] h-[24px] border-[5px] bg-[#475569]");
 doc.body.appendChild(card);
 doc.body.appendChild(row);
 doc.body.appendChild(scroller);
