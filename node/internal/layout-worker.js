@@ -9,7 +9,7 @@ export class LayoutWorker {
   #workerError = null;
 
   constructor() {
-    this.#worker = new Worker(new URL("./workers/layout.js", import.meta.url));
+    this.#worker = new Worker(new URL("../workers/layout.js", import.meta.url));
     this.#worker.on("message", (message) => {
       if (message.id === 0) {
         if (message.type === "error") this.#workerError = new Error(message.error);

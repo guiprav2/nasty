@@ -1,8 +1,7 @@
-import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { LayoutWorker } from "./layout-worker.js";
+import native from "./internal/native.js";
+import { resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
+import { LayoutWorker } from "./internal/layout-worker.js";
 import { loadImage, unloadImage } from "./image-decoder.js";
 import { documentBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
 import { syncDocumentTextForPresent } from "./internal/dom-text.js";
@@ -15,25 +14,6 @@ import { documentImage } from "./internal/raster-document.js";
 import { resolveTailwind } from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 
-const require = createRequire(import.meta.url);
-const packageRoot = fileURLToPath(new URL(".", import.meta.url));
-const releaseNativePath = join(packageRoot, "native/release/nasty.node");
-const nativePath = process.env.NASTY_NATIVE_PATH
-  ?? (process.platform === "android"
-    ? join(packageRoot, "native/android-arm64/nasty.node")
-    : existsSync(releaseNativePath) ? releaseNativePath : join(packageRoot, "native/debug/nasty.node"));
-if (!existsSync(nativePath)) {
-  throw new Error(`Nasty native addon not found at ${nativePath}; build it with npm run build:release, npm run build:debug, or npm run build:android-arm64`);
-}
-const native = process.platform === "android"
-  ? (() => {
-      const nativeModule = { exports: {} };
-      process.dlopen(nativeModule, nativePath);
-      return nativeModule.exports;
-    })()
-  : require(nativePath);
-
-export const LayoutTree = native.LayoutTree;
 export const VideoDecoder = native.VideoDecoder;
 export const AudioDecoder = native.AudioDecoder;
 export const AudioPlayer = native.AudioPlayer;
@@ -389,7 +369,7 @@ function setHostStyle(element, values) {
 
 class CSSStyleDeclaration {
   constructor(element, initial) {
-    const state = { element, values: initial, baseValues: initial, hostValues: {}, classValues: {}, transitions: new Map() };
+    const state = { element, values: { ...initial }, baseValues: initial, hostValues: {}, classValues: {}, transitions: new Map() };
     styleData.set(this, state);
     const proxy = new Proxy(this, {
       get: (target, property, receiver) => {
@@ -413,21 +393,12 @@ class CSSStyleDeclaration {
     return proxy;
   }
 
-  setProperty(property, value) {
-    throw new TypeError("element.style is read-only; use Tailwind utility classes");
-  }
-
   getPropertyValue(property) {
     const name = property.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
     const value = styleData.get(this).values[name];
     return value === undefined ? "" : String(value);
   }
-
-  removeProperty(property) {
-    throw new TypeError("element.style is read-only; use Tailwind utility classes");
-  }
 }
-
 
 export class Element extends EventTarget {
   constructor(document, name) {
@@ -467,19 +438,64 @@ export class Element extends EventTarget {
   get className() { return this.getAttribute("class") || ""; }
   set className(value) { this.setAttribute("class", value); }
   get classList() {
+    const state = elementState(this);
+    if (state.classList) return state.classList;
     const element = this;
-    const tokens = () => element.className.split(/\s+/).filter(Boolean);
-    return {
-      contains: token => tokens().includes(token),
-      add(...values) { element.className = [...new Set([...tokens(), ...values])].join(" "); },
-      remove(...values) { element.className = tokens().filter(value => !values.includes(value)).join(" "); },
+    let cachedValue, cachedTokens;
+    const tokens = () => {
+      const value = element.className;
+      if (value !== cachedValue) {
+        cachedValue = value;
+        cachedTokens = [...new Set(value.split(/[\t\n\f\r ]+/).filter(Boolean))];
+      }
+      return cachedTokens;
+    };
+    const validate = value => {
+      const token = String(value);
+      if (!token) throw new DOMException("The token must not be empty", "SyntaxError");
+      if (/[\t\n\f\r ]/.test(token)) throw new DOMException("The token must not contain whitespace", "InvalidCharacterError");
+      return token;
+    };
+    const commit = next => element.setAttribute("class", next.join(" "));
+    state.classList = {
+      get length() { return tokens().length; },
+      get value() { return element.className; },
+      set value(value) { element.setAttribute("class", value); },
+      item(index) { return tokens()[index] ?? null; },
+      contains(token) { return tokens().includes(String(token)); },
+      add(...values) {
+        const next = [...tokens()];
+        for (const token of values.map(validate)) if (!next.includes(token)) next.push(token);
+        if (next.length !== tokens().length) commit(next);
+      },
+      remove(...values) {
+        const removed = new Set(values.map(validate));
+        const next = tokens().filter(token => !removed.has(token));
+        if (next.length !== tokens().length) commit(next);
+      },
+      replace(token, replacement) {
+        token = validate(token); replacement = validate(replacement);
+        const next = [...tokens()], index = next.indexOf(token);
+        if (index < 0) return false;
+        if (token === replacement) return true;
+        next[index] = replacement;
+        commit([...new Set(next)]);
+        return true;
+      },
       toggle(token, force) {
-        const add = force ?? !this.contains(token);
+        token = validate(token);
+        const add = force === undefined ? !this.contains(token) : Boolean(force);
         if (add) this.add(token); else this.remove(token);
         return add;
       },
-      [Symbol.iterator]: () => tokens()[Symbol.iterator](),
+      entries() { return tokens().entries(); },
+      keys() { return tokens().keys(); },
+      values() { return tokens().values(); },
+      forEach(callback, thisArg) { tokens().forEach((value, index) => callback.call(thisArg, value, index, this)); },
+      toString() { return element.className; },
+      [Symbol.iterator]() { return this.values(); },
     };
+    return state.classList;
   }
   get hidden() { return this.hasAttribute("hidden"); }
   set hidden(value) { if (value) this.setAttribute("hidden", ""); else this.removeAttribute("hidden"); }
@@ -531,6 +547,7 @@ export class Element extends EventTarget {
   setAttribute(name, value) {
     name = String(name).toLowerCase();
     value = String(value);
+    if (name === "style") throw new TypeError("element.style is read-only; use Tailwind utility classes");
     const oldValue = this.attributes.get(name);
     if (name === "class" && oldValue === value) return;
     this.attributes.set(name, value);
@@ -941,20 +958,6 @@ export class Element extends EventTarget {
     const changed = refreshStyleValues(state);
     if (changed.size) this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
     return changed.size > 0;
-  }
-
-  _setTailwindUtilityStyles(className, baseClassName, utilityValues) {
-    const state = styleData.get(this.style);
-    const width = documentState(this.document).viewport.width;
-    const next = { ...resolveTailwind(baseClassName, width), ...utilityValues };
-    const same = Object.keys(next).length === Object.keys(state.classValues).length
-      && Object.keys(next).every(key => Object.is(next[key], state.classValues[key]));
-    if (this.className === className && same) return;
-    this.attributes.set("class", className);
-    state.hasResponsiveUtilities = /(?:^|\s)(?:sm|md|lg|xl|2xl):/.test(baseClassName);
-    state.classValues = next;
-    const changed = refreshStyleValues(state);
-    this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
   }
 
   _taffyStyle() {

@@ -21,13 +21,14 @@ const childBox = nestedBoxes.find((box) => box.element === child);
 const projectNested = createBoxProjector(nestedBoxes);
 const childOriginBefore = projectNested(childBox, childBox.x, childBox.y);
 const nestedDisplayListBefore = buildTransformedDisplayList(nestedBoxes, 160, 160);
-parent.className = "[transform:translateX(24px)]";
-child.className = "[transform:translateY(12px)]";
+parent.classList.add("[transform:translateX(24px)]");
+child.classList.add("[transform:translateY(12px)]");
 const childOriginAfter = createBoxProjector(nestedBoxes)(childBox, childBox.x, childBox.y);
 assert.ok(Math.abs(childOriginAfter.x - childOriginBefore.x - 24) < 0.01, "parent translation should reach its child");
 assert.ok(Math.abs(childOriginAfter.y - childOriginBefore.y - 12) < 0.01, "child transform should compose with its parent");
 assert.ok(!Buffer.from(nestedDisplayListBefore).equals(Buffer.from(buildTransformedDisplayList(nestedBoxes, 160, 160))), "parent transforms should change descendant geometry");
-parent.className = "[transform:scale(2)] [transform-origin:top_left]";
+parent.classList.replace("[transform:translateX(24px)]", "[transform:scale(2)]");
+parent.classList.add("[transform-origin:top_left]");
 const projectScaled = createBoxProjector(nestedBoxes);
 const scaledOrigin = projectScaled(childBox, childBox.x, childBox.y);
 const scaledCorner = projectScaled(childBox, childBox.x + childBox.width, childBox.y + childBox.height);
@@ -42,6 +43,7 @@ window.document = document;
 document.body.className = "flex flex-wrap justify-center content-center items-center gap-2";
 
 const cards = [];
+const transformClasses = [];
 for (let i = 0; i < 42; i++) {
   const card = document.createElement("div");
   card.id = `card-${i}`;
@@ -53,10 +55,13 @@ const boxes = documentBoxes(document);
 assert.equal(boxes.length, 43, "42 cards plus body should be laid out");
 
 const before = buildTransformedDisplayList(boxes, viewport.width, viewport.height);
-for (const card of cards) card.className += " [transform:perspective(450px)_rotateY(24deg)_rotateX(-12deg)_translateZ(12px)]";
+for (const [index, card] of cards.entries()) {
+  transformClasses[index] = "[transform:perspective(450px)_rotateY(24deg)_rotateX(-12deg)_translateZ(12px)]";
+  card.classList.add(transformClasses[index]);
+}
 const transformed = buildTransformedDisplayList(boxes, viewport.width, viewport.height);
-assert.equal(new Float32Array(before.buffer, before.byteOffset, 1)[0], 4);
-assert.equal(new Float32Array(transformed.buffer, transformed.byteOffset, 1)[0], 4);
+assert.equal(new Float32Array(before.buffer, before.byteOffset, 1)[0], 5);
+assert.equal(new Float32Array(transformed.buffer, transformed.byteOffset, 1)[0], 5);
 assert.ok(!Buffer.from(before).equals(Buffer.from(transformed)), "3D transforms should change projected GPU geometry");
 assert.equal(documentState(document).dirty, false, "transform-only changes must not invalidate Taffy layout");
 
@@ -94,7 +99,10 @@ function draw() {
     const rotateY = 18 + 12 * Math.sin(elapsed * 1.7 + phase);
     const rotateX = 8 * Math.cos(elapsed * 1.3 + phase * 0.8);
     const z = 8 + 7 * Math.sin(elapsed * 1.1 + phase);
-    cards[i].className = `w-[84px] h-[48px] bg-[#${((0x4477bb + i * 0x03090d) & 0xffffff).toString(16).padStart(6, "0")}] border border-solid border-[#d9e4f2] [transform-origin:center_center] [transform:perspective(450px)_rotateY(${rotateY}deg)_rotateX(${rotateX}deg)_translateZ(${z}px)]`;
+    const nextTransformClass = `[transform:perspective(450px)_rotateY(${rotateY}deg)_rotateX(${rotateX}deg)_translateZ(${z}px)]`;
+    if (transformClasses[i]) cards[i].classList.replace(transformClasses[i], nextTransformClass);
+    else cards[i].classList.add(nextTransformClass);
+    transformClasses[i] = nextTransformClass;
   }
   jsUpdateTimes.push(performance.now() - updateStart);
   const listStart = performance.now();

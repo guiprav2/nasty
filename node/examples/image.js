@@ -81,7 +81,7 @@ const [pngDecodeMs, jpegDecodeMs] = await Promise.all([pngDecoded, jpegDecoded])
 await Promise.all([dataImage.decode(), httpImage.decode()]);
 await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 documentBoxes(document);
-image.className = imageClasses(450);
+image.classList.replace("w-[440px]", "w-[450px]");
 const flushStart = performance.now();
 const flushedRect = image.getBoundingClientRect();
 const dirtyFlushMs = performance.now() - flushStart;
@@ -90,7 +90,7 @@ assert.equal(flushedRect.width, 450, "getBoundingClientRect flushes current styl
 const cacheStart = performance.now();
 image.getBoundingClientRect();
 const cachedReadMs = performance.now() - cacheStart;
-image.className = imageClasses(440);
+image.classList.replace("w-[450px]", "w-[440px]");
 await assert.rejects(failedImage.decode(), { name: "EncodingError" });
 await errorEvent;
 assert.equal(failedImage.complete, true, "a failed image request is complete");

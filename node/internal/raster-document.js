@@ -314,7 +314,12 @@ function rasterizeCachedLayer(document, width, height, surface, state, key, opti
       includeRect(currentPaintBounds.get(element));
       includeRect(previousPaintBounds.get(element));
     }
-    dirtyRegions = mergeDirtyRegions(dirtyRegions);
+    dirtyRegions = mergeDirtyRegions(mergeDirtyRegions(dirtyRegions).map(rect => {
+      const left = Math.max(0, Math.floor(rect.x)), top = Math.max(0, Math.floor(rect.y));
+      const right = Math.min(width, Math.ceil(rect.x + rect.width));
+      const bottom = Math.min(height, Math.ceil(rect.y + rect.height));
+      return { x: left, y: top, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
+    }).filter(rect => rect.width > 0 && rect.height > 0));
     if (!dirtyRegions.length) {
       state[geometryKey] = doc.geometryGeneration;
       state[`${key}BoxMap`] = currentBoxMap;

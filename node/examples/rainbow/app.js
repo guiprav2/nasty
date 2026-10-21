@@ -1,5 +1,6 @@
 const canvas = document.querySelector('#field');
 const ctx = canvas.getContext('2d');
+let cursorClass = '[cursor:grab]';
 const tooltip = document.querySelector('#tooltip');
 const seen = new Map();
 let processes = [], nodes = [], width = 0, height = 0, dpr = 1;
@@ -32,6 +33,22 @@ function networkGlowLevel(node) {
   const traffic = Math.max(0, node.networkUpBps || 0) + Math.max(0, node.networkDownBps || 0);
   return Math.min(1, Math.expm1(Math.min(Math.log(2), traffic * usageScale / (12 * 1024))));
 }
+function loadGlowLevel(node) {
+  // Log-normalized weighted RMS: a busy resource remains visible without requiring
+  // every resource to be busy. Saturation points: 100% CPU, 1 GiB RSS, 1 MiB/s per disk direction.
+  const cpu = loadUnit(node.cpuPercent || 0, 6.25);
+  const memory = loadUnit(node.rssBytes || 0, 64 * 1024 * 1024);
+  const read = loadUnit(node.diskReadBps || 0, 64 * 1024);
+  const write = loadUnit(node.diskWriteBps || 0, 64 * 1024);
+  const load = Math.sqrt(.45 * cpu * cpu + .20 * memory * memory + .175 * read * read + .175 * write * write);
+  return 1 - Math.pow(1 - load, usageScale);
+}
+function glowLevel(node) {
+  const network = networkGlowLevel(node);
+  if (window.glowMode === 'load') return loadGlowLevel(node);
+  if (window.glowMode === 'both') return 1 - (1 - network) * (1 - loadGlowLevel(node));
+  return network;
+}
 function formatBytes(value) {
   const units = ['B', 'KiB', 'MiB', 'GiB']; let amount = Math.max(0, value || 0), unit = 0;
   while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit++; }
@@ -45,14 +62,10 @@ function familyOf(proc) {
   const words = text.split(/\s+/).filter((word, i) => i > 0 && !/^(-{1,2})?\d/.test(word) && !word.includes('/') && word.length < 32).slice(0, 2);
   return `${base} ${words.join(' ')}`.trim();
 }
-function setUtility(element, property, value) {
-  const token = `[${property.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}:${String(value).replace(/\s+/g, '_')}]`;
-  element.className = [...element.className.split(/\s+/).filter(name => name && !name.startsWith(`[${property.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}:`)), token].join(' ');
-}
 function hueFor(key) { return hash(key) % 360; }
 function resize() {
   dpr = Math.min(devicePixelRatio || 1, 2); width = innerWidth; height = innerHeight;
-  canvas.width = width*dpr; canvas.height = height*dpr; canvas.className = `[width:${width}px] [height:${height}px]`;
+  canvas.width = width*dpr; canvas.height = height*dpr;
   ctx.setTransform(dpr,0,0,dpr,0,0);
   if (nodes.length) placeNodes();
 }
@@ -213,9 +226,9 @@ function drawWindowSnapshots() {
   stack.hidden = associated.length === 0 && document.querySelector('#recent-command-section').hidden;
   if (associated.length) {
     stack.hidden = false;
-    setUtility(stack, 'opacity', 1);
+    stack.classList.replace('[opacity:0]', '[opacity:1]');
   } else if (document.querySelector('#recent-command-section').hidden) {
-    setUtility(stack, 'opacity', 0);
+    stack.classList.replace('[opacity:1]', '[opacity:0]');
   }
   document.querySelector('#windows-rule').hidden = associated.length === 0 || document.querySelector('#recent-command-section').hidden;
   document.querySelector('#window-head').hidden = associated.length === 0;
@@ -279,9 +292,9 @@ function fitGraph() {
   for (const node of nodes) {
     const point = projectBase(node.x, node.y, node.z);
     const activity = 1 - Math.pow(1 - processActivity(node), usageScale);
-    const network = networkGlowLevel(node);
+    const glow = glowLevel(node);
     const displaySize = node.size * point.scale * (.72 + 1.6 * Math.sqrt(activity));
-    const glowRadius = displaySize * Math.min(11, 3 + 2 * activity + 2.8 * network);
+    const glowRadius = displaySize * Math.min(11, 3 + 4.8 * glow);
     const radius = Math.max(displaySize * 1.7, glowRadius);
     bounds.left = Math.min(bounds.left, point.x - radius); bounds.right = Math.max(bounds.right, point.x + radius);
     bounds.top = Math.min(bounds.top, point.y - radius); bounds.bottom = Math.max(bounds.bottom, point.y + radius);
@@ -310,14 +323,27 @@ function fitGraph() {
   pan.x = targetX - pivotX - (centerX - pivotX) * zoom;
   pan.y = targetY - pivotY - (centerY - pivotY) * zoom;
 }
+addEventListener('message', event => {
+  if (event.data?.type !== 'rainbow-glow-mode' || userAdjustedView || !nodes.length) return;
+  fitGraph();
+  fittedLayoutKey = `${width}x${height}:${nodes.map(node => `${node.pid},${node.x},${node.y},${node.z}`).join(';')}`;
+});
 
 function positionCard(card,x,y){
   const tw=card.offsetWidth,th=card.offsetHeight;
-  setUtility(card, 'left', `${Math.max(12,Math.min(innerWidth-tw-12,x+16))}px`);
-  setUtility(card, 'top', `${Math.max(12,Math.min(innerHeight-th-12,y+16))}px`);
+  for (const token of [
+    `[left:${Math.max(12, Math.min(innerWidth-tw-12, x+16))}px]`,
+    `[top:${Math.max(12, Math.min(innerHeight-th-12, y+16))}px]`,
+  ]) {
+    const prefix = token.slice(0, token.indexOf(':') + 1);
+    const previous = [...card.classList].find(value => value.startsWith(prefix));
+    if (previous) card.classList.replace(previous, token);
+    else card.classList.add(token);
+  }
 }
 function drawHoverCard(node){
-  tooltip.className = `${tooltip.className.replace(/\b(hidden|block)\b/g, '').trim()} block`;
+  tooltip.classList.remove('hidden');
+  tooltip.classList.add('block');
   const setText = (selector, value) => { const element = tooltip.querySelector(selector); if (element.textContent !== value) element.textContent = value; };
   setText('.tip-family', node.family);
   setText('strong', node.label);
@@ -345,11 +371,16 @@ function animateMetricColors(time) {
     const from = intensity < .55 ? low : middle, to = intensity < .55 ? middle : high;
     const amount = intensity < .55 ? intensity / .55 : (intensity - .55) / .45;
     const rgb = from.map((channel, index) => Math.round(channel + (to[index] - channel) * amount));
-    setUtility(tooltip.querySelector(`#tip-${key}`), 'color', `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`);
+    const metric = tooltip.querySelector(`#tip-${key}`);
+    const previous = [...metric.classList].find(token => token.startsWith('[color:'));
+    const next = `[color:rgb(${rgb[0]},${rgb[1]},${rgb[2]})]`;
+    if (previous) metric.classList.replace(previous, next);
+    else metric.classList.add(next);
   }
 }
 function hideCard(){
-  tooltip.className = `${tooltip.className.replace(/\b(hidden|block)\b/g, '').trim()} hidden`;
+  tooltip.classList.remove('block');
+  tooltip.classList.add('hidden');
 }
 function draw(t) {
   ctx.clearRect(0,0,width,height);
@@ -362,7 +393,7 @@ function draw(t) {
     const p = project(n.x, n.y, n.z);
     n.screenX = p.x; n.screenY = p.y; n.depth = p.depth; n.perspective = p.scale;
     n.activity = 1 - Math.pow(1 - processActivity(n), usageScale);
-    n.networkGlow = networkGlowLevel(n);
+    n.glow = glowLevel(n);
     n.displaySize = n.size * p.scale * zoom * (.72 + 1.6 * Math.sqrt(n.activity));
     return { n, ...p };
   }).sort((a,b) => a.depth-b.depth);
@@ -391,8 +422,8 @@ function draw(t) {
     const pulse=n.fresh ? .75+.25*Math.sin(t/220) : 1;
     const color=`hsla(${n.hue},76%,72%,${n.fresh?.94:.68})`;
     if(n.fresh){ctx.beginPath();ctx.arc(x,y,size+5+Math.sin(t/250)*1.5,0,Math.PI*2);ctx.strokeStyle=`hsla(${n.hue},88%,82%,${.25*pulse})`;ctx.lineWidth=.8;ctx.stroke();}
-    const glowRadius = size * Math.min(11, 3 + 2 * n.activity + 2.8 * n.networkGlow);
-    const glowOpacity = Math.min(.92, .12 + .32 * n.activity + .22 * n.networkGlow);
+    const glowRadius = size * Math.min(11, 3 + 4.8 * n.glow);
+    const glowOpacity = Math.min(.92, .12 + .54 * n.glow);
     const g=ctx.createRadialGradient(x,y,0,x,y,glowRadius);g.addColorStop(0,`hsla(${n.hue},90%,75%,${glowOpacity*pulse})`);g.addColorStop(1,`hsla(${n.hue},80%,65%,0)`);ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,glowRadius,0,Math.PI*2);ctx.fill();
     ctx.beginPath();ctx.arc(x,y,size*(n.pid===hover?.pid?1.7:1),0,Math.PI*2);ctx.fillStyle=color;ctx.fill();
     if(n.pid===hover?.pid){ctx.beginPath();ctx.arc(x,y,size+5,0,Math.PI*2);ctx.strokeStyle=`hsla(${n.hue},85%,88%,.8)`;ctx.lineWidth=1;ctx.stroke();}
@@ -415,7 +446,7 @@ function inspect(x,y) {
 canvas.addEventListener('pointerdown',e=>{
   if(e.button!==undefined&&e.button!==0)return;
   dragging={id:e.pointerId,x:e.clientX,y:e.clientY};
-  setUtility(canvas, 'cursor', 'grabbing');canvas.setPointerCapture(e.pointerId);
+  canvas.classList.replace(cursorClass, '[cursor:grabbing]'); cursorClass = '[cursor:grabbing]';canvas.setPointerCapture(e.pointerId);
 });
 canvas.addEventListener('pointermove',e=>{
   if(dragging&&dragging.id===e.pointerId){
@@ -425,11 +456,11 @@ canvas.addEventListener('pointermove',e=>{
     userAdjustedView = true;
     dragging.x=e.clientX;dragging.y=e.clientY;return;
   }
-  inspect(e.clientX,e.clientY);setUtility(canvas, 'cursor', hover?'pointer':'grab');
+  inspect(e.clientX,e.clientY);canvas.classList.replace(cursorClass, hover ? '[cursor:pointer]' : '[cursor:grab]'); cursorClass = hover ? '[cursor:pointer]' : '[cursor:grab]';
 });
-const endDrag=e=>{if(dragging&&dragging.id===e.pointerId){dragging=null;setUtility(canvas, 'cursor', 'grab');}};
+const endDrag=e=>{if(dragging&&dragging.id===e.pointerId){dragging=null;canvas.classList.replace(cursorClass, '[cursor:grab]'); cursorClass = '[cursor:grab]';}};
 canvas.addEventListener('pointerup',endDrag);canvas.addEventListener('pointercancel',endDrag);
-canvas.addEventListener('pointerleave',()=>{if(!dragging){hover=null;drawWindowSnapshots();setUtility(canvas, 'cursor', 'grab');hideCard();}});
+canvas.addEventListener('pointerleave',()=>{if(!dragging){hover=null;drawWindowSnapshots();canvas.classList.replace(cursorClass, '[cursor:grab]'); cursorClass = '[cursor:grab]';hideCard();}});
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
   const factor = Math.exp(-e.deltaY * .001);

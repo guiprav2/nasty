@@ -15,6 +15,11 @@ import { inherited } from '../internal/text-metrics.js';
 import { createRainbowUI } from './rainbow/ui.js';
 import { ProcessSampler } from './rainbow/process-sampler.js';
 
+function parseGlowMode(value) {
+  if (value !== 'net' && value !== 'load' && value !== 'both') throw new InvalidArgumentError('must be net, load, or both');
+  return value;
+}
+
 function parseUsageScale(value) {
   const multiplier = Number(value);
   if (!Number.isFinite(multiplier) || multiplier <= 0 || multiplier > 100) {
@@ -27,6 +32,7 @@ const cli = new Command();
 cli
   .name('rainbow')
   .description('Show a live process graph in Nasty')
+  .option('--glow <mode>', 'node glow source: net, load, or both (press g to cycle)', parseGlowMode, 'net')
   .option('--net-only', 'show only processes with active network sockets')
   .option('--usage-scale <multiplier>', 'adjust how strongly resource usage changes node size and glow', parseUsageScale, 1)
   .option('--logfile <path>', 'write traced command lines here', path.join(os.homedir(), '.rainbow', 'trace.log'))
@@ -356,6 +362,7 @@ let netOnly = options.netOnly;
 const window = new Window({ title: 'Rainbow — process field', width: 1180, height: 760, resizable: 'both', borderless: true, dragAnywhere: 'Ctrl', maximizable: true, maximized: true });
 const document = new Document(); window.document = document;
 const ui = createRainbowUI(document);
+ui.setGlowMode(options.glow);
 ui.setMaximized(window.maximized);
 ui.maximizeButton.addEventListener('click', () => { window.maximized = !window.maximized; ui.setMaximized(window.maximized); });
 let viewport = window.size(); ui.resize(viewport.width, viewport.height);
@@ -374,6 +381,7 @@ let pointerDownTarget = null;
 const browser = {
   document, console, performance, devicePixelRatio: 1,
   usageScale: options.usageScale,
+  glowMode: options.glow,
   showRecentCommands: ui.showRecentCommands,
   clearRecentCommands: ui.clearRecentCommands,
   innerWidth: viewport.width, innerHeight: viewport.height,
@@ -427,17 +435,17 @@ function dispatch() {
     }
     if (event.type === 'keydown' && event.key === 'Named(Escape)') window.close();
     if (event.type === 'keydown' || event.type === 'keyup') {
-      const key = event.key === 'Character("n")' || event.key === "Character('n')" ? 'n'
-        : event.key === 'Character("N")' || event.key === "Character('N')" ? 'n'
-        : event.key === 'Character("q")' || event.key === "Character('q')" ? 'q'
-        : event.key === 'Character("Q")' || event.key === "Character('Q')" ? 'q'
-        : event.key === 'Character("t")' || event.key === "Character('t')" ? 't'
-        : event.key === 'Character("T")' || event.key === "Character('T')" ? 't' : null;
+      const key = /^Character\(["']([nqtg])["']\)$/i.exec(event.key || '')?.[1].toLowerCase() ?? null;
       if (event.type === 'keyup') {
         if (key) actionKeysDown.delete(key);
       } else if (key && !actionKeysDown.has(key)) {
         actionKeysDown.add(key);
         if (key === 'q') window.close();
+        if (key === 'g') {
+          browser.glowMode = browser.glowMode === 'net' ? 'load' : browser.glowMode === 'load' ? 'both' : 'net';
+          ui.setGlowMode(browser.glowMode);
+          browser.postMessage({ type: 'rainbow-glow-mode' });
+        }
         if (key === 'n') {
           netOnly = !netOnly;
           publishProcessSnapshot(true);

@@ -37,8 +37,12 @@ export function textStyle(element) {
   const font = `${weight} ${size}px ${family}`;
   let bounds = fontBounds.get(font);
   if (!bounds) { context.font = font; bounds = context.measureText('Mg'); fontBounds.set(font, bounds); }
-  const line = rawLine === 'normal' ? bounds.fontBoundingBoxAscent + bounds.fontBoundingBoxDescent : typeof rawLine === 'string' && !/[a-z%]/i.test(rawLine)
-    ? parseFloat(rawLine) * size : parseFloat(rawLine);
+  const lineValue = String(rawLine).trim();
+  const line = lineValue === 'normal' ? bounds.fontBoundingBoxAscent + bounds.fontBoundingBoxDescent
+    : /^-?(?:\d+\.?\d*|\.\d+)$/.test(lineValue) ? parseFloat(lineValue) * size
+      : lineValue.endsWith('em') ? parseFloat(lineValue) * size
+        : lineValue.endsWith('rem') ? parseFloat(lineValue) * 16
+          : lineValue.endsWith('%') ? parseFloat(lineValue) * size / 100 : parseFloat(lineValue);
   return { size, spacing, line, font, color: inherited(element, 'color', '#000'),
     wrap: !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')) };
 }

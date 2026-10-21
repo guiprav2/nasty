@@ -3,28 +3,32 @@ import { writeFileSync } from "node:fs";
 import os from "node:os";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
-import { LayoutWorker } from "../layout-worker.js";
+import { Document } from "../index.js";
+import { documentState } from "../internal/dom-state.js";
 
-const nodes = [{ style: { display: "flex", direction: "column", width: 800, height: 300, padding: 24, gap: 16 }, children: [1, 2] }];
-nodes.push({ style: { widthPercent: 1, height: 64 }, children: [] });
-nodes.push({ style: { display: "flex", direction: "column", gap: 8, flexGrow: 1 }, children: [] });
+const initStart = performance.now();
+const document = new Document();
+const nodes = [document.body];
+document.body.className = "flex flex-col w-[800px] h-[300px] p-6 gap-4";
+function element(parent, classes) {
+  const node = document.createElement("div");
+  node.className = classes;
+  parent.appendChild(node);
+  nodes.push(node);
+  return node;
+}
+element(document.body, "w-full h-[64px]");
+const grid = element(document.body, "flex flex-col gap-2 grow");
 const cards = [];
 for (let rowIndex = 0; rowIndex < 8; rowIndex++) {
-  const row = nodes.length;
-  nodes.push({ style: { display: "flex", direction: "row", gap: 8 }, children: [] });
-  nodes[2].children.push(row);
-  for (let column = 0; column < 10; column++) {
-    const index = nodes.length;
-    nodes.push({ style: { width: 60, height: 14, flexShrink: 0 }, children: [] });
-    nodes[row].children.push(index);
-    cards.push(index);
-  }
+  const row = element(grid, "flex flex-row gap-2");
+  for (let column = 0; column < 10; column++) cards.push(element(row, "w-[60px] h-[14px] shrink-0"));
 }
-
-const layout = new LayoutWorker();
-const initStart = performance.now();
-await layout.initialize(nodes);
+// This benchmark inspects worker timings and stale results through internal state.
+// Element styling still goes through the same public classList API as applications.
+const layout = documentState(document).layoutTree;
 console.log(`persistent Taffy worker initialized ${nodes.length} nodes in ${(performance.now() - initStart).toFixed(3)} ms`);
+let widthClass = "w-[60px]";
 
 const refreshRate = 60;
 const budget = 1000 / refreshRate;
@@ -85,7 +89,9 @@ try {
     const frameStart = performance.now();
     if (frame) frameIntervals.push(frameStart - previous);
     previous = frameStart;
-    layout.setStyle(cards[0], { width: 60 + (frame % 2), height: 14, flexShrink: 0 });
+    const nextWidthClass = `w-[${60 + (frame % 2)}px]`;
+    cards[0].classList.replace(widthClass, nextWidthClass);
+    widthClass = nextWidthClass;
     const requestStart = performance.now();
     const result = await layout.layout(800, 300);
     roundTrips.push(performance.now() - requestStart);
@@ -109,9 +115,9 @@ try {
   assert.equal(finalBoxes[3].x, 24);
   assert.equal(finalBoxes[4].x, 24);
   assert.equal(finalBoxes[5].x, 93);
-  layout.setStyle(cards[0], { width: 62, height: 14, flexShrink: 0 });
+  cards[0].classList.replace(widthClass, "w-[62px]");
   const staleRequest = layout.layout(800, 300);
-  layout.setStyle(cards[0], { width: 63, height: 14, flexShrink: 0 });
+  cards[0].classList.replace("w-[62px]", "w-[63px]");
   const currentRequest = layout.layout(800, 300);
   const [staleResult, currentResult] = await Promise.all([staleRequest, currentRequest]);
   assert.equal(staleResult.stale, true, "superseded layout result was not marked stale");
@@ -139,5 +145,5 @@ try {
 } finally {
   clearInterval(resourceTimer);
   loopDelay.disable();
-  await layout.close();
+  await document.close();
 }

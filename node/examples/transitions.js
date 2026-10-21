@@ -34,10 +34,12 @@ const transitionEnds = [];
 cards.forEach((card, index) => card.addEventListener("transitionend", (event) => {
   transitionEnds.push(`${index}:${event.propertyName}`);
 }));
+// Present the initial state before timing transitions; cold GPU setup can exceed their first 200 ms.
+window.presentOrdered(buildOrderedDisplayList(documentBoxes(document), window.size().width, window.size().height));
 const start = performance.now();
 for (const card of cards) {
-  card.className = cardClasses(target, "#17202a");
-  card.className = cardClasses(target, "#00d8ff");
+  card.classList.replace(`bg-[${original}]`, `bg-[${target}]`);
+  card.classList.replace("border-[#17202a]", "border-[#00d8ff]");
 }
 
 const refreshHz = window.refreshRate() || 60;
@@ -65,9 +67,8 @@ function colorDistance(a, b) {
 
 function retarget(card, property, value) {
   const before = computedStyleValue(card.style, property);
-  const background = property === "backgroundColor" ? value : card.style.backgroundColor;
-  const border = property === "borderColor" ? value : card.style.borderColor;
-  card.className = cardClasses(background, border);
+  const prefix = property === "backgroundColor" ? "bg" : "border";
+  card.classList.replace(`${prefix}-[${card.style[property]}]`, `${prefix}-[${value}]`);
   assert.equal(card.style[property], value, "read-only CSSOM should expose the utility-class transition target");
   const after = computedStyleValue(card.style, property);
   assert.ok(colorDistance(before, after) < 0.02, `${property} retarget should not jump`);

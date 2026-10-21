@@ -1,8 +1,8 @@
 import { parentPort } from "node:worker_threads";
 import { performance } from "node:perf_hooks";
-import { LayoutTree } from "../index.js";
+import native from "../internal/native.js";
 
-const tree = new LayoutTree();
+const tree = new native.LayoutTree();
 tree.setRounding(false);
 let handles = [];
 let root = 0;

@@ -7,7 +7,7 @@ import { FontRegistry } from "../font-registry.js";
 
 const family = process.argv[2] ?? "DejaVu Sans";
 const fontPath = process.argv[3] ?? execFileSync("fc-match", ["-f", "%{file}", family], { encoding: "utf8" }).trim();
-const fontLabel = `style.fontFamily = "${family}"`;
+const fontLabel = `[font-family:${family.replace(/\s+/g, "_")}]`;
 const registry = new FontRegistry().register(family, async () => {
   sourceReadCount++;
   return readFile(fontPath);

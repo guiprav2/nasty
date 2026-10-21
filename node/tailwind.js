@@ -9,7 +9,25 @@ const LENGTHS = new Set([
   "gap", "rowGap", "columnGap", "borderWidth", "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth",
   "fontSize", "lineHeight", "letterSpacing", "borderRadius", "borderTopLeftRadius", "borderTopRightRadius", "borderBottomLeftRadius", "borderBottomRightRadius",
 ]);
-const UNITLESS = new Set(["opacity", "flexGrow", "flexShrink", "zIndex", "order", "fontWeight", "lineHeight", "aspectRatio"]);
+const UNITLESS = new Set(["opacity", "flex", "flexGrow", "flexShrink", "zIndex", "order", "fontWeight", "aspectRatio"]);
+// Only standard CSS declarations may cross from utility tokens into element state.
+// Native layout fields (for example widthPercent and marginLeftAuto) stay internal.
+const CSS_PROPERTIES = new Set([
+  ...LENGTHS, ...UNITLESS,
+  "display", "position", "inset", "boxSizing", "overflow", "overflowX", "overflowY",
+  "flex", "flexBasis", "flexDirection", "flexWrap", "alignItems", "alignSelf", "alignContent",
+  "justifyContent", "justifyItems", "justifySelf", "gridTemplateColumns", "gridTemplateRows",
+  "gridColumn", "gridRow", "gridAutoFlow", "gridAutoColumns", "gridAutoRows",
+  "color", "background", "backgroundColor", "backgroundImage", "backgroundSize", "backgroundPosition",
+  "backgroundRepeat", "border", "borderStyle", "borderColor", "borderTopColor", "borderRightColor",
+  "borderBottomColor", "borderLeftColor", "borderTopStyle", "borderRightStyle", "borderBottomStyle", "borderLeftStyle",
+  "font", "fontFamily", "fontStyle", "fontVariant", "whiteSpace", "textAlign", "textOverflow",
+  "textTransform", "textDecoration", "textShadow", "wordBreak", "overflowWrap", "direction",
+  "transform", "transformOrigin", "transformStyle", "perspective", "perspectiveOrigin", "backfaceVisibility",
+  "transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction",
+  "boxShadow", "filter", "backdropFilter", "objectFit", "objectPosition", "visibility",
+  "cursor", "pointerEvents", "userSelect", "touchAction",
+]);
 const BREAKPOINTS = { sm: 640, md: 768, lg: 1024, xl: 1280, "2xl": 1536 };
 const kebabToCamel = value => value.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
@@ -27,20 +45,22 @@ function parseToken(token) {
   let utility = parts.pop() ?? "";
   const important = utility.startsWith("!");
   if (important) utility = utility.slice(1);
-  parsed = { utility, variants: parts, important };
+  parsed = { utility, variants: parts, important, declarations: utilityStyle(utility) };
   tokenCache.set(token, parsed);
+  if (tokenCache.size > 4096) tokenCache.delete(tokenCache.keys().next().value);
   return parsed;
 }
 
 function parseLength(value) {
-  if (value.startsWith("[") && value.endsWith("]")) value = value.slice(1, -1);
+  const arbitrary = value.startsWith("[") && value.endsWith("]");
+  if (arbitrary) value = value.slice(1, -1);
   if (value === "full") return "100%";
   if (value === "screen") return "100vw";
   if (value === "auto" || value === "min-content" || value === "max-content" || value === "fit-content") return value;
   const fraction = /^(\d+)\/(\d+)$/.exec(value);
   if (fraction) return `${100 * Number(fraction[1]) / Number(fraction[2])}%`;
   if (/^-?(?:\d+\.?\d*|\.\d+)(?:px|%|rem|em|vw|vh)?$/.test(value)) {
-    if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) return Number(value) * 4;
+    if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) return arbitrary ? undefined : Number(value) * 4;
     if (value.endsWith("rem") || value.endsWith("em")) return Number.parseFloat(value) * 16;
     return value.endsWith("px") ? Number.parseFloat(value) : value;
   }
@@ -54,10 +74,11 @@ function arbitraryValue(raw) {
   if (colon < 1) return null;
   const property = kebabToCamel(body.slice(0, colon));
   let value = body.slice(colon + 1).replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_").trim();
-  if (!property || !value) return null;
-  if (LENGTHS.has(property)) value = parseLength(value) ?? value;
-  else if (UNITLESS.has(property) && /^-?\d+(?:\.\d+)?$/.test(value)) value = Number(value);
-  else if ((property === "widthPercent" || property === "heightPercent") && /^\d+(?:\.\d+)?$/.test(value)) value = Number(value);
+  if (!CSS_PROPERTIES.has(property) || !value) return null;
+  if (property === "direction" && value !== "ltr" && value !== "rtl") return null;
+  if (LENGTHS.has(property) && property !== "lineHeight" && /^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) return null;
+  if (UNITLESS.has(property) && /^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) value = Number(value);
+  else if (LENGTHS.has(property) && /^-?(?:\d+\.?\d*|\.\d+)px$/.test(value)) value = Number.parseFloat(value);
   return [property, value];
 }
 
@@ -82,12 +103,14 @@ function utilityStyle(utility) {
     "flex-wrap": ["flexWrap", "wrap"], "flex-nowrap": ["flexWrap", "nowrap"], "flex-wrap-reverse": ["flexWrap", "wrap-reverse"],
     "flex-1": ["flex", 1], "flex-auto": ["flex", "auto"], "flex-initial": ["flex", "initial"], "flex-none": ["flex", "none"],
     grow: ["flexGrow", 1], shrink: ["flexShrink", 1], relative: ["position", "relative"], absolute: ["position", "absolute"], fixed: ["position", "fixed"],
-    "items-start": ["alignItems", "start"], "items-end": ["alignItems", "end"], "items-center": ["alignItems", "center"], "items-stretch": ["alignItems", "stretch"],
-    "justify-start": ["justifyContent", "start"], "justify-end": ["justifyContent", "end"], "justify-center": ["justifyContent", "center"], "justify-between": ["justifyContent", "space-between"], "justify-around": ["justifyContent", "space-around"], "justify-evenly": ["justifyContent", "space-evenly"],
+    "items-start": ["alignItems", "flex-start"], "items-end": ["alignItems", "flex-end"], "items-center": ["alignItems", "center"], "items-stretch": ["alignItems", "stretch"],
+    "justify-start": ["justifyContent", "flex-start"], "justify-end": ["justifyContent", "flex-end"], "justify-center": ["justifyContent", "center"], "justify-between": ["justifyContent", "space-between"], "justify-around": ["justifyContent", "space-around"], "justify-evenly": ["justifyContent", "space-evenly"],
+    "content-center": ["alignContent", "center"], "whitespace-nowrap": ["whiteSpace", "nowrap"],
     "text-left": ["textAlign", "left"], "text-center": ["textAlign", "center"], "text-right": ["textAlign", "right"],
     "overflow-hidden": ["overflow", "hidden"], "overflow-auto": ["overflow", "auto"], "overflow-scroll": ["overflow", "scroll"], "overflow-visible": ["overflow", "visible"],
     "object-cover": ["objectFit", "cover"], "object-contain": ["objectFit", "contain"], "object-fill": ["objectFit", "fill"],
     transition: ["transition", "all 150ms ease"], "transition-none": ["transition", "none"],
+    "leading-none": ["lineHeight", "1"], "leading-tight": ["lineHeight", "1.25"], "leading-snug": ["lineHeight", "1.375"], "leading-normal": ["lineHeight", "normal"], "leading-relaxed": ["lineHeight", "1.625"], "leading-loose": ["lineHeight", "2"],
     "rounded": ["borderRadius", 4], "border-solid": ["borderStyle", "solid"], "border-dashed": ["borderStyle", "dashed"], "border-dotted": ["borderStyle", "dotted"], "border-none": ["borderStyle", "none"],
     "rounded-sm": ["borderRadius", 2], "rounded-md": ["borderRadius", 6], "rounded-lg": ["borderRadius", 8], "rounded-xl": ["borderRadius", 12], "rounded-2xl": ["borderRadius", 16], "rounded-full": ["borderRadius", 9999],
     "cursor-pointer": ["cursor", "pointer"], "cursor-grab": ["cursor", "grab"], "cursor-grabbing": ["cursor", "grabbing"], "cursor-default": ["cursor", "default"],
@@ -99,13 +122,13 @@ function utilityStyle(utility) {
     const [, side, value] = borderWidth;
     const color = colorValue(value);
     if (color) return [side ? `border${({ t: "Top", r: "Right", b: "Bottom", l: "Left" })[side]}Color` : "borderColor", color];
-    const width = parseLength(value);
+    const width = /^\d+$/.test(value) ? Number(value) : parseLength(value);
     if (width !== undefined && typeof width === "number") return [side ? `border${({ t: "Top", r: "Right", b: "Bottom", l: "Left" })[side]}Width` : "borderWidth", width];
   }
   const pair = /^(p[xytrbl]?|m[xytrbl]?|gap(?:-[xy])?|w|h|min-w|min-h|max-w|max-h|basis|grow|shrink)-(.+)$/.exec(utility);
   if (pair) {
     const [, prefix, value] = pair;
-    const amount = spacing(value);
+    const amount = prefix === "grow" || prefix === "shrink" ? Number(value) : spacing(value);
     if (amount === undefined) return null;
     const map = {
       p: ["padding"], px: ["paddingLeft", "paddingRight"], py: ["paddingTop", "paddingBottom"], pt: ["paddingTop"], pr: ["paddingRight"], pb: ["paddingBottom"], pl: ["paddingLeft"],
@@ -126,7 +149,16 @@ function utilityStyle(utility) {
     if (prefix === "border" && colorValue(value)) return ["borderColor", colorValue(value)];
     if (prefix === "opacity") return ["opacity", Number(value) / 100];
     if (prefix === "z") return ["zIndex", value === "auto" ? "auto" : Number(value)];
-    if (prefix === "leading") return ["lineHeight", spacing(value)];
+    if (prefix === "leading") {
+      if (/^\[.*\]$/.test(value)) {
+        const raw = value.slice(1, -1);
+        if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(raw)) return ["lineHeight", raw];
+        if (/^-?(?:\d+\.?\d*|\.\d+)(?:em|rem|%)$/.test(raw)) return ["lineHeight", raw];
+        const parsed = parseLength(raw);
+        return parsed === undefined ? null : ["lineHeight", parsed];
+      }
+      return ["lineHeight", spacing(value)];
+    }
     if (prefix === "font" && /^\d+$/.test(value)) return ["fontWeight", Number(value)];
     if (prefix === "font") return ({ thin: ["fontWeight", 100], extralight: ["fontWeight", 200], light: ["fontWeight", 300], normal: ["fontWeight", 400], medium: ["fontWeight", 500], semibold: ["fontWeight", 600], bold: ["fontWeight", 700], extrabold: ["fontWeight", 800], black: ["fontWeight", 900] })[value] ?? null;
   }
@@ -151,58 +183,11 @@ export function resolveTailwind(className, width = 0) {
     || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
     || a.variants.length - b.variants.length || a.index - b.index);
   const values = {};
-  for (const { utility } of utilities) {
-    const pairs = utilityStyle(utility);
+  for (const { declarations: pairs } of utilities) {
     if (pairs) for (const [property, value] of Array.isArray(pairs[0]) ? pairs : [pairs]) values[property] = value;
   }
+  Object.freeze(values);
   classCache.set(key, values);
   if (classCache.size > 1024) classCache.delete(classCache.keys().next().value);
   return values;
-}
-
-const generated = new WeakMap();
-const CSS_UNITLESS = new Set(["opacity", "flex", "flexGrow", "flexShrink", "zIndex", "order", "fontWeight", "lineHeight", "aspectRatio", "widthPercent", "heightPercent"]);
-const kebab = name => name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
-
-// Convenience for authored or animated arbitrary-value utilities. It only
-// writes standard class tokens and preserves any non-generated class names.
-export function setTailwindStyles(element, styles) {
-  const prior = generated.get(element) ?? { tokens: new Set(), values: {} };
-  if (prior.className === element.className
-    && Object.entries(styles).every(([name, value]) => Object.is(prior.values[name], value))) return;
-  const retained = element.className.split(/\s+/).filter(token => token && !prior.tokens.has(token));
-  const values = { ...prior.values, ...styles };
-  const tokens = [];
-  for (const [name, raw] of Object.entries(values)) {
-    if (raw === undefined || raw === null) continue;
-    let property = name;
-    let value = raw;
-    if (name === "widthPercent" || name === "heightPercent") {
-      property = name === "widthPercent" ? "width" : "height";
-      value = `${Number(raw) * 100}%`;
-    } else if (name === "flex" && typeof raw === "string" && /^-?\d+(?:\.\d+)?$/.test(raw)) {
-      value = Number(raw);
-    } else if (typeof raw === "number" && !CSS_UNITLESS.has(name)) value = `${raw}px`;
-    const encoded = String(value).replaceAll("\\", "\\\\").replaceAll("_", "\\_").replace(/\s+/g, "_");
-    tokens.push(`[${kebab(property)}:${encoded}]`);
-  }
-  const className = [...retained, ...tokens].join(" ");
-  generated.set(element, { tokens: new Set(tokens), values, className });
-  const resolved = {};
-  for (const [name, raw] of Object.entries(values)) {
-    if (raw === undefined || raw === null) continue;
-    let property = name, value = raw;
-    if (name === "widthPercent" || name === "heightPercent") {
-      property = name === "widthPercent" ? "width" : "height";
-      value = `${Number(raw) * 100}%`;
-    } else if (name === "flex" && typeof raw === "string" && /^-?\d+(?:\.\d+)?$/.test(raw)) {
-      value = Number(raw);
-    } else if (typeof raw === "string" && LENGTHS.has(name) && /^-?(?:\d+\.?\d*|\.\d+)px$/.test(raw)) {
-      value = Number.parseFloat(raw);
-    }
-    resolved[property] = value;
-  }
-  if (typeof element._setTailwindUtilityStyles === "function") {
-    element._setTailwindUtilityStyles(className, retained.join(" "), resolved);
-  } else element.className = className;
 }

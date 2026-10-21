@@ -80,7 +80,8 @@ const samples = [];
 const phases = { style: [], compute: [], workerAssembly: [], transfer: [], assembly: [] };
 for (let frame = 0; frame < 360; frame++) {
   const start = performance.now();
-  cards[0].className = `w-[${60 + (frame % 2)}px] h-[14px] shrink-0`;
+  const previousWidthClass = [...cards[0].classList].find(token => token.startsWith("w-["));
+  cards[0].classList.replace(previousWidthClass, `w-[${60 + (frame % 2)}px]`);
   const styleEnd = performance.now();
   const timings = {};
   boxes = await layoutDocument(doc, 800, 300, timings);
