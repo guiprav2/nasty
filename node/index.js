@@ -234,10 +234,6 @@ export class Window extends native.Window {
     }
   }
 
-  _validateDocumentStyleChange(property, value) {
-    if (property === 'maxWidth' || property === 'maxHeight') this._validateDocumentMaxConstraints(this.#document?.body?.style, property, value);
-  }
-
   present(list) {
     syncDocumentTextForPresent(this, this.#document);
     try { return super.present(list); }
@@ -311,7 +307,6 @@ export class Window extends native.Window {
       this.#applyWindowDimensions();
       return;
     }
-    this._validateDocumentMaxConstraints(style);
     const key = [style.minWidth, style.minHeight, style.maxWidth, style.maxHeight];
     if (this.#documentSizeConstraintsKey?.every((value, index) => Object.is(value, key[index]))) return;
     const display = super.displaySize();
@@ -332,7 +327,16 @@ export class Window extends native.Window {
       try { return resolveWindowDimension(value, "height", viewport, viewport.percentHeight); }
       catch { return null; }
     };
-    super.setSizeConstraints(widthConstraint(style.minWidth), heightConstraint(style.minHeight), widthConstraint(style.maxWidth), heightConstraint(style.maxHeight));
+    const minWidth = widthConstraint(style.minWidth);
+    const minHeight = heightConstraint(style.minHeight);
+    let maxWidth = this.#maximizable ? null : widthConstraint(style.maxWidth);
+    let maxHeight = this.#maximizable ? null : heightConstraint(style.maxHeight);
+    // CSS min-width/min-height win when they exceed the corresponding max.
+    // The native window API requires an ordered interval, so normalize the
+    // maximum to the minimum instead of letting a transient className throw.
+    if (minWidth !== null && maxWidth !== null && maxWidth < minWidth) maxWidth = minWidth;
+    if (minHeight !== null && maxHeight !== null && maxHeight < minHeight) maxHeight = minHeight;
+    super.setSizeConstraints(minWidth, minHeight, maxWidth, maxHeight);
     this.#documentSizeConstraintsKey = key;
     this.#applyWindowDimensions();
   }
@@ -368,7 +372,16 @@ function styleForTaffy(style) {
     const value = result[property];
     if (typeof value === "string" && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:px)?$/.test(value.trim())) {
       result[property] = Number.parseFloat(value);
+    } else if (typeof value === "string") {
+      // The current Taffy bridge accepts pixel lengths as numbers (and
+      // width/height percentages through their dedicated fields). Keep
+      // unsupported CSS values out of the native layout struct so an
+      // unfinished or invalid utility can never take down the layout worker.
+      delete result[property];
     }
+  }
+  for (const [property, value] of Object.entries(result)) {
+    if (typeof value === "number" && !Number.isFinite(value)) delete result[property];
   }
   if (result.flexDirection !== undefined) {
     result.direction = result.flexDirection;
@@ -441,7 +454,6 @@ function refreshStyleValues(state) {
     if (Object.is(before, after)) continue;
     changed.add(property);
     if (after !== undefined) {
-      state.element._validateStyleChange(property, after);
       if (isPaintColorProperty(property)) startColorTransition(state, property, String(after));
       else if (property === "opacity") startNumberTransition(state, property, after);
       state.values[property] = after;
@@ -1034,12 +1046,6 @@ export class Element extends EventTarget {
     doc.dirty = true;
     markGeometryDirty(doc);
     if (this === this.document.body && (property === undefined || ["minWidth", "minHeight", "maxWidth", "maxHeight"].includes(property))) doc.defaultView?._syncDocumentSizeConstraints();
-  }
-
-  _validateStyleChange(property, value) {
-    if (this === this.document.body && (property === "maxWidth" || property === "maxHeight")) {
-      documentState(this.document).defaultView?._validateDocumentStyleChange(property, value);
-    }
   }
 
   _refreshTailwind(width) {
