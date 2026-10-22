@@ -26,6 +26,24 @@ function inherited(element, property, fallback) {
   }
   return fallback;
 }
+function fontMetrics(element) {
+  const parsedFontSize = Number.parseFloat(inherited(element, 'fontSize', 16));
+  const fontSize = Number.isFinite(parsedFontSize) && parsedFontSize > 0 ? parsedFontSize : 16;
+  const rawLineHeight = inherited(element, 'lineHeight', 'normal');
+  let lineHeight;
+  if (rawLineHeight === 'normal' || rawLineHeight === undefined || rawLineHeight === null) {
+    lineHeight = fontSize * 1.2;
+  } else if (typeof rawLineHeight === 'number') {
+    lineHeight = rawLineHeight;
+  } else {
+    const value = String(rawLineHeight).trim();
+    const parsed = Number.parseFloat(value);
+    if (/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(value)) lineHeight = parsed * fontSize;
+    else lineHeight = parsed;
+  }
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0) lineHeight = fontSize * 1.2;
+  return { fontSize, lineHeight };
+}
 function parkRun(run) {
   return { ...run, x: -100000, y: -100000, clipX: 0, clipY: 0, clipWidth: 0, clipHeight: 0 };
 }
@@ -43,11 +61,13 @@ function textEntries(document, selectedElements = null) {
       if (current.style.opacity !== undefined && Number.isFinite(opacity)) rgba[3] *= Math.max(0, Math.min(1, opacity));
     }
     const color = '#' + rgba.map((v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0')).join('');
-    const fontSize = parseFloat(inherited(element, 'fontSize', 16));
+    const { fontSize, lineHeight } = fontMetrics(element);
     const textOrigin = projectPoint(box, bounds.x, bounds.y);
     const transformedWidth = bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
+    if (![textOrigin.x, textOrigin.y, transformedWidth, fontSize, lineHeight].every(Number.isFinite)
+        || transformedWidth < 0 || fontSize <= 0 || lineHeight <= 0) continue;
     const run = { text, x: textOrigin.x, y: textOrigin.y, width: transformedWidth, fontSize,
-      lineHeight: parseFloat(inherited(element, 'lineHeight', fontSize * 1.2)),
+      lineHeight,
       fontFamily: fontFamilyForElement(element, inherited(element, 'fontFamily', 'sans-serif')),
       fontWeight: Math.max(100, Math.min(900, parseInt(inherited(element, 'fontWeight', 400), 10) || 400)), color,
       wrap: inherited(element, 'whiteSpace', 'normal') !== 'nowrap' };

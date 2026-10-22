@@ -23,8 +23,6 @@ const transitionEnds = [];
 cards.forEach((card, index) => card.addEventListener("transitionend", (event) => {
   transitionEnds.push(`${index}:${event.propertyName}`);
 }));
-// Present the initial state before timing transitions; cold GPU setup can exceed their first 200 ms.
-window.presentDocument();
 const start = performance.now();
 for (const card of cards) {
   card.classList.replace(`bg-[${original}]`, `bg-[${target}]`);
@@ -41,7 +39,6 @@ let changedAt450 = false;
 let missedIntervals = 0;
 const intervals = [];
 const updateTimes = [];
-const presentTimes = [];
 const cpuStart = process.cpuUsage();
 
 function retarget(card, property, value) {
@@ -70,9 +67,6 @@ function draw() {
     retarget(cards[1], "backgroundColor", "#f1c40f");
   }
   updateTimes.push(performance.now() - updateStart);
-  const presentStart = performance.now();
-  window.presentDocument();
-  presentTimes.push(performance.now() - presentStart);
   frames++;
   for (const event of window.drainEvents()) if (event.type === "keydown" && event.key === "Named(Escape)") window.close();
   deadline += budget;
@@ -111,7 +105,7 @@ function finish() {
   const memory = process.memoryUsage();
   console.log(`transition run: ${frames} frames in ${(elapsed / 1000).toFixed(2)} s; ${(frames / elapsed * 1000).toFixed(1)} FPS; reversal/interruption/multiple colors passed`);
   console.log(`frame interval median/p95/max ${percentile(intervals, .5).toFixed(3)}/${percentile(intervals, .95).toFixed(3)}/${percentile(intervals, 1).toFixed(3)} ms; expired deadlines skipped ${missedIntervals}`);
-  console.log(`JS sample/update median/p95 ${percentile(updateTimes, .5).toFixed(3)}/${percentile(updateTimes, .95).toFixed(3)} ms; present ${percentile(presentTimes, .5).toFixed(3)}/${percentile(presentTimes, .95).toFixed(3)} ms`);
+  console.log(`JS sample/update median/p95 ${percentile(updateTimes, .5).toFixed(3)}/${percentile(updateTimes, .95).toFixed(3)} ms`);
   console.log(`process CPU ${(cpuMs / elapsed / 2 * 100).toFixed(1)}% machine / ${(cpuMs / elapsed).toFixed(2)} cores; RSS ${(memory.rss / 1048576).toFixed(1)} MB`);
   window.document = null;
   document.close();

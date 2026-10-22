@@ -201,7 +201,6 @@ export async function install() {
     previousFrameAt = now;
     dispatchNativeEvents();
     for (const { callback } of callbacks.splice(0)) callback(now);
-    nativeWindow.presentDocument();
     if (!shown) {
       nativeWindow.show();
       shown = true;

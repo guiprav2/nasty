@@ -499,7 +499,6 @@ async function frame() {
   const callbacks = [...frames.values()]; frames.clear();
   for (const callback of callbacks) callback(start);
   ui.update(start);
-  window.presentDocument();
   ui.setMaximized(window.maximized);
   if (!shown) { window.show(); shown = true; }
   if (!(refreshRate > 0)) {

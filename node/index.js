@@ -50,6 +50,7 @@ export class Window extends native.Window {
   #documentStopped = false;
   #dragBlocked = false;
   #lastDragClick = null;
+  #presentationTimer = null;
   constructor(options = {}) {
     const initialWidth = options.width ?? 960;
     const initialHeight = options.height ?? 600;
@@ -240,6 +241,8 @@ export class Window extends native.Window {
   }
 
   close() {
+    clearTimeout(this.#presentationTimer);
+    this.#presentationTimer = null;
     this.#stopMedia();
     const result = super.close();
     this.#closeDocument();
@@ -409,7 +412,17 @@ export class Window extends native.Window {
   }
   presentDocument() {
     this._syncDragHitTest();
-    if (this.#document && [...documentState(this.#document).elements].some(element => element.localName === "video")) {
+    const isRendered = element => {
+      for (let current = element; current; current = current.parentElement) {
+        if (current.hidden || current.style.display === "none") return false;
+      }
+      return true;
+    };
+    const visibleElements = this.#document
+      ? [this.#document.body, ...this.#document.querySelectorAll("*")].filter(isRendered)
+      : [];
+    if (visibleElements.some(element =>
+      element.localName === "video" || (element.style.transform && element.style.transform !== "none"))) {
       const size = this.size();
       return this.presentTransformed(buildTransformedDisplayList(documentBoxes(this.#document), size.width, size.height));
     }
@@ -438,12 +451,24 @@ export class Window extends native.Window {
     return result;
   }
 
+  #scheduleAutomaticPresentation(delay = 0) {
+    if (this.#presentationTimer !== null || this.closed || !this.#document) return;
+    this.#presentationTimer = setTimeout(() => {
+      this.#presentationTimer = null;
+      if (this.closed || !this.#document) return;
+      this.presentDocument();
+      const refreshRate = this.refreshRate();
+      this.#scheduleAutomaticPresentation(refreshRate > 0 ? 1000 / refreshRate : 1000 / 60);
+    }, delay);
+  }
+
   get document() {
     return this.#document;
   }
 
   set document(document) {
     if (document) this._validateDocumentMaxConstraints(document.body.style);
+    const nativeClosed = super.closed;
     if (this.#document) documentState(this.#document).defaultView = null;
     this.#document = document;
     this.#documentStopped = false;
@@ -451,8 +476,15 @@ export class Window extends native.Window {
     this.#bodyAppearanceKey = null;
     if (document) {
       document._attachWindow(this);
-    }
-    else {
+      this.#scheduleAutomaticPresentation();
+    } else {
+      clearTimeout(this.#presentationTimer);
+      this.#presentationTimer = null;
+      if (nativeClosed) {
+        this.#documentSizeConstraintsKey = null;
+        this.#bodyAppearanceKey = null;
+        return;
+      }
       this._syncDocumentSizeConstraints();
       this._syncBodyWindowAppearance();
     }

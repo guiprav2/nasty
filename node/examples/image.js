@@ -140,12 +140,9 @@ const budget = 1000 / refreshHz;
 const frameLimit = Number.parseInt(process.env.NASTY_IMAGE_FRAMES ?? "600", 10);
 const intervals = [];
 const jsBuild = [];
-const presentCosts = [];
-const nativeCosts = [];
 let frame = 0;
 let previous = performance.now();
 let deadline = previous;
-let firstVisibleMs;
 const started = previous;
 const cpuStart = process.cpuUsage();
 const percentile = (values, p) => [...values].sort((a, b) => a - b)[Math.min(values.length - 1, Math.floor(values.length * p))] ?? 0;
@@ -156,13 +153,6 @@ while (!window.closed && frame < frameLimit) {
   const frameStart = performance.now();
   if (frame) intervals.push(frameStart - previous);
   previous = frameStart;
-  const presentStart = performance.now();
-  const result = window.presentDocument();
-  presentCosts.push(performance.now() - presentStart);
-  if (result.rendered) {
-    nativeCosts.push(result.nativeRenderMs);
-    if (firstVisibleMs === undefined) firstVisibleMs = performance.now() - started;
-  }
   frame++;
   for (const event of window.drainEvents()) {
     if (event.type === "keydown" && event.key === "Named(Escape)") window.close();
@@ -176,11 +166,8 @@ while (!window.closed && frame < frameLimit) {
 }
 const elapsed = performance.now() - started;
 const cpu = process.cpuUsage(cpuStart);
-console.log(`frames ${frame} in ${(elapsed / 1000).toFixed(2)} s; ${(frame / elapsed * 1000).toFixed(1)} FPS at ${refreshHz.toFixed(3)} Hz; first visible ${firstVisibleMs?.toFixed(2) ?? "n/a"} ms; process CPU ${((cpu.user + cpu.system) / 1000 / elapsed * 100).toFixed(1)}% of one core; missed intervals ${intervals.filter((value) => value > budget * 1.5).length}/${intervals.length}`);
+console.log(`frames ${frame} in ${(elapsed / 1000).toFixed(2)} s; ${(frame / elapsed * 1000).toFixed(1)} FPS at ${refreshHz.toFixed(3)} Hz; process CPU ${((cpu.user + cpu.system) / 1000 / elapsed * 100).toFixed(1)}% of one core; missed intervals ${intervals.filter((value) => value > budget * 1.5).length}/${intervals.length}`);
 report("frame interval", intervals);
-report("JS box/image list build", jsBuild);
-report("native present call", presentCosts);
-report("native render CPU", nativeCosts);
 await document.close();
 window.close();
 await closeImageDecoder();

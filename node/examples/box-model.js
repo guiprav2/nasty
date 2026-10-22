@@ -58,7 +58,6 @@ assert.equal(doc.createElement("plain").style.backgroundColor, "transparent",
 assert.equal(doc.createElement("img").style.padding, 0,
   "images receive generic reset box-model defaults");
 
-window.presentDocument();
 console.log(`box model passed: ${boxes.length} elements; adapter ${window.adapterName()}`);
 console.log("GPU preview is open; press Escape or close the window to exit.");
 while (!window.closed) {
@@ -66,7 +65,6 @@ while (!window.closed) {
     if (event.type === "close" || (event.type === "key" && event.key === "Escape")) window.close();
   }
   if (!window.closed) {
-    window.presentDocument();
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }

@@ -68,7 +68,6 @@ while (!window.closed) {
   }
   if (window.closed) break;
   try {
-    window.presentDocument();
   } catch (error) {
     if (window.closed || /GPU renderer is unavailable|window is closed/.test(error?.message || "")) break;
     throw error;

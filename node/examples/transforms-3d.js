@@ -27,8 +27,8 @@ for (const [index, card] of cards.entries()) {
 }
 for (const card of cards) assert.ok(card.style.transform.includes("perspective"), "transform class is reflected in the CSSOM");
 
-const refreshHz = window.refreshRate() || 60;
-const budget = 1000 / refreshHz;
+let refreshHz = window.refreshRate() || 60;
+let budget = 1000 / refreshHz;
 const start = performance.now();
 let deadline = start;
 let previous = start;
@@ -36,10 +36,6 @@ let frames = 0;
 let missed = 0;
 const intervals = [];
 const jsUpdateTimes = [];
-const nativePrepare = [];
-const nativeRender = [];
-const nativeSubmit = [];
-const nativePresent = [];
 const cpuStart = process.cpuUsage();
 const cpuCount = os.cpus().length;
 const hostCpusStart = os.cpus();
@@ -66,32 +62,24 @@ function draw() {
     transformClasses[i] = nextTransformClass;
   }
   jsUpdateTimes.push(performance.now() - updateStart);
-  const result = window.presentDocument();
-  nativePrepare.push(result.prepareMs);
-  nativeRender.push(result.nativeRenderMs);
-  nativeSubmit.push(result.submitMs);
-  nativePresent.push(result.presentMs);
   frames++;
   for (const event of window.drainEvents()) {
-    if (event.type === "refreshRate" && event.x > 0) console.log(`frame pacing updated to ${event.x.toFixed(3)} Hz`);
+    if (event.type === "refreshRate" && event.x > 0) {
+      refreshHz = event.x;
+      budget = 1000 / refreshHz;
+      console.log(`frame pacing updated to ${event.x.toFixed(3)} Hz`);
+    }
     if (event.type === "keydown" && event.key === "Named(Escape)") window.close();
   }
+  if (window.closed || frames >= frameLimit) return finish();
   deadline += budget;
   const delay = deadline - performance.now();
-  if (delay > 1) setTimeout(spin, delay - 1);
-  else {
-    if (delay <= -budget) {
-      const count = Math.floor(-delay / budget) + 1;
-      missed += count;
-      deadline += count * budget;
-    }
-    spin();
+  if (delay <= 0) {
+    const count = Math.floor(-delay / budget) + 1;
+    missed += count;
+    deadline += count * budget;
   }
-}
-
-function spin() {
-  while (performance.now() < deadline) {}
-  draw();
+  setTimeout(draw, Math.max(0, deadline - performance.now()));
 }
 
 function percentile(values, p) {
@@ -113,10 +101,6 @@ function finish() {
   console.log(`frames ${frames} in ${(elapsed / 1000).toFixed(2)} s; ${(frames / elapsed * 1000).toFixed(1)} FPS; expired deadlines skipped ${missed}`);
   report("frame interval", intervals);
   report("JS transform/style update", jsUpdateTimes);
-  report("native vertex preparation", nativePrepare);
-  report("native render", nativeRender);
-  report("GPU submit", nativeSubmit);
-  report("surface present", nativePresent);
   console.log(`process CPU ${(cpuMs / elapsed / cpuCount * 100).toFixed(1)}% machine / ${(cpuMs / elapsed).toFixed(2)} cores; RSS ${(memory.rss / 1048576).toFixed(1)} MB`);
   console.log(`host CPU ${hostCpuPercent.toFixed(1)}% (${hostCpusEnd.length} logical CPUs); load avg ${os.loadavg().map((value) => value.toFixed(2)).join("/")}; available ${(os.freemem() / 1048576).toFixed(1)} MB`);
   window.document = null;

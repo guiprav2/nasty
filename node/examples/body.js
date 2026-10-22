@@ -72,7 +72,6 @@ async function frame() {
       document.body.className = editorState.value;
     }
   }
-  window.presentDocument();
   if (!window.closed) setTimeout(frame, 16);
 }
 

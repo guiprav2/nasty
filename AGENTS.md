@@ -1,6 +1,7 @@
 # Nasty project standards
 
 Examples that build interfaces must use standard DOM APIs exposed by Nasty; do not use internal DOM or rendering APIs.
+Examples must never present or render frames themselves. Do not call `Window.presentDocument`, `Window.present`, `Window.presentWithImages`, `Window.presentOrdered`, or `Window.presentTransformed`; do not build or submit display lists, and do not import renderer helpers. Nasty owns presentation: it must render attached documents automatically on active animation frames and when layout or paint changes, including resize. Examples update interfaces through standard DOM operations and let Nasty schedule presentation.
 
 ## Architecture and public APIs
 
