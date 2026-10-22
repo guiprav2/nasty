@@ -1197,6 +1197,7 @@ struct Renderer {
     image_pipeline: wgpu::RenderPipeline,
     image_bind_group_layout: wgpu::BindGroupLayout,
     images: std::collections::HashMap<u32, GpuImage>,
+    retired_images: std::collections::HashMap<u32, GpuImage>,
     next_image_id: u32,
     image_vertex_buffer: wgpu::Buffer,
     image_vertex_capacity: usize,
@@ -2072,6 +2073,10 @@ fn create_text_runtime(
 }
 
 impl Renderer {
+    fn image(&self, id: &u32) -> Option<&GpuImage> {
+        self.images.get(id).or_else(|| self.retired_images.get(id))
+    }
+
     fn select_present_mode(
         supported: &[wgpu::PresentMode],
         vsync: bool,
@@ -2603,6 +2608,7 @@ impl Renderer {
             image_pipeline,
             image_bind_group_layout,
             images: std::collections::HashMap::new(),
+            retired_images: std::collections::HashMap::new(),
             next_image_id: 1,
             image_vertex_buffer,
             image_vertex_capacity,
@@ -2872,8 +2878,7 @@ impl Renderer {
         let mut image_batches = Vec::with_capacity(image_draws.len());
         for image in image_draws {
             let gpu_image = self
-                .images
-                .get(&image.texture_id)
+                .image(&image.texture_id)
                 .ok_or_else(|| format!("unknown image texture {}", image.texture_id))?;
             if let Some(vertices) = image.vertices.as_ref() {
                 if vertices.is_empty() || vertices.len() % 15 != 0 {
@@ -3133,7 +3138,7 @@ impl Renderer {
                     DrawOrder::Image(index) => if let Some((texture_id, range, x, y, w, h)) = image_batches.get(*index).and_then(Option::as_ref) {
                         pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
                         pass.set_scissor_rect(*x, *y, *w, *h);
-                        pass.set_bind_group(0, &self.images[texture_id].bind_group, &[]); pass.draw(range.clone(), 0..1);
+                        pass.set_bind_group(0, &self.image(texture_id).expect("prepared image texture").bind_group, &[]); pass.draw(range.clone(), 0..1);
                     },
                     DrawOrder::BackdropBlur { .. } => unreachable!(),
                 }
@@ -3162,7 +3167,7 @@ impl Renderer {
                 for batch in image_batches.iter().flatten() {
                     let (texture_id, range, x, y, w, h) = batch;
                     pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
-                    pass.set_scissor_rect(*x, *y, *w, *h); pass.set_bind_group(0, &self.images[texture_id].bind_group, &[]); pass.draw(range.clone(), 0..1);
+                    pass.set_scissor_rect(*x, *y, *w, *h); pass.set_bind_group(0, &self.image(texture_id).expect("prepared image texture").bind_group, &[]); pass.draw(range.clone(), 0..1);
                 }
             } else {
                 for command in draw_order {
@@ -3190,7 +3195,7 @@ impl Renderer {
                             let right=(*clip_x+*clip_width).ceil().clamp(0.0,width as f64) as u32; let bottom=(*clip_y+*clip_height).ceil().clamp(0.0,height as f64) as u32;
                             if right>left && bottom>top { pass.set_pipeline(&self.canvas_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_vertex_buffer.slice(..)); pass.set_scissor_rect(left,top,right-left,bottom-top); pass.draw(range.clone(),0..1); pass.set_scissor_rect(0,0,self.config.width,self.config.height); }
                         }
-                        DrawOrder::Image(index) => if let Some((texture_id,range,x,y,w,h))=image_batches.get(*index).and_then(Option::as_ref) { pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0,self.image_vertex_buffer.slice(..)); pass.set_scissor_rect(*x,*y,*w,*h); pass.set_bind_group(0,&self.images[texture_id].bind_group,&[]); pass.draw(range.clone(),0..1); },
+                        DrawOrder::Image(index) => if let Some((texture_id,range,x,y,w,h))=image_batches.get(*index).and_then(Option::as_ref) { pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0,self.image_vertex_buffer.slice(..)); pass.set_scissor_rect(*x,*y,*w,*h); pass.set_bind_group(0,&self.image(texture_id).expect("prepared image texture").bind_group,&[]); pass.draw(range.clone(),0..1); },
                         DrawOrder::BackdropBlur { .. } => unreachable!(),
                     }
                 }
@@ -3986,6 +3991,10 @@ impl ApplicationHandler for WindowApp {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
                 }
+                // The JS frame builder owns size-dependent image textures.
+                // Keep displaying the last submitted frame until JS submits
+                // its resized frame, rather than rendering stale image IDs.
+                self.render_pending = false;
                 self.events.push(NativeEvent {
                     kind: "resize".into(),
                     x: size.width as f64,
@@ -4023,6 +4032,7 @@ impl ApplicationHandler for WindowApp {
             }
             OsWindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                let mut resize_edge = false;
                 if let Some(window) = self.window.as_ref() {
                     let scale = window.scale_factor();
                     let logical_size = window.inner_size().to_logical::<f64>(scale);
@@ -4033,19 +4043,22 @@ impl ApplicationHandler for WindowApp {
                         logical_size.width,
                         logical_size.height,
                     );
-                    let cursor = if self.drag_active {
+                    resize_edge = direction.is_some();
+                    let cursor = if let Some(direction) = direction {
+                        CursorIcon::from(direction)
+                    } else if self.drag_active {
                         CursorIcon::Grabbing
                     } else if self.drag_key_is_down() && !self.drag_blocked {
                         CursorIcon::Grab
                     } else {
-                        direction.map(CursorIcon::from).unwrap_or(CursorIcon::Default)
+                        CursorIcon::Default
                     };
                     if self.cursor_icon != Some(cursor) {
                         window.set_cursor(cursor);
                         self.cursor_icon = Some(cursor);
                     }
                 }
-                if (self.drag_key_is_down() && !self.drag_blocked) || self.drag_active { return; }
+                if !resize_edge && ((self.drag_key_is_down() && !self.drag_blocked) || self.drag_active) { return; }
                 self.events.push(NativeEvent {
                     kind: "pointermove".into(),
                     x: position.x,
@@ -4075,7 +4088,24 @@ impl ApplicationHandler for WindowApp {
                 }
                 let drag_key_down = self.drag_key_is_down();
                 let drag_allowed = !self.drag_blocked;
-                if button == MouseButton::Left && (self.drag_active || drag_key_down) {
+                // Resize edges take priority over drag-anywhere. Otherwise a
+                // borderless window configured with a drag modifier consumes
+                // every left click before the native resize request below.
+                let resize_direction = self.window.as_ref().and_then(|window| {
+                    let scale = window.scale_factor();
+                    let size = window.inner_size().to_logical::<f64>(scale);
+                    resize_direction(
+                        &self.resizable,
+                        self.cursor.0 / scale,
+                        self.cursor.1 / scale,
+                        size.width,
+                        size.height,
+                    )
+                });
+                if button == MouseButton::Left
+                    && (self.drag_active || drag_key_down)
+                    && resize_direction.is_none()
+                {
                     if state == ElementState::Pressed {
                         self.events.push(NativeEvent {
                             kind: "pointerdown".into(),
@@ -4105,22 +4135,13 @@ impl ApplicationHandler for WindowApp {
                     }
                     return;
                 }
-                if drag_key_down && drag_allowed { return; }
+                if drag_key_down && drag_allowed && resize_direction.is_none() { return; }
                 if state == ElementState::Pressed && button == MouseButton::Left {
-                    if let Some(window) = self.window.as_ref() {
-                        let scale = window.scale_factor();
-                        let logical_size = window.inner_size().to_logical::<f64>(scale);
-                        let direction = resize_direction(
-                            &self.resizable,
-                            self.cursor.0 / scale,
-                            self.cursor.1 / scale,
-                            logical_size.width,
-                            logical_size.height,
-                        );
-                        if let Some(direction) = direction {
-                            if window.drag_resize_window(direction).is_ok() {
-                                return;
-                            }
+                    if let (Some(window), Some(direction)) =
+                        (self.window.as_ref(), resize_direction)
+                    {
+                        if window.drag_resize_window(direction).is_ok() {
+                            return;
                         }
                     }
                 }
@@ -4262,13 +4283,15 @@ impl WindowApp {
         let Some(window) = self.window.as_ref() else { return; };
         let scale = window.scale_factor();
         let size = window.inner_size().to_logical::<f64>(scale);
-        let cursor = if self.drag_active {
+        let direction = resize_direction(&self.resizable, self.cursor.0 / scale, self.cursor.1 / scale, size.width, size.height);
+        let cursor = if let Some(direction) = direction {
+            CursorIcon::from(direction)
+        } else if self.drag_active {
             CursorIcon::Grabbing
         } else if self.drag_key_is_down() && !self.drag_blocked {
             CursorIcon::Grab
         } else {
-            resize_direction(&self.resizable, self.cursor.0 / scale, self.cursor.1 / scale, size.width, size.height)
-                .map(CursorIcon::from).unwrap_or(CursorIcon::Default)
+            CursorIcon::Default
         };
         if self.cursor_icon != Some(cursor) {
             window.set_cursor(cursor);
@@ -5011,10 +5034,12 @@ impl Window {
 
     #[napi(js_name = "deleteImageTexture")]
     pub fn delete_image_texture(&mut self, texture_id: u32) -> bool {
-        self.app
-            .renderer
-            .as_mut()
-            .is_some_and(|renderer| renderer.images.remove(&texture_id).is_some())
+        let referenced = self.app.image_draws.iter().any(|image| image.texture_id == texture_id);
+        self.app.renderer.as_mut().is_some_and(|renderer| {
+            let Some(image) = renderer.images.remove(&texture_id) else { return false; };
+            if referenced { renderer.retired_images.insert(texture_id, image); }
+            true
+        })
     }
 
     #[napi(js_name = "updateImageTexture")]
@@ -5161,6 +5186,16 @@ impl Window {
         images: Vec<ImageDraw>,
         order: Vec<DrawOrder>,
     ) -> Result<PresentStats> {
+        if let Some(renderer) = self.app.renderer.as_mut() {
+            let live_ids: std::collections::HashSet<u32> = images.iter().map(|image| image.texture_id).collect();
+            let no_images = images.is_empty();
+            let retired_ids: Vec<u32> = renderer.retired_images.keys().copied().collect();
+            for id in retired_ids {
+                if no_images || !live_ids.contains(&id) {
+                    renderer.retired_images.remove(&id);
+                }
+            }
+        }
         self.app.display_list = list;
         self.app.display_triangles = triangles;
         self.app.display_circles = circles;

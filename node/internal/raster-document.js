@@ -584,6 +584,8 @@ export function documentImage(window, document) {
     const basePixels = baseDirty || !state.baseSize ? state.baseSurface.data() : null;
     const fieldPixels = fieldTriangles ? null : layer.field.surface.data();
     if (basePixels) uploadTexture(window, state, 'baseTextureId', 'baseSize', width, height, basePixels);
+    if (fieldPixels) uploadTexture(window, state, 'fieldTextureId', 'fieldSize',
+      layer.field.surface.width, layer.field.surface.height, fieldPixels);
     const images = [
       { textureId: state.baseTextureId, x: 0, y: 0, width, height },
       ...(fieldTriangles ? [{ type: 'canvas-triangles', x: layer.field.box.x, y: layer.field.box.y,
