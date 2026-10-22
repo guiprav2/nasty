@@ -1,7 +1,4 @@
 import { Document, Window } from "../index.js";
-import { buildOrderedDisplayList } from "../render.js";
-import { documentBoxes } from "../internal/dom-state.js";
-import { performance } from "node:perf_hooks";
 
 const source = process.argv[2];
 if (!source) {
@@ -13,7 +10,7 @@ const window = new Window({ title: "Nasty video", width: 960, height: 600, resiz
 const document = new Document();
 window.document = document;
 
-document.body.className = "max-w-[800px] max-h-[600px] flex flex-col p-[18px] gap-3 bg-[#10151f]";
+document.body.className = "flex flex-col p-[18px] gap-3 bg-[#10151f]";
 
 const heading = document.createElement("div");
 heading.textContent = "Video player";
@@ -29,6 +26,7 @@ document.body.appendChild(video);
 
 const status = document.createElement("div");
 status.className = "text-[#b9c7dc] text-sm leading-[20px] shrink-0";
+status.textContent = `Opening ${source}`;
 document.body.appendChild(status);
 
 video.addEventListener("error", event => {
@@ -39,14 +37,8 @@ video.addEventListener("error", event => {
 video.addEventListener("loadeddata", () => {
   console.log(`video ready: ${video.videoWidth}x${video.videoHeight}, ${video.duration.toFixed(2)} s`);
 });
-let perfVideoFrames = 0;
-let lastVideoFrameAt = null;
-const videoFrameIntervals = [];
 video.addEventListener("timeupdate", () => {
-  const now = performance.now();
-  if (lastVideoFrameAt !== null) videoFrameIntervals.push(now - lastVideoFrameAt);
-  lastVideoFrameAt = now;
-  perfVideoFrames++;
+  status.textContent = `${video.paused ? "Paused" : "Playing"}  ${formatTime(video.currentTime)} / ${formatTime(video.duration)}`;
 });
 
 void video.play().catch(error => {
@@ -60,87 +52,26 @@ function formatTime(seconds) {
   return `${Math.floor(value / 60).toString().padStart(2, "0")}:${(value % 60).toString().padStart(2, "0")}`;
 }
 
-let frameTimer = null;
-let stopped = false;
-let perfStarted = performance.now();
-let perfPrevious = perfStarted;
-let perfFrames = 0;
-const perfIntervals = [];
-const perfBuildMs = [];
-const perfPresentMs = [];
-const perfNativeMs = [];
-const percentile = (values, p) => [...values].sort((a, b) => a - b)[Math.min(values.length - 1, Math.floor(values.length * p))] ?? 0;
-function logPerformance(now) {
-  const elapsed = now - perfStarted;
-  if (!perfFrames || elapsed < 5000) return;
-  const report = values => `${percentile(values, .5).toFixed(2)}/${percentile(values, .95).toFixed(2)}/${percentile(values, 1).toFixed(2)} ms`;
-  console.log(`video window: redraw ${perfFrames} frames, ${(perfFrames / elapsed * 1000).toFixed(1)} FPS; decoded/delivered ${perfVideoFrames} frames, ${(perfVideoFrames / elapsed * 1000).toFixed(1)} FPS; redraw interval median/p95/max ${report(perfIntervals)}; decoded frame interval ${report(videoFrameIntervals)}; JS display-list build ${report(perfBuildMs)}; present call ${report(perfPresentMs)}; native render ${report(perfNativeMs)}`);
-  perfStarted = now;
-  perfFrames = 0;
-  perfVideoFrames = 0;
-  perfIntervals.length = videoFrameIntervals.length = perfBuildMs.length = perfPresentMs.length = perfNativeMs.length = 0;
-}
-function stop() {
-  if (stopped) return;
-  stopped = true;
-  if (frameTimer) clearTimeout(frameTimer);
-  frameTimer = null;
-  video.pause();
-  void document.close();
-}
-function handleDrawError(error) {
-  if (window.closed || /GPU renderer is unavailable|window is closed/.test(error?.message || "")) {
-    stop();
-    return;
-  }
-  console.error(`video example stopped: ${error?.stack || error}`);
-  window.close();
-  stop();
-}
-async function draw() {
-  if (window.closed) {
-    stop();
-    return;
-  }
+console.log(`Opening video source: ${source}`);
+console.log("Audio is enabled. Click the window to pause or resume; press Escape or close the window to exit.");
+
+while (!window.closed) {
   for (const event of window.drainEvents()) {
     if (event.type === "close" || (event.type === "keydown" && event.key === "Named(Escape)")) {
       window.close();
-      stop();
-      continue;
+      break;
     }
     if (event.type === "pointerdown" && event.button === 0) {
       if (video.paused) void video.play().catch(error => console.error(error));
       else video.pause();
     }
   }
-  if (window.closed) return;
-  if (video.videoWidth) {
-    status.textContent = `${video.paused ? "Paused" : "Playing"}  ${formatTime(video.currentTime)} / ${formatTime(video.duration)}  ·  click to play or pause`;
-  } else if (!status.textContent) status.textContent = `Opening ${source}`;
-  const size = window.size();
-  const now = performance.now();
-  perfIntervals.push(now - perfPrevious);
-  perfPrevious = now;
-  const buildStarted = performance.now();
-  const displayList = buildOrderedDisplayList(documentBoxes(document), size.width, size.height);
-  perfBuildMs.push(performance.now() - buildStarted);
+  if (window.closed) break;
   try {
-    const presentStarted = performance.now();
-    const result = window.presentOrdered(displayList);
-    perfPresentMs.push(performance.now() - presentStarted);
-    if (result.rendered) perfNativeMs.push(result.nativeRenderMs);
-    perfFrames++;
-    logPerformance(performance.now());
+    window.presentDocument();
   } catch (error) {
-    if (window.closed || /GPU renderer is unavailable|window is closed/.test(error?.message || "")) {
-      stop();
-      return;
-    }
+    if (window.closed || /GPU renderer is unavailable|window is closed/.test(error?.message || "")) break;
     throw error;
   }
-  frameTimer = setTimeout(() => { void draw().catch(handleDrawError); }, 33);
+  await new Promise(resolve => setTimeout(resolve, 16));
 }
-
-console.log(`Opening video source: ${source}`);
-console.log("Audio is enabled. Click the window to pause or resume; press Escape or close the window to exit.");
-void draw().catch(handleDrawError);

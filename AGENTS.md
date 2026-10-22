@@ -1,10 +1,13 @@
 # Nasty project standards
 
+Examples that build interfaces must use standard DOM APIs exposed by Nasty; do not use internal DOM or rendering APIs.
+
 ## Architecture and public APIs
 
 - Implement as much as possible in JavaScript. Rust changes are a last resort when the existing native API lacks a necessary primitive. Keep policy and algorithms in JS; expose narrow native bridges for Taffy, GPU operations, windowing, and other native facilities.
 - Nasty uses Taffy. Use its layout engine instead of writing an application-specific layout engine. If a browser block layout cannot be represented correctly, adapt only the affected containers to flex/grid while preserving their appearance and behavior. Check which Taffy features and properties the binding actually exposes.
 - From `Document` down, public APIs must be a strict subset of standard web APIs. Do not invent DOM APIs to make an example work. Internal implementation helpers and host-level Window APIs are separate from the DOM surface.
+- Composite CSS properties must expose their component longhands through the read-only `element.style` CSSOM, including values inherited from a shorthand utility; preserve standard CSSOM property access and keep style declarations read-only.
 - Construct interfaces with `document.createElement` and standard DOM operations. Do not introduce an HTML loader or parser for application ports.
 - Tailwind utility classes are the only authoring mechanism for element styling. Resolve every supported utility to standard CSS property names and values so the read-only `element.style` CSSOM reflects the computed declarations. Class tokens must not trigger renderer-specific behavior outside those CSS properties. Keep the resolver in JavaScript; do not introduce CSS source parsing, stylesheets, or CSSOM stylesheet creation/insertion. Class names may also identify elements. Use `className` for initial construction or intentional whole-list replacement; use standard `classList.add/remove/replace/toggle` for incremental updates, including animated transform classes. Do not expose style setters or style-object-to-class helpers.
 - All compositing activity must be performed at the WGPU level. Do not use CPU canvas/image processing to combine layers or implement backdrop effects.

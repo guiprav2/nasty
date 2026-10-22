@@ -111,9 +111,7 @@ export async function install() {
   const { dirname, resolve } = await import("node:path");
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
-  const { Document, TransitionEvent, Window, buildTransformedDisplayList } = await import("../index.js");
-  const { documentBoxes, documentState } = await import("../internal/dom-state.js");
-  const { lastDocumentTextSyncDetails, lastDocumentTextSyncMs, prepareDocumentText } = await import("../internal/dom-text.js");
+  const { Document, TransitionEvent, Window } = await import("../index.js");
 
   const { parameters, recordPath: requestedRecordPath } = parseTourArguments(process.argv.slice(2), process.env);
   const recordPath = requestedRecordPath ? resolve(requestedRecordPath) : null;
@@ -139,17 +137,9 @@ export async function install() {
   globalThis.window = view;
   globalThis.location = { search: parameters.size ? `?${parameters}` : "" };
   globalThis.TransitionEvent = TransitionEvent;
-  let fontsReady;
   Object.defineProperty(document, "fonts", {
     configurable: true,
-    value: Object.freeze({
-      get ready() {
-        fontsReady ??= (async () => {
-          await prepareDocumentText(nativeWindow, document);
-        })();
-        return fontsReady;
-      },
-    }),
+    value: Object.freeze({ ready: Promise.resolve() }),
   });
 
   const callbacks = [];
@@ -169,15 +159,6 @@ export async function install() {
   let frameRunning = false;
   let previousFrameAt = 0;
   const frameSamples = [];
-  const textSyncOutliers = [];
-  const stageSamples = { layout: [], callbacks: [], boxes: [], displayList: [], textSync: [], present: [], nativePresentCall: [] };
-  const panSamples = new Map();
-  const sample = (stage, name, value) => {
-    let samples = panSamples.get(stage);
-    if (!samples) panSamples.set(stage, samples = { frameInterval: [], layout: [], layoutDirty: 0, callbacks: [], boxes: [], displayList: [], textSync: [], present: [], nativePresentCall: [], nativeRender: [], prepare: [], acquire: [], submit: [], surfacePresent: [] });
-    if (name === "layoutDirty") samples.layoutDirty += Number(value);
-    else samples[name].push(value);
-  };
 
   function scheduleFrame(delay = 0) {
     if (ended || frameScheduled || frameRunning) return;
@@ -216,48 +197,11 @@ export async function install() {
     frameScheduled = false;
     frameRunning = true;
     const now = performance.now();
-    const intervalStage = document.body.getAttribute("data-tour-perf-stage") ?? "setup";
-    if (previousFrameAt) {
-      frameSamples.push(now - previousFrameAt);
-      sample(intervalStage, "frameInterval", now - previousFrameAt);
-    }
+    if (previousFrameAt) frameSamples.push(now - previousFrameAt);
     previousFrameAt = now;
     dispatchNativeEvents();
-    let stageStart = performance.now();
     for (const { callback } of callbacks.splice(0)) callback(now);
-    stageSamples.callbacks.push(performance.now() - stageStart);
-    const perfStage = document.body.getAttribute("data-tour-perf-stage") ?? "setup";
-    sample(perfStage, "callbacks", stageSamples.callbacks.at(-1));
-    stageStart = performance.now();
-    const layoutWasDirty = documentState(document).dirty;
-    const timings = {};
-    const boxes = documentBoxes(document, timings);
-    const boxesElapsed = performance.now() - stageStart;
-    stageSamples.layout.push(timings.layout ?? 0);
-    sample(perfStage, "layout", stageSamples.layout.at(-1));
-    sample(perfStage, "layoutDirty", layoutWasDirty);
-    stageSamples.boxes.push(Math.max(0, boxesElapsed - (timings.layout ?? 0)));
-    sample(perfStage, "boxes", stageSamples.boxes.at(-1));
-    stageStart = performance.now();
-    const size = nativeWindow.size();
-    const displayList = buildTransformedDisplayList(boxes, size.width, size.height);
-    stageSamples.displayList.push(performance.now() - stageStart);
-    sample(perfStage, "displayList", stageSamples.displayList.at(-1));
-    stageStart = performance.now();
-    const presentResult = nativeWindow.presentTransformed(displayList);
-    const presentCallMs = performance.now() - stageStart;
-    const textSyncMs = lastDocumentTextSyncMs(nativeWindow);
-    if (textSyncMs > frameBudget) textSyncOutliers.push({ stage: perfStage, ...lastDocumentTextSyncDetails(nativeWindow) });
-    stageSamples.textSync.push(textSyncMs);
-    stageSamples.present.push(presentCallMs);
-    stageSamples.nativePresentCall.push(Math.max(0, presentCallMs - textSyncMs));
-    sample(perfStage, "textSync", textSyncMs);
-    sample(perfStage, "present", stageSamples.present.at(-1));
-    sample(perfStage, "nativePresentCall", stageSamples.nativePresentCall.at(-1));
-    for (const [key, property] of Object.entries({ nativeRender: "nativeRenderMs", prepare: "prepareMs", acquire: "acquireMs", submit: "submitMs", surfacePresent: "presentMs" })) {
-      (stageSamples[key] ??= []).push(presentResult[property]);
-      sample(perfStage, key, presentResult[property]);
-    }
+    nativeWindow.presentDocument();
     if (!shown) {
       nativeWindow.show();
       shown = true;
@@ -277,12 +221,6 @@ export async function install() {
       };
       const summarize = (values) => `${percentile(values, 0.5).toFixed(2)}/${percentile(values, 0.95).toFixed(2)}/${percentile(values, 1).toFixed(2)} ms`;
       console.log(`host frame interval median/p95/max ${summarize(frameSamples)}`);
-      for (const [name, values] of Object.entries(stageSamples)) console.log(`host ${name} median/p95/max ${summarize(values)}`);
-      for (const outlier of textSyncOutliers) console.log(`host DOM text sync outlier ${JSON.stringify(outlier)}`);
-      for (const [stage, values] of panSamples) {
-        if (!stage.startsWith("pan:")) continue;
-        console.log(`host ${stage} frames ${values.frameInterval.length}; interval ${summarize(values.frameInterval)}; layout ${summarize(values.layout)} (${values.layoutDirty} dirty); display-list ${summarize(values.displayList)}; text sync ${summarize(values.textSync)}; native call ${summarize(values.nativePresentCall)}; native render ${summarize(values.nativeRender)}; submit ${summarize(values.submit)}; surface ${summarize(values.surfacePresent)}`);
-      }
       await document.close();
       nativeWindow.close();
       globalThis.document = null;

@@ -1,7 +1,6 @@
 import os from "node:os";
 import { performance } from "node:perf_hooks";
 import { Document, Window } from "../index.js";
-import { layoutDocument } from "../internal/dom-state.js";
 
 const window = new Window({ resizable: "none", title: "Nasty input and textarea", width: 960, height: 600 });
 const refreshRate = window.refreshRate() > 0 ? window.refreshRate() : 60;
@@ -23,13 +22,16 @@ document.body.appendChild(titleElement);
 document.body.appendChild(subtitleElement);
 document.body.appendChild(inputElement);
 document.body.appendChild(textareaElement);
-const boxes = await layoutDocument(document, viewport.width, viewport.height);
-const titleBox = boxes.find((box) => box.element === titleElement);
-const subtitleBox = boxes.find((box) => box.element === subtitleElement);
-const inputBox = boxes.find((box) => box.element === inputElement);
-const textareaBox = boxes.find((box) => box.element === textareaElement);
-const inputContentBox = inputBox.contentBox;
-const textareaContentBox = textareaBox.contentBox;
+const titleBox = titleElement.getBoundingClientRect();
+const subtitleBox = subtitleElement.getBoundingClientRect();
+const inputBox = inputElement.getBoundingClientRect();
+const textareaBox = textareaElement.getBoundingClientRect();
+const contentRect = (element, rect) => {
+  const padding = ["Top", "Right", "Bottom", "Left"].map(side => Number.parseFloat(element.style[`padding${side}`]) || 0);
+  return { x: rect.x + padding[3], y: rect.y + padding[0], width: rect.width - padding[1] - padding[3], height: rect.height - padding[0] - padding[2] };
+};
+const inputContentBox = contentRect(inputElement, inputBox);
+const textareaContentBox = contentRect(textareaElement, textareaBox);
 
 console.log(`GPU adapter: ${window.adapterName()}; active refresh: ${refreshRate.toFixed(3)} Hz`);
 console.log("Both controls are active: input is single-line; textarea supports multiline. Enter is ignored in the input. Double-click selects words; Ctrl/Cmd+A selects all.");

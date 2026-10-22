@@ -3,11 +3,12 @@ import { writeFileSync } from "node:fs";
 import os from "node:os";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
-import { Document } from "../index.js";
-import { documentState } from "../internal/dom-state.js";
+import { Document, Window } from "../index.js";
 
 const initStart = performance.now();
+const window = new Window({ visible: false, width: 800, height: 300, resizable: "none" });
 const document = new Document();
+window.document = document;
 const nodes = [document.body];
 document.body.className = "flex flex-col w-[800px] h-[300px] p-6 gap-4";
 function element(parent, classes) {
@@ -24,10 +25,7 @@ for (let rowIndex = 0; rowIndex < 8; rowIndex++) {
   const row = element(grid, "flex flex-row gap-2");
   for (let column = 0; column < 10; column++) cards.push(element(row, "w-[60px] h-[14px] shrink-0"));
 }
-// This benchmark inspects worker timings and stale results through internal state.
-// Element styling still goes through the same public classList API as applications.
-const layout = documentState(document).layoutTree;
-console.log(`persistent Taffy worker initialized ${nodes.length} nodes in ${(performance.now() - initStart).toFixed(3)} ms`);
+console.log(`DOM benchmark initialized ${nodes.length} nodes in ${(performance.now() - initStart).toFixed(3)} ms`);
 let widthClass = "w-[60px]";
 
 const refreshRate = 60;
@@ -40,8 +38,7 @@ let skipped = 0;
 let finalBoxes = [];
 const frameIntervals = [];
 const roundTrips = [];
-const workerComputes = [];
-const workerAssemblies = [];
+const geometryReads = [];
 const loopDelay = monitorEventLoopDelay({ resolution: 1 });
 loopDelay.enable();
 const cpuStart = process.cpuUsage();
@@ -93,12 +90,9 @@ try {
     cards[0].classList.replace(widthClass, nextWidthClass);
     widthClass = nextWidthClass;
     const requestStart = performance.now();
-    const result = await layout.layout(800, 300);
+    finalBoxes = [...document.querySelectorAll("*")].map(element => ({ element, ...element.getBoundingClientRect() }));
     roundTrips.push(performance.now() - requestStart);
-    workerComputes.push(result.computeMs);
-    workerAssemblies.push(result.workerMs - result.computeMs);
-    assert.equal(result.stale, false, "frame consumed a stale layout snapshot");
-    finalBoxes = result.boxes;
+    geometryReads.push(roundTrips.at(-1));
     next += budget;
     const now = performance.now();
     if (next <= now) {
@@ -115,13 +109,6 @@ try {
   assert.equal(finalBoxes[3].x, 24);
   assert.equal(finalBoxes[4].x, 24);
   assert.equal(finalBoxes[5].x, 93);
-  cards[0].classList.replace(widthClass, "w-[62px]");
-  const staleRequest = layout.layout(800, 300);
-  cards[0].classList.replace("w-[62px]", "w-[63px]");
-  const currentRequest = layout.layout(800, 300);
-  const [staleResult, currentResult] = await Promise.all([staleRequest, currentRequest]);
-  assert.equal(staleResult.stale, true, "superseded layout result was not marked stale");
-  assert.equal(currentResult.stale, false, "latest layout result was incorrectly marked stale");
   const elapsed = performance.now() - started;
   const cpu = process.cpuUsage(cpuStart);
   const cpuMs = (cpu.user + cpu.system) / 1000;
@@ -129,12 +116,9 @@ try {
   console.log(`worker layout frames: ${frame} in ${(elapsed / 1000).toFixed(2)} s; ${(frame / elapsed * 1000).toFixed(1)} FPS against ${refreshRate} Hz pacing; expired deadlines skipped ${skipped}`);
   console.log(`process CPU ${(cpuMs / elapsed / logicalCpus * 100).toFixed(1)}% machine / ${(cpuMs / elapsed).toFixed(2)} cores; host CPU count ${logicalCpus}; process RSS ${(process.memoryUsage().rss / 1048576).toFixed(1)} MB`);
   summary("frame intervals", frameIntervals);
-  summary("worker round trip including cloned 91-box snapshot", roundTrips);
-  summary("Taffy compute + native box transfer in worker", workerComputes);
-  summary("absolute-box assembly in worker", workerAssemblies);
+  summary("public DOM geometry reads", geometryReads);
   console.log(`main-thread event-loop delay: p95 ${(loopDelay.percentile(95) / 1e6).toFixed(3)} ms, max ${(loopDelay.max / 1e6).toFixed(3)} ms`);
-  console.log(`worker layout checks passed: ${finalBoxes.length} boxes; host logical CPUs ${logicalCpus}`);
-  console.log("stale-result check passed: superseded snapshots are marked stale; latest snapshot is current");
+  console.log(`DOM layout checks passed: ${finalBoxes.length} boxes; host logical CPUs ${logicalCpus}`);
 
   const colors = ["#16233e", "#25b3ad", "#557ee5", "#a783ec"];
   const rectangles = finalBoxes.map(({ x, y, width, height }, index) => `<rect x="${x}" y="${y}" width="${width}" height="${height}" fill="${colors[index % colors.length]}" fill-opacity="0.7" stroke="#fff" stroke-width="1"/>`).join("\n");
@@ -146,4 +130,5 @@ try {
   clearInterval(resourceTimer);
   loopDelay.disable();
   await document.close();
+  window.close();
 }

@@ -1,41 +1,10 @@
 import assert from "node:assert/strict";
 import os from "node:os";
 import { performance } from "node:perf_hooks";
-import { Document, Window, buildTransformedDisplayList } from "../index.js";
-import { documentBoxes, documentState, layoutDocument } from "../internal/dom-state.js";
-import { createBoxProjector } from "../render.js";
+import { Document, Window } from "../index.js";
 
 const frameLimit = Number(process.env.NASTY_TRANSFORM_FRAMES ?? 600);
 const viewport = { width: 720, height: 480 };
-
-const nestedDocument = new Document();
-const parent = nestedDocument.createElement("div");
-const child = nestedDocument.createElement("div");
-parent.className = "w-[80px] h-[80px]";
-child.className = "w-[20px] h-[20px] bg-[#4477bb]";
-parent.appendChild(child);
-nestedDocument.body.appendChild(parent);
-await layoutDocument(nestedDocument, 160, 160);
-const nestedBoxes = documentBoxes(nestedDocument);
-const childBox = nestedBoxes.find((box) => box.element === child);
-const projectNested = createBoxProjector(nestedBoxes);
-const childOriginBefore = projectNested(childBox, childBox.x, childBox.y);
-const nestedDisplayListBefore = buildTransformedDisplayList(nestedBoxes, 160, 160);
-parent.classList.add("[transform:translateX(24px)]");
-child.classList.add("[transform:translateY(12px)]");
-const childOriginAfter = createBoxProjector(nestedBoxes)(childBox, childBox.x, childBox.y);
-assert.ok(Math.abs(childOriginAfter.x - childOriginBefore.x - 24) < 0.01, "parent translation should reach its child");
-assert.ok(Math.abs(childOriginAfter.y - childOriginBefore.y - 12) < 0.01, "child transform should compose with its parent");
-assert.ok(!Buffer.from(nestedDisplayListBefore).equals(Buffer.from(buildTransformedDisplayList(nestedBoxes, 160, 160))), "parent transforms should change descendant geometry");
-parent.classList.replace("[transform:translateX(24px)]", "[transform:scale(2)]");
-parent.classList.add("[transform-origin:top_left]");
-const projectScaled = createBoxProjector(nestedBoxes);
-const scaledOrigin = projectScaled(childBox, childBox.x, childBox.y);
-const scaledCorner = projectScaled(childBox, childBox.x + childBox.width, childBox.y + childBox.height);
-assert.ok(Math.abs(projectScaled.widthScaleAt(childBox, childBox.x, childBox.y) - 2) < 0.01, "text width should inherit a uniform parent scale");
-assert.ok(Math.abs(scaledCorner.x - scaledOrigin.x - childBox.width * 2) < 0.01, "parent scale should scale the child's geometry");
-assert.ok(Math.abs(scaledCorner.y - scaledOrigin.y - childBox.height * 2) < 0.01, "parent scale should scale the child's geometry vertically");
-nestedDocument.close();
 
 const window = new Window({ resizable: "none", title: "Nasty CSS 3D transforms", ...viewport });
 const document = new Document();
@@ -51,19 +20,12 @@ for (let i = 0; i < 42; i++) {
   document.body.appendChild(card);
   cards.push(card);
 }
-const boxes = documentBoxes(document);
-assert.equal(boxes.length, 43, "42 cards plus body should be laid out");
-
-const before = buildTransformedDisplayList(boxes, viewport.width, viewport.height);
+assert.equal(document.querySelectorAll("*").length, 43, "the body and 42 cards should be laid out");
 for (const [index, card] of cards.entries()) {
   transformClasses[index] = "[transform:perspective(450px)_rotateY(24deg)_rotateX(-12deg)_translateZ(12px)]";
   card.classList.add(transformClasses[index]);
 }
-const transformed = buildTransformedDisplayList(boxes, viewport.width, viewport.height);
-assert.equal(new Float32Array(before.buffer, before.byteOffset, 1)[0], 5);
-assert.equal(new Float32Array(transformed.buffer, transformed.byteOffset, 1)[0], 5);
-assert.ok(!Buffer.from(before).equals(Buffer.from(transformed)), "3D transforms should change projected GPU geometry");
-assert.equal(documentState(document).dirty, false, "transform-only changes must not invalidate Taffy layout");
+for (const card of cards) assert.ok(card.style.transform.includes("perspective"), "transform class is reflected in the CSSOM");
 
 const refreshHz = window.refreshRate() || 60;
 const budget = 1000 / refreshHz;
@@ -74,7 +36,6 @@ let frames = 0;
 let missed = 0;
 const intervals = [];
 const jsUpdateTimes = [];
-const listTimes = [];
 const nativePrepare = [];
 const nativeRender = [];
 const nativeSubmit = [];
@@ -105,11 +66,7 @@ function draw() {
     transformClasses[i] = nextTransformClass;
   }
   jsUpdateTimes.push(performance.now() - updateStart);
-  const listStart = performance.now();
-  const size = window.size();
-  const list = buildTransformedDisplayList(documentBoxes(document), size.width, size.height);
-  listTimes.push(performance.now() - listStart);
-  const result = window.presentTransformed(list);
+  const result = window.presentDocument();
   nativePrepare.push(result.prepareMs);
   nativeRender.push(result.nativeRenderMs);
   nativeSubmit.push(result.submitMs);
@@ -156,7 +113,6 @@ function finish() {
   console.log(`frames ${frames} in ${(elapsed / 1000).toFixed(2)} s; ${(frames / elapsed * 1000).toFixed(1)} FPS; expired deadlines skipped ${missed}`);
   report("frame interval", intervals);
   report("JS transform/style update", jsUpdateTimes);
-  report("JS matrix projection + display-list build", listTimes);
   report("native vertex preparation", nativePrepare);
   report("native render", nativeRender);
   report("GPU submit", nativeSubmit);

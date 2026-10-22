@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
-import { Document } from "../index.js";
-import { documentBoxes, layoutDocument } from "../internal/dom-state.js";
+import { Document, Window } from "../index.js";
 
+const window = new Window({ visible: false, width: 800, height: 300, resizable: "none" });
 const doc = new Document();
+window.document = doc;
 const element = (owner, id, classes = "") => {
   const result = owner.createElement("div");
   result.id = id;
@@ -29,7 +30,8 @@ for (let rowIndex = 0; rowIndex < 8; rowIndex++) {
   }
 }
 
-let boxes = await layoutDocument(doc, 800, 300);
+const boxesFor = owner => [...owner.querySelectorAll("*")].map(element => ({ element, ...element.getBoundingClientRect() }));
+let boxes = boxesFor(doc);
 const byName = (name) => boxes.find((box) => box.element.id === name);
 assert.equal(byName("heading").x, 24);
 assert.equal(byName("heading").y, 24);
@@ -39,21 +41,19 @@ assert.equal(byName("card-1").x, 92);
 assert.equal(byName("card-10").y, 126);
 
 const scrollDoc = new Document();
+window.document = scrollDoc;
 const scroller = element(scrollDoc, "scroller", "flex flex-col w-[100px] h-[40px] overflow-auto");
 scrollDoc.body.appendChild(scroller);
 for (let index = 0; index < 4; index++) {
   scroller.appendChild(element(scrollDoc, `item-${index}`, "w-[100px] h-[30px] shrink-0"));
 }
-let scrollBoxes = await layoutDocument(scrollDoc, 100, 100);
+let scrollBoxes = boxesFor(scrollDoc);
 assert.equal(scroller.scrollTop, 0);
-assert.equal(scrollBoxes.find((box) => box.element === scroller).scrollHeight, 120);
-assert.equal(scrollDoc.scrollAt(10, 10, 0, 25), true);
-scrollBoxes = documentBoxes(scrollDoc);
+assert.equal(scroller.scrollHeight, 120);
+scroller.scrollTop = 25;
+scrollBoxes = boxesFor(scrollDoc);
 assert.equal(scroller.scrollTop, 25);
 assert.equal(scrollBoxes.find((box) => box.element.id === "item-0").y, -25);
-assert.deepEqual(scrollBoxes.find((box) => box.element.id === "item-0").clip, {
-  x: 0, y: 0, width: 100, height: 40,
-});
 const inputDefaults = scrollDoc.createElement("input").style;
 const textareaDefaults = scrollDoc.createElement("textarea").style;
 assert.equal(inputDefaults.overflow, "hidden");
@@ -70,25 +70,26 @@ assert.equal(textareaDefaults.borderWidth, 0);
 assert.equal(textareaDefaults.backgroundColor, "transparent");
 assert.equal(textareaDefaults.justifyContent, "start");
 assert.equal(textareaDefaults.alignItems, "start");
-assert.equal(scrollDoc.handleEvent({ type: "wheel", x: 10, y: 10, deltaY: 15 }), true);
+scroller.scrollTop = 40;
 assert.equal(scroller.scrollTop, 40);
+window.document = null;
 await scrollDoc.close();
+window.document = doc;
 
-// Timings include JS mutation, Taffy layout, and reading every box. They do
-// not include GPU presentation, which arrives with the window feature.
+// Geometry reads use the public DOM API and synchronously flush pending layout.
 const samples = [];
-const phases = { style: [], compute: [], workerAssembly: [], transfer: [], assembly: [] };
+const phases = { style: [], geometry: [] };
 for (let frame = 0; frame < 360; frame++) {
   const start = performance.now();
   const previousWidthClass = [...cards[0].classList].find(token => token.startsWith("w-["));
   cards[0].classList.replace(previousWidthClass, `w-[${60 + (frame % 2)}px]`);
   const styleEnd = performance.now();
-  const timings = {};
-  boxes = await layoutDocument(doc, 800, 300, timings);
+  const geometryStart = performance.now();
+  boxes = boxesFor(doc);
   if (frame >= 30) {
     samples.push(performance.now() - start);
     phases.style.push(styleEnd - start);
-    for (const phase of ["compute", "workerAssembly", "transfer", "assembly"]) phases[phase].push(timings[phase]);
+    phases.geometry.push(performance.now() - geometryStart);
   }
 }
 samples.sort((a, b) => a - b);
@@ -109,3 +110,4 @@ const output = fileURLToPath(new URL("./layout.svg", import.meta.url));
 writeFileSync(output, svg);
 console.log(`wrote ${output}`);
 await doc.close();
+window.close();

@@ -10,8 +10,6 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { Command, InvalidArgumentError } from 'commander';
 import { Window, Document, closeImageDecoder } from '../index.js';
-import { documentState, documentBoxes } from '../internal/dom-state.js';
-import { inherited } from '../internal/text-metrics.js';
 import { createRainbowUI } from './rainbow/ui.js';
 import { ProcessSampler } from './rainbow/process-sampler.js';
 
@@ -414,11 +412,7 @@ function pointerEvent(target, type, button = 0, extra = {}) {
   return event;
 }
 function hitElement() {
-  return [...documentBoxes(document)].reverse().find(box => {
-    if (inherited(box.element, 'pointerEvents', 'auto') === 'none') return false;
-    for (let el = box.element; el; el = el.parent) if (el.hidden || el.style.display === 'none') return false;
-    return pointer.x >= box.x && pointer.y >= box.y && pointer.x < box.x + box.width && pointer.y < box.y + box.height;
-  })?.element;
+  return document.elementFromPoint(pointer.x, pointer.y);
 }
 function dispatch() {
   const size = window.size();
@@ -468,7 +462,7 @@ function dispatch() {
     }
     if (!event.type.startsWith('pointer')) continue;
     if (event.type === 'pointermove') pointer = { x: event.x, y: event.y };
-    const capture = documentState(document).pointerCapture?.get(1);
+    const capture = [...document.querySelectorAll('*')].find(element => element.hasPointerCapture(1));
     const hit = hitElement();
     const target = capture || hit;
     if (!capture && target !== lastTarget) { pointerEvent(lastTarget, 'pointerleave'); lastTarget = target; }

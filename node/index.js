@@ -594,7 +594,7 @@ function styleForTaffy(style, fontSize = 16) {
       result[property] = Number.parseFloat(value);
     } else if (typeof value === "string" && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:em|rem)$/.test(value.trim())) {
       result[property] = Number.parseFloat(value) * (value.trim().endsWith("rem") ? 16 : fontSize);
-    } else if (typeof value === "string") {
+    } else if (typeof value === "string" && !(property.startsWith("margin") && value === "auto")) {
       // The current Taffy bridge accepts pixel lengths as numbers (and
       // width/height percentages through their dedicated fields). Keep
       // unsupported CSS values out of the native layout struct so an
@@ -700,8 +700,9 @@ class CSSStyleDeclaration {
     styleData.set(this, state);
     const proxy = new Proxy(this, {
       get: (target, property, receiver) => {
-        if (typeof property === "string" && property in state.values) {
-          return state.values[property];
+        if (typeof property === "string") {
+          const value = cssStyleValue(state.values, property);
+          if (value !== undefined) return value;
         }
         return Reflect.get(target, property, receiver);
       },
@@ -722,9 +723,24 @@ class CSSStyleDeclaration {
 
   getPropertyValue(property) {
     const name = property.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
-    const value = styleData.get(this).values[name];
+    const value = cssStyleValue(styleData.get(this).values, name);
     return value === undefined ? "" : String(value);
   }
+}
+
+function cssStyleValue(values, property) {
+  if (Object.hasOwn(values, property)) return values[property];
+  const side = /^(padding|margin|border)(Top|Right|Bottom|Left)(Width|Color|Style)?$/.exec(property);
+  if (!side) return undefined;
+  const [, family, direction, suffix = ""] = side;
+  if (family === "border") {
+    const specific = `border${direction}${suffix || "Width"}`;
+    if (Object.hasOwn(values, specific)) return values[specific];
+    const shorthand = suffix === "Color" ? "borderColor" : suffix === "Style" ? "borderStyle" : "borderWidth";
+    return values[shorthand];
+  }
+  const shorthand = family;
+  return values[property] ?? values[shorthand];
 }
 
 export class Element extends EventTarget {
@@ -738,13 +754,12 @@ export class Element extends EventTarget {
     this.attributes = new Map();
     const state = { image: null, imageLoad: null, imageLoadState: "empty", currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null,
       selectionStyle: {}, textAreaState: null, inputValue: "", selectionStart: 0, selectionEnd: 0, selectionDirection: "none",
+      scrollLeft: 0, scrollTop: 0,
       renderScrollLeft: null, renderTextOriginX: null, renderCaretX: null,
       video: { audioId: nextVideoAudioId++, audioGeneration: 0, audioStartPromise: null, seekPending: false, paused: true, ended: false, currentTime: 0, duration: NaN, width: 0, height: 0, timer: null, token: 0, source: "", frameRequest: null, resolveFrame: null, rejectFrame: null, textureId: null, volume: 1, metadataLoaded: false, dataLoaded: false } };
     registerElementState(this, state);
     documentState(document).elements.add(this);
     Object.defineProperty(this, "style", { value: new CSSStyleDeclaration(this, { ...defaultElementStyle(this.localName) }), enumerable: true });
-    this.scrollLeft = 0;
-    this.scrollTop = 0;
     state.handle = documentState(document).layoutTree.createNode(this._taffyStyle());
   }
 
@@ -1347,11 +1362,28 @@ export class Element extends EventTarget {
     return styleForTaffy(style, fontSize);
   }
 
+  get scrollLeft() { return elementState(this).scrollLeft; }
+  set scrollLeft(value) {
+    const next = Math.max(0, Number(value) || 0);
+    const state = elementState(this);
+    if (next === state.scrollLeft) return;
+    state.scrollLeft = next;
+    markGeometryDirty(documentState(this.document));
+  }
+
+  get scrollTop() { return elementState(this).scrollTop; }
+  set scrollTop(value) {
+    const next = Math.max(0, Number(value) || 0);
+    const state = elementState(this);
+    if (next === state.scrollTop) return;
+    state.scrollTop = next;
+    markGeometryDirty(documentState(this.document));
+  }
+
   scrollBy(x = 0, y = 0) {
     if (!Number.isFinite(x) || !Number.isFinite(y)) throw new TypeError("scroll offsets must be finite");
     this.scrollLeft = Math.max(0, this.scrollLeft + x);
     this.scrollTop = Math.max(0, this.scrollTop + y);
-    markGeometryDirty(documentState(this.document));
     return this;
   }
 

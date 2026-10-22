@@ -1,5 +1,4 @@
 import { Document, Window } from "../index.js";
-import { layoutDocument } from "../internal/dom-state.js";
 
 const window = new Window({ title: "Nasty body className", width: 900, height: 500, borderless: true, dragAnywhere: true });
 const document = new Document();
@@ -50,16 +49,19 @@ async function frame() {
   }
 
   const size = window.size();
-  const boxes = await layoutDocument(document, size.width, size.height);
-  const fieldBox = boxes.find(box => box.element === field);
-  if (fieldBox) {
+  const fieldRect = field.getBoundingClientRect();
+  if (fieldRect.width) {
+    const paddingLeft = Number.parseFloat(field.style.paddingLeft) || 0;
+    const paddingRight = Number.parseFloat(field.style.paddingRight) || 0;
+    const paddingTop = Number.parseFloat(field.style.paddingTop) || 0;
+    const paddingBottom = Number.parseFloat(field.style.paddingBottom) || 0;
     const states = window.updateTextAreas([{
       id: "body-class-name",
       value: field.value,
-      x: fieldBox.contentBox.x,
-      y: fieldBox.contentBox.y,
-      width: fieldBox.contentBox.width,
-      height: fieldBox.contentBox.height,
+      x: fieldRect.x + paddingLeft,
+      y: fieldRect.y + paddingTop,
+      width: fieldRect.width - paddingLeft - paddingRight,
+      height: fieldRect.height - paddingTop - paddingBottom,
       fontSize: 16,
       lineHeight: 24,
       multiline: false,

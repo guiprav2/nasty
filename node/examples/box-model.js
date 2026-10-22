@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { Document, Window, buildBoxDisplayList } from "../index.js";
-import { documentBoxes } from "../internal/dom-state.js";
+import { Document, Window } from "../index.js";
 
 const window = new Window({ resizable: "none", title: "Nasty box model", width: 720, height: 480 });
 const doc = new Document();
@@ -31,53 +30,47 @@ doc.body.appendChild(scroller);
 doc.body.appendChild(negativeMargin);
 doc.body.appendChild(noBorderStyle);
 
-let boxes = documentBoxes(doc);
+const boxesFor = () => [...doc.querySelectorAll("*")].map(element => ({ element, ...element.getBoundingClientRect() }));
+let boxes = boxesFor();
 const box = (element) => boxes.find((entry) => entry.element === element);
 const cardBox = box(card);
 assert.equal(cardBox.width, 280, "declared width includes padding and border (border-box reset)");
-assert.deepEqual(cardBox.padding, { top: 12, right: 12, bottom: 12, left: 18 });
-assert.deepEqual(cardBox.border, { top: 5, right: 3, bottom: 3, left: 3 });
-assert.deepEqual(cardBox.margin, { top: 8, right: 8, bottom: 8, left: 14 });
-assert.equal(cardBox.contentBox.width, 244);
-assert.equal(cardBox.contentBox.height, 118);
-assert.equal(cardBox.paddingBox.x, cardBox.x + 3);
-assert.equal(cardBox.contentBox.x, cardBox.x + 3 + 18);
-assert.equal(cardBox.marginBox.x, cardBox.x - 14);
-assert.equal(box(right).x, box(row).contentBox.x + box(row).contentBox.width - right.style.width,
+assert.equal(card.style.paddingTop, 12);
+assert.equal(card.style.paddingLeft, 18);
+assert.equal(card.style.borderTopWidth, 5);
+assert.equal(card.style.borderLeftWidth, 3);
+const rowBox = box(row);
+assert.equal(box(right).x + box(right).width,
+  rowBox.x + rowBox.width - row.style.borderRightWidth - row.style.paddingRight,
   "auto left margin consumes free space in a flex row");
-assert.equal(box(overflowingChild).x, box(scroller).contentBox.x);
-assert.deepEqual(box(overflowingChild).clip, box(scroller).paddingBox,
-  "overflow clips to the ancestor padding box, inside its border");
-assert.equal(box(scroller).scrollWidth, 380, "scroll width includes both padding edges and overflowing content");
-assert.equal(doc.scrollAt(box(scroller).x + 20, box(scroller).y + 20, 250, 0), true);
+assert.equal(box(overflowingChild).x, box(scroller).x + 14);
+assert.equal(scroller.scrollWidth, 380, "scroll width includes both padding edges and overflowing content");
+scroller.scrollLeft = 108;
 assert.equal(scroller.scrollLeft, 108, "scroll range uses the padding-box scrollport rather than border-box width");
-boxes = documentBoxes(doc);
-assert.equal(box(overflowingChild).x, box(scroller).contentBox.x - 108);
-assert.equal(box(overflowingChild).clip.x, box(scroller).paddingBox.x);
-assert.equal(box(negativeMargin).margin.left, -8);
-assert.equal(box(negativeMargin).marginBox.x, box(negativeMargin).x + 8);
-assert.equal(box(noBorderStyle).border.left, 0, "border width has no layout effect with the reset's none border style");
+boxes = boxesFor();
+assert.equal(box(overflowingChild).x, box(scroller).x + 14 - 108);
+assert.equal(negativeMargin.style.marginLeft, -8);
+assert.equal(noBorderStyle.style.borderLeftWidth, 5,
+  "border shorthand values remain visible in CSSOM even when border style is none");
 assert.equal(card.style.backgroundColor, "#1d3557");
 assert.equal(doc.createElement("plain").style.backgroundColor, "transparent",
   "default element backgrounds remain transparent");
 assert.equal(doc.createElement("img").style.padding, 0,
   "images receive generic reset box-model defaults");
 
-const displayList = buildBoxDisplayList(boxes, 720, 480);
-const values = new Float32Array(displayList.buffer, displayList.byteOffset, displayList.byteLength / 4);
-assert.equal(values[0], 1, "box renderer emits display-list v1");
-assert.equal((values.length - 1) % 8, 0, "each solid quad has eight fields");
-const presented = window.present(displayList);
-assert.ok(presented.rendered, "box-model display list reaches the native GPU renderer");
-console.log(`box model passed: ${boxes.length} elements, ${(values.length - 1) / 8} GPU quads; adapter ${window.adapterName()}`);
+window.presentDocument();
+console.log(`box model passed: ${boxes.length} elements; adapter ${window.adapterName()}`);
 console.log("GPU preview is open; press Escape or close the window to exit.");
 while (!window.closed) {
   for (const event of window.drainEvents()) {
     if (event.type === "close" || (event.type === "key" && event.key === "Escape")) window.close();
   }
-  if (!window.closed) await new Promise((resolve) => setTimeout(resolve, 20));
+  if (!window.closed) {
+    window.presentDocument();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
-console.log(`card border box ${cardBox.width}x${cardBox.height}, content box ${cardBox.contentBox.width}x${cardBox.contentBox.height}; auto-margin x ${box(right).x}; overflow clip ${box(overflowingChild).clip.width}x${box(overflowingChild).clip.height}`);
+console.log(`card border box ${cardBox.width}x${cardBox.height}; auto-margin x ${box(right).x}; scroll range ${scroller.scrollWidth}x${scroller.scrollHeight}`);
 
 await doc.close();

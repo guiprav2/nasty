@@ -1,4 +1,3 @@
-import { nerdGlyphs } from "../../internal/nerd-glyphs.js";
 // Direct createElement/Tailwind utility port of ../rainbow/index.html and style.css.
 // Inline text containers use flex where Nasty has no inline formatting context.
 export function createRainbowUI(document) {
@@ -37,14 +36,17 @@ export function createRainbowUI(document) {
   const maximizeButton = el(live, 'button', 'maximize-control', '', `${row} justify-center [width:26px] [height:26px] [margin-left:2px] [padding:0px] [border-width:0px] border-none [border-radius:5px] [background-color:transparent] [color:#c7a8ff] [pointer-events:auto] [cursor:pointer]`, 'maximize-control');
   maximizeButton.setAttribute('aria-label', 'Maximize window');
   maximizeButton.setAttribute('title', 'Maximize window');
-  const maximizeGlyph = el(maximizeButton, 'span', '', nerdGlyphs.get('nf-md-window-maximize') ?? '', `[font-family:Nerd_Symbols] relative [top:-6px] [font-size:15px] [line-height:1]`);
+  const maximizeGlyph = el(maximizeButton, 'span', 'nf nf-md-window-maximize', '', `relative [top:-6px] [font-size:15px] [line-height:1]`);
   let maximizedState = null;
+  let maximizeGlyphClass = 'nf-md-window-maximize';
   let maximizeTopClass = "[top:-6px]";
   function setMaximized(maximized) {
     maximized = Boolean(maximized);
     if (maximizedState === maximized) return;
     maximizedState = maximized;
-    maximizeGlyph.textContent = nerdGlyphs.get(`nf-md-window-${maximized ? 'restore' : 'maximize'}`) ?? '';
+    const nextGlyphClass = `nf-md-window-${maximized ? 'restore' : 'maximize'}`;
+    maximizeGlyph.classList.replace(maximizeGlyphClass, nextGlyphClass);
+    maximizeGlyphClass = nextGlyphClass;
     const nextTopClass = `[top:${maximized ? -0.33 : 0}px]`;
     maximizeGlyph.classList.replace(maximizeTopClass, nextTopClass);
     maximizeTopClass = nextTopClass;

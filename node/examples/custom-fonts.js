@@ -2,8 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import { performance } from "node:perf_hooks";
-import { Window } from "../index.js";
-import { FontRegistry } from "../font-registry.js";
+import { FontRegistry, Window } from "../index.js";
 
 const family = process.argv[2] ?? "DejaVu Sans";
 const fontPath = process.argv[3] ?? execFileSync("fc-match", ["-f", "%{file}", family], { encoding: "utf8" }).trim();

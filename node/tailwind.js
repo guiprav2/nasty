@@ -120,6 +120,14 @@ function utilityStyle(utility) {
   const caret = /^caret-(.+)$/.exec(utility);
   if (caret && colorValue(caret[1])) return ["caretColor", colorValue(caret[1])];
   if (utility === "border") return [["borderWidth", 1], ["borderStyle", "solid"]];
+  const autoMargin = /^m([xytrbl]?)-auto$/.exec(utility);
+  if (autoMargin) {
+    const map = {
+      "": ["margin"], x: ["marginLeft", "marginRight"], y: ["marginTop", "marginBottom"],
+      t: ["marginTop"], r: ["marginRight"], b: ["marginBottom"], l: ["marginLeft"],
+    }[autoMargin[1]];
+    return map.map(property => [property, "auto"]);
+  }
   const borderWidth = /^border(?:-([trbl]))?-(.+)$/.exec(utility);
   if (borderWidth) {
     const [, side, value] = borderWidth;
