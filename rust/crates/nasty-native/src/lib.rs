@@ -785,6 +785,14 @@ pub struct WindowSize {
 }
 
 #[napi(object)]
+pub struct DisplaySize {
+    pub width: f64,
+    pub height: f64,
+    #[napi(js_name = "scaleFactor")]
+    pub scale_factor: f64,
+}
+
+#[napi(object)]
 pub struct NativeEvent {
     #[napi(js_name = "type")]
     pub kind: String,
@@ -3722,6 +3730,7 @@ struct WindowApp {
     min_height: Option<f64>,
     max_width: Option<f64>,
     max_height: Option<f64>,
+    body_transparent: bool,
     visible: bool,
     resizable: String,
     orientation: String,
@@ -3768,13 +3777,13 @@ impl ApplicationHandler for WindowApp {
             .with_visible(self.visible)
             .with_resizable(self.resizable != "none")
             .with_decorations(!self.borderless)
-            .with_transparent(self.borderless)
+            .with_transparent(self.borderless || self.body_transparent)
             .with_maximized(self.maximized)
             .with_inner_size(LogicalSize::new(self.width, self.height));
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
-                match Renderer::new(window.clone(), self.borderless, self.vsync) {
+                match Renderer::new(window.clone(), self.borderless || self.body_transparent, self.vsync) {
                     Ok(renderer) => {
                         self.text_editor = Some(TextEditor::new(window.as_ref()));
                         self.apply_resizable(&window);
@@ -4134,6 +4143,17 @@ impl WindowApp {
             let _ = window.request_inner_size(bounded);
         }
     }
+
+    fn apply_transparency(&mut self) {
+        let transparent = self.borderless || self.body_transparent;
+        if let Some(window) = self.window.as_ref() {
+            window.set_transparent(transparent);
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_transparent(window, transparent);
+            }
+            self.render_pending = true;
+        }
+    }
 }
 
 fn key_matches(configured: &str, debug_key: &str, text: Option<&str>) -> bool {
@@ -4321,10 +4341,15 @@ impl Window {
         self.app.borderless = value;
         if let Some(window) = self.app.window.as_ref() {
             window.set_decorations(!value);
-            window.set_transparent(value);
-            if let Some(renderer) = self.app.renderer.as_mut() { renderer.set_transparent(window, value); }
         }
+        self.app.apply_transparency();
         Ok(())
+    }
+
+    #[napi(js_name = "setBodyTransparency")]
+    pub fn set_body_transparency(&mut self, value: bool) {
+        self.app.body_transparent = value;
+        self.app.apply_transparency();
     }
 
     #[napi(js_name = "setDragAnywhere")]
@@ -4410,7 +4435,31 @@ impl Window {
         self.app.min_height = min_height;
         self.app.max_width = max_width;
         self.app.max_height = max_height;
-        if let Some(window) = self.app.window.as_ref() { self.app.apply_resizable(window); }
+        if let Some(window) = self.app.window.as_ref() {
+            self.app.apply_resizable(window);
+            let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+            let bounded = LogicalSize::new(
+                size.width.clamp(min_width.unwrap_or(1.0).max(1.0), max_width.unwrap_or(i32::MAX as f64).max(1.0)),
+                size.height.clamp(min_height.unwrap_or(1.0).max(1.0), max_height.unwrap_or(i32::MAX as f64).max(1.0)),
+            );
+            if (bounded.width - size.width).abs() > 0.5 || (bounded.height - size.height).abs() > 0.5 {
+                let _ = window.request_inner_size(bounded);
+            }
+            window.request_redraw();
+            self.app.render_pending = true;
+        }
+        for _ in 0..8 {
+            self.pump(Duration::from_millis(4))?;
+            self.check_error()?;
+            let Some(window) = self.app.window.as_ref() else { break; };
+            let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+            let min_width = self.app.min_width.unwrap_or(1.0).max(1.0);
+            let min_height = self.app.min_height.unwrap_or(1.0).max(1.0);
+            let max_width = self.app.max_width.unwrap_or(i32::MAX as f64).max(1.0);
+            let max_height = self.app.max_height.unwrap_or(i32::MAX as f64).max(1.0);
+            if size.width >= min_width - 0.5 && size.height >= min_height - 0.5
+                && size.width <= max_width + 0.5 && size.height <= max_height + 0.5 { break; }
+        }
         Ok(())
     }
 
@@ -4463,6 +4512,39 @@ impl Window {
             width: size.width,
             height: size.height,
         }
+    }
+
+    #[napi(js_name = "displaySize")]
+    pub fn display_size(&self) -> DisplaySize {
+        let Some(window) = self.app.window.as_ref() else {
+            return DisplaySize { width: 960.0, height: 600.0, scale_factor: 1.0 };
+        };
+        let scale_factor = window.scale_factor();
+        let size = window.current_monitor()
+            .map(|monitor| monitor.size().to_logical::<f64>(scale_factor))
+            .unwrap_or_else(|| window.inner_size().to_logical::<f64>(scale_factor));
+        DisplaySize { width: size.width, height: size.height, scale_factor }
+    }
+
+    #[napi(js_name = "setSize")]
+    pub fn set_size(&mut self, width: f64, height: f64) -> Result<()> {
+        if !width.is_finite() || !height.is_finite() || width < 0.0 || height < 0.0 {
+            return Err(Error::new(Status::InvalidArg, "window width and height must be finite nonnegative numbers"));
+        }
+        let min_width = self.app.min_width.unwrap_or(1.0).max(1.0);
+        let min_height = self.app.min_height.unwrap_or(1.0).max(1.0);
+        let max_width = self.app.max_width.unwrap_or(i32::MAX as f64).max(1.0);
+        let max_height = self.app.max_height.unwrap_or(i32::MAX as f64).max(1.0);
+        let width = width.clamp(min_width, max_width);
+        let height = height.clamp(min_height, max_height);
+        self.app.width = width;
+        self.app.height = height;
+        let window = self.app.window.as_ref().ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+        let _ = window.request_inner_size(LogicalSize::new(width, height));
+        window.request_redraw();
+        self.app.render_pending = true;
+        self.pump(Duration::from_millis(2))?;
+        self.check_error()
     }
 
     #[napi]

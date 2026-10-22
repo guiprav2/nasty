@@ -552,7 +552,7 @@ export function documentImage(window, document) {
       images.push({ textureId: state.postBlurTextureId, x: 0, y: 0, width, height });
     } else {
       if (state.overlayChanged) {
-        uploadTextureRegion(window, state, 'overlayTextureId', 'overlaySize', width, height, state.surface, state.overlayDirtyRegions);
+        uploadTexture(window, state, 'overlayTextureId', 'overlaySize', width, height, state.surface.data());
       }
       images.push({ textureId: state.overlayTextureId, x: 0, y: 0, width, height });
     }

@@ -6,13 +6,14 @@ import { loadImage, unloadImage } from "./image-decoder.js";
 import { documentBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
 import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
-import { isPaintColorProperty, registerStyleTransitionState, startColorTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
-import { buildTransformedDisplayList, displayListElements } from "./render.js";
+import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
+import { buildTransformedDisplayList, displayListElements, parseColor } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { textMetrics } from "./internal/text-metrics.js";
 import { documentImage } from "./internal/raster-document.js";
 import { resolveTailwind } from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
+import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
 
 export const VideoDecoder = native.VideoDecoder;
 export const AudioDecoder = native.AudioDecoder;
@@ -33,6 +34,10 @@ function readAudioOutputs() {
 }
 export class Window extends native.Window {
   #document = null;
+  #documentSizeConstraintsKey = null;
+  #bodyAppearanceKey = null;
+  #width;
+  #height;
   #resizable;
   #orientation;
   #borderless;
@@ -42,6 +47,11 @@ export class Window extends native.Window {
   #audioOutputId = null;
   #mediaStopped = false;
   constructor(options = {}) {
+    const initialWidth = options.width ?? 960;
+    const initialHeight = options.height ?? 600;
+    validateWindowDimension(initialWidth, "width");
+    validateWindowDimension(initialHeight, "height");
+    const showAfterSizing = (typeof initialWidth === "string" || typeof initialHeight === "string") && (options.visible ?? true);
     const initialResizable = options.resizable ?? "both";
     if (!RESIZABLE_MODES.has(initialResizable)) {
       throw new TypeError('resizable must be "horizontal", "vertical", "both", or "none"');
@@ -63,8 +73,14 @@ export class Window extends native.Window {
     }
     if (typeof initialVsync !== 'boolean') throw new TypeError('vsync must be a boolean');
     if (typeof initialMaximized !== 'boolean') throw new TypeError('maximized must be a boolean');
-    super({ ...options, resizable: initialResizable, orientation: initialOrientation, borderless: initialBorderless,
+    super({ ...options,
+      width: typeof initialWidth === "number" ? Math.max(1, initialWidth) : 960,
+      height: typeof initialHeight === "number" ? Math.max(1, initialHeight) : 600,
+      visible: showAfterSizing ? false : options.visible,
+      resizable: initialResizable, orientation: initialOrientation, borderless: initialBorderless,
       dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized, vsync: initialVsync });
+    this.#width = initialWidth;
+    this.#height = initialHeight;
     this.#resizable = initialResizable;
     this.#orientation = initialOrientation;
     this.#borderless = initialBorderless;
@@ -72,6 +88,36 @@ export class Window extends native.Window {
     this.#maximizable = initialMaximizable;
     this.#vsync = initialVsync;
     this.DOMRect = DOMRect;
+    this.#applyWindowDimensions();
+    if (showAfterSizing) {
+      super.show();
+      this.#applyWindowDimensions();
+    }
+  }
+
+  get width() { return this.#width; }
+  set width(value) {
+    validateWindowDimension(value, "width");
+    this.#width = value;
+    this.#applyWindowDimensions();
+  }
+  get height() { return this.#height; }
+  set height(value) {
+    validateWindowDimension(value, "height");
+    this.#height = value;
+    this.#applyWindowDimensions();
+  }
+
+  #applyWindowDimensions() {
+    const display = super.displaySize();
+    const current = super.size();
+    const viewport = {
+      width: display.width || current.width || 960,
+      height: display.height || current.height || 600,
+    };
+    const width = resolveWindowDimension(this.#width, "width", viewport);
+    const height = resolveWindowDimension(this.#height, "height", viewport);
+    super.setSize(width, height);
   }
 
   get resizable() { return this.#resizable; }
@@ -229,19 +275,66 @@ export class Window extends native.Window {
     if (document) this._validateDocumentMaxConstraints(document.body.style);
     if (this.#document) documentState(this.#document).defaultView = null;
     this.#document = document;
+    this.#documentSizeConstraintsKey = null;
+    this.#bodyAppearanceKey = null;
     if (document) document._attachWindow(this);
+    else {
+      this._syncDocumentSizeConstraints();
+      this._syncBodyWindowAppearance();
+    }
+  }
+
+  _syncBodyWindowAppearance() {
+    const style = this.#document?.body?.style;
+    if (!style) {
+      if (this.#bodyAppearanceKey !== null) super.setBodyTransparency(false);
+      this.#bodyAppearanceKey = null;
+      return;
+    }
+    const background = computedStyleValue(style, "backgroundColor") ?? style.backgroundColor;
+    const opacity = Number(computedStyleValue(style, "opacity") ?? style.opacity ?? 1);
+    const radius = style.borderRadius;
+    const key = [background, opacity, radius];
+    if (this.#bodyAppearanceKey?.every((value, index) => Object.is(value, key[index]))) return;
+    const color = background && background !== "transparent" ? parseColor(background) : null;
+    const hasAlpha = opacity < 1 || (color !== null && color[3] < 1)
+      || (Number.parseFloat(radius) || 0) > 0;
+    super.setBodyTransparency(hasAlpha);
+    this.#bodyAppearanceKey = key;
   }
 
   _syncDocumentSizeConstraints() {
     const style = this.#document?.body?.style;
-    if (!style) return;
+    if (!style) {
+      super.setSizeConstraints(null, null, null, null);
+      this.#documentSizeConstraintsKey = null;
+      this.#applyWindowDimensions();
+      return;
+    }
     this._validateDocumentMaxConstraints(style);
-    const dimension = value => {
-      if (value === undefined || value === null || value === "" || value === "none" || value === "auto") return null;
-      const parsed = typeof value === "number" ? value : /^\s*\d+(?:\.\d+)?(?:px)?\s*$/.test(String(value)) ? parseFloat(value) : NaN;
-      return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+    const key = [style.minWidth, style.minHeight, style.maxWidth, style.maxHeight];
+    if (this.#documentSizeConstraintsKey?.every((value, index) => Object.is(value, key[index]))) return;
+    const display = super.displaySize();
+    const current = super.size();
+    const viewport = {
+      width: display.width || current.width || 960,
+      height: display.height || current.height || 600,
+      percentWidth: current.width / (display.scaleFactor || 1) || 960,
+      percentHeight: current.height / (display.scaleFactor || 1) || 600,
     };
-    super.setSizeConstraints(dimension(style.minWidth), dimension(style.minHeight), dimension(style.maxWidth), dimension(style.maxHeight));
+    const widthConstraint = value => {
+      if (value === undefined || value === null || value === "" || value === "none" || value === "auto") return null;
+      try { return resolveWindowDimension(value, "width", viewport, viewport.percentWidth); }
+      catch { return null; }
+    };
+    const heightConstraint = value => {
+      if (value === undefined || value === null || value === "" || value === "none" || value === "auto") return null;
+      try { return resolveWindowDimension(value, "height", viewport, viewport.percentHeight); }
+      catch { return null; }
+    };
+    super.setSizeConstraints(widthConstraint(style.minWidth), heightConstraint(style.minHeight), widthConstraint(style.maxWidth), heightConstraint(style.maxHeight));
+    this.#documentSizeConstraintsKey = key;
+    this.#applyWindowDimensions();
   }
 }
 
@@ -935,11 +1028,12 @@ export class Element extends EventTarget {
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
     doc.paintDirtyElements ??= new Set();
     doc.paintDirtyElements.add(this);
+    if (this === this.document.body) doc.defaultView?._syncBodyWindowAppearance();
     if (property !== undefined && !LAYOUT_STYLE_PROPERTIES.has(property)) return;
     doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
     doc.dirty = true;
     markGeometryDirty(doc);
-    if (this === this.document.body && ["minWidth", "minHeight", "maxWidth", "maxHeight"].includes(property)) doc.defaultView?._syncDocumentSizeConstraints();
+    if (this === this.document.body && (property === undefined || ["minWidth", "minHeight", "maxWidth", "maxHeight"].includes(property))) doc.defaultView?._syncDocumentSizeConstraints();
   }
 
   _validateStyleChange(property, value) {
@@ -956,7 +1050,7 @@ export class Element extends EventTarget {
       && Object.keys(next).every(key => Object.is(next[key], state.classValues[key]))) return false;
     state.classValues = next;
     const changed = refreshStyleValues(state);
-    if (changed.size) this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
+    this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
     return changed.size > 0;
   }
 
@@ -1092,6 +1186,7 @@ export class Document extends EventTarget {
   _attachWindow(window) {
     documentState(this).defaultView = window;
     window._syncDocumentSizeConstraints();
+    window._syncBodyWindowAppearance();
     for (const element of documentState(this).elements) {
       if (element.localName === "img" && elementState(element).imageLoadState === "pending") element._beginImageLoad(element.src, window, elementState(element).imageRequest);
       else if (element.localName === "video" && element.autoplay && element.src) element.play().catch(() => {});

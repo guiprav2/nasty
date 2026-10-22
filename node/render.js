@@ -337,6 +337,41 @@ function clipPolygon(polygon, rect) {
   return polygon;
 }
 
+function clipConvexPolygon(polygon, clip) {
+  if (!clip?.length || polygon.length < 3) return polygon;
+  const area = clip.reduce((sum, point, index) => {
+    const next = clip[(index + 1) % clip.length];
+    return sum + point.x * next.y - next.x * point.y;
+  }, 0);
+  const orientation = area >= 0 ? 1 : -1;
+  for (let edge = 0; edge < clip.length; edge++) {
+    const a = clip[edge], b = clip[(edge + 1) % clip.length];
+    const distance = point => orientation * ((b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x));
+    const input = polygon;
+    polygon = [];
+    if (!input.length) break;
+    let previous = input.at(-1), previousDistance = distance(previous);
+    for (const current of input) {
+      const currentDistance = distance(current);
+      const previousInside = previousDistance >= -1e-5, currentInside = currentDistance >= -1e-5;
+      if (previousInside !== currentInside) {
+        const amount = previousDistance / (previousDistance - currentDistance);
+        const point = {};
+        for (const key of new Set([...Object.keys(previous), ...Object.keys(current)])) {
+          if (typeof previous[key] === "number" && typeof current[key] === "number") {
+            point[key] = previous[key] + (current[key] - previous[key]) * amount;
+          }
+        }
+        polygon.push(point);
+      }
+      if (currentInside) polygon.push(current);
+      previous = current;
+      previousDistance = currentDistance;
+    }
+  }
+  return polygon;
+}
+
 function lineAtX(a, b, x) {
   const t = (x - a.x) / (b.x - a.x);
   return { x, y: a.y + (b.y - a.y) * t };
@@ -386,6 +421,25 @@ export function buildTransformedDisplayList(boxes, width, height) {
   let commandCount = 0;
   const viewport = { x: 0, y: 0, width, height };
   const projectPoint = createBoxProjector(boxes);
+  const bodyBox = boxes.find(box => box.element.localName === "body");
+  const bodyStyle = bodyBox?.element.style;
+  const radiusText = String(bodyStyle?.borderRadius ?? "");
+  const rawRadius = Number.parseFloat(radiusText) || 0;
+  const windowRadius = Math.max(0, Math.min((bodyBox?.width || 0) / 2, (bodyBox?.height || 0) / 2,
+    radiusText.trim().endsWith("%") ? Math.min(bodyBox?.width || 0, bodyBox?.height || 0) * rawRadius / 100 : rawRadius));
+  let windowClip = null;
+  if (bodyBox && windowRadius > 0) {
+    windowClip = [];
+    for (const [cx, cy, start] of [
+      [bodyBox.x + bodyBox.width - windowRadius, bodyBox.y + windowRadius, -Math.PI / 2],
+      [bodyBox.x + bodyBox.width - windowRadius, bodyBox.y + bodyBox.height - windowRadius, 0],
+      [bodyBox.x + windowRadius, bodyBox.y + bodyBox.height - windowRadius, Math.PI / 2],
+      [bodyBox.x + windowRadius, bodyBox.y + windowRadius, Math.PI],
+    ]) for (let step = 0; step <= 6; step++) {
+      const angle = start + step / 6 * Math.PI / 2;
+      windowClip.push({ x: cx + Math.cos(angle) * windowRadius, y: cy + Math.sin(angle) * windowRadius });
+    }
+  }
   const visibleElements = new Set();
   const addVisibleAncestors = (element) => {
     for (let current = element; current; current = current.parentElement ?? current.parentNode ?? current.parent) {
@@ -416,7 +470,7 @@ export function buildTransformedDisplayList(boxes, width, height) {
     const polygon = localPoints.map(([x, y]) => project(x, y));
     if (polygon.some((point) => point === null)) return;
     const clip = box.clip ? intersection(box.clip, viewport) : viewport;
-    const visible = clipPolygon(polygon, clip);
+    const visible = clipConvexPolygon(clipPolygon(polygon, clip), windowClip);
     if (visible.length < 3) return;
     for (let i = 1; i < visible.length - 1; i++) {
       const a = visible[0]; const b = visible[i]; const c = visible[i + 1];
@@ -454,7 +508,9 @@ export function buildTransformedDisplayList(boxes, width, height) {
       continue;
     }
     const opacity = opacityFor(box.element);
-    const radius = parseFloat(style.borderRadius) || 0;
+    const radiusText = String(style.borderRadius ?? "");
+    const radiusValue = Number.parseFloat(radiusText) || 0;
+    const radius = radiusText.trim().endsWith("%") ? Math.min(box.width, box.height) * radiusValue / 100 : radiusValue;
     push(box, box.borderBox, withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity), project, radius);
     if (box.element.localName === "canvas") {
       const state = elementState(box.element);
@@ -474,7 +530,7 @@ export function buildTransformedDisplayList(boxes, width, height) {
       const canvasClip = intersection(canvasViewport, box.contentBox);
       const canvasMatrix = projectPoint.matrixFor(box);
       if (commands.length && canvasClip.width > 0 && canvasClip.height > 0) {
-        if (canvasMatrix === IDENTITY_MATRIX) {
+        if (canvasMatrix === IDENTITY_MATRIX && !windowClip) {
           // Keep an identity canvas mesh packed and let the renderer apply its
           // placement, scaling, opacity, and scissor in one native batch.
           values.push(2, canvasClip.x, canvasClip.y, canvasClip.width, canvasClip.height,
@@ -499,7 +555,7 @@ export function buildTransformedDisplayList(boxes, width, height) {
             commandCount++;
             continue;
           }
-          const visible = clipPolygon([a, b, c], canvasClip);
+          const visible = clipConvexPolygon(clipPolygon([a, b, c], canvasClip), windowClip);
           for (let index = 1; index < visible.length - 1; index++) {
             values.push(0, visible[0].x, visible[0].y, visible[index].x, visible[index].y,
               visible[index + 1].x, visible[index + 1].y, red, green, blue, alpha);
@@ -523,7 +579,7 @@ export function buildTransformedDisplayList(boxes, width, height) {
         return Number.isFinite(point.x) && Number.isFinite(point.y) ? { ...point, u, v } : null;
       });
       if (corners.every(Boolean) && imageClip.width > 0 && imageClip.height > 0) {
-        const clipped = clipTexturedPolygon(corners, imageClip);
+        const clipped = clipConvexPolygon(clipTexturedPolygon(corners, imageClip), windowClip);
         if (clipped.length >= 3) {
           const triangles = [];
           for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
