@@ -832,8 +832,8 @@ pub struct TextAreaOptions {
     pub multiline: Option<bool>,
     pub focus: Option<bool>,
     pub trace: Option<bool>,
-    #[napi(js_name = "glyphAdvances")]
-    pub glyph_advances: Option<Vec<f64>>,
+    #[napi(js_name = "glyphBoundaries")]
+    pub glyph_boundaries: Option<Vec<f64>>,
     #[napi(js_name = "renderTextOriginX")]
     pub render_text_origin_x: Option<f64>,
 }
@@ -1252,6 +1252,7 @@ struct TextEditor {
     system_font_family: Option<String>,
     caret_geometry_calibration: Option<CaretGeometryCalibration>,
     word_drag: Option<WordDragState>,
+    selection_drag: Option<SelectionDragState>,
 }
 
 struct WordDragState {
@@ -1267,6 +1268,53 @@ struct WordDragState {
     tap_drag_armed_at: Option<Instant>,
     tap_drag_last_motion: Option<Instant>,
     text: String,
+}
+
+struct SelectionDragState {
+    control_id: String,
+    start_x: f64,
+    anchor: Option<usize>,
+}
+
+fn glyph_boundary_index(boundaries: &[f64], x: f64, toward_right: bool) -> usize {
+    let count = boundaries.len().saturating_sub(1);
+    if count == 0 || x < boundaries[0] {
+        return 0;
+    }
+    if x >= boundaries[count] {
+        return count;
+    }
+    for index in 0..count {
+        let first = boundaries[index];
+        let second = boundaries[index + 1];
+        let left = first.min(second);
+        let right = first.max(second);
+        if x >= left && x < right {
+            return if toward_right { index + 1 } else { index };
+        }
+    }
+    if x < boundaries[0] { 0 } else { count }
+}
+
+fn glyph_boundary_index_for_click(boundaries: &[f64], x: f64) -> usize {
+    let count = boundaries.len().saturating_sub(1);
+    if count == 0 || x < boundaries[0] {
+        return 0;
+    }
+    if x >= boundaries[count] {
+        return count;
+    }
+    for index in 0..count {
+        let first = boundaries[index];
+        let second = boundaries[index + 1];
+        let left = first.min(second);
+        let right = first.max(second);
+        if x >= left && x < right {
+            let nearer_to_leading_edge = (x - first).abs() < (x - second).abs();
+            return if nearer_to_leading_edge { index } else { index + 1 };
+        }
+    }
+    if x < boundaries[0] { 0 } else { count }
 }
 
 fn egui_word_range(text: &str, cursor_index: usize) -> (usize, usize) {
@@ -1398,6 +1446,7 @@ impl TextEditor {
             system_font_family: None,
             caret_geometry_calibration: None,
             word_drag: None,
+            selection_drag: None,
         }
     }
 
@@ -1534,24 +1583,39 @@ impl TextEditor {
                         pointer_position.filter(|position| edit.response.rect.contains(*position))
                     })
             });
+            let pointer_dragging = edit.response.dragged_by(pointer_button)
+                || self.word_drag.as_ref().is_some_and(|state| {
+                    state.control_id == options.id && state.tap_drag_active
+                });
             let pointer_cursor = pointer_for_cursor.map(|pointer| {
-                if let (Some(advances), Some(origin_x)) =
-                    (&options.glyph_advances, options.render_text_origin_x)
-                {
-                    if origin_x.is_finite() && !advances.is_empty() {
+                if let (Some(boundaries), Some(origin_x)) = (
+                    &options.glyph_boundaries,
+                    options.render_text_origin_x,
+                ) {
+                    if origin_x.is_finite() && boundaries.len() > 1 {
                         let target_x = pointer.x as f64 * pixels_per_point as f64 - origin_x;
-                        let mut accumulated = 0.0;
-                        for (index, advance) in advances.iter().enumerate() {
-                            if !advance.is_finite() || *advance < 0.0 {
-                                continue;
+                        if pointer_dragging {
+                            if let Some(range) = edit.cursor_range {
+                                let start_x = self
+                                    .selection_drag
+                                    .as_ref()
+                                    .filter(|state| state.control_id == options.id)
+                                    .map(|state| state.start_x)
+                                    .unwrap_or(
+                                        boundaries[range
+                                            .secondary
+                                            .ccursor
+                                            .index
+                                            .min(boundaries.len() - 1)],
+                                    );
+                                return glyph_boundary_index(
+                                    boundaries,
+                                    target_x,
+                                    target_x >= start_x,
+                                );
                             }
-                            let midpoint = accumulated + advance / 2.0;
-                            if target_x < midpoint {
-                                return index;
-                            }
-                            accumulated += advance;
                         }
-                        return advances.len();
+                        return glyph_boundary_index_for_click(boundaries, target_x);
                     }
                 }
                 edit.galley
@@ -1559,6 +1623,25 @@ impl TextEditor {
                     .ccursor
                     .index
             });
+            if pointer_dragging {
+                if let (Some(boundaries), Some(origin_x), Some(pointer)) = (
+                    &options.glyph_boundaries,
+                    options.render_text_origin_x,
+                    pointer_for_cursor,
+                ) {
+                    if let Some(state) = self.selection_drag.as_mut().filter(|state| {
+                        state.control_id == options.id && state.anchor.is_none()
+                    }) {
+                        let start_x = state.start_x;
+                        let target_x = pointer.x as f64 * pixels_per_point as f64 - origin_x;
+                        state.anchor = Some(glyph_boundary_index(
+                            boundaries,
+                            start_x,
+                            target_x >= start_x,
+                        ));
+                    }
+                }
+            }
             if options.trace.unwrap_or(false)
                 && (pointer_pressed
                     || pointer_released
@@ -1613,6 +1696,7 @@ impl TextEditor {
                     })
                 });
             if continue_word_drag {
+                self.selection_drag = None;
                 if let Some(state) = self.word_drag.as_mut() {
                     state.armed_for_followup = false;
                     state.dragging = true;
@@ -1637,6 +1721,7 @@ impl TextEditor {
                 && pointer_down
                 && !edit.response.double_clicked_by(pointer_button)
             {
+                self.selection_drag = None;
                 // Some touchpad drivers coalesce the first tap's release and the
                 // second tap's press into one egui frame. If the second press is
                 // then held and moved, egui sees only a normal drag and never emits
@@ -1668,6 +1753,7 @@ impl TextEditor {
                     }
                 }
             } else if edit.response.double_clicked_by(pointer_button) {
+                self.selection_drag = None;
                 if let Some(range) = edit.cursor_range.filter(|range| !range.is_empty()) {
                     let selected = range.as_sorted_char_range();
                     self.word_drag = Some(WordDragState {
@@ -1689,11 +1775,44 @@ impl TextEditor {
                 // A new press after a completed word drag starts a fresh selection
                 // at that point, even if it lies inside the previous word range.
                 self.word_drag = None;
+                self.selection_drag = pointer_for_cursor
+                    .zip(options.render_text_origin_x)
+                    .map(|(pointer, origin_x)| SelectionDragState {
+                        control_id: options.id.clone(),
+                        start_x: pointer.x as f64 * pixels_per_point as f64 - origin_x,
+                        anchor: None,
+                    });
                 if let Some(index) = pointer_cursor {
                     let cursor = edit
                         .galley
                         .from_ccursor(egui::text::CCursor::new(index));
                     let range = egui::text::CursorRange::two(cursor, cursor);
+                    edit.cursor_range = Some(range);
+                    edit.state.cursor.set_range(Some(range));
+                    edit.state.clone().store(&self.context, edit.response.id);
+                }
+            }
+            let word_drag_active = self.word_drag.as_ref().is_some_and(|state| {
+                state.control_id == options.id && state.dragging
+            });
+            if pointer_down
+                && edit.response.dragged_by(pointer_button)
+                && !word_drag_active
+            {
+                if let (Some(index), Some(mut range)) = (pointer_cursor, edit.cursor_range) {
+                    range.primary = edit
+                        .galley
+                        .from_ccursor(egui::text::CCursor::new(index));
+                    if let Some(anchor) = self
+                        .selection_drag
+                        .as_ref()
+                        .filter(|state| state.control_id == options.id)
+                        .and_then(|state| state.anchor)
+                    {
+                        range.secondary = edit
+                            .galley
+                            .from_ccursor(egui::text::CCursor::new(anchor));
+                    }
                     edit.cursor_range = Some(range);
                     edit.state.cursor.set_range(Some(range));
                     edit.state.clone().store(&self.context, edit.response.id);
@@ -1787,6 +1906,9 @@ impl TextEditor {
                         state.dragging = false;
                     }
                 }
+            }
+            if pointer_released {
+                self.selection_drag = None;
             }
             let range = edit.cursor_range;
             let (selection_start, selection_end) = range

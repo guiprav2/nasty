@@ -73,6 +73,24 @@ export function measureText(element, text) {
   context.letterSpacing = `${style.spacing}px`;
   return context.measureText(String(text)).width;
 }
+
+export function measureTextBoundaries(element, text) {
+  text = String(text);
+  const style = textStyle(element);
+  const state = elementState(element);
+  const key = JSON.stringify([text, style.font, style.spacing]);
+  if (state.glyphBoundaryCache?.key === key) return state.glyphBoundaryCache.boundaries;
+  context.font = style.font;
+  context.letterSpacing = `${style.spacing}px`;
+  const boundaries = [0];
+  let prefix = '';
+  for (const character of text) {
+    prefix += character;
+    boundaries.push(context.measureText(prefix).width);
+  }
+  state.glyphBoundaryCache = { key, boundaries };
+  return boundaries;
+}
 export function textLines(metrics, width) {
   const lines = []; let line = '', size = 0;
   metrics.tokens.forEach((word, index) => {

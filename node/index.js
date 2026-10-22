@@ -9,7 +9,7 @@ import { DOMRect } from "./dom-rect.js";
 import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
 import { buildTransformedDisplayList, displayListElements, parseColor } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
-import { inherited as inheritedStyle, measureText, textMetrics } from "./internal/text-metrics.js";
+import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics } from "./internal/text-metrics.js";
 import { documentImage } from "./internal/raster-document.js";
 import { blocksWindowDrag, elementsFromPoint as hitTestElementsFromPoint } from "./internal/dom-hit-testing.js";
 import { resolveTailwind, resolveTailwindSelection } from "./tailwind.js";
@@ -289,7 +289,7 @@ export class Window extends native.Window {
         value,
         multiline: element.localName === "textarea",
         ...(element.localName === "input" && {
-          glyphAdvances: Array.from(value, character => measureText(element, character)),
+          glyphBoundaries: measureTextBoundaries(element, value),
           renderTextOriginX: control.x - (elementStateValue.renderScrollLeft ?? 0),
         }),
       };
