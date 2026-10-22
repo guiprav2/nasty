@@ -20,14 +20,14 @@ const fieldLabel = document.createElement("div");
 fieldLabel.className = "text-sm font-semibold";
 fieldLabel.textContent = "document.body.className";
 const field = document.createElement("input");
-field.className = "w-full px-3 py-2 bg-[#242b38] text-white rounded-md";
-field.textContent = initialClasses;
+field.id = "body-class-name";
+field.className = "w-full px-3 py-2 leading-[24px] bg-[#242b38] text-white rounded-md caret-emerald-400 selection:bg-blue-500/50 selection:text-white";
+field.value = initialClasses;
 const hint = document.createElement("div");
 hint.className = "text-xs text-[#a9b5c8]";
 hint.textContent = "Try [min-width:500px], [max-width:1000px], [min-height:400px], [max-height:800px], bg-[#203040], opacity-90, or rounded-2xl.";
 document.body.append(heading, description, fieldLabel, field, hint);
 
-let value = initialClasses;
 let editorState = null;
 let focused = false;
 
@@ -55,7 +55,7 @@ async function frame() {
   if (fieldBox) {
     const states = window.updateTextAreas([{
       id: "body-class-name",
-      value,
+      value: field.value,
       x: fieldBox.contentBox.x,
       y: fieldBox.contentBox.y,
       width: fieldBox.contentBox.width,
@@ -66,10 +66,8 @@ async function frame() {
       focus: focused,
     }]);
     editorState = states[0];
-    if (editorState.value !== value) {
-      value = editorState.value;
-      document.body.className = value;
-      field.textContent = value;
+    if (editorState.value !== document.body.className) {
+      document.body.className = editorState.value;
     }
   }
   window.presentDocument();

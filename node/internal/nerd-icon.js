@@ -5,7 +5,9 @@ export function nerdIcon(element) {
 }
 
 export function renderedText(element) {
-  const text = elementState(element).text;
+  const state = elementState(element);
+  const text = element.localName === 'input' || element.localName === 'textarea'
+    ? state.inputValue : state.text;
   if (text) return text;
   return nerdIcon(element)?.glyph ?? '';
 }

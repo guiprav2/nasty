@@ -27,6 +27,7 @@ const CSS_PROPERTIES = new Set([
   "transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction",
   "boxShadow", "filter", "backdropFilter", "objectFit", "objectPosition", "visibility",
   "cursor", "pointerEvents", "userSelect", "touchAction",
+  "caretColor",
 ]);
 const BREAKPOINTS = { sm: 640, md: 768, lg: 1024, xl: 1280, "2xl": 1536 };
 const kebabToCamel = value => value.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -116,6 +117,8 @@ function utilityStyle(utility) {
     "cursor-pointer": ["cursor", "pointer"], "cursor-grab": ["cursor", "grab"], "cursor-grabbing": ["cursor", "grabbing"], "cursor-default": ["cursor", "default"],
   };
   if (fixed[utility]) return fixed[utility];
+  const caret = /^caret-(.+)$/.exec(utility);
+  if (caret && colorValue(caret[1])) return ["caretColor", colorValue(caret[1])];
   if (utility === "border") return [["borderWidth", 1], ["borderStyle", "solid"]];
   const borderWidth = /^border(?:-([trbl]))?-(.+)$/.exec(utility);
   if (borderWidth) {
@@ -153,6 +156,7 @@ function utilityStyle(utility) {
       if (/^\[.*\]$/.test(value)) {
         const raw = value.slice(1, -1);
         if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(raw)) return ["lineHeight", raw];
+        if (/^-?(?:\d+\.?\d*|\.\d+)px$/.test(raw)) return ["lineHeight", raw];
         if (/^-?(?:\d+\.?\d*|\.\d+)(?:em|rem|%)$/.test(raw)) return ["lineHeight", raw];
         const parsed = parseLength(raw);
         return parsed === undefined ? null : ["lineHeight", parsed];
@@ -178,7 +182,8 @@ export function resolveTailwind(className, width = 0) {
     classCache.set(key, cached);
     return cached;
   }
-  const utilities = className.split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index })).filter(token => active(token.variants, width));
+  const utilities = className.split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index }))
+    .filter(token => !token.variants.includes("selection") && active(token.variants, width));
   utilities.sort((a, b) => Number(a.important) - Number(b.important)
     || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
     || a.variants.length - b.variants.length || a.index - b.index);
@@ -190,4 +195,24 @@ export function resolveTailwind(className, width = 0) {
   classCache.set(key, values);
   if (classCache.size > 1024) classCache.delete(classCache.keys().next().value);
   return values;
+}
+
+// Tailwind's selection variant styles the standard ::selection pseudo-element;
+// keep its standard CSS declarations separate from the element's CSSOM.
+export function resolveTailwindSelection(className, width = 0) {
+  const utilities = String(className).split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index }))
+    .filter(token => token.variants.includes("selection")
+      && active(token.variants.filter(variant => variant !== "selection"), width));
+  utilities.sort((a, b) => Number(a.important) - Number(b.important)
+    || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
+    || a.variants.length - b.variants.length || a.index - b.index);
+  const values = {};
+  for (const { utility } of utilities) {
+    const match = /^(bg|text)-(.+)$/.exec(utility);
+    if (!match) continue;
+    const [, prefix, value] = match;
+    const color = colorValue(value);
+    if (color) values[prefix === "bg" ? "backgroundColor" : "color"] = color;
+  }
+  return Object.freeze(values);
 }

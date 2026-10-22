@@ -44,7 +44,7 @@ export function textStyle(element) {
         : lineValue.endsWith('rem') ? parseFloat(lineValue) * 16
           : lineValue.endsWith('%') ? parseFloat(lineValue) * size / 100 : parseFloat(lineValue);
   return { size, spacing, line, font, color: inherited(element, 'color', '#000'),
-    wrap: !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')) };
+    wrap: element.localName !== 'input' && !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')) };
 }
 export function textMetrics(element) {
   const style = textStyle(element);
@@ -66,6 +66,12 @@ export function textMetrics(element) {
   const space = context.measureText(' ').width;
   state.textMetrics = { key, style, tokens, words, space };
   return state.textMetrics;
+}
+export function measureText(element, text) {
+  const style = textStyle(element);
+  context.font = style.font;
+  context.letterSpacing = `${style.spacing}px`;
+  return context.measureText(String(text)).width;
 }
 export function textLines(metrics, width) {
   const lines = []; let line = '', size = 0;

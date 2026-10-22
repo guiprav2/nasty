@@ -3736,6 +3736,8 @@ struct WindowApp {
     orientation: String,
     borderless: bool,
     drag_anywhere: Option<String>,
+    drag_exclusion_rects: Vec<[f64; 4]>,
+    drag_suppressed: bool,
     drag_key_down: bool,
     drag_active: bool,
     left_mouse_down: bool,
@@ -3859,6 +3861,7 @@ impl ApplicationHandler for WindowApp {
             }
             OsWindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                let drag_excluded = self.is_drag_excluded(self.cursor);
                 if let Some(window) = self.window.as_ref() {
                     let scale = window.scale_factor();
                     let logical_size = window.inner_size().to_logical::<f64>(scale);
@@ -3871,7 +3874,7 @@ impl ApplicationHandler for WindowApp {
                     );
                     let cursor = if self.drag_active {
                         CursorIcon::Grabbing
-                    } else if self.drag_key_is_down() {
+                    } else if self.drag_key_is_down() && !drag_excluded && !self.drag_suppressed {
                         CursorIcon::Grab
                     } else {
                         direction.map(CursorIcon::from).unwrap_or(CursorIcon::Default)
@@ -3881,7 +3884,7 @@ impl ApplicationHandler for WindowApp {
                         self.cursor_icon = Some(cursor);
                     }
                 }
-                if self.drag_key_is_down() || self.drag_active { return; }
+                if (self.drag_key_is_down() && !drag_excluded && !self.drag_suppressed) || self.drag_active { return; }
                 self.events.push(NativeEvent {
                     kind: "pointermove".into(),
                     x: position.x,
@@ -3907,9 +3910,13 @@ impl ApplicationHandler for WindowApp {
             OsWindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
                     self.left_mouse_down = state.is_pressed();
+                    if state.is_pressed() {
+                        self.drag_suppressed = self.is_drag_excluded(self.cursor);
+                    }
                 }
                 let drag_key_down = self.drag_key_is_down();
-                if button == MouseButton::Left && (drag_key_down || self.drag_active) {
+                let drag_allowed = !self.drag_suppressed && !self.is_drag_excluded(self.cursor);
+                if button == MouseButton::Left && (self.drag_active || (drag_key_down && drag_allowed)) {
                     if state == ElementState::Pressed {
                         let now = Instant::now();
                         let double_click = self.last_drag_click.is_some_and(|(at, x, y)| {
@@ -3933,9 +3940,10 @@ impl ApplicationHandler for WindowApp {
                     } else {
                         self.drag_active = false;
                     }
+                    if state == ElementState::Released { self.drag_suppressed = false; }
                     return;
                 }
-                if drag_key_down { return; }
+                if drag_key_down && drag_allowed { return; }
                 if state == ElementState::Pressed && button == MouseButton::Left {
                     if let Some(window) = self.window.as_ref() {
                         let scale = window.scale_factor();
@@ -3965,9 +3973,12 @@ impl ApplicationHandler for WindowApp {
                     delta_x: None,
                     delta_y: None,
                 });
+                if button == MouseButton::Left && state == ElementState::Released {
+                    self.drag_suppressed = false;
+                }
             }
             OsWindowEvent::MouseWheel { delta, .. } => {
-                if self.drag_key_is_down() || self.drag_active { return; }
+                if (self.drag_key_is_down() && !self.is_drag_excluded(self.cursor) && !self.drag_suppressed) || self.drag_active { return; }
                 let (delta_x, delta_y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x as f64 * 40.0, y as f64 * 40.0),
                     MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
@@ -4072,6 +4083,12 @@ impl ApplicationHandler for WindowApp {
 }
 
 impl WindowApp {
+    fn is_drag_excluded(&self, point: (f64, f64)) -> bool {
+        self.drag_exclusion_rects.iter().any(|[x, y, width, height]| {
+            point.0 >= *x && point.0 < *x + *width && point.1 >= *y && point.1 < *y + *height
+        })
+    }
+
     fn drag_key_is_down(&self) -> bool {
         match self.drag_anywhere.as_deref() {
             None => false,
@@ -4085,7 +4102,9 @@ impl WindowApp {
     }
 
     fn update_drag_cursor(&mut self) {
-        if self.drag_key_is_down() && self.left_mouse_down && !self.drag_active {
+        let drag_excluded = self.is_drag_excluded(self.cursor);
+        if self.drag_key_is_down() && self.left_mouse_down && !self.drag_active
+            && !drag_excluded && !self.drag_suppressed {
             if let Some(window) = self.window.as_ref() { let _ = window.drag_window(); }
             self.drag_active = true;
         }
@@ -4094,7 +4113,7 @@ impl WindowApp {
         let size = window.inner_size().to_logical::<f64>(scale);
         let cursor = if self.drag_active {
             CursorIcon::Grabbing
-        } else if self.drag_key_is_down() {
+        } else if self.drag_key_is_down() && !drag_excluded && !self.drag_suppressed {
             CursorIcon::Grab
         } else {
             resize_direction(&self.resizable, self.cursor.0 / scale, self.cursor.1 / scale, size.width, size.height)
@@ -4364,6 +4383,18 @@ impl Window {
         self.app.drag_key_down = false;
         self.app.drag_active = false;
         self.app.left_mouse_down = false;
+        self.app.update_drag_cursor();
+        Ok(())
+    }
+
+    #[napi(js_name = "setDragExclusionRects")]
+    pub fn set_drag_exclusion_rects(&mut self, values: Vec<f64>) -> Result<()> {
+        if values.len() % 4 != 0 || values.iter().any(|value| !value.is_finite()) {
+            return Err(Error::new(Status::InvalidArg, "drag exclusion rectangles must be finite x, y, width, height tuples"));
+        }
+        self.app.drag_exclusion_rects = values.chunks_exact(4)
+            .map(|rect| [rect[0], rect[1], rect[2].max(0.0), rect[3].max(0.0)])
+            .collect();
         self.app.update_drag_cursor();
         Ok(())
     }

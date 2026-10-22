@@ -450,12 +450,59 @@ export function rasterizeDocument(document, width, height, surface = createCanva
       const ascent = font.fontBoundingBoxAscent || text.size * .8;
       const descent = font.fontBoundingBoxDescent || text.size * .2;
       const lines = textLines(metrics, content.width);
+      const editor = state.textAreaState;
+      const textX = state.renderTextOriginX ?? editor?.textOriginX ?? content.x;
+      const textY = editor?.textOriginY ?? content.y;
+      const selectionRects = [];
+      if ((element.localName === 'input' || element.localName === 'textarea') && editor?.focused
+        && editor.selectionEnd > editor.selectionStart) {
+        const value = renderedText(element);
+        const codePointIndex = index => Array.from(value).slice(0, index).join('').length;
+        const start = codePointIndex(editor.selectionStart), end = codePointIndex(editor.selectionEnd);
+        const font = ctx.measureText('Mg');
+        const topOffset = (text.line - (font.fontBoundingBoxAscent || text.size * .8)
+          - (font.fontBoundingBoxDescent || text.size * .2)) / 2;
+        let searchFrom = 0;
+        for (let index = 0; index < lines.length; index++) {
+          const line = lines[index];
+          const lineStart = value.indexOf(line, searchFrom);
+          if (lineStart < 0) continue;
+          const lineEnd = lineStart + line.length;
+          const selectedStart = Math.max(start, lineStart), selectedEnd = Math.min(end, lineEnd);
+          if (selectedEnd > selectedStart) {
+            const left = textX + ctx.measureText(value.slice(lineStart, selectedStart)).width;
+            const right = textX + ctx.measureText(value.slice(lineStart, selectedEnd)).width;
+            if (right > left) selectionRects.push({ x: left, y: textY + index * text.line + topOffset,
+              width: right - left, height: text.line, lineIndex: index });
+          }
+          searchFrom = lineEnd;
+          while (searchFrom < value.length && /[\s]/.test(value[searchFrom])) searchFrom++;
+        }
+      }
+      if (selectionRects.length) {
+        ctx.save();
+        ctx.beginPath(); ctx.rect(content.x, content.y, content.width, content.height); ctx.clip();
+        ctx.fillStyle = state.selectionStyle?.backgroundColor ?? 'rgba(59, 130, 246, 0.42)';
+        for (const rect of selectionRects) ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+        ctx.restore();
+      }
       lines.forEach((line, index) => {
         if (style.textOverflow === 'ellipsis' && ctx.measureText(line).width > content.width) {
           while (line.length && ctx.measureText(line + '…').width > content.width) line = line.slice(0, -1);
           line += '…';
         }
-        ctx.fillText(line, content.x, content.y + index * text.line + (text.line - ascent - descent) / 2 + ascent);
+        const baseline = textY + index * text.line + (text.line - ascent - descent) / 2 + ascent;
+        ctx.fillText(line, textX, baseline);
+        const lineSelectionRects = selectionRects.filter(rect => rect.lineIndex === index);
+        if (lineSelectionRects.length && state.selectionStyle?.color) {
+          ctx.save();
+          ctx.beginPath();
+          for (const rect of lineSelectionRects) ctx.rect(rect.x, rect.y, rect.width, rect.height);
+          ctx.clip();
+          ctx.fillStyle = state.selectionStyle.color;
+          ctx.fillText(line, textX, baseline);
+          ctx.restore();
+        }
       });
     }
     ctx.restore();

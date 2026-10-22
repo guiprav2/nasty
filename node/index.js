@@ -9,9 +9,9 @@ import { DOMRect } from "./dom-rect.js";
 import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
 import { buildTransformedDisplayList, displayListElements, parseColor } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
-import { textMetrics } from "./internal/text-metrics.js";
+import { inherited as inheritedStyle, measureText, textMetrics } from "./internal/text-metrics.js";
 import { documentImage } from "./internal/raster-document.js";
-import { resolveTailwind } from "./tailwind.js";
+import { resolveTailwind, resolveTailwindSelection } from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
 
@@ -46,6 +46,8 @@ export class Window extends native.Window {
   #vsync;
   #audioOutputId = null;
   #mediaStopped = false;
+  #documentStopped = false;
+  #dragExclusionKey = "";
   constructor(options = {}) {
     const initialWidth = options.width ?? 960;
     const initialHeight = options.height ?? 600;
@@ -151,6 +153,36 @@ export class Window extends native.Window {
     if (typeof value === 'string' && !value.trim()) throw new TypeError('dragAnywhere key name must not be empty');
     super.setDragAnywhere(value);
     this.#dragAnywhere = value;
+    this._syncDragExclusionRects();
+  }
+
+  _syncDragExclusionRects() {
+    if (!this.#document || typeof super.setDragExclusionRects !== "function") return;
+    const interactive = new Set(["input", "textarea", "button", "select", "a", "summary"]);
+    const rects = [];
+    for (const box of documentBoxes(this.#document)) {
+      const element = box.element;
+      if (!interactive.has(element.localName)) continue;
+      if (element.localName === "a" && !element.hasAttribute("href")) continue;
+      if (element.localName !== "a" && element.disabled) continue;
+      let disabledByFieldset = false;
+      for (let ancestor = element.parent; ancestor; ancestor = ancestor.parent) {
+        if (ancestor.localName === "fieldset" && ancestor.disabled) { disabledByFieldset = true; break; }
+      }
+      if (disabledByFieldset) continue;
+      let { x, y, width, height } = box;
+      if (box.clip) {
+        const left = Math.max(x, box.clip.x), top = Math.max(y, box.clip.y);
+        const right = Math.min(x + width, box.clip.x + box.clip.width);
+        const bottom = Math.min(y + height, box.clip.y + box.clip.height);
+        x = left; y = top; width = Math.max(0, right - left); height = Math.max(0, bottom - top);
+      }
+      if (width > 0 && height > 0) rects.push(x, y, width, height);
+    }
+    const key = rects.join(",");
+    if (key === this.#dragExclusionKey) return;
+    super.setDragExclusionRects(rects);
+    this.#dragExclusionKey = key;
   }
 
   get maximizable() { return this.#maximizable; }
@@ -170,7 +202,10 @@ export class Window extends native.Window {
   get audioOutputs() { return readAudioOutputs(); }
   get closed() {
     const closed = super.closed;
-    if (closed) this.#stopMedia();
+    if (closed) {
+      this.#stopMedia();
+      this.#closeDocument();
+    }
     return closed;
   }
   get audioOutput() {
@@ -200,7 +235,19 @@ export class Window extends native.Window {
 
   close() {
     this.#stopMedia();
-    return super.close();
+    const result = super.close();
+    this.#closeDocument();
+    return result;
+  }
+
+  #closeDocument() {
+    if (this.#documentStopped || !this.#document) return;
+    this.#documentStopped = true;
+    const document = this.#document;
+    this.#document = null;
+    const state = documentState(document);
+    if (state.defaultView === this) state.defaultView = null;
+    document.close();
   }
 
   #stopMedia() {
@@ -223,6 +270,73 @@ export class Window extends native.Window {
     super.setVsync(value);
     this.#vsync = value;
   }
+
+  updateTextAreas(options) {
+    const controls = options.map(control => {
+      const element = this.#document && [...documentState(this.#document).elements]
+        .find(candidate => candidate.id === control.id && (candidate.localName === "input" || candidate.localName === "textarea"));
+      return element ? { ...control, value: element.value, multiline: element.localName === "textarea" } : control;
+    });
+    const states = super.updateTextAreas(controls);
+    for (let index = 0; index < controls.length; index++) {
+      const element = this.#document && [...documentState(this.#document).elements]
+        .find(candidate => candidate.id === controls[index].id && (candidate.localName === "input" || candidate.localName === "textarea"));
+      if (!element) continue;
+      const elementStateValue = elementState(element);
+      const previous = elementStateValue.textAreaState;
+      const previousRenderTextOriginX = elementStateValue.renderTextOriginX;
+      const previousRenderCaretX = elementStateValue.renderCaretX;
+      const next = states[index];
+      if (element.localName === "input") {
+        const value = next.displayText ?? next.value;
+        const characters = Array.from(value);
+        const caretIndex = Math.min(next.caretIndex, characters.length);
+        const totalWidth = measureText(element, value);
+        const caretOffset = measureText(element, characters.slice(0, caretIndex).join(""));
+        const availableWidth = Math.max(0, controls[index].width);
+        const caretWidth = 1.5;
+        const caretViewportWidth = Math.max(0, availableWidth - caretWidth);
+        const maxScroll = Math.max(0, totalWidth - caretViewportWidth);
+        const previousScroll = elementStateValue.renderScrollLeft;
+        let scroll = previousScroll === null || previousScroll === undefined
+          ? controls[index].x - next.textOriginX
+          : previousScroll;
+        scroll = Math.max(0, Math.min(maxScroll, scroll));
+        if (caretOffset < scroll) scroll = caretOffset;
+        else if (caretOffset > scroll + caretViewportWidth) scroll = caretOffset - caretViewportWidth;
+        scroll = Math.max(0, Math.min(maxScroll, scroll));
+        elementStateValue.renderScrollLeft = scroll;
+        elementStateValue.renderTextOriginX = controls[index].x - scroll;
+        elementStateValue.renderCaretX = Math.min(
+          controls[index].x + Math.max(0, availableWidth - caretWidth),
+          elementStateValue.renderTextOriginX + caretOffset,
+        );
+      } else {
+        elementStateValue.renderTextOriginX = null;
+        elementStateValue.renderCaretX = null;
+      }
+      if (element.value !== next.value) {
+        element.value = next.value;
+        element.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      elementStateValue.selectionStart = next.selectionStart;
+      elementStateValue.selectionEnd = next.selectionEnd;
+      elementStateValue.selectionDirection = "none";
+      elementStateValue.textAreaState = next;
+      if (!previous || previous.textOriginX !== next.textOriginX || previous.textOriginY !== next.textOriginY
+        || previous.selectionStart !== next.selectionStart || previous.selectionEnd !== next.selectionEnd
+        || previous.focused !== next.focused || previousRenderTextOriginX !== elementStateValue.renderTextOriginX
+        || previousRenderCaretX !== elementStateValue.renderCaretX) {
+        const doc = documentState(this.#document);
+        doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
+        doc.paintDirtyElements ??= new Set();
+        doc.paintDirtyElements.add(element);
+      }
+    }
+    return states;
+  }
+
+  updateTextArea(options) { return this.updateTextAreas([options])[0]; }
 
   _validateDocumentMaxConstraints(style = this.#document?.body?.style, property = null, value = undefined) {
     if (!this.#maximizable || !style) return;
@@ -255,11 +369,25 @@ export class Window extends native.Window {
     catch (error) { if (super.closed) this.#stopMedia(); throw error; }
   }
   presentDocument() {
+    this._syncDragExclusionRects();
     if (this.#document && [...documentState(this.#document).elements].some(element => element.localName === "video")) {
       const size = this.size();
       return this.presentTransformed(buildTransformedDisplayList(documentBoxes(this.#document), size.width, size.height));
     }
     const frame = documentImage(this, this.#document);
+    const size = this.size();
+    const decorations = inputDecorationQuads(this.#document, size.width, size.height);
+    if (decorations.length) {
+      if (frame.ordered) {
+        return super.presentOrdered(appendOrderedQuads(frame.list, decorations), frame.triangles, frame.circles, frame.beziers, frame.canvasOperations);
+      }
+      const records = [2, frame.images.length];
+      for (const image of frame.images) {
+        records.push(1, image.textureId, image.x, image.y, image.width, image.height,
+          image.clipX ?? 0, image.clipY ?? 0, image.clipWidth ?? image.width, image.clipHeight ?? image.height);
+      }
+      return super.presentOrdered(appendOrderedQuads(Buffer.from(new Float32Array(records).buffer), decorations));
+    }
     return frame.ordered ? super.presentOrdered(frame.list, frame.triangles, frame.circles, frame.beziers, frame.canvasOperations) : super.presentWithImages(frame.list, frame.images);
   }
 
@@ -271,9 +399,13 @@ export class Window extends native.Window {
     if (document) this._validateDocumentMaxConstraints(document.body.style);
     if (this.#document) documentState(this.#document).defaultView = null;
     this.#document = document;
+    this.#documentStopped = false;
     this.#documentSizeConstraintsKey = null;
     this.#bodyAppearanceKey = null;
-    if (document) document._attachWindow(this);
+    if (document) {
+      document._attachWindow(this);
+      this._syncDragExclusionRects();
+    }
     else {
       this._syncDocumentSizeConstraints();
       this._syncBodyWindowAppearance();
@@ -344,6 +476,47 @@ export class Window extends native.Window {
 
 const RESIZABLE_MODES = new Set(["horizontal", "vertical", "both", "none"]);
 const ORIENTATION_MODES = new Set(["auto", "portrait", "landscape"]);
+
+function inputDecorationQuads(document, width, height) {
+  const boxes = documentBoxes(document);
+  const byElement = new Map(boxes.map(box => [box.element, box]));
+  const values = [];
+  const push = (rect, color, clip) => {
+    let x = Math.max(0, rect.x, clip?.x ?? 0), y = Math.max(0, rect.y, clip?.y ?? 0);
+    const right = Math.min(width, rect.x + rect.width, clip ? clip.x + clip.width : width);
+    const bottom = Math.min(height, rect.y + rect.height, clip ? clip.y + clip.height : height);
+    if (right <= x || bottom <= y || !color) return;
+    values.push(0, x, y, right - x, bottom - y, color[0], color[1], color[2], color[3], 0);
+  };
+  for (const element of documentState(document).elements) {
+    if (element.localName !== "input" && element.localName !== "textarea") continue;
+    const state = elementState(element), editor = state.textAreaState, box = byElement.get(element);
+    if (!editor?.focused || !box) continue;
+    const clip = box.clip
+      ? { x: Math.max(box.clip.x, box.contentBox.x), y: Math.max(box.clip.y, box.contentBox.y),
+        width: Math.max(0, Math.min(box.clip.x + box.clip.width, box.contentBox.x + box.contentBox.width) - Math.max(box.clip.x, box.contentBox.x)),
+        height: Math.max(0, Math.min(box.clip.y + box.clip.height, box.contentBox.y + box.contentBox.height) - Math.max(box.clip.y, box.contentBox.y)) }
+      : box.contentBox;
+    if (Math.floor(performance.now() / 500) % 2 === 0) {
+      const caretColor = parseColor(element.style.caretColor ?? "#22c55e");
+      push({ x: state.renderCaretX ?? editor.caretX, y: editor.caretY, width: Math.max(1, box.contentBox.width > 0 ? 1.5 : 1), height: editor.caretHeight }, caretColor, clip);
+    }
+  }
+  return values;
+}
+
+function appendOrderedQuads(list, quads) {
+  const current = new Float32Array(list.buffer, list.byteOffset, list.byteLength / Float32Array.BYTES_PER_ELEMENT);
+  const isOrdered = current[0] === 2;
+  const base = isOrdered ? current : new Float32Array([2, 0]);
+  const count = isOrdered ? base[1] : 0;
+  const result = new Float32Array(base.length + quads.length);
+  result.set(base);
+  result[1] = count + quads.length / 10;
+  result.set(quads, base.length);
+  return Buffer.from(result.buffer);
+}
+
 export { FontRegistry } from "./font-registry.js";
 export { buildBoxDisplayList } from "./render.js";
 export { buildImageDraws } from "./render.js";
@@ -351,7 +524,7 @@ export { buildOrderedDisplayList } from "./render.js";
 export { buildTransformedDisplayList } from "./render.js";
 export { closeImageDecoder } from "./image-decoder.js";
 
-function styleForTaffy(style) {
+function styleForTaffy(style, fontSize = 16) {
   const result = { ...style };
   delete result.boxSizing;
   for (const name of ["width", "height"]) {
@@ -372,6 +545,8 @@ function styleForTaffy(style) {
     const value = result[property];
     if (typeof value === "string" && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:px)?$/.test(value.trim())) {
       result[property] = Number.parseFloat(value);
+    } else if (typeof value === "string" && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:em|rem)$/.test(value.trim())) {
+      result[property] = Number.parseFloat(value) * (value.trim().endsWith("rem") ? 16 : fontSize);
     } else if (typeof value === "string") {
       // The current Taffy bridge accepts pixel lengths as numbers (and
       // width/height percentages through their dedicated fields). Keep
@@ -414,10 +589,10 @@ function styleForTaffy(style) {
 function defaultElementStyle(name) {
   const reset = { display: "block", padding: 0, margin: 0, borderWidth: 0, borderStyle: "none", backgroundColor: "transparent" };
   if (name === "input") {
-    return { ...reset, display: "flex", justifyContent: "start", alignItems: "center", overflow: "hidden" };
+    return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "center", overflow: "hidden", whiteSpace: "nowrap" };
   }
   if (name === "textarea") {
-    return { ...reset, display: "flex", justifyContent: "start", alignItems: "start", overflow: "hidden" };
+    return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "start", overflow: "hidden", whiteSpace: "pre-wrap" };
   }
   return reset;
 }
@@ -474,7 +649,7 @@ function setHostStyle(element, values) {
 
 class CSSStyleDeclaration {
   constructor(element, initial) {
-    const state = { element, values: { ...initial }, baseValues: initial, hostValues: {}, classValues: {}, transitions: new Map() };
+    const state = { element, values: { ...initial }, baseValues: initial, hostValues: {}, classValues: {}, selectionValues: {}, transitions: new Map() };
     styleData.set(this, state);
     const proxy = new Proxy(this, {
       get: (target, property, receiver) => {
@@ -515,6 +690,8 @@ export class Element extends EventTarget {
     this.children = [];
     this.attributes = new Map();
     const state = { image: null, imageLoad: null, imageLoadState: "empty", currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null,
+      selectionStyle: {}, textAreaState: null, inputValue: "", selectionStart: 0, selectionEnd: 0, selectionDirection: "none",
+      renderScrollLeft: null, renderTextOriginX: null, renderCaretX: null,
       video: { audioId: nextVideoAudioId++, audioGeneration: 0, audioStartPromise: null, seekPending: false, paused: true, ended: false, currentTime: 0, duration: NaN, width: 0, height: 0, timer: null, token: 0, source: "", frameRequest: null, resolveFrame: null, rejectFrame: null, textureId: null, volume: 1, metadataLoaded: false, dataLoaded: false } };
     registerElementState(this, state);
     documentState(document).elements.add(this);
@@ -526,6 +703,28 @@ export class Element extends EventTarget {
 
   get textContent() {
     return (elementState(this).text ?? "") + this.children.map((child) => child.textContent).join("");
+  }
+
+  get value() { return this.localName === "input" || this.localName === "textarea" ? elementState(this).inputValue : undefined; }
+  set value(value) {
+    if (this.localName !== "input" && this.localName !== "textarea") return;
+    const state = elementState(this);
+    let next = String(value ?? "");
+    if (this.localName === "input") next = next.replace(/[\r\n]/g, "");
+    if (state.inputValue === next) return;
+    state.inputValue = next;
+    state.selectionStart = state.selectionEnd = Math.min(state.selectionStart, next.length);
+    this._styleChanged();
+  }
+
+  get disabled() {
+    return ["button", "input", "select", "textarea", "fieldset", "option", "optgroup"].includes(this.localName)
+      && this.hasAttribute("disabled");
+  }
+  set disabled(value) {
+    if (!["button", "input", "select", "textarea", "fieldset", "option", "optgroup"].includes(this.localName)) return;
+    if (value) this.setAttribute("disabled", "");
+    else this.removeAttribute("disabled");
   }
 
   get parentElement() {
@@ -662,8 +861,10 @@ export class Element extends EventTarget {
       state.hasResponsiveUtilities = /(?:^|\s)(?:sm|md|lg|xl|2xl):/.test(value);
       const styles = resolveTailwind(value, width);
       state.classValues = styles;
+      state.selectionValues = resolveTailwindSelection(value, width);
+      elementState(this).selectionStyle = state.selectionValues;
       const changed = refreshStyleValues(state);
-      this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
+      this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
     } else if (name === "hidden") this._styleChanged();
     if (name === "muted" && this.localName === "video") {
       const video = elementState(this).video;
@@ -697,7 +898,7 @@ export class Element extends EventTarget {
       state.hasResponsiveUtilities = false;
       state.classValues = {};
       const changed = refreshStyleValues(state);
-      this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
+      this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
     } else if (name === "hidden") this._styleChanged();
     if (name === "muted" && this.localName === "video") {
       const video = elementState(this).video;
@@ -1035,7 +1236,7 @@ export class Element extends EventTarget {
     documentState(this.document).dirty = true;
   }
 
-  _styleChanged(property) {
+  _styleChanged(property, inheritedFontChanged = false) {
     const doc = documentState(this.document);
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
     doc.paintDirtyElements ??= new Set();
@@ -1043,6 +1244,15 @@ export class Element extends EventTarget {
     if (this === this.document.body) doc.defaultView?._syncBodyWindowAppearance();
     if (property !== undefined && !LAYOUT_STYLE_PROPERTIES.has(property)) return;
     doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
+    if (inheritedFontChanged) {
+      const refreshDescendants = element => {
+        for (const child of element.children) {
+          doc.layoutTree.setStyle(elementState(child).handle, child._taffyStyle());
+          refreshDescendants(child);
+        }
+      };
+      refreshDescendants(this);
+    }
     doc.dirty = true;
     markGeometryDirty(doc);
     if (this === this.document.body && (property === undefined || ["minWidth", "minHeight", "maxWidth", "maxHeight"].includes(property))) doc.defaultView?._syncDocumentSizeConstraints();
@@ -1052,36 +1262,42 @@ export class Element extends EventTarget {
     const state = styleData.get(this.style);
     if (!state.hasResponsiveUtilities) return false;
     const next = resolveTailwind(this.className, width);
+    const nextSelection = resolveTailwindSelection(this.className, width);
+    if (JSON.stringify(nextSelection) !== JSON.stringify(state.selectionValues)) {
+      state.selectionValues = nextSelection;
+      elementState(this).selectionStyle = nextSelection;
+    }
     if (Object.keys(next).length === Object.keys(state.classValues).length
       && Object.keys(next).every(key => Object.is(next[key], state.classValues[key]))) return false;
     state.classValues = next;
     const changed = refreshStyleValues(state);
-    this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class");
+    this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
     return changed.size > 0;
   }
 
   _taffyStyle() {
     const style = { ...styleData.get(this.style).values, ...(this.hidden && { display: "none" }) };
+    const fontSize = Number.parseFloat(inheritedStyle(this, "fontSize", 16)) || 16;
     if (this.localName === "img") {
       const imageStyle = { ...style };
       if (imageStyle.width === undefined) imageStyle.width = parseDimension(this.getAttribute("width")) ?? elementState(this).image?.width;
       if (imageStyle.height === undefined) imageStyle.height = parseDimension(this.getAttribute("height")) ?? elementState(this).image?.height;
-      return styleForTaffy(imageStyle);
+      return styleForTaffy(imageStyle, fontSize);
     }
     if (this.localName === "video") {
       const video = elementState(this).video;
       const videoStyle = { ...style };
       if (videoStyle.width === undefined) videoStyle.width = parseDimension(this.getAttribute("width")) ?? (video.width || undefined);
       if (videoStyle.height === undefined) videoStyle.height = parseDimension(this.getAttribute("height")) ?? (video.height || undefined);
-      return styleForTaffy(videoStyle);
+      return styleForTaffy(videoStyle, fontSize);
     }
     if (this.localName === "canvas") {
       const canvasStyle = { ...style };
       if (canvasStyle.width === undefined) canvasStyle.width = this.width;
       if (canvasStyle.height === undefined) canvasStyle.height = this.height;
-      return styleForTaffy(canvasStyle);
+      return styleForTaffy(canvasStyle, fontSize);
     }
-    return styleForTaffy(style);
+    return styleForTaffy(style, fontSize);
   }
 
   scrollBy(x = 0, y = 0) {
@@ -1104,6 +1320,7 @@ export class Element extends EventTarget {
     if (child.parent) child.parent.removeChild(child);
     this.children.push(child);
     child.parent = this;
+    child._styleChanged(undefined, true);
     this.#syncChildren();
     return child;
   }
@@ -1114,6 +1331,7 @@ export class Element extends EventTarget {
     this.children.splice(index, 1);
     child.parent = null;
     if (child.localName === "video") child.pause();
+    child._styleChanged(undefined, true);
     this.#syncChildren();
     return child;
   }
@@ -1179,12 +1397,13 @@ export class Document extends EventTarget {
     const doc = documentState(this);
     for (const element of doc.elements) {
       const state = elementState(element);
-      if (!state.text) continue;
+      const isTextControl = element.localName === "input" || element.localName === "textarea";
+      if (!state.text && !isTextControl) continue;
       const metrics = textMetrics(element);
       if (state.sentTextMetrics === metrics.key) continue;
       state.sentTextMetrics = metrics.key;
-      doc.layoutTree.setTextMetrics(state.handle, { words: metrics.words, space: metrics.space,
-        lineHeight: metrics.style.line, wrap: metrics.style.wrap });
+      doc.layoutTree.setTextMetrics(state.handle, { words: isTextControl ? [0] : metrics.words, space: metrics.space,
+        lineHeight: metrics.style.line, wrap: isTextControl ? false : metrics.style.wrap });
       doc.dirty = true;
     }
   }
@@ -1375,6 +1594,9 @@ export class Document extends EventTarget {
   }
 
   close() {
+    const state = documentState(this);
+    if (state.closePromise) return state.closePromise;
+    state.closed = true;
     for (const element of documentState(this).elements) {
       if (element.localName === "img") element._cancelImageRequest();
       else if (element.localName === "video") {
@@ -1392,7 +1614,8 @@ export class Document extends EventTarget {
       documentState(this).defaultView.document = null;
       documentState(this).defaultView = null;
     }
-    return documentState(this).layoutTree.close();
+    state.closePromise = state.layoutTree.close();
+    return state.closePromise;
   }
 }
 
