@@ -11,6 +11,7 @@ import { buildTransformedDisplayList, displayListElements, parseColor } from "./
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { inherited as inheritedStyle, measureText, textMetrics } from "./internal/text-metrics.js";
 import { documentImage } from "./internal/raster-document.js";
+import { blocksWindowDrag, elementsFromPoint as hitTestElementsFromPoint } from "./internal/dom-hit-testing.js";
 import { resolveTailwind, resolveTailwindSelection } from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
@@ -47,7 +48,8 @@ export class Window extends native.Window {
   #audioOutputId = null;
   #mediaStopped = false;
   #documentStopped = false;
-  #dragExclusionKey = "";
+  #dragBlocked = false;
+  #lastDragClick = null;
   constructor(options = {}) {
     const initialWidth = options.width ?? 960;
     const initialHeight = options.height ?? 600;
@@ -153,36 +155,40 @@ export class Window extends native.Window {
     if (typeof value === 'string' && !value.trim()) throw new TypeError('dragAnywhere key name must not be empty');
     super.setDragAnywhere(value);
     this.#dragAnywhere = value;
-    this._syncDragExclusionRects();
+    this._syncDragHitTest();
   }
 
-  _syncDragExclusionRects() {
-    if (!this.#document || typeof super.setDragExclusionRects !== "function") return;
-    const interactive = new Set(["input", "textarea", "button", "select", "a", "summary"]);
-    const rects = [];
-    for (const box of documentBoxes(this.#document)) {
-      const element = box.element;
-      if (!interactive.has(element.localName)) continue;
-      if (element.localName === "a" && !element.hasAttribute("href")) continue;
-      if (element.localName !== "a" && element.disabled) continue;
-      let disabledByFieldset = false;
-      for (let ancestor = element.parent; ancestor; ancestor = ancestor.parent) {
-        if (ancestor.localName === "fieldset" && ancestor.disabled) { disabledByFieldset = true; break; }
+  _syncDragHitTest() {
+    const position = super.cursorPosition();
+    const target = this.#document?.elementFromPoint(position.x, position.y) ?? null;
+    const blocked = this.#dragAnywhere !== false && blocksWindowDrag(target);
+    if (blocked === this.#dragBlocked) return;
+    this.#dragBlocked = blocked;
+    super.setDragBlocked(blocked);
+  }
+
+  drainEvents() {
+    const events = super.drainEvents();
+    for (const event of events) {
+      if (event.type !== "pointerdown" || event.button !== 0 || !event.dragRequested) continue;
+      const target = this.#document?.elementFromPoint(event.x, event.y) ?? null;
+      const blocked = blocksWindowDrag(target);
+      this.#dragBlocked = blocked;
+      super.setDragBlocked(blocked);
+      if (blocked) continue;
+      const now = Date.now();
+      const previous = this.#lastDragClick;
+      const isDoubleClick = previous && now - previous.time <= 500
+        && Math.hypot(event.x - previous.x, event.y - previous.y) <= 8;
+      if (isDoubleClick && this.#maximizable) {
+        this.#lastDragClick = null;
+        this.maximized = !this.maximized;
+      } else {
+        this.#lastDragClick = { time: now, x: event.x, y: event.y };
+        try { super.startDragging(); } catch {}
       }
-      if (disabledByFieldset) continue;
-      let { x, y, width, height } = box;
-      if (box.clip) {
-        const left = Math.max(x, box.clip.x), top = Math.max(y, box.clip.y);
-        const right = Math.min(x + width, box.clip.x + box.clip.width);
-        const bottom = Math.min(y + height, box.clip.y + box.clip.height);
-        x = left; y = top; width = Math.max(0, right - left); height = Math.max(0, bottom - top);
-      }
-      if (width > 0 && height > 0) rects.push(x, y, width, height);
     }
-    const key = rects.join(",");
-    if (key === this.#dragExclusionKey) return;
-    super.setDragExclusionRects(rects);
-    this.#dragExclusionKey = key;
+    return events;
   }
 
   get maximizable() { return this.#maximizable; }
@@ -275,7 +281,18 @@ export class Window extends native.Window {
     const controls = options.map(control => {
       const element = this.#document && [...documentState(this.#document).elements]
         .find(candidate => candidate.id === control.id && (candidate.localName === "input" || candidate.localName === "textarea"));
-      return element ? { ...control, value: element.value, multiline: element.localName === "textarea" } : control;
+      if (!element) return control;
+      const elementStateValue = elementState(element);
+      const value = element.value;
+      return {
+        ...control,
+        value,
+        multiline: element.localName === "textarea",
+        ...(element.localName === "input" && {
+          glyphAdvances: Array.from(value, character => measureText(element, character)),
+          renderTextOriginX: control.x - (elementStateValue.renderScrollLeft ?? 0),
+        }),
+      };
     });
     const states = super.updateTextAreas(controls);
     for (let index = 0; index < controls.length; index++) {
@@ -302,8 +319,10 @@ export class Window extends native.Window {
           ? controls[index].x - next.textOriginX
           : previousScroll;
         scroll = Math.max(0, Math.min(maxScroll, scroll));
-        if (caretOffset < scroll) scroll = caretOffset;
-        else if (caretOffset > scroll + caretViewportWidth) scroll = caretOffset - caretViewportWidth;
+        if (next.focused) {
+          if (caretOffset < scroll) scroll = caretOffset;
+          else if (caretOffset > scroll + caretViewportWidth) scroll = caretOffset - caretViewportWidth;
+        }
         scroll = Math.max(0, Math.min(maxScroll, scroll));
         elementStateValue.renderScrollLeft = scroll;
         elementStateValue.renderTextOriginX = controls[index].x - scroll;
@@ -349,27 +368,47 @@ export class Window extends native.Window {
   }
 
   present(list) {
+    this._syncDragHitTest();
     syncDocumentTextForPresent(this, this.#document);
-    try { return super.present(list); }
+    try {
+      const result = super.present(list);
+      this._syncDragHitTest();
+      return result;
+    }
     catch (error) { if (super.closed) this.#stopMedia(); throw error; }
   }
   presentWithImages(list, images) {
+    this._syncDragHitTest();
     syncDocumentTextForPresent(this, this.#document);
-    try { return super.presentWithImages(list, images); }
+    try {
+      const result = super.presentWithImages(list, images);
+      this._syncDragHitTest();
+      return result;
+    }
     catch (error) { if (super.closed) this.#stopMedia(); throw error; }
   }
   presentOrdered(list, canvasTriangles, canvasCircles, canvasBeziers, canvasOperations) {
+    this._syncDragHitTest();
     syncDocumentTextForPresent(this, this.#document);
-    try { return super.presentOrdered(list, canvasTriangles, canvasCircles, canvasBeziers, canvasOperations); }
+    try {
+      const result = super.presentOrdered(list, canvasTriangles, canvasCircles, canvasBeziers, canvasOperations);
+      this._syncDragHitTest();
+      return result;
+    }
     catch (error) { if (super.closed) this.#stopMedia(); throw error; }
   }
   presentTransformed(list) {
+    this._syncDragHitTest();
     syncDocumentTextForPresent(this, this.#document, displayListElements(list));
-    try { return super.presentTransformed(list); }
+    try {
+      const result = super.presentTransformed(list);
+      this._syncDragHitTest();
+      return result;
+    }
     catch (error) { if (super.closed) this.#stopMedia(); throw error; }
   }
   presentDocument() {
-    this._syncDragExclusionRects();
+    this._syncDragHitTest();
     if (this.#document && [...documentState(this.#document).elements].some(element => element.localName === "video")) {
       const size = this.size();
       return this.presentTransformed(buildTransformedDisplayList(documentBoxes(this.#document), size.width, size.height));
@@ -379,16 +418,24 @@ export class Window extends native.Window {
     const decorations = inputDecorationQuads(this.#document, size.width, size.height);
     if (decorations.length) {
       if (frame.ordered) {
-        return super.presentOrdered(appendOrderedQuads(frame.list, decorations), frame.triangles, frame.circles, frame.beziers, frame.canvasOperations);
+        const result = super.presentOrdered(appendOrderedQuads(frame.list, decorations), frame.triangles, frame.circles, frame.beziers, frame.canvasOperations);
+        this._syncDragHitTest();
+        return result;
       }
       const records = [2, frame.images.length];
       for (const image of frame.images) {
         records.push(1, image.textureId, image.x, image.y, image.width, image.height,
           image.clipX ?? 0, image.clipY ?? 0, image.clipWidth ?? image.width, image.clipHeight ?? image.height);
       }
-      return super.presentOrdered(appendOrderedQuads(Buffer.from(new Float32Array(records).buffer), decorations));
+      const result = super.presentOrdered(appendOrderedQuads(Buffer.from(new Float32Array(records).buffer), decorations));
+      this._syncDragHitTest();
+      return result;
     }
-    return frame.ordered ? super.presentOrdered(frame.list, frame.triangles, frame.circles, frame.beziers, frame.canvasOperations) : super.presentWithImages(frame.list, frame.images);
+    const result = frame.ordered
+      ? super.presentOrdered(frame.list, frame.triangles, frame.circles, frame.beziers, frame.canvasOperations)
+      : super.presentWithImages(frame.list, frame.images);
+    this._syncDragHitTest();
+    return result;
   }
 
   get document() {
@@ -404,12 +451,12 @@ export class Window extends native.Window {
     this.#bodyAppearanceKey = null;
     if (document) {
       document._attachWindow(this);
-      this._syncDragExclusionRects();
     }
     else {
       this._syncDocumentSizeConstraints();
       this._syncBodyWindowAppearance();
     }
+    this._syncDragHitTest();
   }
 
   _syncBodyWindowAppearance() {
@@ -1378,6 +1425,8 @@ export class Document extends EventTarget {
 
   get baseURI() { return documentState(this).baseURI; }
   get defaultView() { return documentState(this).defaultView; }
+  elementFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y)[0] ?? null; }
+  elementsFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y); }
 
   dispatchEvent(event) {
     const result = super.dispatchEvent(event);

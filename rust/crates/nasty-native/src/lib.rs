@@ -785,6 +785,12 @@ pub struct WindowSize {
 }
 
 #[napi(object)]
+pub struct WindowPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[napi(object)]
 pub struct DisplaySize {
     pub width: f64,
     pub height: f64,
@@ -802,6 +808,8 @@ pub struct NativeEvent {
     pub button: Option<u32>,
     pub text: Option<String>,
     pub modifiers: Option<String>,
+    #[napi(js_name = "dragRequested")]
+    pub drag_requested: Option<bool>,
     #[napi(js_name = "deltaX")]
     pub delta_x: Option<f64>,
     #[napi(js_name = "deltaY")]
@@ -824,6 +832,10 @@ pub struct TextAreaOptions {
     pub multiline: Option<bool>,
     pub focus: Option<bool>,
     pub trace: Option<bool>,
+    #[napi(js_name = "glyphAdvances")]
+    pub glyph_advances: Option<Vec<f64>>,
+    #[napi(js_name = "renderTextOriginX")]
+    pub render_text_origin_x: Option<f64>,
 }
 
 #[napi(object)]
@@ -1523,6 +1535,25 @@ impl TextEditor {
                     })
             });
             let pointer_cursor = pointer_for_cursor.map(|pointer| {
+                if let (Some(advances), Some(origin_x)) =
+                    (&options.glyph_advances, options.render_text_origin_x)
+                {
+                    if origin_x.is_finite() && !advances.is_empty() {
+                        let target_x = pointer.x as f64 * pixels_per_point as f64 - origin_x;
+                        let mut accumulated = 0.0;
+                        for (index, advance) in advances.iter().enumerate() {
+                            if !advance.is_finite() || *advance < 0.0 {
+                                continue;
+                            }
+                            let midpoint = accumulated + advance / 2.0;
+                            if target_x < midpoint {
+                                return index;
+                            }
+                            accumulated += advance;
+                        }
+                        return advances.len();
+                    }
+                }
                 edit.galley
                     .cursor_from_pos(pointer - edit.galley_pos)
                     .ccursor
@@ -1658,6 +1689,15 @@ impl TextEditor {
                 // A new press after a completed word drag starts a fresh selection
                 // at that point, even if it lies inside the previous word range.
                 self.word_drag = None;
+                if let Some(index) = pointer_cursor {
+                    let cursor = edit
+                        .galley
+                        .from_ccursor(egui::text::CCursor::new(index));
+                    let range = egui::text::CursorRange::two(cursor, cursor);
+                    edit.cursor_range = Some(range);
+                    edit.state.cursor.set_range(Some(range));
+                    edit.state.clone().store(&self.context, edit.response.id);
+                }
             }
             if let (Some(state), Some(pointer_index)) = (self.word_drag.as_mut(), pointer_cursor) {
                 if state.control_id != options.id {
@@ -3736,12 +3776,10 @@ struct WindowApp {
     orientation: String,
     borderless: bool,
     drag_anywhere: Option<String>,
-    drag_exclusion_rects: Vec<[f64; 4]>,
-    drag_suppressed: bool,
     drag_key_down: bool,
     drag_active: bool,
+    drag_blocked: bool,
     left_mouse_down: bool,
-    last_drag_click: Option<(Instant, f64, f64)>,
     maximizable: bool,
     maximized: bool,
     vsync: bool,
@@ -3834,6 +3872,7 @@ impl ApplicationHandler for WindowApp {
                     button: None,
                     text: None,
                     modifiers: None,
+                    drag_requested: None,
                     delta_x: None,
                     delta_y: None,
                 });
@@ -3854,6 +3893,7 @@ impl ApplicationHandler for WindowApp {
                         button: None,
                         text: None,
                         modifiers: None,
+                        drag_requested: None,
                         delta_x: None,
                         delta_y: None,
                     });
@@ -3861,7 +3901,6 @@ impl ApplicationHandler for WindowApp {
             }
             OsWindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                let drag_excluded = self.is_drag_excluded(self.cursor);
                 if let Some(window) = self.window.as_ref() {
                     let scale = window.scale_factor();
                     let logical_size = window.inner_size().to_logical::<f64>(scale);
@@ -3874,7 +3913,7 @@ impl ApplicationHandler for WindowApp {
                     );
                     let cursor = if self.drag_active {
                         CursorIcon::Grabbing
-                    } else if self.drag_key_is_down() && !drag_excluded && !self.drag_suppressed {
+                    } else if self.drag_key_is_down() && !self.drag_blocked {
                         CursorIcon::Grab
                     } else {
                         direction.map(CursorIcon::from).unwrap_or(CursorIcon::Default)
@@ -3884,7 +3923,7 @@ impl ApplicationHandler for WindowApp {
                         self.cursor_icon = Some(cursor);
                     }
                 }
-                if (self.drag_key_is_down() && !drag_excluded && !self.drag_suppressed) || self.drag_active { return; }
+                if (self.drag_key_is_down() && !self.drag_blocked) || self.drag_active { return; }
                 self.events.push(NativeEvent {
                     kind: "pointermove".into(),
                     x: position.x,
@@ -3893,6 +3932,7 @@ impl ApplicationHandler for WindowApp {
                     button: None,
                     text: None,
                     modifiers: None,
+                    drag_requested: None,
                     delta_x: None,
                     delta_y: None,
                 });
@@ -3910,37 +3950,37 @@ impl ApplicationHandler for WindowApp {
             OsWindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
                     self.left_mouse_down = state.is_pressed();
-                    if state.is_pressed() {
-                        self.drag_suppressed = self.is_drag_excluded(self.cursor);
-                    }
                 }
                 let drag_key_down = self.drag_key_is_down();
-                let drag_allowed = !self.drag_suppressed && !self.is_drag_excluded(self.cursor);
-                if button == MouseButton::Left && (self.drag_active || (drag_key_down && drag_allowed)) {
+                let drag_allowed = !self.drag_blocked;
+                if button == MouseButton::Left && (self.drag_active || drag_key_down) {
                     if state == ElementState::Pressed {
-                        let now = Instant::now();
-                        let double_click = self.last_drag_click.is_some_and(|(at, x, y)| {
-                            now.duration_since(at) <= Duration::from_millis(500)
-                                && (self.cursor.0 - x).hypot(self.cursor.1 - y) <= 8.0
+                        self.events.push(NativeEvent {
+                            kind: "pointerdown".into(),
+                            x: self.cursor.0,
+                            y: self.cursor.1,
+                            key: None,
+                            button: Some(0),
+                            text: None,
+                            modifiers: None,
+                            drag_requested: Some(drag_key_down),
+                            delta_x: None,
+                            delta_y: None,
                         });
-                        if double_click {
-                            self.last_drag_click = None;
-                            if self.maximizable {
-                                if let Some(window) = self.window.as_ref() {
-                                    let maximized = !window.is_maximized();
-                                    window.set_maximized(maximized);
-                                    self.maximized = maximized;
-                                }
-                            }
-                        } else {
-                            self.last_drag_click = Some((now, self.cursor.0, self.cursor.1));
-                            if let Some(window) = self.window.as_ref() { let _ = window.drag_window(); }
-                            self.drag_active = true;
-                        }
                     } else {
-                        self.drag_active = false;
+                        self.events.push(NativeEvent {
+                            kind: "pointerup".into(),
+                            x: self.cursor.0,
+                            y: self.cursor.1,
+                            key: None,
+                            button: Some(0),
+                            text: None,
+                            modifiers: None,
+                            drag_requested: Some(false),
+                            delta_x: None,
+                            delta_y: None,
+                        });
                     }
-                    if state == ElementState::Released { self.drag_suppressed = false; }
                     return;
                 }
                 if drag_key_down && drag_allowed { return; }
@@ -3970,15 +4010,13 @@ impl ApplicationHandler for WindowApp {
                     button: Some(match button { MouseButton::Left => 0, MouseButton::Middle => 1, MouseButton::Right => 2, MouseButton::Back => 3, MouseButton::Forward => 4, MouseButton::Other(id) => u32::from(id) }),
                     text: None,
                     modifiers: None,
+                    drag_requested: None,
                     delta_x: None,
                     delta_y: None,
                 });
-                if button == MouseButton::Left && state == ElementState::Released {
-                    self.drag_suppressed = false;
-                }
             }
             OsWindowEvent::MouseWheel { delta, .. } => {
-                if (self.drag_key_is_down() && !self.is_drag_excluded(self.cursor) && !self.drag_suppressed) || self.drag_active { return; }
+                if (self.drag_key_is_down() && !self.drag_blocked) || self.drag_active { return; }
                 let (delta_x, delta_y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x as f64 * 40.0, y as f64 * 40.0),
                     MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
@@ -3991,6 +4029,7 @@ impl ApplicationHandler for WindowApp {
                     button: None,
                     text: None,
                     modifiers: None,
+                    drag_requested: None,
                     delta_x: Some(delta_x),
                     delta_y: Some(delta_y),
                 });
@@ -4022,6 +4061,7 @@ impl ApplicationHandler for WindowApp {
                 button: None,
                 text: event.text.map(|text| text.to_string()),
                 modifiers: Some(format!("{:?}", self.modifiers)),
+                    drag_requested: None,
                 delta_x: None,
                 delta_y: None,
             })
@@ -4041,6 +4081,7 @@ impl ApplicationHandler for WindowApp {
                     button: None,
                     text,
                     modifiers: None,
+                    drag_requested: None,
                     delta_x: None,
                     delta_y: None,
                 });
@@ -4083,12 +4124,6 @@ impl ApplicationHandler for WindowApp {
 }
 
 impl WindowApp {
-    fn is_drag_excluded(&self, point: (f64, f64)) -> bool {
-        self.drag_exclusion_rects.iter().any(|[x, y, width, height]| {
-            point.0 >= *x && point.0 < *x + *width && point.1 >= *y && point.1 < *y + *height
-        })
-    }
-
     fn drag_key_is_down(&self) -> bool {
         match self.drag_anywhere.as_deref() {
             None => false,
@@ -4102,18 +4137,12 @@ impl WindowApp {
     }
 
     fn update_drag_cursor(&mut self) {
-        let drag_excluded = self.is_drag_excluded(self.cursor);
-        if self.drag_key_is_down() && self.left_mouse_down && !self.drag_active
-            && !drag_excluded && !self.drag_suppressed {
-            if let Some(window) = self.window.as_ref() { let _ = window.drag_window(); }
-            self.drag_active = true;
-        }
         let Some(window) = self.window.as_ref() else { return; };
         let scale = window.scale_factor();
         let size = window.inner_size().to_logical::<f64>(scale);
         let cursor = if self.drag_active {
             CursorIcon::Grabbing
-        } else if self.drag_key_is_down() && !drag_excluded && !self.drag_suppressed {
+        } else if self.drag_key_is_down() && !self.drag_blocked {
             CursorIcon::Grab
         } else {
             resize_direction(&self.resizable, self.cursor.0 / scale, self.cursor.1 / scale, size.width, size.height)
@@ -4387,16 +4416,15 @@ impl Window {
         Ok(())
     }
 
-    #[napi(js_name = "setDragExclusionRects")]
-    pub fn set_drag_exclusion_rects(&mut self, values: Vec<f64>) -> Result<()> {
-        if values.len() % 4 != 0 || values.iter().any(|value| !value.is_finite()) {
-            return Err(Error::new(Status::InvalidArg, "drag exclusion rectangles must be finite x, y, width, height tuples"));
-        }
-        self.app.drag_exclusion_rects = values.chunks_exact(4)
-            .map(|rect| [rect[0], rect[1], rect[2].max(0.0), rect[3].max(0.0)])
-            .collect();
+    #[napi(js_name = "setDragBlocked")]
+    pub fn set_drag_blocked(&mut self, blocked: bool) {
+        self.app.drag_blocked = blocked;
         self.app.update_drag_cursor();
-        Ok(())
+    }
+
+    #[napi(js_name = "cursorPosition")]
+    pub fn cursor_position(&self) -> WindowPoint {
+        WindowPoint { x: self.app.cursor.0, y: self.app.cursor.1 }
     }
 
     #[napi(js_name = "setVsync")]
