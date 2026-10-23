@@ -364,32 +364,62 @@ ui.setGlowMode(options.glow);
 ui.setMaximized(window.maximized);
 ui.maximizeButton.addEventListener('click', () => { window.maximized = !window.maximized; ui.setMaximized(window.maximized); });
 let viewport = window.size(); ui.resize(viewport.width, viewport.height);
-const events = new EventTarget(), frames = new Map(), timers = new Set(), intervals = new Set();
-events.addEventListener('message', event => {
+const frames = new Map(), timers = new Set(), intervals = new Set();
+window.addEventListener('message', event => {
   if (event.data?.type !== 'rainbow-window-capture' || !Array.isArray(event.data.windowIds)) return;
   requestedWindowIds = new Set(event.data.windowIds.map(String));
   syncWindowCaptures();
 });
-let nextFrame = 0, shown = false, pointer = { x: 0, y: 0 }, lastTarget = null, shiftDown = false;
+let nextFrame = 0, shown = false;
 let refreshRate = Number(window.refreshRate());
 let frameInterval = 1000 / (Number.isFinite(refreshRate) && refreshRate > 0 ? refreshRate : 60);
 let nextFrameDeadline = performance.now();
 const actionKeysDown = new Set();
-let pointerDownTarget = null;
+window.addEventListener('refreshRate', event => {
+  if (!Number.isFinite(event.x) || event.x <= 0) return;
+  refreshRate = event.x;
+  frameInterval = 1000 / refreshRate;
+  nextFrameDeadline = performance.now();
+});
+window.addEventListener('keyup', event => {
+  const key = String(event.key || '').toLowerCase();
+  if (key.length === 1) actionKeysDown.delete(key);
+});
+window.addEventListener('keydown', event => {
+  const key = String(event.key || '').toLowerCase();
+  if (key === 'escape' || key === 'q') { window.close(); return; }
+  if (!['g', 'n', 't'].includes(key) || actionKeysDown.has(key)) return;
+  actionKeysDown.add(key);
+  if (key === 'g') {
+    browser.glowMode = browser.glowMode === 'net' ? 'load' : browser.glowMode === 'load' ? 'both' : 'net';
+    ui.setGlowMode(browser.glowMode);
+    browser.postMessage({ type: 'rainbow-glow-mode' });
+  }
+  if (key === 'n') {
+    netOnly = !netOnly;
+    publishProcessSnapshot(true);
+  }
+  if (key === 't') {
+    const enabled = !tracingEnabled;
+    if (setTracingEnabled(enabled)) ui.setTracingEnabled(enabled);
+  }
+});
 const browser = {
   document, console, performance, devicePixelRatio: 1,
   usageScale: options.usageScale,
   glowMode: options.glow,
   showRecentCommands: ui.showRecentCommands,
   clearRecentCommands: ui.clearRecentCommands,
-  innerWidth: viewport.width, innerHeight: viewport.height,
-  addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events),
-  dispatchEvent: events.dispatchEvent.bind(events),
+  get innerWidth() { return window.size().width; },
+  get innerHeight() { return window.size().height; },
+  addEventListener: window.addEventListener.bind(window),
+  removeEventListener: window.removeEventListener.bind(window),
+  dispatchEvent: window.dispatchEvent.bind(window),
   postMessage(data) {
     queueMicrotask(() => {
       const event = new Event('message');
       Object.assign(event, { data, origin: 'null', source: browser });
-      events.dispatchEvent(event);
+      window.dispatchEvent(event);
     });
   },
   requestAnimationFrame(callback) { const id = ++nextFrame; frames.set(id, callback); return id; },
@@ -404,77 +434,11 @@ const browser = {
 browser.window = browser; browser.self = browser;
 const source = await readFile(new URL('./rainbow/app.js', import.meta.url), 'utf8');
 vm.runInNewContext(source, browser, { filename: 'rainbow/app.js' });
-function pointerEvent(target, type, button = 0, extra = {}) {
-  if (!target) return;
-  const event = new Event(type, { bubbles: true, cancelable: true });
-  Object.assign(event, { pointerId: 1, pointerType: 'mouse', clientX: pointer.x, clientY: pointer.y, button, shiftKey: shiftDown, ...extra });
-  target.dispatchEvent(event);
-  return event;
-}
-function hitElement() {
-  return document.elementFromPoint(pointer.x, pointer.y);
-}
 function dispatch() {
   const size = window.size();
   if (size.width !== viewport.width || size.height !== viewport.height) {
-    viewport = size; browser.innerWidth = size.width; browser.innerHeight = size.height;
-    ui.resize(size.width, size.height); events.dispatchEvent(new Event('resize'));
-  }
-  for (const event of window.drainEvents()) {
-    if (event.type === 'refreshRate' && Number.isFinite(event.x) && event.x > 0) {
-      refreshRate = event.x;
-      frameInterval = 1000 / refreshRate;
-      nextFrameDeadline = performance.now();
-      continue;
-    }
-    if (event.type === 'keydown' && event.key === 'Named(Escape)') window.close();
-    if (event.type === 'keydown' || event.type === 'keyup') {
-      const key = /^Character\(["']([nqtg])["']\)$/i.exec(event.key || '')?.[1].toLowerCase() ?? null;
-      if (event.type === 'keyup') {
-        if (key) actionKeysDown.delete(key);
-      } else if (key && !actionKeysDown.has(key)) {
-        actionKeysDown.add(key);
-        if (key === 'q') window.close();
-        if (key === 'g') {
-          browser.glowMode = browser.glowMode === 'net' ? 'load' : browser.glowMode === 'load' ? 'both' : 'net';
-          ui.setGlowMode(browser.glowMode);
-          browser.postMessage({ type: 'rainbow-glow-mode' });
-        }
-        if (key === 'n') {
-          netOnly = !netOnly;
-          publishProcessSnapshot(true);
-        }
-        if (key === 't') {
-          const enabled = !tracingEnabled;
-          if (setTracingEnabled(enabled)) {
-            ui.setTracingEnabled(enabled);
-          }
-        }
-      }
-    }
-    if (event.type === 'keydown' && /Shift/.test(event.key || '')) shiftDown = true;
-    if (event.type === 'keyup' && /Shift/.test(event.key || '')) shiftDown = false;
-    if (event.type === 'wheel') {
-      pointer = { x: event.x, y: event.y };
-      const target = hitElement();
-      pointerEvent(target, 'wheel', 0, { deltaX: event.deltaX || 0, deltaY: event.deltaY || 0 });
-      continue;
-    }
-    if (!event.type.startsWith('pointer')) continue;
-    if (event.type === 'pointermove') pointer = { x: event.x, y: event.y };
-    const capture = [...document.querySelectorAll('*')].find(element => element.hasPointerCapture(1));
-    const hit = hitElement();
-    const target = capture || hit;
-    if (!capture && target !== lastTarget) { pointerEvent(lastTarget, 'pointerleave'); lastTarget = target; }
-    const button = event.button ?? 0;
-    pointerEvent(target, event.type, button);
-    if (event.type === 'pointerdown' && button === 0) pointerDownTarget = target;
-    if (event.type === 'pointerup' && button === 0) {
-      if (target && target === pointerDownTarget) target.dispatchEvent(new Event('click', { bubbles: true, cancelable: true }));
-      pointerDownTarget = null;
-    }
-    if (event.type === 'pointercancel') pointerDownTarget = null;
-    if (event.type === 'pointerup' || event.type === 'pointercancel') capture?.releasePointerCapture(1);
+    viewport = size;
+    ui.resize(size.width, size.height);
   }
 }
 async function close() {

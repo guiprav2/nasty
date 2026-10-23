@@ -178,12 +178,17 @@ export class Window extends native.Window {
 
   drainEvents() {
     const events = super.drainEvents();
+    const routedEvents = [];
     for (const event of events) {
-      if (event.type !== "pointerdown" || event.button !== 0 || !event.dragRequested) continue;
+      if (event.type !== "pointerdown" || event.button !== 0 || !event.dragRequested) {
+        routedEvents.push(event);
+        continue;
+      }
       const target = this.#document?.elementFromPoint(event.x, event.y) ?? null;
       const blocked = blocksWindowDrag(target);
       this.#dragBlocked = blocked;
       super.setDragBlocked(blocked);
+      routedEvents.push(event);
       if (blocked) continue;
       const now = Date.now();
       const previous = this.#lastDragClick;
@@ -194,10 +199,16 @@ export class Window extends native.Window {
         this.maximized = !this.maximized;
       } else {
         this.#lastDragClick = { time: now, x: event.x, y: event.y };
-        try { super.startDragging(); } catch {}
+        try {
+          super.startDragging();
+          // The OS takes over the pointer sequence for native window moves
+          // and may never send its release back to this window. Cancel the
+          // DOM sequence immediately so captured application drags can end.
+          routedEvents.push({ ...event, type: "pointercancel", dragRequested: undefined });
+        } catch {}
       }
     }
-    return events;
+    return routedEvents;
   }
 
   get maximizable() { return this.#maximizable; }
@@ -313,48 +324,85 @@ export class Window extends native.Window {
   }
 
   #routeNativeEvent(nativeEvent) {
-    const fields = { x: nativeEvent.x, y: nativeEvent.y, button: nativeEvent.button ?? 0, deltaX: nativeEvent.deltaX ?? 0, deltaY: nativeEvent.deltaY ?? 0 };
+    const cursor = Number.isFinite(nativeEvent.x) && Number.isFinite(nativeEvent.y)
+      ? { x: nativeEvent.x, y: nativeEvent.y }
+      : super.cursorPosition();
+    const fields = {
+      x: cursor.x, y: cursor.y, clientX: cursor.x, clientY: cursor.y,
+      button: nativeEvent.button ?? 0, deltaX: nativeEvent.deltaX ?? 0, deltaY: nativeEvent.deltaY ?? 0,
+    };
     const key = normalizeWindowKey(nativeEvent.key, nativeEvent.text);
     const modifiers = String(nativeEvent.modifiers || "");
-    Object.assign(fields, { key, text: nativeEvent.text ?? "", ctrlKey: /CTRL/i.test(modifiers), shiftKey: /SHIFT/i.test(modifiers), altKey: /ALT/i.test(modifiers), metaKey: /SUPER|META|LOGO/i.test(modifiers) });
+    Object.assign(fields, {
+      key, text: nativeEvent.text ?? "", ctrlKey: /CTRL/i.test(modifiers),
+      shiftKey: /SHIFT/i.test(modifiers), altKey: /ALT/i.test(modifiers), metaKey: /SUPER|META|LOGO/i.test(modifiers),
+      pointerId: 1, pointerType: "mouse",
+    });
     const event = makeHostEvent(nativeEvent.type, fields);
     this.#dispatchWindowEvent(event);
 
     const document = this.#document;
-    if (!document || !["pointermove", "pointerdown", "pointerup", "wheel", "keydown", "keyup"].includes(nativeEvent.type)) return;
+    if (!document || !["pointermove", "pointerdown", "pointerup", "pointercancel", "wheel", "keydown", "keyup"].includes(nativeEvent.type)) return;
     if (nativeEvent.type === "pointermove") {
-      const target = document.elementFromPoint(nativeEvent.x, nativeEvent.y);
+      const target = document.elementFromPoint(fields.clientX, fields.clientY);
+      const capture = documentState(document).pointerCapture?.get(1);
       const blocked = this.#dragAnywhere !== false && blocksWindowDrag(target);
       if (blocked !== this.#dragBlocked) {
         this.#dragBlocked = blocked;
         super.setDragBlocked(blocked);
       }
       if (target !== this.#hoveredElement) {
-        if (this.#hoveredElement) dispatchDomEvent(this.#hoveredElement, "mouseleave", fields);
+        if (this.#hoveredElement) {
+          dispatchDomEvent(this.#hoveredElement, "pointerleave", fields);
+          dispatchDomEvent(this.#hoveredElement, "mouseleave", fields);
+        }
         this.#hoveredElement = target;
-        if (target) dispatchDomEvent(target, "mouseenter", fields);
+        if (target) {
+          dispatchDomEvent(target, "pointerenter", fields);
+          dispatchDomEvent(target, "mouseenter", fields);
+        }
       }
+      const pointerTarget = capture ?? target;
+      if (pointerTarget) dispatchDomEvent(pointerTarget, "pointermove", fields);
       if (target) dispatchDomEvent(target, "mousemove", fields);
       return;
     }
     if (nativeEvent.type === "pointerdown") {
-      const target = document.elementFromPoint(nativeEvent.x, nativeEvent.y);
+      const target = document.elementFromPoint(fields.clientX, fields.clientY);
       this.#pressedElement = target;
       const control = nearestFormControl(target);
       if (control) control.focus();
       else document.activeElement?.blur();
+      if (target) dispatchDomEvent(target, "pointerdown", fields);
       if (target) dispatchDomEvent(target, "mousedown", fields);
       return;
     }
     if (nativeEvent.type === "pointerup") {
-      const target = document.elementFromPoint(nativeEvent.x, nativeEvent.y);
+      const capture = documentState(document).pointerCapture?.get(1);
+      const target = capture ?? document.elementFromPoint(fields.clientX, fields.clientY);
+      if (target) dispatchDomEvent(target, "pointerup", fields);
       if (target) dispatchDomEvent(target, "mouseup", fields);
       if (target && target === this.#pressedElement) dispatchDomEvent(target, "click", fields);
+      if (capture) {
+        documentState(document).pointerCapture?.delete(1);
+        dispatchDomEvent(capture, "lostpointercapture", fields);
+      }
+      this.#pressedElement = null;
+      return;
+    }
+    if (nativeEvent.type === "pointercancel") {
+      const capture = documentState(document).pointerCapture?.get(1);
+      const target = capture ?? this.#pressedElement ?? document.elementFromPoint(fields.clientX, fields.clientY);
+      if (target) dispatchDomEvent(target, "pointercancel", fields);
+      if (capture) {
+        documentState(document).pointerCapture?.delete(1);
+        dispatchDomEvent(capture, "lostpointercapture", fields);
+      }
       this.#pressedElement = null;
       return;
     }
     if (nativeEvent.type === "wheel") {
-      const target = document.elementFromPoint(nativeEvent.x, nativeEvent.y);
+      const target = document.elementFromPoint(fields.clientX, fields.clientY);
       if (target) dispatchDomEvent(target, "wheel", fields);
       document.handleEvent(event);
       return;

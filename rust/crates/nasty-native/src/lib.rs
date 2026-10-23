@@ -4008,6 +4008,25 @@ impl ApplicationHandler for WindowApp {
                 self.text_editor = None;
                 event_loop.exit();
             }
+            OsWindowEvent::Focused(false) if self.left_mouse_down => {
+                // Native window dragging can move the pointer outside the
+                // window and consume the eventual mouse release. Cancel the
+                // DOM pointer sequence on focus loss so pointer captures and
+                // application drag state cannot remain stuck.
+                self.left_mouse_down = false;
+                self.events.push(NativeEvent {
+                    kind: "pointercancel".into(),
+                    x: self.cursor.0,
+                    y: self.cursor.1,
+                    key: None,
+                    button: Some(0),
+                    text: None,
+                    modifiers: None,
+                    drag_requested: None,
+                    delta_x: None,
+                    delta_y: None,
+                });
+            }
             OsWindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
@@ -4084,7 +4103,7 @@ impl ApplicationHandler for WindowApp {
                     key: None,
                     button: None,
                     text: None,
-                    modifiers: None,
+                    modifiers: Some(format!("{:?}", self.modifiers)),
                     drag_requested: None,
                     delta_x: None,
                     delta_y: None,
@@ -4132,7 +4151,7 @@ impl ApplicationHandler for WindowApp {
                             key: None,
                             button: Some(0),
                             text: None,
-                            modifiers: None,
+                            modifiers: Some(format!("{:?}", self.modifiers)),
                             drag_requested: Some(drag_key_down),
                             delta_x: None,
                             delta_y: None,
@@ -4145,7 +4164,7 @@ impl ApplicationHandler for WindowApp {
                             key: None,
                             button: Some(0),
                             text: None,
-                            modifiers: None,
+                            modifiers: Some(format!("{:?}", self.modifiers)),
                             drag_requested: Some(false),
                             delta_x: None,
                             delta_y: None,
@@ -4170,7 +4189,7 @@ impl ApplicationHandler for WindowApp {
                     key: None,
                     button: Some(match button { MouseButton::Left => 0, MouseButton::Middle => 1, MouseButton::Right => 2, MouseButton::Back => 3, MouseButton::Forward => 4, MouseButton::Other(id) => u32::from(id) }),
                     text: None,
-                    modifiers: None,
+                    modifiers: Some(format!("{:?}", self.modifiers)),
                     drag_requested: None,
                     delta_x: None,
                     delta_y: None,
@@ -4189,7 +4208,7 @@ impl ApplicationHandler for WindowApp {
                     key: None,
                     button: None,
                     text: None,
-                    modifiers: None,
+                    modifiers: Some(format!("{:?}", self.modifiers)),
                     drag_requested: None,
                     delta_x: Some(delta_x),
                     delta_y: Some(delta_y),
