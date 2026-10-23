@@ -84,6 +84,9 @@ function textEntries(document, selectedElements = null) {
     let text = renderedText(element);
     if (!text || !bounds.width || !bounds.height) continue;
     const rgba = parseColor(inherited(element, 'color', '#000000')) ?? [0, 0, 0, 0];
+    const placeholder = (element.localName === 'input' || element.localName === 'textarea')
+      && !element.value && Boolean(element.placeholder);
+    if (placeholder) rgba[3] *= 0.6;
     for (let current = element; current; current = current.parent) {
       const opacity = Number(current.style.opacity);
       if (current.style.opacity !== undefined && Number.isFinite(opacity)) rgba[3] *= Math.max(0, Math.min(1, opacity));

@@ -962,7 +962,7 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
 function defaultElementStyle(name) {
   const reset = { display: "block", padding: 0, margin: 0, borderWidth: 0, borderStyle: "none", backgroundColor: "transparent" };
   if (name === "input") {
-    return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "center", overflow: "hidden", whiteSpace: "nowrap" };
+    return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "center", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" };
   }
   if (name === "textarea") {
     return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "start", overflow: "hidden", whiteSpace: "pre-wrap" };
