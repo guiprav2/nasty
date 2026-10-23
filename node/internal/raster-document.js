@@ -447,8 +447,9 @@ export function rasterizeDocument(document, width, height, surface = createCanva
       }
       ctx.font = text.font; ctx.letterSpacing = `${text.spacing}px`; ctx.fillStyle = textColor;
       if (isPlaceholderText(element)) ctx.globalAlpha *= 0.6;
-      const clipX = element.localName === 'input' || clipsOverflow(element, 'x');
-      const clipY = clipsOverflow(element, 'y');
+      const textControl = element.localName === 'input' || element.localName === 'textarea';
+      const clipX = textControl || clipsOverflow(element, 'x');
+      const clipY = textControl || clipsOverflow(element, 'y');
       if (clipX || clipY) {
         const viewport = documentState(document).viewport;
         const clipRect = {
@@ -465,7 +466,8 @@ export function rasterizeDocument(document, width, height, surface = createCanva
       const lines = textLines(metrics, content.width);
       const editor = state.textAreaState;
       const textX = state.renderTextOriginX ?? editor?.textOriginX ?? content.x;
-      const textY = editor?.textOriginY ?? content.y;
+      const textY = editor?.textOriginY ?? (element.localName === 'input'
+        ? content.y + Math.max(0, (content.height - text.line) / 2) : content.y);
       const selectionRects = [];
       if ((element.localName === 'input' || element.localName === 'textarea') && editor?.focused
         && editor.selectionEnd > editor.selectionStart) {
@@ -506,7 +508,13 @@ export function rasterizeDocument(document, width, height, surface = createCanva
           line += '…';
         }
         const baseline = textY + index * text.line + (text.line - ascent - descent) / 2 + ascent;
-        ctx.fillText(line, textX, baseline);
+        const align = inherited(element, 'textAlign', 'start');
+        const spare = content.width - ctx.measureText(line).width;
+        const rtl = inherited(element, 'direction', 'ltr') === 'rtl';
+        const offset = align === 'center' ? (spare >= 0 ? spare / 2 : rtl ? spare : 0)
+          : (align === 'right' || (align === 'end' && !rtl) || (align === 'start' && rtl)) ? spare : 0;
+        const lineX = textX + offset;
+        ctx.fillText(line, lineX, baseline);
         const lineSelectionRects = selectionRects.filter(rect => rect.lineIndex === index);
         if (lineSelectionRects.length && state.selectionStyle?.color) {
           ctx.save();
@@ -514,7 +522,7 @@ export function rasterizeDocument(document, width, height, surface = createCanva
           for (const rect of lineSelectionRects) ctx.rect(rect.x, rect.y, rect.width, rect.height);
           ctx.clip();
           ctx.fillStyle = state.selectionStyle.color;
-          ctx.fillText(line, textX, baseline);
+          ctx.fillText(line, lineX, baseline);
           ctx.restore();
         }
       });

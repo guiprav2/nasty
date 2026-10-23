@@ -330,7 +330,8 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
         style.align_items = Some(match value {
             "start" | "flex-start" => AlignItems::START,
             "end" | "flex-end" => AlignItems::END,
-            "center" => AlignItems::CENTER,
+            "center" | "unsafe center" => AlignItems::CENTER,
+            "safe center" => AlignItems::SAFE_CENTER,
             "stretch" => AlignItems::STRETCH,
             _ => {
                 return Err(Error::new(
@@ -344,7 +345,8 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
         style.justify_content = Some(match value {
             "start" | "flex-start" => JustifyContent::START,
             "end" | "flex-end" => JustifyContent::END,
-            "center" => JustifyContent::CENTER,
+            "center" | "unsafe center" => JustifyContent::CENTER,
+            "safe center" => JustifyContent::SAFE_CENTER,
             "space-between" => JustifyContent::SPACE_BETWEEN,
             "space-around" => JustifyContent::SPACE_AROUND,
             "space-evenly" => JustifyContent::SPACE_EVENLY,

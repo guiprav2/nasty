@@ -31,7 +31,7 @@ function closePlayback() {
 
 function openPlayback(time = 0, selectedDevice = deviceId) {
   closePlayback();
-  if (!source || paused || volume <= 0) return;
+  if (!source || paused) return;
   const path = new URL(source);
   decoder = new AudioDecoder(path.protocol === "file:" ? fileURLToPath(path) : source);
   sampleRate = decoder.sampleRate;
@@ -137,9 +137,7 @@ parentPort.on("message", message => {
       } else player?.setPaused(!ready);
     } else if (message.type === "volume") {
       volume = message.volume;
-      if (volume <= 0) closePlayback();
-      else if (player) player.setVolume(volume);
-      else if (!paused) openPlayback(message.time ?? 0);
+      player?.setVolume(volume);
     } else if (message.type === "device") {
       deviceId = message.deviceId;
       if (!paused && volume > 0) openPlayback(message.time ?? 0, deviceId);

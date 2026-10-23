@@ -98,12 +98,15 @@ export function getVideoAudioClock(audioId) {
   return audioClocks.get(audioId) ?? null;
 }
 
+export function hasVideoAudio(audioId) {
+  return !!audioWorker && activeAudioId === audioId && audioGenerations.has(audioId);
+}
+
 export function pauseVideoAudio(audioId, paused) {
   audioWorker?.postMessage({ type: "pause", audioId, paused });
 }
 
 export function setVideoAudioVolume(audioId, volume, time = 0) {
-  if (volume > 0) activeAudioId = audioId;
   audioWorker?.postMessage({ type: "volume", audioId, volume, time });
 }
 

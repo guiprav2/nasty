@@ -1,0 +1,78 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+import { Document } from '../node/index.js';
+import { documentState, elementState } from '../node/internal/dom-state.js';
+import { closeVideoDecoder, getVideoAudioClock } from '../node/video-decoder.js';
+
+test('volume changes preserve the audio stream and restore audible gain after zero', { timeout: 20000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'nasty-audio-volume-'));
+  const sink = `nasty_volume_test_${process.pid}`;
+  const moduleId = execFileSync('pactl', ['load-module', 'module-null-sink', `sink_name=${sink}`, 'rate=48000']).toString().trim();
+  const previousSink = process.env.PULSE_SINK;
+  process.env.PULSE_SINK = sink;
+  const doc = new Document(), video = doc.createElement('video');
+  let recorder;
+  t.after(async () => {
+    recorder?.kill();
+    await closeVideoDecoder();
+    documentState(doc).defaultView = null;
+    await doc.close();
+    if (previousSink === undefined) delete process.env.PULSE_SINK;
+    else process.env.PULSE_SINK = previousSink;
+    execFileSync('pactl', ['unload-module', moduleId]);
+    await rm(directory, { recursive: true, force: true });
+  });
+  const source = join(directory, 'tone.wav');
+  execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=12', source]);
+  video.src = pathToFileURL(source).href;
+  // Exercise the real audio worker and DOM volume setter independently of
+  // video decoding. All sound goes to an owned null sink, never the speakers.
+  documentState(doc).defaultView = { audioOutput: 'pulse' };
+  const state = elementState(video).video;
+  state.paused = false;
+  let samples = [];
+  recorder = spawn('parec', ['--device', `${sink}.monitor`, '--format=float32le', '--rate=48000', '--channels=2', '--latency-msec=20']);
+  recorder.stdout.on('data', chunk => samples.push(chunk));
+  let recordingError = '';
+  recorder.stderr.on('data', chunk => { recordingError += chunk; });
+  const amplitude = async volume => {
+    if (volume !== undefined) video.volume = volume;
+    await delay(300);
+    samples = [];
+    await delay(200);
+    const data = Buffer.concat(samples);
+    assert.ok(data.length > 1000, `monitor must provide samples: ${recordingError}`);
+    let energy = 0;
+    for (let offset = 0; offset + 4 <= data.length; offset += 4) energy += data.readFloatLE(offset) ** 2;
+    return Math.sqrt(energy / (data.length / 4));
+  };
+  video._startVideoAudio(0);
+  await state.audioStartPromise;
+  for (let i = 0; i < 30 && !samples.length; i++) await delay(100);
+  const generation = state.audioGeneration;
+  const full = await amplitude();
+  assert.ok(full > .01, `initial signal must be audible, RMS=${full}`);
+  const clock = getVideoAudioClock(state.audioId).time;
+  const half = await amplitude(.5);
+  assert.equal(state.audioGeneration, generation, 'adjusting gain must not restart decoding');
+  assert.ok(half / full > .4 && half / full < .6, `half-volume RMS ratio=${half / full}`);
+  assert.ok(getVideoAudioClock(state.audioId).time > clock + .3, 'audio clock advances continuously');
+  const silent = await amplitude(0);
+  assert.ok(silent < .001, `zero volume must be silent, RMS=${silent}`);
+  const restored = await amplitude(.25);
+  assert.ok(restored / full > .18 && restored / full < .32, `restored quarter-volume RMS ratio=${restored / full}`);
+  assert.equal(state.audioGeneration, generation, 'zero and restore must preserve the same stream');
+  video.muted = true;
+  assert.ok(await amplitude() < .001, 'muted playback remains silent');
+  video.muted = false;
+  const unmuted = await amplitude();
+  assert.ok(unmuted / full > .18 && unmuted / full < .32, 'unmuting restores the current gain');
+  assert.equal(state.audioGeneration, generation, 'muting must also preserve the stream');
+  t.diagnostic(`RMS full=${full.toFixed(4)}, half=${half.toFixed(4)}, zero=${silent.toFixed(4)}, restored=${restored.toFixed(4)}`);
+});

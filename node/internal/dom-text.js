@@ -101,7 +101,7 @@ function textEntries(document, selectedElements = null) {
     const { fontSize, lineHeight } = fontMetrics(element);
     const textState = element.localName === 'input' ? elementState(element) : null;
     const textY = textState
-      ? bounds.y + (bounds.height - lineHeight) / 2
+      ? bounds.y + Math.max(0, (bounds.height - lineHeight) / 2)
       : bounds.y;
     const textOrigin = projectPoint(box, textState?.renderTextOriginX ?? bounds.x, textY);
     const transformedWidth = bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
@@ -113,13 +113,19 @@ function textEntries(document, selectedElements = null) {
         || (placeholder && explicitTextOverflow === undefined))) {
       text = ellipsizeText(element, text, bounds.width);
     }
+    let textAlign = inherited(element, 'textAlign', 'start');
+    // Keep the beginning reachable when an unwrapped label is wider than its
+    // viewport. Fitting labels retain their authored alignment.
+    if (whiteSpace === 'nowrap' && textAlign === 'center' && measureText(element, text) > bounds.width) {
+      textAlign = inherited(element, 'direction', 'ltr') === 'rtl' ? 'right' : 'left';
+    }
     // Canvas measurements are rounded to hundredths of a pixel. Let the
     // shaper accept that same rounding tolerance at a line's right edge.
     const run = { text, x: textOrigin.x, y: textOrigin.y, width: transformedWidth + 0.01, fontSize,
       lineHeight,
       fontFamily: fontFamilyForElement(element, inherited(element, 'fontFamily', 'sans-serif')),
       fontWeight: Math.max(100, Math.min(900, parseInt(inherited(element, 'fontWeight', 400), 10) || 400)),
-      textAlign: inherited(element, 'textAlign', 'start'), color,
+      textAlign, color,
       wrap: whiteSpace !== 'nowrap',
       breakWords: element.localName === 'textarea'
         || ['anywhere', 'break-word'].includes(inherited(element, 'overflowWrap', 'normal')) };
@@ -207,7 +213,7 @@ export function syncDocumentText(window, document, selectedElements = null) {
         // Typing in input/textarea only changes that run. Reshape it in place so
         // a keystroke cannot enqueue a full-document text worker job and stall
         // the event loop while the rest of the UI glyphs stay unchanged.
-        if (element.localName === "input" || element.localName === "textarea") {
+        if (!state.pending && (element.localName === "input" || element.localName === "textarea")) {
           editableReshapes.push({ index, run });
           runs[index] = run;
         } else {
@@ -242,14 +248,12 @@ export function syncDocumentText(window, document, selectedElements = null) {
       activeIndices.add(index);
       parked.delete(index);
     }
-    // selectedElements is a visible subset. Do not park runs that were merely
-    // outside this present's element filter.
-    if (!selectedElements) {
-      for (let index = 0; index < runs.length; index++) {
-        if (!activeIndices.has(index) && !parked.has(index)) {
-          runs[index] = parkRun(runs[index]);
-          parked.add(index);
-        }
+    // The native text buffer contains the whole document, including runs
+    // prepared at the origin. Only this frame's visible subset may be painted.
+    for (let index = 0; index < runs.length; index++) {
+      if (!activeIndices.has(index) && !parked.has(index)) {
+        runs[index] = parkRun(runs[index]);
+        parked.add(index);
       }
     }
     if (editableReshapes.length) {

@@ -249,20 +249,23 @@ visualTest('long input scrolls horizontally and caret aligns with its selection 
     const rightInk = countPixels(endView, { x: input.x + input.width - 130, y: input.y + 8, width: 110, height: input.height - 16 }, p => p[0] > 180 && p[1] > 180 && p[2] > 180);
     assert.ok(rightInk > 25, 'the final characters should remain visible after horizontal scrolling');
 
-    key(windowId, ['Home']);
-    run('xdotool', ['key', '--repeat', '70', '--delay', '5', '--window', windowId, 'Right']);
-    await waitFor(state, current => current.input.selectionStart === 70 && current.input.selectionEnd === 70);
-    const editor = (await state()).input.editor;
+    // Move within the already-visible tail, so extending the selection cannot
+    // change the viewport between the caret and selection screenshots.
+    run('xdotool', ['key', '--repeat', '30', '--delay', '5', '--window', windowId, 'Left']);
+    await waitFor(state, current => current.input.selectionStart === 130 && current.input.selectionEnd === 130);
+    const caretViews = [await capture(windowId, 'long-input-caret')];
+    await delay(80);
+    caretViews.push(await capture(windowId, 'long-input-caret-next'));
     run('xdotool', ['key', '--repeat', '5', '--delay', '5', '--window', windowId, 'shift+Right']);
-    await waitFor(state, current => current.input.selectionStart === 70 && current.input.selectionEnd === 75);
+    await waitFor(state, current => current.input.selectionStart === 130 && current.input.selectionEnd === 135);
     const selection = await capture(windowId, 'long-short-selection');
     const selectionX = selectionLeft(selection, input);
     const selectionEndX = selectionRight(selection, input);
     assert.ok(selectionX !== null && selectionEndX !== null, 'the scrolled input selection should render');
-    assert.ok(Math.abs(editor.renderCaretX - selectionEndX) <= 9,
-      `the rendered caret should coincide with the selection end at x=${selectionEndX}; got ${editor.renderCaretX}`);
+    assert.ok(caretViews.some(image => hasBrightCaret(image, selectionX, input)),
+      `caret pixels must coincide with the selection's starting edge at x=${selectionX}`);
     type(windowId, 'END');
-    await waitFor(state, current => current.input.value === `${value.slice(0, 70)}END${value.slice(75)}`);
+    await waitFor(state, current => current.input.value === `${value.slice(0, 130)}END${value.slice(135)}`);
   } finally {
     app.kill('SIGTERM'); await delay(250); if (app.exitCode === null) app.kill('SIGKILL');
   }

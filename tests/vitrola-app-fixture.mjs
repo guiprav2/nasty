@@ -17,7 +17,8 @@ await writeFile(join(dataDir, 'library.json'), JSON.stringify({
     tracks: ids.map((videoId, index) => ({ videoId, title: index ? `THE 69 EYES: Sample track ${index}` : 'If You Love Me the Morning After',
       channel: 'The 69 Eyes', duration: 262, pageUrl: '', via: 'ytdlp', id: `track-${index}` })) }],
   player: { playlistId: 'test', index: 0, status: 'paused' },
-  messages: messages.map((body, index) => ({ id: index, role: index % 2 ? 'assistant' : 'user', body })),
+  messages: Array.from({ length: Number(process.env.VITROLA_TEST_MESSAGE_COUNT) || messages.length }, (_, index) =>
+    ({ id: index, role: index % 2 ? 'assistant' : 'user', body: messages[index % messages.length] })),
   logs: [], nextMessage: 20,
 }));
 await writeFile(join(dataDir, 'window-size.json'), JSON.stringify({ width: 1440, height: 800 }));
@@ -26,7 +27,7 @@ const descriptor = Object.getOwnPropertyDescriptor(Window.prototype, 'document')
 const present = Window.prototype.presentDocument;
 const frameTimes = [];
 const delays = monitorEventLoopDelay({ resolution: 10 });
-let win, input, ready = false, inputEvents = [], keys = 0;
+let win, input, scroller, ready = false, inputEvents = [], keys = 0;
 Window.prototype.presentDocument = function (...args) {
   const start = performance.now();
   try { return present.apply(this, args); }
@@ -37,6 +38,7 @@ Object.defineProperty(Window.prototype, 'document', { ...descriptor, set(doc) {
   win = this;
   setTimeout(() => {
     input = doc.querySelectorAll('input').find(el => el.placeholder.startsWith('Play a more'));
+    scroller = doc.querySelectorAll('div').find(el => el.classList.contains('overflow-y-auto') && el.classList.contains('shrink-0'));
     input.addEventListener('keydown', e => { if (e.key.length === 1 && !e.ctrlKey) keys++; });
     input.addEventListener('input', () => inputEvents.push({ time: Date.now(), length: input.value.length }));
     ready = true; delays.enable();
@@ -55,7 +57,9 @@ process.on('message', message => {
   if (message.type === 'reset') { delays.reset(); frameTimes.length = 0; inputEvents = []; keys = 0; }
   if (message.type === 'report') process.send({ id: message.id, value: input.value, keys, inputEvents,
     frames: frameTimes.length, frameP50: quantile(frameTimes, .5), frameP95: quantile(frameTimes, .95),
-    frameMax: Math.max(0, ...frameTimes), delayP95: delays.percentile(95) / 1e6, delayMax: delays.max / 1e6 });
+    frameMax: Math.max(0, ...frameTimes), delayP95: delays.percentile(95) / 1e6, delayMax: delays.max / 1e6,
+    scrollTop: scroller.scrollTop, scrollHeight: scroller.scrollHeight,
+    scroller: scroller.getBoundingClientRect().toJSON(), composer: input.getBoundingClientRect().toJSON() });
   if (message.type === 'close') void close();
 });
 process.on('SIGTERM', () => { void close(); });

@@ -13,7 +13,7 @@ import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMe
 import { documentImage } from "./internal/raster-document.js";
 import { blocksWindowDrag, elementsFromPoint as hitTestElementsFromPoint, trackClickListener } from "./internal/dom-hit-testing.js";
 import { resolveTailwind, resolveTailwindSelection } from "./tailwind.js";
-import { decodeVideoFrame, getVideoAudioClock, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
+import { decodeVideoFrame, getVideoAudioClock, hasVideoAudio, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
 import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
 import { renderedText } from "./internal/nerd-icon.js";
@@ -951,6 +951,11 @@ function fixedInset(value, basis, fontSize, viewport) {
 function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 }) {
   const result = { ...style };
   delete result.boxSizing;
+  // Center fitting content, but keep an overflowing beginning reachable.
+  // Taffy owns the size-dependent fallback; the authored CSSOM stays intact.
+  for (const property of ["alignItems", "justifyContent"]) {
+    if (result[property] === "center") result[property] = "safe center";
+  }
   // A scroll container's automatic flex-item minimum is zero. Taffy keeps its
   // generic auto min-content size, so translate that CSS rule into the
   // corresponding layout constraint without changing the public CSSOM value.
@@ -1067,6 +1072,22 @@ function defaultElementStyle(name) {
 function markGeometryDirty(document) {
   document.geometryDirty = true;
   document.geometryGeneration = (document.geometryGeneration ?? 0) + 1;
+}
+
+function queueScrollEvent(element) {
+  const state = elementState(element);
+  if (state.scrollEventPending) return;
+  state.scrollEventPending = true;
+  setImmediate(() => {
+    state.scrollEventPending = false;
+    if (!documentState(element.document).closed) element.dispatchEvent(new Event("scroll"));
+  });
+}
+
+function updateVideoVolume(element) {
+  const video = elementState(element).video;
+  if (!video.paused && !hasVideoAudio(video.audioId)) element._startVideoAudio(video.currentTime);
+  else setVideoAudioVolume(video.audioId, element.muted ? 0 : video.volume, video.currentTime);
 }
 
 // Keep this in sync with the properties consumed by styleForTaffy() and
@@ -1480,16 +1501,7 @@ export class Element extends EventTarget {
       this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
     } else if (name === "hidden") this._styleChanged();
     if (name === "muted" && this.localName === "video") {
-      const video = elementState(this).video;
-      if (this.muted) {
-        video.audioGeneration++;
-        video.audioStartPending = false;
-        setVideoAudioVolume(video.audioId, 0, video.currentTime);
-        if (!video.paused && video.playbackClockStartedAt == null) {
-          video.playbackClockTime = video.currentTime;
-          video.playbackClockStartedAt = performance.now();
-        }
-      } else if (!video.paused) this._startVideoAudio(video.currentTime);
+      updateVideoVolume(this);
     }
     if (name === "src" && this.localName === "img") this._setImageSource(value === "" ? "" : this.src);
     else if (name === "src" && this.localName === "video") this._setVideoSource(value === "" ? "" : this.src);
@@ -1516,8 +1528,7 @@ export class Element extends EventTarget {
       this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
     } else if (name === "hidden") this._styleChanged();
     if (name === "muted" && this.localName === "video") {
-      const video = elementState(this).video;
-      if (!video.paused) this._startVideoAudio(video.currentTime);
+      updateVideoVolume(this);
     }
     if (name === "src" && this.localName === "img") {
       this._cancelImageRequest();
@@ -1560,12 +1571,7 @@ export class Element extends EventTarget {
     video.seekPending = true;
     if (!video.paused && video.source) {
       video.playbackClockStartedAt = null;
-      if (!this.muted && video.volume > 0) this._startVideoAudio(video.currentTime);
-      else {
-        video.audioStartPending = false;
-        video.playbackClockTime = video.currentTime;
-        video.playbackClockStartedAt = performance.now();
-      }
+      this._startVideoAudio(video.currentTime);
       this._startVideo();
     }
   }
@@ -1586,12 +1592,7 @@ export class Element extends EventTarget {
     video.paused = false;
     video.ended = false;
     video.playbackClockStartedAt = null;
-    if (!this.muted && video.volume > 0) this._startVideoAudio(video.currentTime);
-    else {
-      video.audioStartPending = false;
-      video.playbackClockTime = video.currentTime;
-      video.playbackClockStartedAt = performance.now();
-    }
+    this._startVideoAudio(video.currentTime);
     this._startVideo();
     this.dispatchEvent(new Event("play"));
     return video.frameRequest;
@@ -1614,13 +1615,13 @@ export class Element extends EventTarget {
 
   _startVideoAudio(time) {
     const video = elementState(this).video, view = this.document.defaultView;
-    if (view && video.source && !this.muted && video.volume > 0) {
-      const generation = startVideoAudio(video.audioId, video.source, time, video.volume, view.audioOutput);
+    if (view && video.source) {
+      const generation = startVideoAudio(video.audioId, video.source, time, this.muted ? 0 : video.volume, view.audioOutput);
       video.audioGeneration = generation;
-      video.audioStartPending = video.volume > 0;
+      video.audioStartPending = true;
       video.playbackClockStartedAt = null;
       video.audioStartPromise = waitForVideoAudioReady(video.audioId).then(ready => {
-        if (video.audioGeneration !== generation || video.paused || this.muted || video.volume <= 0) return;
+        if (video.audioGeneration !== generation || video.paused) return;
         if (ready) pauseVideoAudio(video.audioId, false);
         video.audioStartPending = false;
         video.playbackClockTime = time;
@@ -1732,7 +1733,7 @@ export class Element extends EventTarget {
           if (video.currentTime >= video.duration) {
             if (this.loop) {
               video.currentTime = 0;
-              if (!this.muted) this._startVideoAudio(0);
+              this._startVideoAudio(0);
             } else { video.paused = true; video.ended = true; stopVideoAudio(video.audioId); this.dispatchEvent(new Event("ended")); return; }
           } else video.currentTime += frameDuration;
           this._startVideo();
@@ -1753,12 +1754,11 @@ export class Element extends EventTarget {
   set volume(value) {
     if (this.localName !== "video") return;
     const video = elementState(this).video;
-    video.volume = Math.max(0, Math.min(1, Number(value) || 0));
-    if (!video.paused && !this.muted && video.volume > 0) this._startVideoAudio(video.currentTime);
-    else {
-      if (video.volume <= 0) { video.audioGeneration++; video.audioStartPending = false; }
-      setVideoAudioVolume(video.audioId, this.muted ? 0 : video.volume, video.currentTime);
-    }
+    const next = Math.max(0, Math.min(1, Number(value) || 0));
+    if (video.volume === next) return;
+    video.volume = next;
+    updateVideoVolume(this);
+    this.dispatchEvent(new Event("volumechange"));
   }
 
   get naturalWidth() {
@@ -1938,6 +1938,7 @@ export class Element extends EventTarget {
     if (next === state.scrollLeft) return;
     state.scrollLeft = next;
     markGeometryDirty(documentState(this.document));
+    queueScrollEvent(this);
   }
 
   get scrollTop() { return elementState(this).scrollTop; }
@@ -1947,6 +1948,7 @@ export class Element extends EventTarget {
     if (next === state.scrollTop) return;
     state.scrollTop = next;
     markGeometryDirty(documentState(this.document));
+    queueScrollEvent(this);
   }
 
   scrollBy(x = 0, y = 0) {

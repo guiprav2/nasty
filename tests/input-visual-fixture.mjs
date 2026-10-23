@@ -1,6 +1,5 @@
 import { renameSync, writeFileSync } from 'node:fs';
 import { Document, Window } from '../node/index.js';
-import { elementState } from '../node/internal/dom-state.js';
 
 const reportPath = process.env.NASTY_INPUT_TEST_REPORT;
 if (!reportPath) throw new Error('NASTY_INPUT_TEST_REPORT is required');
@@ -58,10 +57,7 @@ function rect(element) {
 function report() {
   const temporaryPath = `${reportPath}.next`;
   writeFileSync(temporaryPath, JSON.stringify({
-    input: { value: input.value, selectionStart: input.selectionStart, selectionEnd: input.selectionEnd, rect: rect(input),
-      editor: { renderCaretX: elementState(input).renderCaretX, renderTextOriginX: elementState(input).renderTextOriginX,
-        textOriginX: elementState(input).textAreaState?.textOriginX, caretX: elementState(input).textAreaState?.caretX,
-        selectionRects: elementState(input).textAreaState?.selectionRects } },
+    input: { value: input.value, selectionStart: input.selectionStart, selectionEnd: input.selectionEnd, rect: rect(input) },
     textarea: { value: textarea.value, selectionStart: textarea.selectionStart, selectionEnd: textarea.selectionEnd, rect: rect(textarea) },
     overflowTextarea: rect(overflowTextarea),
     chat: rect(chat),

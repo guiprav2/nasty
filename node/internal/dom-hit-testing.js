@@ -1,6 +1,6 @@
 import { documentBoxes, documentState } from './dom-state.js';
 import { createBoxProjector } from '../render.js';
-import { clipsOverflow } from './overflow.js';
+import { canScrollByUser, clipsOverflow } from './overflow.js';
 
 const clickListeners = new WeakMap();
 const DRAG_INTERACTIVE_CONTROLS = new Set(['input', 'textarea', 'button', 'select', 'option', 'optgroup', 'a', 'area', 'label', 'summary', 'audio', 'video']);
@@ -162,11 +162,13 @@ export function elementsFromPoint(document, x, y) {
   const viewport = state.defaultView?.size() ?? state.viewport;
   if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) return [];
   let cache = state.hitTestCache;
-  if (!cache || cache.geometryGeneration !== state.geometryGeneration || cache.paintGeneration !== state.paintGeneration) {
+  // Caret blink, selection, and input values repaint without changing any hit
+  // regions. Rebuild only when layout or the styled scene changes.
+  if (!cache || cache.geometryGeneration !== state.geometryGeneration || cache.sceneGeneration !== state.sceneGeneration) {
     const boxes = documentBoxes(document);
     cache = {
       geometryGeneration: state.geometryGeneration,
-      paintGeneration: state.paintGeneration,
+      sceneGeneration: state.sceneGeneration,
       boxes,
       byElement: new Map(boxes.map(box => [box.element, box])),
       project: createBoxProjector(boxes),
@@ -221,6 +223,7 @@ export function blocksWindowDrag(target) {
     break;
   }
   for (let element = target; element; element = element.parent) {
+    if (canScrollByUser(element, 'x') || canScrollByUser(element, 'y')) return true;
     if (hasClickListener(element)) return true;
     const name = element.localName;
     if (!DRAG_INTERACTIVE_CONTROLS.has(name)) {
