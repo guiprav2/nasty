@@ -22,6 +22,11 @@ export function renderedText(element) {
   return nerdIcon(element)?.glyph ?? '';
 }
 
+export function isPlaceholderText(element) {
+  return (element.localName === 'input' || element.localName === 'textarea')
+    && !element.value && Boolean(element.placeholder);
+}
+
 export function fontFamilyForElement(element, fallback) {
   return fallback;
 }

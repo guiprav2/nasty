@@ -2,8 +2,9 @@ import { fontsForRuns } from '../font-registry.js';
 import { documentBoxes, documentBoxesFor, documentState, elementState } from './dom-state.js';
 import { computedStyleValue } from './css-transitions.js';
 import { createBoxProjector, parseColor } from '../render.js';
-import { fontFamilyForElement, renderedText } from './nerd-icon.js';
+import { fontFamilyForElement, isPlaceholderText, renderedText } from './nerd-icon.js';
 import { measureText } from './text-metrics.js';
+import { clipsOverflow } from './overflow.js';
 
 const windows = new WeakMap();
 const lastSyncTimes = new WeakMap();
@@ -60,13 +61,19 @@ function ellipsizeText(element, text, width) {
   }
   return characters.slice(0, low).join('') + ellipsis;
 }
-function textClip(box, style, clip) {
+function textClip(box, clip) {
   let result = clip;
-  const overflow = [style.overflow, style.overflowX, style.overflowY]
-    .some((value) => value === 'hidden' || value === 'clip' || value === 'auto' || value === 'scroll');
-  if (!overflow) return result;
-  const rect = box.paddingBox;
-  const next = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+  const textControl = box.element.localName === 'input' || box.element.localName === 'textarea';
+  const clipX = textControl || clipsOverflow(box.element, 'x');
+  const clipY = textControl || clipsOverflow(box.element, 'y');
+  if (!clipX && !clipY) return result;
+  const rect = textControl ? box.contentBox : box.paddingBox;
+  const next = {
+    x: clipX ? rect.x : -1_000_000,
+    y: clipY ? rect.y : -1_000_000,
+    width: clipX ? rect.width : 2_000_000,
+    height: clipY ? rect.height : 2_000_000,
+  };
   if (!result) return next;
   const x = Math.max(result.x, next.x), y = Math.max(result.y, next.y);
   return { x, y, width: Math.max(0, Math.min(result.x + result.width, next.x + next.width) - x),
@@ -84,8 +91,7 @@ function textEntries(document, selectedElements = null) {
     let text = renderedText(element);
     if (!text || !bounds.width || !bounds.height) continue;
     const rgba = parseColor(inherited(element, 'color', '#000000')) ?? [0, 0, 0, 0];
-    const placeholder = (element.localName === 'input' || element.localName === 'textarea')
-      && !element.value && Boolean(element.placeholder);
+    const placeholder = isPlaceholderText(element);
     if (placeholder) rgba[3] *= 0.6;
     for (let current = element; current; current = current.parent) {
       const opacity = Number(current.style.opacity);
@@ -93,22 +99,31 @@ function textEntries(document, selectedElements = null) {
     }
     const color = '#' + rgba.map((v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0')).join('');
     const { fontSize, lineHeight } = fontMetrics(element);
-    const textOrigin = projectPoint(box, bounds.x, bounds.y);
+    const textState = element.localName === 'input' ? elementState(element) : null;
+    const textY = textState
+      ? bounds.y + (bounds.height - lineHeight) / 2
+      : bounds.y;
+    const textOrigin = projectPoint(box, textState?.renderTextOriginX ?? bounds.x, textY);
     const transformedWidth = bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
     if (![textOrigin.x, textOrigin.y, transformedWidth, fontSize, lineHeight].every(Number.isFinite)
         || transformedWidth < 0 || fontSize <= 0 || lineHeight <= 0) continue;
-    const whiteSpace = inherited(element, 'whiteSpace', 'normal');
-    if (whiteSpace === 'nowrap' && inherited(element, 'textOverflow', 'clip') === 'ellipsis') {
+    const whiteSpace = element.localName === 'input' ? 'nowrap' : inherited(element, 'whiteSpace', 'normal');
+    const explicitTextOverflow = element.style.textOverflow;
+    if (whiteSpace === 'nowrap' && (explicitTextOverflow === 'ellipsis'
+        || (placeholder && explicitTextOverflow === undefined))) {
       text = ellipsizeText(element, text, bounds.width);
     }
-    const run = { text, x: textOrigin.x, y: textOrigin.y, width: transformedWidth, fontSize,
+    // Canvas measurements are rounded to hundredths of a pixel. Let the
+    // shaper accept that same rounding tolerance at a line's right edge.
+    const run = { text, x: textOrigin.x, y: textOrigin.y, width: transformedWidth + 0.01, fontSize,
       lineHeight,
       fontFamily: fontFamilyForElement(element, inherited(element, 'fontFamily', 'sans-serif')),
       fontWeight: Math.max(100, Math.min(900, parseInt(inherited(element, 'fontWeight', 400), 10) || 400)),
       textAlign: inherited(element, 'textAlign', 'start'), color,
       wrap: whiteSpace !== 'nowrap',
-      breakWords: ['anywhere', 'break-word'].includes(inherited(element, 'overflowWrap', 'normal')) };
-    const visibleClip = textClip(box, element.style, clip);
+      breakWords: element.localName === 'textarea'
+        || ['anywhere', 'break-word'].includes(inherited(element, 'overflowWrap', 'normal')) };
+    const visibleClip = textClip(box, clip);
     if (visibleClip) Object.assign(run, { clipX: visibleClip.x, clipY: visibleClip.y, clipWidth: visibleClip.width, clipHeight: visibleClip.height });
     entries.push({ element, run });
   }
@@ -168,7 +183,6 @@ export function syncDocumentText(window, document, selectedElements = null) {
   const geometryGeneration = document ? documentState(document).geometryGeneration : -1;
   if (state.shape && state.paintRuns) {
     const entries = document ? textEntries(document, selectedElements) : [];
-    const allEntries = document && selectedElements ? textEntries(document) : entries;
     details.mode = selectedElements ? "selected-placement" : "full-document-placement";
     details.visibleRuns = entries.length;
     const previousRuns = state.paintRuns;
@@ -178,6 +192,7 @@ export function syncDocumentText(window, document, selectedElements = null) {
     const viewport = document ? documentState(document).viewport : { width: 0, height: 0 };
     const viewportChanged = state.shapeViewportWidth !== viewport.width || state.shapeViewportHeight !== viewport.height;
     let needsReshape = false;
+    const editableReshapes = [];
     for (const { element, run } of entries) {
       const index = state.elementIndices.get(element);
       if (index === undefined) {
@@ -187,28 +202,65 @@ export function syncDocumentText(window, document, selectedElements = null) {
       const shaped = runs[index];
       const contentChanged = !sameShape(shaped, run, true);
       const widthChanged = shaped.width !== run.width;
-      if (contentChanged || (widthChanged && viewportChanged)) needsReshape = true;
-      // Move the currently prepared glyphs with the layout while a replacement
-      // shape is pending. Keep its shaping fields until the new buffers are ready.
-      runs[index] = {
-        ...run,
-        text: shaped.text,
-        width: shaped.width,
-        fontSize: shaped.fontSize,
-        lineHeight: shaped.lineHeight,
-        fontFamily: shaped.fontFamily,
-        fontWeight: shaped.fontWeight,
-        wrap: shaped.wrap,
-        breakWords: shaped.breakWords,
-      };
+      const mustReshape = contentChanged || (widthChanged && (run.wrap || viewportChanged));
+      if (mustReshape) {
+        // Typing in input/textarea only changes that run. Reshape it in place so
+        // a keystroke cannot enqueue a full-document text worker job and stall
+        // the event loop while the rest of the UI glyphs stay unchanged.
+        if (element.localName === "input" || element.localName === "textarea") {
+          editableReshapes.push({ index, run });
+          runs[index] = run;
+        } else {
+          needsReshape = true;
+          runs[index] = {
+            ...run,
+            text: shaped.text,
+            width: shaped.width,
+            fontSize: shaped.fontSize,
+            lineHeight: shaped.lineHeight,
+            fontFamily: shaped.fontFamily,
+            fontWeight: shaped.fontWeight,
+            wrap: shaped.wrap,
+            breakWords: shaped.breakWords,
+          };
+        }
+      } else {
+        // Move the currently prepared glyphs with the layout while a replacement
+        // shape is pending. Keep its shaping fields until the new buffers are ready.
+        runs[index] = {
+          ...run,
+          text: shaped.text,
+          width: shaped.width,
+          fontSize: shaped.fontSize,
+          lineHeight: shaped.lineHeight,
+          fontFamily: shaped.fontFamily,
+          fontWeight: shaped.fontWeight,
+          wrap: shaped.wrap,
+          breakWords: shaped.breakWords,
+        };
+      }
       activeIndices.add(index);
       parked.delete(index);
     }
-    for (let index = 0; index < runs.length; index++) {
-      if (!activeIndices.has(index) && !parked.has(index)) {
-        runs[index] = parkRun(runs[index]);
-        parked.add(index);
+    // selectedElements is a visible subset. Do not park runs that were merely
+    // outside this present's element filter.
+    if (!selectedElements) {
+      for (let index = 0; index < runs.length; index++) {
+        if (!activeIndices.has(index) && !parked.has(index)) {
+          runs[index] = parkRun(runs[index]);
+          parked.add(index);
+        }
       }
+    }
+    if (editableReshapes.length) {
+      details.mode = "editable-reshape";
+      details.reshaped = true;
+      for (const { index, run } of editableReshapes) {
+        const nextRuns = runs.slice();
+        nextRuns[index] = run;
+        window.setTextRunsNow(nextRuns, fontsForRuns([run]), index);
+      }
+      state.shape = textShape(runs);
     }
     const changed = runs.flatMap((run, index) => placementChanged(previousRuns[index], run) ? [index] : []);
     details.changedRuns = changed.length;
@@ -217,6 +269,7 @@ export function syncDocumentText(window, document, selectedElements = null) {
     state.parked = parked;
     state.shapeGeneration = geometryGeneration;
     if (needsReshape && !state.pending) {
+      const allEntries = document && selectedElements ? textEntries(document) : entries;
       const shape = textShape(allEntries.map(({ run }) => run));
       if (shape !== state.shape) {
         const preparedRuns = prewarmRuns(allEntries.map(({ run }) => run), document);

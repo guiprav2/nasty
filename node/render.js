@@ -1,9 +1,10 @@
-import { elementState } from "./internal/dom-state.js";
-import { computedStyleValue } from "./internal/css-transitions.js";
+import { documentState, elementState } from "./internal/dom-state.js";
+import { computedStyleValue, hasActiveStyleTransition } from "./internal/css-transitions.js";
 import { canvasCommands, canvasSurface } from "./canvas-2d.js";
 
 const SIDES = ["Top", "Right", "Bottom", "Left"];
 const transformedListElements = new WeakMap();
+const transformedScenes = new WeakMap();
 
 export function displayListElements(list) {
   return transformedListElements.get(list) ?? null;
@@ -398,16 +399,29 @@ function clipPolygon(polygon, rect) {
   return polygon;
 }
 
+const convexClipData = new WeakMap();
 function clipConvexPolygon(polygon, clip) {
   if (!clip?.length || polygon.length < 3) return polygon;
-  const area = clip.reduce((sum, point, index) => {
-    const next = clip[(index + 1) % clip.length];
-    return sum + point.x * next.y - next.x * point.y;
-  }, 0);
-  const orientation = area >= 0 ? 1 : -1;
-  for (let edge = 0; edge < clip.length; edge++) {
-    const a = clip[edge], b = clip[(edge + 1) % clip.length];
-    const distance = point => orientation * ((b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x));
+  let data = convexClipData.get(clip);
+  if (!data) {
+    const area = clip.reduce((sum, point, index) => {
+      const next = clip[(index + 1) % clip.length];
+      return sum + point.x * next.y - next.x * point.y;
+    }, 0);
+    const orientation = area >= 0 ? 1 : -1;
+    data = clip.map((a, index) => {
+      const b = clip[(index + 1) % clip.length];
+      const dx = -(b.y - a.y) * orientation, dy = (b.x - a.x) * orientation;
+      return { dx, dy, offset: -dx * a.x - dy * a.y };
+    });
+    convexClipData.set(clip, data);
+  }
+  // Most content is fully inside its ancestors' rounded clips. Retain the
+  // original polygon for each satisfied half-plane instead of allocating and
+  // copying every vertex for every edge of every ancestor.
+  for (const { dx, dy, offset } of data) {
+    const distance = point => dx * point.x + dy * point.y + offset;
+    if (polygon.every(point => distance(point) >= -1e-5)) continue;
     const input = polygon;
     polygon = [];
     if (!input.length) break;
@@ -539,24 +553,32 @@ function roundedRectPolygon(rect, radius) {
 
 // Display-list v3 stores screen-space triangles. JS performs the small per-box
 // CSS matrix/projection work; Rust only expands records and submits GPU geometry.
-export function buildTransformedDisplayList(boxes, width, height) {
-  const values = [5, 0];
+export function buildTransformedDisplayList(boxes, width, height, overlays = []) {
+  const document = boxes[0]?.element.ownerDocument;
+  const generation = document ? documentState(document).sceneGeneration ?? 0 : 0;
+  const cacheable = !!document && !boxes.some(box => box.element.localName === 'canvas'
+    || hasActiveStyleTransition(box.element.style));
+  const cached = cacheable && transformedScenes.get(boxes);
+  if (cached && cached.generation === generation && cached.width === width && cached.height === height) {
+    return cached.compose(overlays);
+  }
+  let values = [5, 0];
   let commandCount = 0;
   const viewport = { x: 0, y: 0, width, height };
   const projectPoint = createBoxProjector(boxes);
   const boxesByElement = new Map(boxes.map((box) => [box.element, box]));
   const clipCache = new Map();
+  const ancestorClips = new Map();
   const clipsFor = (box) => {
     const cached = clipCache.get(box.element);
     if (cached) return cached;
-    const regions = [
-      { x: 0, y: 0 }, { x: width, y: 0 }, { x: width, y: height }, { x: 0, y: height },
-    ];
+    const regions = [];
     for (let ancestor = box.element.parentElement ?? box.element.parent; ancestor; ancestor = ancestor.parentElement ?? ancestor.parent) {
       const ancestorStyle = ancestor.style;
       const clipsOverflow = [ancestorStyle.overflow, ancestorStyle.overflowX, ancestorStyle.overflowY]
         .some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll");
       if (!clipsOverflow) continue;
+      if (ancestorClips.has(ancestor)) { regions.push(ancestorClips.get(ancestor)); continue; }
       const ancestorBox = boxesByElement.get(ancestor);
       if (!ancestorBox) continue;
       const rect = ancestorBox.paddingBox ?? ancestorBox.borderBox;
@@ -569,7 +591,10 @@ export function buildTransformedDisplayList(boxes, width, height) {
         const projected = projectPoint(ancestorBox, point.x, point.y);
         return { x: projected.x, y: projected.y };
       });
-      if (polygon.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))) regions.push(polygon);
+      if (polygon.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))) {
+        ancestorClips.set(ancestor, polygon);
+        regions.push(polygon);
+      }
     }
     clipCache.set(box.element, regions);
     return regions;
@@ -868,7 +893,39 @@ export function buildTransformedDisplayList(boxes, width, height) {
     }
   }
   values[1] = commandCount;
-  const displayList = Buffer.from(new Float32Array(values).buffer);
+  const scene = new Float32Array(values);
+  const compose = overlays => {
+  values = [5, 0];
+  commandCount = 0;
+  for (const overlay of overlays) {
+    const box = boxesByElement.get(overlay.element);
+    if (!box) continue;
+    const project = (x, y) => {
+      const point = projectPoint(box, box.x + x, box.y + y);
+      return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
+    };
+    const clipRegions = clipsFor(box).slice();
+    if (overlay.element.localName === 'input' || overlay.element.localName === 'textarea') {
+      const rect = box.contentBox;
+      const contentClip = [
+        [rect.x, rect.y], [rect.x + rect.width, rect.y],
+        [rect.x + rect.width, rect.y + rect.height], [rect.x, rect.y + rect.height],
+      ].map(([x, y]) => {
+        const point = projectPoint(box, x, y);
+        return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
+      });
+      if (contentClip.every(Boolean)) clipRegions.push(contentClip);
+    }
+    push(box, overlay.rect, overlay.color, project, 0, clipRegions);
+  }
+  const combined = new Float32Array(scene.length + values.length - 2);
+  combined.set(scene);
+  combined.set(values.slice(2), scene.length);
+  combined[1] += commandCount;
+  const displayList = Buffer.from(combined.buffer);
   transformedListElements.set(displayList, visibleElements);
   return displayList;
+  };
+  if (cacheable) transformedScenes.set(boxes, { generation, width, height, compose });
+  return compose(overlays);
 }

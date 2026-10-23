@@ -136,10 +136,15 @@ function utilityStyle(utility) {
     grow: ["flexGrow", 1], shrink: ["flexShrink", 1], static: ["position", "static"], relative: ["position", "relative"], absolute: ["position", "absolute"], fixed: ["position", "fixed"],
     "items-start": ["alignItems", "flex-start"], "items-end": ["alignItems", "flex-end"], "items-center": ["alignItems", "center"], "items-stretch": ["alignItems", "stretch"],
     "justify-start": ["justifyContent", "flex-start"], "justify-end": ["justifyContent", "flex-end"], "justify-center": ["justifyContent", "center"], "justify-between": ["justifyContent", "space-between"], "justify-around": ["justifyContent", "space-around"], "justify-evenly": ["justifyContent", "space-evenly"],
+    "origin-center": ["transformOrigin", "50% 50%"], "origin-top": ["transformOrigin", "50% 0%"], "origin-top-right": ["transformOrigin", "100% 0%"],
+    "origin-right": ["transformOrigin", "100% 50%"], "origin-bottom-right": ["transformOrigin", "100% 100%"], "origin-bottom": ["transformOrigin", "50% 100%"],
+    "origin-bottom-left": ["transformOrigin", "0% 100%"], "origin-left": ["transformOrigin", "0% 50%"], "origin-top-left": ["transformOrigin", "0% 0%"],
     "content-center": ["alignContent", "center"], "whitespace-nowrap": ["whiteSpace", "nowrap"],
     truncate: [["overflow", "hidden"], ["textOverflow", "ellipsis"], ["whiteSpace", "nowrap"]],
     "text-left": ["textAlign", "left"], "text-center": ["textAlign", "center"], "text-right": ["textAlign", "right"],
     "overflow-hidden": ["overflow", "hidden"], "overflow-auto": ["overflow", "auto"], "overflow-scroll": ["overflow", "scroll"], "overflow-visible": ["overflow", "visible"],
+    "overflow-x-hidden": ["overflowX", "hidden"], "overflow-x-auto": ["overflowX", "auto"], "overflow-x-scroll": ["overflowX", "scroll"], "overflow-x-visible": ["overflowX", "visible"],
+    "overflow-y-hidden": ["overflowY", "hidden"], "overflow-y-auto": ["overflowY", "auto"], "overflow-y-scroll": ["overflowY", "scroll"], "overflow-y-visible": ["overflowY", "visible"],
     "object-cover": ["objectFit", "cover"], "object-contain": ["objectFit", "contain"], "object-fill": ["objectFit", "fill"],
     "object-center": ["objectPosition", "50% 50%"], "object-bottom": ["objectPosition", "50% 100%"],
     "object-top": ["objectPosition", "50% 0%"], "object-left": ["objectPosition", "0% 50%"],
@@ -228,7 +233,13 @@ function utilityStyle(utility) {
       return ["lineHeight", spacing(value)];
     }
     if (prefix === "font" && /^\d+$/.test(value)) return ["fontWeight", Number(value)];
-    if (prefix === "font") return ({ thin: ["fontWeight", 100], extralight: ["fontWeight", 200], light: ["fontWeight", 300], normal: ["fontWeight", 400], medium: ["fontWeight", 500], semibold: ["fontWeight", 600], bold: ["fontWeight", 700], extrabold: ["fontWeight", 800], black: ["fontWeight", 900] })[value] ?? null;
+    if (prefix === "font") {
+      if (value.startsWith("[") && value.endsWith("]")) {
+        const family = value.slice(1, -1).replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_").trim();
+        return family ? ["fontFamily", family] : null;
+      }
+      return ({ thin: ["fontWeight", 100], extralight: ["fontWeight", 200], light: ["fontWeight", 300], normal: ["fontWeight", 400], medium: ["fontWeight", 500], semibold: ["fontWeight", 600], bold: ["fontWeight", 700], extrabold: ["fontWeight", 800], black: ["fontWeight", 900] })[value] ?? null;
+    }
   }
   return null;
 }

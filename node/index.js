@@ -17,6 +17,7 @@ import { decodeVideoFrame, getVideoAudioClock, pauseVideoAudio, setVideoAudioVol
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
 import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
 import { renderedText } from "./internal/nerd-icon.js";
+import { canScroll, canScrollByUser, clipsOverflow, overflowMode } from "./internal/overflow.js";
 
 export const VideoDecoder = native.VideoDecoder;
 export const AudioDecoder = native.AudioDecoder;
@@ -303,6 +304,10 @@ export class Window extends native.Window {
     return this.#eventTarget.dispatchEvent(event);
   }
 
+  #flushNativeEvents() {
+    for (const event of this.drainEvents()) this.#routeNativeEvent(event);
+  }
+
   #startEventPolling() {
     if (this.#eventTimer !== null || super.closed) return;
     const poll = () => {
@@ -312,13 +317,14 @@ export class Window extends native.Window {
         return;
       }
       try {
-        for (const event of this.drainEvents()) this.#routeNativeEvent(event);
+        this.#flushNativeEvents();
       } catch (error) {
         if (!super.closed) console.error("Nasty window event polling failed:", error);
       }
       if (!super.closed) {
-        const rate = this.refreshRate();
-        this.#eventTimer = setTimeout(poll, rate > 0 ? 1000 / rate : 1000 / 60);
+        // Keep OS key delivery ahead of presentation so a slow frame cannot
+        // starve the winit/egui input queue.
+        this.#eventTimer = setTimeout(poll, 4);
         this.#eventTimer.unref?.();
       } else this.#notifyClosed();
     };
@@ -484,8 +490,17 @@ export class Window extends native.Window {
         const value = renderedInputValue(element, next.displayText ?? next.value);
         const characters = Array.from(value);
         const caretIndex = Math.min(next.caretIndex, characters.length);
-        const totalWidth = measureText(element, value);
-        const caretOffset = measureText(element, characters.slice(0, caretIndex).join(""));
+        const boundaries = controls[index].glyphBoundaries?.length
+          && renderedInputValue(element, controls[index].value) === value
+          ? controls[index].glyphBoundaries
+          : measureTextBoundaries(element, value);
+        const totalWidth = next.renderedGeometry && Number.isFinite(next.textWidth)
+          ? next.textWidth : boundaries.at(-1) ?? 0;
+        const previousTextOriginX = next.renderedGeometry ? next.renderTextOriginX
+          : previousRenderTextOriginX ?? controls[index].x;
+        const caretOffset = next.renderedGeometry
+          ? Math.max(0, next.caretX - previousTextOriginX)
+          : boundaries[caretIndex] ?? totalWidth;
         const availableWidth = Math.max(0, controls[index].width);
         const caretWidth = 1.5;
         const caretViewportWidth = Math.max(0, availableWidth - caretWidth);
@@ -496,7 +511,8 @@ export class Window extends native.Window {
           : previousScroll;
         scroll = Math.max(0, Math.min(maxScroll, scroll));
         if (next.focused) {
-          if (caretOffset < scroll) scroll = caretOffset;
+          const previousGlyphStart = boundaries[Math.max(0, caretIndex - 1)] ?? 0;
+          if (caretOffset < scroll && previousGlyphStart < scroll) scroll = previousGlyphStart;
           else if (caretOffset > scroll + caretViewportWidth) scroll = caretOffset - caretViewportWidth;
         }
         scroll = Math.max(0, Math.min(maxScroll, scroll));
@@ -506,13 +522,33 @@ export class Window extends native.Window {
           controls[index].x + Math.max(0, availableWidth - caretWidth),
           elementStateValue.renderTextOriginX + caretOffset,
         );
+        if (next.selectionEnd > next.selectionStart) {
+          const shift = elementStateValue.renderTextOriginX - previousTextOriginX;
+          elementStateValue.renderSelectionRects = next.renderedGeometry && next.selectionRects.length
+            ? next.selectionRects.map(rect => ({ ...rect, x: rect.x + shift }))
+            : [{
+              x: elementStateValue.renderTextOriginX + (boundaries[next.selectionStart] ?? 0),
+              y: next.caretY,
+              width: Math.max(0, (boundaries[next.selectionEnd] ?? totalWidth) - (boundaries[next.selectionStart] ?? 0)),
+              height: next.caretHeight,
+            }];
+        } else {
+          elementStateValue.renderSelectionRects = [];
+        }
       } else {
         elementStateValue.renderTextOriginX = null;
         elementStateValue.renderCaretX = null;
+        elementStateValue.renderSelectionRects = next.selectionRects;
       }
       if (element.value !== next.value) {
         element.value = next.value;
         element.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      if (elementStateValue.textControlSync) {
+        elementStateValue.textControlSync = {
+          ...elementStateValue.textControlSync,
+          value: element.value,
+        };
       }
       elementStateValue.selectionStart = next.selectionStart;
       elementStateValue.selectionEnd = next.selectionEnd;
@@ -555,20 +591,32 @@ export class Window extends native.Window {
         id = `dom-text-control-${this.#nextTextControlId++}`;
         this.#textControlIds.set(element, id);
       }
-      const metrics = textMetrics(element).style;
+      const focused = document.activeElement === element;
       const x = box.contentBox.x, y = box.contentBox.y;
+      const width = box.contentBox.width, height = box.contentBox.height;
       const state = elementState(element);
+      const previous = state.textControlSync;
+      // Unfocused idle fields do not need an egui pass every frame. Revisit them
+      // when value or content-box geometry changes.
+      if (!focused && previous
+        && previous.value === element.value
+        && previous.x === x && previous.y === y
+        && previous.width === width && previous.height === height) {
+        continue;
+      }
+      const metrics = textMetrics(element).style;
       options.push({
         id, element, value: element.value, x, y,
-        width: box.contentBox.width, height: box.contentBox.height,
+        width, height,
         fontSize: metrics.size, lineHeight: metrics.line,
         multiline: element.localName === "textarea",
-        focus: document.activeElement === element,
+        focus: focused,
         ...(element.localName === "input" && {
           glyphBoundaries: measureTextBoundaries(element, renderedInputValue(element, element.value)),
           renderTextOriginX: x - (state.renderScrollLeft ?? 0),
         }),
       });
+      state.textControlSync = { value: element.value, x, y, width, height };
     }
     if (options.length) this.#updateTextAreas(options, false);
   }
@@ -625,6 +673,11 @@ export class Window extends native.Window {
   }
   presentDocument() {
     this._syncDragHitTest();
+    try {
+      this.#flushNativeEvents();
+    } catch (error) {
+      if (!super.closed) console.error("Nasty window event polling failed:", error);
+    }
     this.#syncDocumentTextControls();
     const isRendered = element => {
       for (let current = element; current; current = current.parentElement) {
@@ -635,33 +688,42 @@ export class Window extends native.Window {
     const visibleElements = this.#document
       ? [this.#document.body, ...this.#document.querySelectorAll("*")].filter(isRendered)
       : [];
+    let result;
     if (visibleElements.some(element =>
       element.localName === "video" || (element.style.transform && element.style.transform !== "none"))) {
       const size = this.size();
-      return this.presentTransformed(buildTransformedDisplayList(documentBoxes(this.#document), size.width, size.height));
-    }
-    const frame = documentImage(this, this.#document);
-    const size = this.size();
-    const decorations = inputDecorationQuads(this.#document, size.width, size.height);
-    if (decorations.length) {
-      if (frame.ordered) {
-        const result = super.presentOrdered(appendOrderedQuads(frame.list, decorations), frame.triangles, frame.circles, frame.beziers, frame.canvasOperations);
-        this._syncDragHitTest();
-        return result;
+      const boxes = documentBoxes(this.#document);
+      const overlays = inputDecorationOverlays(this.#document);
+      result = this.presentTransformed(buildTransformedDisplayList(boxes, size.width, size.height, overlays));
+    } else {
+      const frame = documentImage(this, this.#document);
+      const size = this.size();
+      const decorations = inputDecorationQuads(this.#document, size.width, size.height);
+      if (decorations.length) {
+        if (frame.ordered) {
+          result = super.presentOrdered(appendOrderedQuads(frame.list, decorations), frame.triangles, frame.circles, frame.beziers, frame.canvasOperations);
+        } else {
+          const records = [2, frame.images.length];
+          for (const image of frame.images) {
+            records.push(1, image.textureId, image.x, image.y, image.width, image.height,
+              image.clipX ?? 0, image.clipY ?? 0, image.clipWidth ?? image.width, image.clipHeight ?? image.height);
+          }
+          result = super.presentOrdered(appendOrderedQuads(Buffer.from(new Float32Array(records).buffer), decorations));
+        }
+      } else {
+        result = frame.ordered
+          ? super.presentOrdered(frame.list, frame.triangles, frame.circles, frame.beziers, frame.canvasOperations)
+          : super.presentWithImages(frame.list, frame.images);
       }
-      const records = [2, frame.images.length];
-      for (const image of frame.images) {
-        records.push(1, image.textureId, image.x, image.y, image.width, image.height,
-          image.clipX ?? 0, image.clipY ?? 0, image.clipWidth ?? image.width, image.clipHeight ?? image.height);
-      }
-      const result = super.presentOrdered(appendOrderedQuads(Buffer.from(new Float32Array(records).buffer), decorations));
-      this._syncDragHitTest();
-      return result;
     }
-    const result = frame.ordered
-      ? super.presentOrdered(frame.list, frame.triangles, frame.circles, frame.beziers, frame.canvasOperations)
-      : super.presentWithImages(frame.list, frame.images);
     this._syncDragHitTest();
+    // Native present pumps OS events into the queue; route them before the next
+    // timer tick so rapid typing is not gated on refresh-rate polling alone.
+    try {
+      this.#flushNativeEvents();
+    } catch (error) {
+      if (!super.closed) console.error("Nasty window event polling failed:", error);
+    }
     return result;
   }
 
@@ -791,12 +853,37 @@ function inputDecorationQuads(document, width, height) {
         width: Math.max(0, Math.min(box.clip.x + box.clip.width, box.contentBox.x + box.contentBox.width) - Math.max(box.clip.x, box.contentBox.x)),
         height: Math.max(0, Math.min(box.clip.y + box.clip.height, box.contentBox.y + box.contentBox.height) - Math.max(box.clip.y, box.contentBox.y)) }
       : box.contentBox;
+    const selectionColor = parseColor(state.selectionStyle?.backgroundColor ?? "rgba(59, 130, 246, 0.42)");
+    for (const rect of state.renderSelectionRects ?? editor.selectionRects ?? []) push(rect, selectionColor, clip);
     if (Math.floor(performance.now() / 500) % 2 === 0) {
-      const caretColor = parseColor(element.style.caretColor ?? "#22c55e");
+      const caretColor = parseColor(element.style.caretColor ?? "#ffffff");
       push({ x: state.renderCaretX ?? editor.caretX, y: editor.caretY, width: Math.max(1, box.contentBox.width > 0 ? 1.5 : 1), height: editor.caretHeight }, caretColor, clip);
     }
   }
   return values;
+}
+
+function inputDecorationOverlays(document) {
+  const overlays = [];
+  for (const element of documentState(document).elements) {
+    if (element.localName !== "input" && element.localName !== "textarea") continue;
+    const state = elementState(element), editor = state.textAreaState;
+    if (!editor?.focused) continue;
+    const selectionColor = parseColor(state.selectionStyle?.backgroundColor ?? "rgba(59, 130, 246, 0.42)");
+    for (const rect of state.renderSelectionRects ?? editor.selectionRects ?? []) {
+      overlays.push({ element, color: selectionColor, rect });
+    }
+    if (Math.floor(performance.now() / 500) % 2 === 0) {
+      const color = parseColor(element.style.caretColor ?? "#ffffff");
+      if (color) overlays.push({ element, color, rect: {
+        x: state.renderCaretX ?? editor.caretX,
+        y: editor.caretY,
+        width: 1.5,
+        height: editor.caretHeight,
+      } });
+    }
+  }
+  return overlays;
 }
 
 function appendOrderedQuads(list, quads) {
@@ -864,6 +951,13 @@ function fixedInset(value, basis, fontSize, viewport) {
 function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 }) {
   const result = { ...style };
   delete result.boxSizing;
+  // A scroll container's automatic flex-item minimum is zero. Taffy keeps its
+  // generic auto min-content size, so translate that CSS rule into the
+  // corresponding layout constraint without changing the public CSSOM value.
+  const overflowX = overflowMode({ style: result }, "x");
+  const overflowY = overflowMode({ style: result }, "y");
+  if (result.minWidth === undefined && ["hidden", "auto", "scroll"].includes(overflowX)) result.minWidth = 0;
+  if (result.minHeight === undefined && ["hidden", "auto", "scroll"].includes(overflowY)) result.minHeight = 0;
   if (result.position === "static") {
     for (const name of ["top", "right", "bottom", "left", "topPercent", "rightPercent", "bottomPercent", "leftPercent"]) delete result[name];
   }
@@ -871,7 +965,7 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
     const ratio = /^\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*$/.exec(result.aspectRatio);
     result.aspectRatio = ratio ? Number(ratio[1]) / Number(ratio[2]) : undefined;
   }
-  for (const name of ["width", "height"]) {
+  for (const name of ["width", "height", "minWidth", "minHeight", "maxWidth", "maxHeight"]) {
     if (typeof result[name] === "string" && result[name].endsWith("%")) {
       result[`${name}Percent`] = parseFloat(result[name]) / 100;
       delete result[name];
@@ -962,7 +1056,7 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
 function defaultElementStyle(name) {
   const reset = { display: "block", padding: 0, margin: 0, borderWidth: 0, borderStyle: "none", backgroundColor: "transparent" };
   if (name === "input") {
-    return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "center", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" };
+    return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "center", overflow: "hidden", whiteSpace: "nowrap" };
   }
   if (name === "textarea") {
     return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "start", overflow: "hidden", whiteSpace: "pre-wrap" };
@@ -1166,7 +1260,10 @@ export class Element extends EventTarget {
     if (state.inputValue === next) return;
     state.inputValue = next;
     state.selectionStart = state.selectionEnd = Math.min(state.selectionStart, next.length);
-    this._styleChanged();
+    state.textControlSync = null;
+    // Editing a value changes text paint, not the control's intrinsic size.
+    // Its layout measurement is a zero-width line independent of its value.
+    this._styleChanged("value");
   }
   get type() { return this.localName === "input" || this.localName === "button" ? (this.getAttribute("type") || (this.localName === "input" ? "text" : "submit")) : undefined; }
   set type(value) { if (this.localName === "input" || this.localName === "button") this.setAttribute("type", value); }
@@ -1756,11 +1853,13 @@ export class Element extends EventTarget {
 
   _styleChanged(property, inheritedFontChanged = false) {
     const doc = documentState(this.document);
+    if (property !== "value") doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
     doc.paintDirtyElements ??= new Set();
     doc.paintDirtyElements.add(this);
     if (this === this.document.body) doc.defaultView?._syncBodyWindowAppearance();
     if (property !== undefined && !LAYOUT_STYLE_PROPERTIES.has(property)) return;
+    doc.textMetricsDirty = true;
     doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
     if (inheritedFontChanged) {
       const refreshDescendants = element => {
@@ -1778,6 +1877,7 @@ export class Element extends EventTarget {
 
   _scheduleTransitionFrame(property) {
     const doc = documentState(this.document);
+    doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
     doc.paintDirtyElements ??= new Set();
     doc.paintDirtyElements.add(this);
@@ -1974,6 +2074,8 @@ export class Document extends EventTarget {
 
   #prepareText() {
     const doc = documentState(this);
+    if (doc.textMetricsDirty === false) return;
+    doc.textMetricsDirty = false;
     for (const element of doc.elements) {
       const state = elementState(element);
       const isTextControl = element.localName === "input" || element.localName === "textarea";
@@ -2077,6 +2179,9 @@ export class Document extends EventTarget {
         if (timings) timings.assembly = 0;
         return cached.boxes;
       }
+      const boxes = this.#boxes(timings).filter(box => selectedElements.has(box.element));
+      state.renderBoxCache.set(selectedElements, { generation: state.geometryGeneration, boxes });
+      return boxes;
     }
     if (!selectedElements && !state.geometryDirty && state.boxesSnapshot) {
       if (timings) timings.assembly = 0;
@@ -2154,18 +2259,23 @@ export class Document extends EventTarget {
       for (let parent = box.element.parent; parent; parent = parent.parent) {
         if (box.fixedRoot && parent === box.fixedRoot.parent) break;
         const parentBox = byElement.get(parent);
-        if (parent.style.overflow === "hidden" || parent.style.overflow === "auto" || parent.style.overflow === "scroll") {
-          x -= parent.scrollLeft;
-          y -= parent.scrollTop;
-          let clipX = parentBox.paddingBox.x;
-          let clipY = parentBox.paddingBox.y;
+        const clipX = clipsOverflow(parent, 'x'), clipY = clipsOverflow(parent, 'y');
+        const scrollX = canScroll(parent, 'x'), scrollY = canScroll(parent, 'y');
+        if (scrollX) x -= parent.scrollLeft;
+        if (scrollY) y -= parent.scrollTop;
+        if ((clipX || clipY) && parentBox) {
+          let clipLeft = parentBox.paddingBox.x;
+          let clipTop = parentBox.paddingBox.y;
           for (let ancestor = parent.parent; ancestor; ancestor = ancestor.parent) {
-            if (ancestor.style.overflow === "hidden" || ancestor.style.overflow === "auto" || ancestor.style.overflow === "scroll") {
-              clipX -= ancestor.scrollLeft;
-              clipY -= ancestor.scrollTop;
-            }
+            if (canScroll(ancestor, 'x')) clipLeft -= ancestor.scrollLeft;
+            if (canScroll(ancestor, 'y')) clipTop -= ancestor.scrollTop;
           }
-          const next = { ...parentBox.paddingBox, x: clipX, y: clipY };
+          const next = {
+            x: clipX ? clipLeft : 0,
+            y: clipY ? clipTop : 0,
+            width: clipX ? parentBox.paddingBox.width : state.viewport.width,
+            height: clipY ? parentBox.paddingBox.height : state.viewport.height,
+          };
           clip = clip ? intersect(clip, next) : next;
         }
       }
@@ -2195,13 +2305,15 @@ export class Document extends EventTarget {
     const boxes = documentBoxes(this);
     for (let i = boxes.length - 1; i >= 0; i--) {
       const box = boxes[i];
-      const overflow = box.element.style.overflow;
-      if (overflow !== "auto" && overflow !== "scroll") continue;
+      const scrollX = canScrollByUser(box.element, 'x');
+      const scrollY = canScrollByUser(box.element, 'y');
+      if ((!scrollX || !deltaX) && (!scrollY || !deltaY)) continue;
       if (x < box.x || y < box.y || x >= box.x + box.width || y >= box.y + box.height) continue;
+      if (box.clip && (x < box.clip.x || y < box.clip.y || x >= box.clip.x + box.clip.width || y >= box.clip.y + box.clip.height)) continue;
       const maxX = Math.max(0, box.scrollWidth - box.paddingBox.width);
       const maxY = Math.max(0, box.scrollHeight - box.paddingBox.height);
-      const nextX = Math.max(0, Math.min(maxX, box.element.scrollLeft + deltaX));
-      const nextY = Math.max(0, Math.min(maxY, box.element.scrollTop + deltaY));
+      const nextX = scrollX ? Math.max(0, Math.min(maxX, box.element.scrollLeft + deltaX)) : box.element.scrollLeft;
+      const nextY = scrollY ? Math.max(0, Math.min(maxY, box.element.scrollTop + deltaY)) : box.element.scrollTop;
       if (nextX === box.element.scrollLeft && nextY === box.element.scrollTop) continue;
       box.element.scrollLeft = nextX;
       box.element.scrollTop = nextY;

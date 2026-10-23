@@ -1,4 +1,5 @@
 *.mp4
+.codex-checks/
 /native/
 /node/examples/*.svg
 /node/native/

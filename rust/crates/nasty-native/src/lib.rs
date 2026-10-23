@@ -56,6 +56,10 @@ pub struct LayoutStyle {
     pub min_height: Option<f64>,
     pub max_width: Option<f64>,
     pub max_height: Option<f64>,
+    pub min_width_percent: Option<f64>,
+    pub min_height_percent: Option<f64>,
+    pub max_width_percent: Option<f64>,
+    pub max_height_percent: Option<f64>,
     pub flex_wrap: Option<String>,
     pub padding: Option<f64>,
     pub padding_top: Option<f64>,
@@ -216,18 +220,21 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
             *target = Dimension::percent(finite_nonnegative(percent, name)?);
         }
     }
-    if let Some(value) = input.min_width {
-        style.min_size.width = LengthPercentageAuto::length(finite_nonnegative(value, "minWidth")?);
-    }
-    if let Some(value) = input.min_height {
-        style.min_size.height =
-            LengthPercentageAuto::length(finite_nonnegative(value, "minHeight")?);
-    }
-    if let Some(value) = input.max_width {
-        style.max_size.width = LengthPercentageAuto::length(finite_nonnegative(value, "maxWidth")?);
-    }
-    if let Some(value) = input.max_height {
-        style.max_size.height = LengthPercentageAuto::length(finite_nonnegative(value, "maxHeight")?);
+    for (name, px, percent, target) in [
+        ("minWidth", input.min_width, input.min_width_percent, &mut style.min_size.width),
+        ("minHeight", input.min_height, input.min_height_percent, &mut style.min_size.height),
+        ("maxWidth", input.max_width, input.max_width_percent, &mut style.max_size.width),
+        ("maxHeight", input.max_height, input.max_height_percent, &mut style.max_size.height),
+    ] {
+        if px.is_some() && percent.is_some() {
+            return Err(Error::new(Status::InvalidArg, format!("{name} cannot be both pixels and percent")));
+        }
+        if let Some(value) = px {
+            *target = LengthPercentageAuto::length(finite_nonnegative(value, name)?);
+        }
+        if let Some(value) = percent {
+            *target = LengthPercentageAuto::percent(finite_nonnegative(value, name)?);
+        }
     }
     style.flex_wrap = match input.flex_wrap.as_deref() {
         Some("wrap") => FlexWrap::Wrap,
@@ -911,6 +918,12 @@ pub struct TextAreaState {
     pub system_font_load_ms: f64,
     #[napi(js_name = "selectionRects")]
     pub selection_rects: Vec<TextSelectionRect>,
+    #[napi(js_name = "renderedGeometry")]
+    pub rendered_geometry: bool,
+    #[napi(js_name = "renderTextOriginX")]
+    pub render_text_origin_x: f64,
+    #[napi(js_name = "textWidth")]
+    pub text_width: f64,
 }
 
 #[napi(object)]
@@ -923,6 +936,10 @@ pub struct TextAreaGeometry {
     pub caret_height: f64,
     #[napi(js_name = "selectionRects")]
     pub selection_rects: Vec<TextSelectionRect>,
+    #[napi(js_name = "textOriginX")]
+    pub text_origin_x: f64,
+    #[napi(js_name = "textWidth")]
+    pub text_width: f64,
 }
 
 #[napi(object)]
@@ -1177,6 +1194,15 @@ fn text_run_align(value: Option<&str>) -> Option<Align> {
     }
 }
 
+// A family can have several files (regular, medium, bold, italic). Loading only
+// the first file leaves the other faces unavailable to the font matcher.
+fn custom_font_key(family: &str, data: &[u8]) -> (String, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hash);
+    (family.to_owned(), hash.finish())
+}
+
 fn text_family(family: Option<&str>) -> Family<'_> {
     let Some(family) = family else {
         return Family::SansSerif;
@@ -1283,7 +1309,7 @@ struct PositionedText {
 struct TextRuntime {
     font_system: Option<FontSystem>,
     system_font_init_ms: f64,
-    loaded_custom_fonts: std::collections::HashSet<String>,
+    loaded_custom_fonts: std::collections::HashSet<(String, u64)>,
     swash_cache: SwashCache,
     text_viewport: Viewport,
     text_atlas: TextAtlas,
@@ -2028,6 +2054,9 @@ impl TextEditor {
                 system_font_ready: self.system_font_ready,
                 system_font_load_ms: self.system_font_load_ms,
                 selection_rects,
+                rendered_geometry: false,
+                render_text_origin_x: edit.galley_pos.x as f64 * pixels_per_point as f64,
+                text_width: 0.0,
             };
             let exact_geometry = renderer.and_then(|renderer| {
                 renderer.textarea_geometry(
@@ -2037,11 +2066,14 @@ impl TextEditor {
                     state.caret_index,
                 )
             });
-            if let Some((x, y, height, rects)) = exact_geometry {
+            if let Some((x, y, height, rects, origin_x, text_width)) = exact_geometry {
                 state.caret_x = x;
                 state.caret_y = y;
                 state.caret_height = height;
                 state.selection_rects = rects;
+                state.rendered_geometry = true;
+                state.render_text_origin_x = origin_x;
+                state.text_width = text_width;
                 self.caret_geometry_calibration = Some(CaretGeometryCalibration {
                     control_id: options.id.clone(),
                     rendered_x: x,
@@ -3480,13 +3512,15 @@ impl Renderer {
         selection_end: u32,
         caret_index: u32,
     ) -> Option<TextAreaGeometry> {
-        let (caret_x, caret_y, caret_height, selection_rects) =
+        let (caret_x, caret_y, caret_height, selection_rects, text_origin_x, text_width) =
             Renderer::textarea_geometry(self, text, selection_start, selection_end, caret_index)?;
         Some(TextAreaGeometry {
             caret_x,
             caret_y,
             caret_height,
             selection_rects,
+            text_origin_x,
+            text_width,
         })
     }
 
@@ -3606,7 +3640,7 @@ impl TextRuntime {
         let font_system = self.font_system.as_mut().expect("font system initialized");
         let font_load_started = Instant::now();
         for (family, data) in custom_fonts {
-            if self.loaded_custom_fonts.insert(family.clone()) {
+            if self.loaded_custom_fonts.insert(custom_font_key(family, data)) {
                 font_system.db_mut().load_font_data(data.clone());
             }
         }
@@ -3774,7 +3808,7 @@ impl TextRuntime {
         let font_system = self.font_system.as_mut().expect("font system initialized");
         let font_load_started = Instant::now();
         for (family, data) in custom_fonts {
-            if self.loaded_custom_fonts.insert(family.clone()) {
+            if self.loaded_custom_fonts.insert(custom_font_key(family, data)) {
                 font_system.db_mut().load_font_data(data.clone());
             }
         }
@@ -3936,7 +3970,7 @@ impl Renderer {
         selection_start: u32,
         selection_end: u32,
         caret_index: u32,
-    ) -> Option<(f64, f64, f64, Vec<TextSelectionRect>)> {
+    ) -> Option<(f64, f64, f64, Vec<TextSelectionRect>, f64, f64)> {
         let runtime = self.text_runtime.as_ref()?;
         let positioned = runtime.text_buffers.iter().find(|positioned| {
             positioned
@@ -3954,7 +3988,11 @@ impl Renderer {
         let caret_cursor = cosmic_cursor_at_char(buffer, caret_index as usize);
         let mut caret = None;
         let mut selection_rects = Vec::new();
+        let mut text_width: f32 = 0.0;
         for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                text_width = text_width.max(glyph.x + glyph.w);
+            }
             if let Some(x) = cosmic_cursor_x(caret_cursor, &run) {
                 caret = Some((
                     (positioned.x + x) as f64,
@@ -3987,7 +4025,14 @@ impl Renderer {
             }
         }
         let (caret_x, caret_y, caret_height) = caret?;
-        Some((caret_x, caret_y, caret_height, selection_rects))
+        Some((
+            caret_x,
+            caret_y,
+            caret_height,
+            selection_rects,
+            positioned.x as f64,
+            text_width as f64,
+        ))
     }
 }
 
@@ -4296,8 +4341,10 @@ impl ApplicationHandler for WindowApp {
             OsWindowEvent::MouseWheel { delta, .. } => {
                 if (self.drag_key_is_down() && !self.drag_blocked) || self.drag_active { return; }
                 let (delta_x, delta_y) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x as f64 * 40.0, y as f64 * 40.0),
-                    MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
+                    // Winit deltas describe which way content moves; DOM
+                    // WheelEvent deltas describe the user's scroll direction.
+                    MouseScrollDelta::LineDelta(x, y) => (-x as f64 * 40.0, -y as f64 * 40.0),
+                    MouseScrollDelta::PixelDelta(position) => (-position.x, -position.y),
                 };
                 self.events.push(NativeEvent {
                     kind: "wheel".into(),
@@ -5114,8 +5161,14 @@ impl Window {
     }
 
     #[napi]
-    pub fn drain_events(&mut self) -> Vec<NativeEvent> {
-        std::mem::take(&mut self.app.events)
+    pub fn drain_events(&mut self) -> Result<Vec<NativeEvent>> {
+        // Event polling must work independently of drawing a frame. Otherwise
+        // expensive or infrequent presentation also throttles keyboard input.
+        if !self.app.closed {
+            self.pump(Duration::ZERO)?;
+            self.check_error()?;
+        }
+        Ok(std::mem::take(&mut self.app.events))
     }
 
     #[napi(js_name = "setImeAllowed")]

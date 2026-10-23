@@ -28,7 +28,7 @@ function updateBodyFrame(maximized = windowMaximized) {
   windowMaximized = maximized;
   const open = process.env.SWEET_ANDROID_APK || maximized || doc.fullscreenElement;
   const frame = open ? "" : "rounded-2xl border border-white/10 ";
-  doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[#070709] text-white [font-family:Inter]`;
+  doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[#070709] text-white font-[Inter]`;
 }
 updateBodyFrame();
 

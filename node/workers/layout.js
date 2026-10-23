@@ -20,10 +20,9 @@ function measure({ node, knownWidth, knownHeight, availableWidth, minContent }) 
     const word = text.words[wordIndex];
     if (word < 0) { widest = Math.max(widest, line); line = 0; lines++; continue; }
     const next = line ? line + text.space + word : word;
-    if (text.wrap && next > limit + .01 && line > 0) { widest = Math.max(widest, line); line = word; lines++; }
-    else line = next;
+    if (text.wrap && next > limit + .01 && line > 0) { widest = Math.max(widest, line); line = 0; lines++; }
     const chars = text.breakWords?.[wordIndex];
-    if (text.wrap && chars && line > limit + .01) {
+    if (text.wrap && chars && word > limit + .01) {
       let fragment = 0;
       for (const width of chars) {
         if (fragment > 0 && fragment + width > limit + .01) {
@@ -32,8 +31,8 @@ function measure({ node, knownWidth, knownHeight, availableWidth, minContent }) 
           fragment = width;
         } else fragment += width;
       }
-      line = fragment;
-    }
+      line += fragment;
+    } else line += (line ? text.space : 0) + word;
   }
   return { width: knownWidth ?? Math.max(widest, line), height: knownHeight ?? lines * text.lineHeight };
 }

@@ -28,6 +28,9 @@ export function textStyle(element) {
   // Skia does not inherit the host system's CSS font fallback list. Keep the
   // requested families first, then use the bundled system sans face for glyphs
   // that those families (or our named font files) do not contain.
+  if (!requestedFamilies.some(name => name.toLowerCase() === systemFontFamily.toLowerCase())) {
+    requestedFamilies.push(systemFontFamily);
+  }
   if (!requestedFamilies.some(name => name.toLowerCase() === 'dejavu sans')) requestedFamilies.push('DejaVu Sans');
   const family = requestedFamilies.map(name => `'${name}'`).join(', ');
   loadFamilies(requestedFamilies.join(', '));
@@ -46,7 +49,7 @@ export function textStyle(element) {
   const overflowWrap = inherited(element, 'overflowWrap', 'normal');
   return { size, spacing, line, font, color: inherited(element, 'color', '#000'),
     wrap: element.localName !== 'input' && !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')),
-    breakWords: overflowWrap === 'anywhere' || overflowWrap === 'break-word' };
+    breakWords: element.localName === 'textarea' || overflowWrap === 'anywhere' || overflowWrap === 'break-word' };
 }
 export function textMetrics(element) {
   const style = textStyle(element);
@@ -81,17 +84,33 @@ export function measureTextBoundaries(element, text) {
   text = String(text);
   const style = textStyle(element);
   const state = elementState(element);
-  const key = JSON.stringify([text, style.font, style.spacing]);
-  if (state.glyphBoundaryCache?.key === key) return state.glyphBoundaryCache.boundaries;
+  const cache = state.glyphBoundaryCache;
+  if (cache?.text === text && cache.styleKey === style.font + "\0" + style.spacing) return cache.boundaries;
   context.font = style.font;
   context.letterSpacing = `${style.spacing}px`;
-  const boundaries = [0];
-  let prefix = '';
-  for (const character of text) {
-    prefix += character;
-    boundaries.push(context.measureText(prefix).width);
+  const characters = [...text];
+  const styleKey = style.font + "\0" + style.spacing;
+  let commonPrefix = 0;
+  if (cache?.styleKey === styleKey) {
+    const limit = Math.min(cache.characters.length, characters.length);
+    while (commonPrefix < limit && cache.characters[commonPrefix] === characters[commonPrefix]) commonPrefix++;
   }
-  state.glyphBoundaryCache = { key, boundaries };
+  const boundaries = cache?.styleKey === styleKey
+    ? cache.boundaries.slice(0, commonPrefix + 1)
+    : [0];
+  const advances = cache?.styleKey === styleKey
+    ? cache.advances.slice(0, commonPrefix)
+    : [];
+  for (let index = commonPrefix; index < characters.length; index++) {
+    advances[index] = context.measureText(characters[index]).width;
+    let offset = boundaries[index] + advances[index];
+    if (index > 0) {
+      offset += context.measureText(characters[index - 1] + characters[index]).width
+        - advances[index - 1] - advances[index];
+    }
+    boundaries.push(offset);
+  }
+  state.glyphBoundaryCache = { styleKey, text, characters, advances, boundaries };
   return boundaries;
 }
 export function textLines(metrics, width) {
@@ -100,8 +119,27 @@ export function textLines(metrics, width) {
     const advance = metrics.words[index];
     if (advance < 0) { lines.push(line); line = ''; size = 0; return; }
     const next = size + (line ? metrics.space : 0) + advance;
-    if (metrics.style.wrap && next > width + .01 && line) { lines.push(line); line = word; size = advance; }
-    else { line += (line ? ' ' : '') + word; size = next; }
+    if (metrics.style.wrap && next > width + .01 && line) {
+      lines.push(line);
+      line = '';
+      size = 0;
+    }
+    const characters = metrics.breakWords?.[index];
+    if (metrics.style.wrap && characters && advance > width + .01) {
+      for (const [characterIndex, character] of [...word].entries()) {
+        const characterWidth = characters[characterIndex] ?? 0;
+        if (line && size + characterWidth > width + .01) {
+          lines.push(line);
+          line = '';
+          size = 0;
+        }
+        line += character;
+        size += characterWidth;
+      }
+    } else {
+      line += (line ? ' ' : '') + word;
+      size += (line === word ? 0 : metrics.space) + advance;
+    }
   });
   if (line || !lines.length) lines.push(line);
   return lines;

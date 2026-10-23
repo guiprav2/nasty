@@ -2,8 +2,9 @@ import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { documentBoxes, documentState, elementState } from './dom-state.js';
 import { canvasSurface, canvasTriangleBuffer, imageSurface } from '../canvas-2d.js';
 import { textMetrics, textLines, inherited } from './text-metrics.js';
+import { isPlaceholderText, renderedText } from './nerd-icon.js';
+import { clipsOverflow } from './overflow.js';
 import { computedStyleValue, hasActiveStyleTransition } from './css-transitions.js';
-import { renderedText } from './nerd-icon.js';
 import { parseColor } from '../render.js';
 const windows = new WeakMap();
 const stackingOrders = new WeakMap();
@@ -170,7 +171,7 @@ function paintBounds(box, element) {
     const descent = paintMeasureContext.measureText('Mg').fontBoundingBoxDescent || metrics.style.size * .2;
     let textWidth = 0;
     for (const line of lines) textWidth = Math.max(textWidth, paintMeasureContext.measureText(line).width);
-    if (style.textOverflow === 'ellipsis') textWidth = Math.min(textWidth, content.width);
+    if (style.textOverflow === 'ellipsis' || (style.textOverflow === undefined && isPlaceholderText(element))) textWidth = Math.min(textWidth, content.width);
     const firstBaseline = content.y + (metrics.style.line - ascent - descent) / 2 + ascent;
     left = Math.min(left, content.x - 2);
     right = Math.max(right, content.x + textWidth + 2);
@@ -445,7 +446,19 @@ export function rasterizeDocument(document, width, height, surface = createCanva
         }
       }
       ctx.font = text.font; ctx.letterSpacing = `${text.spacing}px`; ctx.fillStyle = textColor;
-      if (['hidden', 'auto', 'scroll'].includes(style.overflow)) { round(ctx, content.x, content.y, content.width, content.height, 0); ctx.clip(); }
+      if (isPlaceholderText(element)) ctx.globalAlpha *= 0.6;
+      const clipX = element.localName === 'input' || clipsOverflow(element, 'x');
+      const clipY = clipsOverflow(element, 'y');
+      if (clipX || clipY) {
+        const viewport = documentState(document).viewport;
+        const clipRect = {
+          x: clipX ? content.x : 0,
+          y: clipY ? content.y : 0,
+          width: clipX ? content.width : viewport.width,
+          height: clipY ? content.height : viewport.height,
+        };
+        round(ctx, clipRect.x, clipRect.y, clipRect.width, clipRect.height, 0); ctx.clip();
+      }
       const font = ctx.measureText('Mg');
       const ascent = font.fontBoundingBoxAscent || text.size * .8;
       const descent = font.fontBoundingBoxDescent || text.size * .2;
@@ -487,7 +500,8 @@ export function rasterizeDocument(document, width, height, surface = createCanva
         ctx.restore();
       }
       lines.forEach((line, index) => {
-        if (style.textOverflow === 'ellipsis' && ctx.measureText(line).width > content.width) {
+        if ((style.textOverflow === 'ellipsis' || (style.textOverflow === undefined && isPlaceholderText(element)))
+            && ctx.measureText(line).width > content.width) {
           while (line.length && ctx.measureText(line + '…').width > content.width) line = line.slice(0, -1);
           line += '…';
         }

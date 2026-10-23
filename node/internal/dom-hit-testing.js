@@ -1,5 +1,6 @@
 import { documentBoxes, documentState } from './dom-state.js';
 import { createBoxProjector } from '../render.js';
+import { clipsOverflow } from './overflow.js';
 
 const clickListeners = new WeakMap();
 const DRAG_INTERACTIVE_CONTROLS = new Set(['input', 'textarea', 'button', 'select', 'option', 'optgroup', 'a', 'area', 'label', 'summary', 'audio', 'video']);
@@ -177,6 +178,7 @@ export function elementsFromPoint(document, x, y) {
     state.hitTestCache = cache;
   }
   const { byElement, project, paintOrder } = cache;
+  if (cache.lastX === x && cache.lastY === y) return cache.lastHits.slice();
   const hits = [];
   for (let index = paintOrder.length - 1; index >= 0; index--) {
     const box = paintOrder[index].box;
@@ -187,10 +189,15 @@ export function elementsFromPoint(document, x, y) {
       if (!point || !insideRoundedBox(box, point)) continue;
       let clipped = false;
       for (let parent = element.parent; parent; parent = parent.parent) {
-        if (!['hidden', 'auto', 'scroll'].includes(parent.style.overflow)) continue;
+        const clipX = clipsOverflow(parent, 'x'), clipY = clipsOverflow(parent, 'y');
+        if (!clipX && !clipY) continue;
         const parentBox = byElement.get(parent);
         const parentPoint = parentBox && projectedLocalPoint(project, parentBox, x, y);
-        if (!parentBox || !parentPoint || !insideRoundedBox(parentBox, parentPoint)) {
+        const outsideX = clipX && (!parentBox || !parentPoint
+          || parentPoint.x < parentBox.paddingBox.x || parentPoint.x >= parentBox.paddingBox.x + parentBox.paddingBox.width);
+        const outsideY = clipY && (!parentBox || !parentPoint
+          || parentPoint.y < parentBox.paddingBox.y || parentPoint.y >= parentBox.paddingBox.y + parentBox.paddingBox.height);
+        if (outsideX || outsideY) {
           clipped = true;
           break;
         }
@@ -200,7 +207,10 @@ export function elementsFromPoint(document, x, y) {
       // An invalid transform declaration must not make hit-testing crash.
     }
   }
-  return hits;
+  cache.lastX = x;
+  cache.lastY = y;
+  cache.lastHits = hits;
+  return hits.slice();
 }
 
 export function blocksWindowDrag(target) {

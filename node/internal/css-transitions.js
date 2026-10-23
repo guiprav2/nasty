@@ -38,8 +38,15 @@ export function computedStyleValue(style, property) {
   return style[property];
 }
 
-export function hasActiveStyleTransition(style) {
-  return (styleTransitionStates.get(style)?.transitions.size ?? 0) > 0;
+export function hasActiveStyleTransition(style, now = performance.now()) {
+  const state = styleTransitionStates.get(style);
+  if (!state?.transitions.size) return false;
+  let active = false;
+  for (const [property, transition] of state.transitions) {
+    if (now < transition.started + transition.duration) active = true;
+    else state.transitions.delete(property);
+  }
+  return active;
 }
 
 const kebab = (name) => name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
