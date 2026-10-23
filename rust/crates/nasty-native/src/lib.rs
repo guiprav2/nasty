@@ -79,6 +79,8 @@ pub struct LayoutStyle {
     pub gap: Option<f64>,
     pub flex_grow: Option<f64>,
     pub flex_shrink: Option<f64>,
+    pub flex_basis: Option<f64>,
+    pub flex_basis_percent: Option<f64>,
     pub align_items: Option<String>,
     pub justify_content: Option<String>,
 }
@@ -304,6 +306,18 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
     }
     if let Some(value) = input.flex_shrink {
         style.flex_shrink = finite_nonnegative(value, "flexShrink")?;
+    }
+    if input.flex_basis.is_some() && input.flex_basis_percent.is_some() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "flexBasis cannot be both pixels and percent",
+        ));
+    }
+    if let Some(value) = input.flex_basis {
+        style.flex_basis = Dimension::length(finite_nonnegative(value, "flexBasis")?);
+    }
+    if let Some(value) = input.flex_basis_percent {
+        style.flex_basis = Dimension::percent(finite_nonnegative(value, "flexBasisPercent")?);
     }
     if let Some(value) = input.align_items.as_deref() {
         style.align_items = Some(match value {

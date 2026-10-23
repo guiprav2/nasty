@@ -3,6 +3,7 @@ import { documentBoxes, documentBoxesFor, documentState, elementState } from './
 import { computedStyleValue } from './css-transitions.js';
 import { createBoxProjector, parseColor } from '../render.js';
 import { fontFamilyForElement, renderedText } from './nerd-icon.js';
+import { measureText } from './text-metrics.js';
 
 const windows = new WeakMap();
 const lastSyncTimes = new WeakMap();
@@ -44,6 +45,31 @@ function fontMetrics(element) {
   if (!Number.isFinite(lineHeight) || lineHeight <= 0) lineHeight = fontSize * 1.2;
   return { fontSize, lineHeight };
 }
+function ellipsizeText(element, text, width) {
+  const ellipsis = '…';
+  if (measureText(element, text) <= width) return text;
+  if (measureText(element, ellipsis) > width) return '';
+  const characters = [...text];
+  let low = 0, high = characters.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (measureText(element, characters.slice(0, middle).join('') + ellipsis) <= width) low = middle;
+    else high = middle - 1;
+  }
+  return characters.slice(0, low).join('') + ellipsis;
+}
+function textClip(box, style, clip) {
+  let result = clip;
+  const overflow = [style.overflow, style.overflowX, style.overflowY]
+    .some((value) => value === 'hidden' || value === 'clip' || value === 'auto' || value === 'scroll');
+  if (!overflow) return result;
+  const rect = box.paddingBox;
+  const next = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+  if (!result) return next;
+  const x = Math.max(result.x, next.x), y = Math.max(result.y, next.y);
+  return { x, y, width: Math.max(0, Math.min(result.x + result.width, next.x + next.width) - x),
+    height: Math.max(0, Math.min(result.y + result.height, next.y + next.height) - y) };
+}
 function parkRun(run) {
   return { ...run, x: -100000, y: -100000, clipX: 0, clipY: 0, clipWidth: 0, clipHeight: 0 };
 }
@@ -53,7 +79,7 @@ function textEntries(document, selectedElements = null) {
   const projectPoint = createBoxProjector(boxes);
   for (const box of boxes) {
     const { element, contentBox: bounds, clip } = box;
-    const text = renderedText(element);
+    let text = renderedText(element);
     if (!text || !bounds.width || !bounds.height) continue;
     const rgba = parseColor(inherited(element, 'color', '#000000')) ?? [0, 0, 0, 0];
     for (let current = element; current; current = current.parent) {
@@ -66,12 +92,17 @@ function textEntries(document, selectedElements = null) {
     const transformedWidth = bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
     if (![textOrigin.x, textOrigin.y, transformedWidth, fontSize, lineHeight].every(Number.isFinite)
         || transformedWidth < 0 || fontSize <= 0 || lineHeight <= 0) continue;
+    const whiteSpace = inherited(element, 'whiteSpace', 'normal');
+    if (whiteSpace === 'nowrap' && inherited(element, 'textOverflow', 'clip') === 'ellipsis') {
+      text = ellipsizeText(element, text, bounds.width);
+    }
     const run = { text, x: textOrigin.x, y: textOrigin.y, width: transformedWidth, fontSize,
       lineHeight,
       fontFamily: fontFamilyForElement(element, inherited(element, 'fontFamily', 'sans-serif')),
       fontWeight: Math.max(100, Math.min(900, parseInt(inherited(element, 'fontWeight', 400), 10) || 400)), color,
-      wrap: inherited(element, 'whiteSpace', 'normal') !== 'nowrap' };
-    if (clip) Object.assign(run, { clipX: clip.x, clipY: clip.y, clipWidth: clip.width, clipHeight: clip.height });
+      wrap: whiteSpace !== 'nowrap' };
+    const visibleClip = textClip(box, element.style, clip);
+    if (visibleClip) Object.assign(run, { clipX: visibleClip.x, clipY: visibleClip.y, clipWidth: visibleClip.width, clipHeight: visibleClip.height });
     entries.push({ element, run });
   }
   return entries;

@@ -833,7 +833,7 @@ function resolveCssLength(value, fontSize, viewport) {
       case "vw": return amount * viewport.width / 100;
     }
   }
-  const fn = /^(min|max)\((.*)\)$/i.exec(text);
+  const fn = /^(min|max|clamp)\((.*)\)$/i.exec(text);
   if (!fn) return undefined;
   const args = [];
   let depth = 0, start = 0;
@@ -845,7 +845,11 @@ function resolveCssLength(value, fontSize, viewport) {
   args.push(fn[2].slice(start));
   const resolved = args.map(argument => resolveCssLength(argument, fontSize, viewport));
   if (resolved.some(amount => amount === undefined)) return undefined;
-  return fn[1].toLowerCase() === "min" ? Math.min(...resolved) : Math.max(...resolved);
+  const mode = fn[1].toLowerCase();
+  if (mode === "min") return Math.min(...resolved);
+  if (mode === "max") return Math.max(...resolved);
+  if (resolved.length !== 3) return undefined;
+  return Math.max(resolved[0], Math.min(resolved[1], resolved[2]));
 }
 
 function fixedInset(value, basis, fontSize, viewport) {
@@ -860,6 +864,9 @@ function fixedInset(value, basis, fontSize, viewport) {
 function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 }) {
   const result = { ...style };
   delete result.boxSizing;
+  if (result.position === "static") {
+    for (const name of ["top", "right", "bottom", "left", "topPercent", "rightPercent", "bottomPercent", "leftPercent"]) delete result[name];
+  }
   if (typeof result.aspectRatio === "string") {
     const ratio = /^\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*$/.exec(result.aspectRatio);
     result.aspectRatio = ratio ? Number(ratio[1]) / Number(ratio[2]) : undefined;
@@ -896,6 +903,12 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
       delete result[property];
       }
     }
+  }
+  if (typeof result.flexBasis === "string" && result.flexBasis.endsWith("%")) {
+    result.flexBasisPercent = parseFloat(result.flexBasis) / 100;
+    delete result.flexBasis;
+  } else if (typeof result.flexBasis === "string" && result.flexBasis.endsWith("px")) {
+    result.flexBasis = parseFloat(result.flexBasis);
   }
   for (const [property, value] of Object.entries(result)) {
     if (typeof value === "number" && !Number.isFinite(value)) delete result[property];

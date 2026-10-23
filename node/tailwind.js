@@ -55,6 +55,7 @@ function parseToken(token) {
 function parseLength(value) {
   const arbitrary = value.startsWith("[") && value.endsWith("]");
   if (arbitrary) value = value.slice(1, -1);
+  if (arbitrary && /^(?:min|max|clamp)\(.+\)$/i.test(value)) return value;
   const containerWidths = { xs: 320, sm: 384, md: 448, lg: 512, xl: 576, "2xl": 672, "3xl": 768, "4xl": 896, "5xl": 1024, "6xl": 1152, "7xl": 1280 };
   if (Object.hasOwn(containerWidths, value)) return containerWidths[value];
   if (value === "full") return "100%";
@@ -100,19 +101,42 @@ function colorValue(value) {
 }
 function utilityStyle(utility) {
   if (utility.startsWith("[") && utility.endsWith("]")) return arbitraryValue(utility);
+  const translate = /^(-)?translate-([xy])-(.+)$/.exec(utility);
+  if (translate) {
+    const [, negative, axis, raw] = translate;
+    const amount = raw === "full" ? "100%" : spacing(raw);
+    if (amount === undefined) return null;
+    const signed = negative ? (typeof amount === "number" ? -amount : `-${amount}`) : amount;
+    return [[`__translate${axis.toUpperCase()}`, signed]];
+  }
+  const perspective = /^perspective-\[(.+)\]$/.exec(utility);
+  if (perspective) return ["perspective", perspective[1]];
+  const ringWidth = /^ring(?:-(\d+))?$/.exec(utility);
+  if (ringWidth) return ["__ringWidth", Number(ringWidth[1] ?? 3)];
+  const ringColor = /^ring-(.+)$/.exec(utility);
+  if (ringColor && colorValue(ringColor[1])) return ["__ringColor", colorValue(ringColor[1])];
   const fixed = {
     block: ["display", "block"], flex: ["display", "flex"], "inline-flex": ["display", "flex"], grid: ["display", "grid"], hidden: ["display", "none"],
     "flex-row": ["flexDirection", "row"], "flex-row-reverse": ["flexDirection", "row-reverse"], "flex-col": ["flexDirection", "column"], "flex-col-reverse": ["flexDirection", "column-reverse"],
     "flex-wrap": ["flexWrap", "wrap"], "flex-nowrap": ["flexWrap", "nowrap"], "flex-wrap-reverse": ["flexWrap", "wrap-reverse"],
-    "flex-1": ["flex", 1], "flex-auto": ["flex", "auto"], "flex-initial": ["flex", "initial"], "flex-none": ["flex", "none"],
+    // These Tailwind shorthands expand to their standard CSS longhands so the
+    // read-only CSSOM reports the declarations and Taffy receives grow/shrink.
+    "flex-1": [["flexGrow", 1], ["flexShrink", 1], ["flexBasis", "0%"]],
+    "flex-auto": [["flexGrow", 1], ["flexShrink", 1], ["flexBasis", "auto"]],
+    "flex-initial": [["flexGrow", 0], ["flexShrink", 1], ["flexBasis", "auto"]],
+    "flex-none": [["flexGrow", 0], ["flexShrink", 0], ["flexBasis", "auto"]],
     "aspect-auto": ["aspectRatio", "auto"], "aspect-square": ["aspectRatio", "1 / 1"], "aspect-video": ["aspectRatio", "16 / 9"],
-    grow: ["flexGrow", 1], shrink: ["flexShrink", 1], relative: ["position", "relative"], absolute: ["position", "absolute"], fixed: ["position", "fixed"],
+    grow: ["flexGrow", 1], shrink: ["flexShrink", 1], static: ["position", "static"], relative: ["position", "relative"], absolute: ["position", "absolute"], fixed: ["position", "fixed"],
     "items-start": ["alignItems", "flex-start"], "items-end": ["alignItems", "flex-end"], "items-center": ["alignItems", "center"], "items-stretch": ["alignItems", "stretch"],
     "justify-start": ["justifyContent", "flex-start"], "justify-end": ["justifyContent", "flex-end"], "justify-center": ["justifyContent", "center"], "justify-between": ["justifyContent", "space-between"], "justify-around": ["justifyContent", "space-around"], "justify-evenly": ["justifyContent", "space-evenly"],
     "content-center": ["alignContent", "center"], "whitespace-nowrap": ["whiteSpace", "nowrap"],
+    truncate: [["overflow", "hidden"], ["textOverflow", "ellipsis"], ["whiteSpace", "nowrap"]],
     "text-left": ["textAlign", "left"], "text-center": ["textAlign", "center"], "text-right": ["textAlign", "right"],
     "overflow-hidden": ["overflow", "hidden"], "overflow-auto": ["overflow", "auto"], "overflow-scroll": ["overflow", "scroll"], "overflow-visible": ["overflow", "visible"],
     "object-cover": ["objectFit", "cover"], "object-contain": ["objectFit", "contain"], "object-fill": ["objectFit", "fill"],
+    "object-center": ["objectPosition", "50% 50%"], "object-bottom": ["objectPosition", "50% 100%"],
+    "object-top": ["objectPosition", "50% 0%"], "object-left": ["objectPosition", "0% 50%"],
+    "object-right": ["objectPosition", "100% 50%"],
     transition: ["transition", "all 150ms ease"], "transition-none": ["transition", "none"],
     "leading-none": ["lineHeight", "1"], "leading-tight": ["lineHeight", "1.25"], "leading-snug": ["lineHeight", "1.375"], "leading-normal": ["lineHeight", "normal"], "leading-relaxed": ["lineHeight", "1.625"], "leading-loose": ["lineHeight", "2"],
     "rounded": ["borderRadius", 4], "border-solid": ["borderStyle", "solid"], "border-dashed": ["borderStyle", "dashed"], "border-dotted": ["borderStyle", "dotted"], "border-none": ["borderStyle", "none"],
@@ -155,7 +179,10 @@ function utilityStyle(utility) {
   const pair = /^(p[xytrbl]?|m[xytrbl]?|gap(?:-[xy])?|w|h|min-w|min-h|max-w|max-h|basis|grow|shrink)-(.+)$/.exec(utility);
   if (pair) {
     const [, prefix, value] = pair;
-    const amount = prefix === "grow" || prefix === "shrink" ? Number(value) : spacing(value);
+    const amount = prefix === "grow" || prefix === "shrink" ? Number(value)
+      : value === "screen" && ["w", "min-w", "max-w"].includes(prefix) ? "100vw"
+        : value === "screen" && ["h", "min-h", "max-h"].includes(prefix) ? "100vh"
+          : spacing(value);
     if (amount === undefined) return null;
     const map = {
       p: ["padding"], px: ["paddingLeft", "paddingRight"], py: ["paddingTop", "paddingBottom"], pt: ["paddingTop"], pr: ["paddingRight"], pb: ["paddingBottom"], pl: ["paddingLeft"],
@@ -175,7 +202,10 @@ function utilityStyle(utility) {
     }
     if (prefix === "border" && colorValue(value)) return ["borderColor", colorValue(value)];
     if (prefix === "opacity") return ["opacity", Number(value) / 100];
-    if (prefix === "z") return ["zIndex", value === "auto" ? "auto" : Number(value)];
+    if (prefix === "z") {
+      const raw = value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
+      return ["zIndex", raw === "auto" ? "auto" : Number(raw)];
+    }
     if (prefix === "leading") {
       if (/^\[.*\]$/.test(value)) {
         const raw = value.slice(1, -1);
@@ -212,8 +242,24 @@ export function resolveTailwind(className, width = 0) {
     || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
     || a.variants.length - b.variants.length || a.index - b.index);
   const values = {};
+  let translateX, translateY;
+  let ringWidth, ringColor;
   for (const { declarations: pairs } of utilities) {
-    if (pairs) for (const [property, value] of Array.isArray(pairs[0]) ? pairs : [pairs]) values[property] = value;
+    if (pairs) for (const [property, value] of Array.isArray(pairs[0]) ? pairs : [pairs]) {
+      if (property === "__translateX") translateX = value;
+      else if (property === "__translateY") translateY = value;
+      else if (property === "__ringWidth") ringWidth = value;
+      else if (property === "__ringColor") ringColor = value;
+      else values[property] = value;
+    }
+  }
+  const translation = [
+    translateX !== undefined && `translateX(${typeof translateX === "number" ? `${translateX}px` : translateX})`,
+    translateY !== undefined && `translateY(${typeof translateY === "number" ? `${translateY}px` : translateY})`,
+  ].filter(Boolean).join(" ");
+  if (translation) values.transform = [translation, values.transform].filter(Boolean).join(" ");
+  if (ringWidth !== undefined || ringColor !== undefined) {
+    values.boxShadow = `0 0 0 ${ringWidth ?? 3}px ${ringColor ?? "rgba(59, 130, 246, 0.5)"}`;
   }
   Object.freeze(values);
   classCache.set(key, values);

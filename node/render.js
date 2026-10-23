@@ -264,6 +264,22 @@ function boxTransformMatrix(box) {
   );
 }
 
+function childPerspectiveMatrix(box) {
+  const style = box.element.style;
+  const source = style.perspective;
+  if (!source || source === "none") return IDENTITY_MATRIX;
+  const distance = lengthValue(String(source));
+  if (distance <= 0) throw new TypeError("perspective must be positive");
+  const parts = String(style.perspectiveOrigin ?? "50% 50%").trim().split(/\s+/);
+  const origin = [lengthValue(parts[0] ?? "50%", box.width), lengthValue(parts[1] ?? "50%", box.height)];
+  const perspective = identity4();
+  perspective[3][2] = -1 / distance;
+  return multiply4(
+    multiply4(translation(box.x + origin[0], box.y + origin[1], 0), perspective),
+    translation(-box.x - origin[0], -box.y - origin[1], 0),
+  );
+}
+
 // Layout boxes use document coordinates; compose local transforms from the
 // root down so a parent transform also moves and projects every descendant.
 export function createBoxProjector(boxes) {
@@ -275,7 +291,11 @@ export function createBoxProjector(boxes) {
     const parentElement = box.element.parentElement ?? box.element.parentNode ?? box.element.parent;
     const parent = byElement.get(parentElement);
     const local = boxTransformMatrix(box);
-    const parentMatrix = parent ? worldMatrix(parent) : IDENTITY_MATRIX;
+    let parentMatrix = parent ? worldMatrix(parent) : IDENTITY_MATRIX;
+    if (parent) {
+      const perspective = childPerspectiveMatrix(parent);
+      if (perspective !== IDENTITY_MATRIX) parentMatrix = multiply4(parentMatrix, perspective);
+    }
     const matrix = local === IDENTITY_MATRIX ? parentMatrix
       : parentMatrix === IDENTITY_MATRIX ? local
         : multiply4(parentMatrix, local);
@@ -416,6 +436,65 @@ function clipTexturedPolygon(polygon, rect) {
   return polygon;
 }
 
+function paintOrder(boxes) {
+  const members = new Set(boxes.map((box) => box.element));
+  const children = new Map();
+  const roots = [];
+  for (const box of boxes) {
+    const parent = box.element.parentElement ?? box.element.parent;
+    if (parent && members.has(parent)) {
+      const siblings = children.get(parent) ?? [];
+      siblings.push(box);
+      children.set(parent, siblings);
+    } else roots.push(box);
+  }
+  const result = [];
+  const visit = (siblings) => {
+    siblings.sort((a, b) => {
+      const az = Number(a.element.style.zIndex), bz = Number(b.element.style.zIndex);
+      return (Number.isFinite(az) ? az : 0) - (Number.isFinite(bz) ? bz : 0);
+    });
+    for (const box of siblings) {
+      result.push(box);
+      const descendants = children.get(box.element);
+      if (descendants) visit(descendants);
+    }
+  };
+  visit(roots);
+  return result;
+}
+
+function objectPosition(style) {
+  const values = String(style.objectPosition ?? "50% 50%").trim().split(/\s+/);
+  const fraction = (value, fallback) => {
+    if (value === "left" || value === "top") return 0;
+    if (value === "right" || value === "bottom") return 1;
+    if (value === "center") return 0.5;
+    if (value?.endsWith("%")) return Math.max(0, Math.min(1, Number.parseFloat(value) / 100));
+    return fallback;
+  };
+  return [fraction(values[0], 0.5), fraction(values[1] ?? values[0], 0.5)];
+}
+
+function roundedRectPolygon(rect, radius) {
+  const r = Math.max(0, Math.min(radius, rect.width / 2, rect.height / 2));
+  if (!r) return [
+    { x: rect.x, y: rect.y }, { x: rect.x + rect.width, y: rect.y },
+    { x: rect.x + rect.width, y: rect.y + rect.height }, { x: rect.x, y: rect.y + rect.height },
+  ];
+  const polygon = [];
+  for (const [cx, cy, start] of [
+    [rect.x + rect.width - r, rect.y + r, -Math.PI / 2],
+    [rect.x + rect.width - r, rect.y + rect.height - r, 0],
+    [rect.x + r, rect.y + rect.height - r, Math.PI / 2],
+    [rect.x + r, rect.y + r, Math.PI],
+  ]) for (let step = 0; step <= 6; step++) {
+    const angle = start + step / 6 * Math.PI / 2;
+    polygon.push({ x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r });
+  }
+  return polygon;
+}
+
 // Display-list v3 stores screen-space triangles. JS performs the small per-box
 // CSS matrix/projection work; Rust only expands records and submits GPU geometry.
 export function buildTransformedDisplayList(boxes, width, height) {
@@ -423,6 +502,36 @@ export function buildTransformedDisplayList(boxes, width, height) {
   let commandCount = 0;
   const viewport = { x: 0, y: 0, width, height };
   const projectPoint = createBoxProjector(boxes);
+  const boxesByElement = new Map(boxes.map((box) => [box.element, box]));
+  const clipCache = new Map();
+  const clipsFor = (box) => {
+    const cached = clipCache.get(box.element);
+    if (cached) return cached;
+    const regions = [
+      { x: 0, y: 0 }, { x: width, y: 0 }, { x: width, y: height }, { x: 0, y: height },
+    ];
+    for (let ancestor = box.element.parentElement ?? box.element.parent; ancestor; ancestor = ancestor.parentElement ?? ancestor.parent) {
+      const ancestorStyle = ancestor.style;
+      const clipsOverflow = [ancestorStyle.overflow, ancestorStyle.overflowX, ancestorStyle.overflowY]
+        .some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll");
+      if (!clipsOverflow) continue;
+      const ancestorBox = boxesByElement.get(ancestor);
+      if (!ancestorBox) continue;
+      const rect = ancestorBox.paddingBox ?? ancestorBox.borderBox;
+      const radiusText = String(ancestorStyle.borderRadius ?? "");
+      const rawRadius = Number.parseFloat(radiusText) || 0;
+      const radius = radiusText.trim().endsWith("%")
+        ? Math.min(rect.width, rect.height) * rawRadius / 100
+        : rawRadius;
+      const polygon = roundedRectPolygon(rect, radius).map((point) => {
+        const projected = projectPoint(ancestorBox, point.x, point.y);
+        return { x: projected.x, y: projected.y };
+      });
+      if (polygon.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))) regions.push(polygon);
+    }
+    clipCache.set(box.element, regions);
+    return regions;
+  };
   const bodyBox = boxes.find(box => box.element.localName === "body");
   const bodyStyle = bodyBox?.element.style;
   const radiusText = String(bodyStyle?.borderRadius ?? "");
@@ -444,16 +553,15 @@ export function buildTransformedDisplayList(boxes, width, height) {
   }
   const visibleElements = new Set();
   const addVisibleAncestors = (element) => {
-    for (let current = element; current; current = current.parentElement ?? current.parentNode ?? current.parent) {
+    for (let current = element; current?.nodeType === 1; current = current.parentElement ?? current.parent) {
       visibleElements.add(current);
     }
   };
-  const push = (box, rect, color, project, radius = 0) => {
+  const push = (box, rect, color, project, radius = 0, clipRegions = null) => {
     if (!color || rect.width <= 0 || rect.height <= 0) return;
     let localPoints;
     const r = Math.min(radius, rect.width / 2, rect.height / 2);
-    if (r > 0 && rect.x === box.borderBox.x && rect.y === box.borderBox.y
-        && rect.width === box.borderBox.width && rect.height === box.borderBox.height) {
+    if (r > 0) {
       localPoints = [];
       for (const [cx, cy, start] of [
         [rect.x + rect.width - r, rect.y + r, -Math.PI / 2],
@@ -471,8 +579,13 @@ export function buildTransformedDisplayList(boxes, width, height) {
     }
     const polygon = localPoints.map(([x, y]) => project(x, y));
     if (polygon.some((point) => point === null)) return;
-    const clip = box.clip ? intersection(box.clip, viewport) : viewport;
-    const visible = clipConvexPolygon(clipPolygon(polygon, clip), windowClip);
+    let visible = polygon;
+    if (clipRegions) for (const region of clipRegions) visible = clipConvexPolygon(visible, region);
+    else {
+      const clip = box.clip ? intersection(box.clip, viewport) : viewport;
+      visible = clipPolygon(visible, clip);
+    }
+    visible = clipConvexPolygon(visible, windowClip);
     if (visible.length < 3) return;
     for (let i = 1; i < visible.length - 1; i++) {
       const a = visible[0]; const b = visible[i]; const c = visible[i + 1];
@@ -480,8 +593,9 @@ export function buildTransformedDisplayList(boxes, width, height) {
       commandCount++;
     }
   };
-  for (const box of boxes) {
+  for (const box of paintOrder(boxes)) {
     const style = box.element.style;
+    const clipRegions = clipsFor(box);
     const project = (x, y) => {
       const point = projectPoint(box, box.x + x, box.y + y);
       return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
@@ -491,14 +605,13 @@ export function buildTransformedDisplayList(boxes, width, height) {
       project(box.width, box.height), project(0, box.height),
     ];
     if (corners.every(Boolean)) {
-      const minX = Math.min(...corners.map((point) => point.x));
-      const minY = Math.min(...corners.map((point) => point.y));
-      const maxX = Math.max(...corners.map((point) => point.x));
-      const maxY = Math.max(...corners.map((point) => point.y));
-      const clip = box.clip ? intersection(box.clip, viewport) : viewport;
-      const visible = clip.width > 0 && clip.height > 0
-        && maxX > clip.x && minX < clip.x + clip.width
-        && maxY > clip.y && minY < clip.y + clip.height;
+      let clippedBounds = corners.map((point) => ({ x: point.x, y: point.y }));
+      for (const region of clipRegions) clippedBounds = clipConvexPolygon(clippedBounds, region);
+      const visible = clippedBounds.length >= 3
+        && Math.max(...clippedBounds.map((point) => point.x)) > 0
+        && Math.min(...clippedBounds.map((point) => point.x)) < width
+        && Math.max(...clippedBounds.map((point) => point.y)) > 0
+        && Math.min(...clippedBounds.map((point) => point.y)) < height;
       if (visible) {
         addVisibleAncestors(box.element);
       }
@@ -513,7 +626,7 @@ export function buildTransformedDisplayList(boxes, width, height) {
     const radiusText = String(style.borderRadius ?? "");
     const radiusValue = Number.parseFloat(radiusText) || 0;
     const radius = radiusText.trim().endsWith("%") ? Math.min(box.width, box.height) * radiusValue / 100 : radiusValue;
-    push(box, box.borderBox, withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity), project, radius);
+    push(box, box.borderBox, withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity), project, radius, clipRegions);
     if (box.element.localName === "canvas") {
       const state = elementState(box.element);
       const surface = canvasSurface(state.canvasContext);
@@ -572,16 +685,45 @@ export function buildTransformedDisplayList(boxes, width, height) {
     const image = state.image ?? state.video?.image;
     const content = box.contentBox;
     if (image && content.width > 0 && content.height > 0) {
-      const imageClip = box.clip ? intersection(box.clip, viewport) : viewport;
+      const imageClip = viewport;
+      const imageRect = { ...content };
+      let u0 = 0, v0 = 0, u1 = 1, v1 = 1;
+      const fit = style.objectFit ?? "fill";
+      const [positionX, positionY] = objectPosition(style);
+      if (fit === "cover" || fit === "contain") {
+        const sourceRatio = image.width / image.height;
+        const targetRatio = content.width / content.height;
+        if ((fit === "cover" && sourceRatio > targetRatio) || (fit === "contain" && sourceRatio < targetRatio)) {
+          const fraction = targetRatio / sourceRatio;
+          if (fit === "cover") {
+            u0 = (1 - fraction) * positionX;
+            u1 = u0 + fraction;
+          } else {
+            imageRect.width = content.width * fraction;
+            imageRect.x += (content.width - imageRect.width) * positionX;
+          }
+        } else if ((fit === "cover" && sourceRatio < targetRatio) || (fit === "contain" && sourceRatio > targetRatio)) {
+          const fraction = sourceRatio / targetRatio;
+          if (fit === "cover") {
+            v0 = (1 - fraction) * positionY;
+            v1 = v0 + fraction;
+          } else {
+            imageRect.height = content.height * fraction;
+            imageRect.y += (content.height - imageRect.height) * positionY;
+          }
+        }
+      }
       const corners = [
-        [content.x, content.y, 0, 0], [content.x + content.width, content.y, 1, 0],
-        [content.x + content.width, content.y + content.height, 1, 1], [content.x, content.y + content.height, 0, 1],
+        [imageRect.x, imageRect.y, u0, v0], [imageRect.x + imageRect.width, imageRect.y, u1, v0],
+        [imageRect.x + imageRect.width, imageRect.y + imageRect.height, u1, v1], [imageRect.x, imageRect.y + imageRect.height, u0, v1],
       ].map(([x, y, u, v]) => {
         const point = projectPoint(box, x, y);
         return Number.isFinite(point.x) && Number.isFinite(point.y) ? { ...point, u, v } : null;
       });
       if (corners.every(Boolean) && imageClip.width > 0 && imageClip.height > 0) {
-        const clipped = clipConvexPolygon(clipTexturedPolygon(corners, imageClip), windowClip);
+        let clipped = clipTexturedPolygon(corners, imageClip);
+        for (const region of clipRegions) clipped = clipConvexPolygon(clipped, region);
+        clipped = clipConvexPolygon(clipped, windowClip);
         if (clipped.length >= 3) {
           const triangles = [];
           for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
@@ -605,8 +747,26 @@ export function buildTransformedDisplayList(boxes, width, height) {
             : { x: borderBox.x, y: borderBox.y, width: thickness, height: borderBox.height };
       const property = `border${side}Color`;
       const color = computedStyleValue(style, style[property] === undefined ? "borderColor" : property) ?? "#000000";
-      push(box, rect, withOpacity(parseColor(color), opacity), project);
+      push(box, rect, withOpacity(parseColor(color), opacity), project, 0, clipRegions);
     }
+  }
+  // Paint zero-blur box-shadow rings after their image descendants. This is
+  // the standard box-shadow ordering and keeps the selected card's ring crisp.
+  for (const box of paintOrder(boxes)) {
+    const ring = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(String(box.element.style.boxShadow ?? ""));
+    if (!ring) continue;
+    const spread = Number(ring[1]);
+    const color = withOpacity(parseColor(ring[2]), opacityFor(box.element));
+    const project = (x, y) => {
+      const point = projectPoint(box, box.x + x, box.y + y);
+      return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
+    };
+    const { x, y, width, height } = box.borderBox;
+    const clipRegions = clipsFor(box);
+    push(box, { x, y, width, height: spread }, color, project, 0, clipRegions);
+    push(box, { x, y: y + height - spread, width, height: spread }, color, project, 0, clipRegions);
+    push(box, { x, y: y + spread, width: spread, height: Math.max(0, height - spread * 2) }, color, project, 0, clipRegions);
+    push(box, { x: x + width - spread, y: y + spread, width: spread, height: Math.max(0, height - spread * 2) }, color, project, 0, clipRegions);
   }
   values[1] = commandCount;
   const displayList = Buffer.from(new Float32Array(values).buffer);
