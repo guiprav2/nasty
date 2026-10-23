@@ -59,6 +59,9 @@ export class Window extends native.Window {
   #closeNotified = false;
   #pressedElement = null;
   #hoveredElement = null;
+  #textControlIds = new WeakMap();
+  #managedTextControls = new WeakSet();
+  #nextTextControlId = 1;
   constructor(options = {}) {
     const initialWidth = options.width ?? 960;
     const initialHeight = options.height ?? 600;
@@ -409,7 +412,6 @@ export class Window extends native.Window {
     }
     if (nativeEvent.type === "keydown" || nativeEvent.type === "keyup") {
       const active = document.activeElement;
-      if (nativeEvent.type === "keydown" && active && !active.disabled) editFormControl(active, fields);
       if (active) dispatchDomEvent(active, nativeEvent.type, fields);
     }
   }
@@ -446,9 +448,16 @@ export class Window extends native.Window {
   }
 
   updateTextAreas(options) {
-    const controls = options.map(control => {
-      const element = this.#document && [...documentState(this.#document).elements]
-        .find(candidate => candidate.id === control.id && (candidate.localName === "input" || candidate.localName === "textarea"));
+    return this.#updateTextAreas(options, true);
+  }
+
+  #updateTextAreas(options, markManaged) {
+    const elements = options.map(control => control.element ?? (this.#document && [...documentState(this.#document).elements]
+      .find(candidate => candidate.id === control.id && (candidate.localName === "input" || candidate.localName === "textarea"))));
+    const nativeControls = options.map(({ element: _element, ...control }) => control);
+    if (markManaged) for (const element of elements) if (element) this.#managedTextControls.add(element);
+    const controls = nativeControls.map((control, index) => {
+      const element = elements[index];
       if (!element) return control;
       const elementStateValue = elementState(element);
       const value = element.value;
@@ -457,15 +466,14 @@ export class Window extends native.Window {
         value,
         multiline: element.localName === "textarea",
         ...(element.localName === "input" && {
-          glyphBoundaries: measureTextBoundaries(element, value),
+          glyphBoundaries: measureTextBoundaries(element, renderedInputValue(element, value)),
           renderTextOriginX: control.x - (elementStateValue.renderScrollLeft ?? 0),
         }),
       };
     });
     const states = super.updateTextAreas(controls);
     for (let index = 0; index < controls.length; index++) {
-      const element = this.#document && [...documentState(this.#document).elements]
-        .find(candidate => candidate.id === controls[index].id && (candidate.localName === "input" || candidate.localName === "textarea"));
+      const element = elements[index];
       if (!element) continue;
       const elementStateValue = elementState(element);
       const previous = elementStateValue.textAreaState;
@@ -473,7 +481,7 @@ export class Window extends native.Window {
       const previousRenderCaretX = elementStateValue.renderCaretX;
       const next = states[index];
       if (element.localName === "input") {
-        const value = next.displayText ?? next.value;
+        const value = renderedInputValue(element, next.displayText ?? next.value);
         const characters = Array.from(value);
         const caretIndex = Math.min(next.caretIndex, characters.length);
         const totalWidth = measureText(element, value);
@@ -524,6 +532,46 @@ export class Window extends native.Window {
   }
 
   updateTextArea(options) { return this.updateTextAreas([options])[0]; }
+
+  #syncDocumentTextControls() {
+    const document = this.#document;
+    if (!document) return;
+    const visible = element => {
+      for (let current = element; current; current = current.parentElement) {
+        if (current.hidden || current.style.display === "none") return false;
+      }
+      return true;
+    };
+    const boxes = new Map(documentBoxes(document).map(box => [box.element, box]));
+    const options = [];
+    for (const element of documentState(document).elements) {
+      if ((element.localName !== "input" && element.localName !== "textarea")
+        || this.#managedTextControls.has(element) || !visible(element) || element.disabled) continue;
+      if (element.localName === "input" && !["text", "search", "url", "email", "password", "tel", ""].includes(element.type)) continue;
+      const box = boxes.get(element);
+      if (!box) continue;
+      let id = this.#textControlIds.get(element);
+      if (!id) {
+        id = `dom-text-control-${this.#nextTextControlId++}`;
+        this.#textControlIds.set(element, id);
+      }
+      const metrics = textMetrics(element).style;
+      const x = box.contentBox.x, y = box.contentBox.y;
+      const state = elementState(element);
+      options.push({
+        id, element, value: element.value, x, y,
+        width: box.contentBox.width, height: box.contentBox.height,
+        fontSize: metrics.size, lineHeight: metrics.line,
+        multiline: element.localName === "textarea",
+        focus: document.activeElement === element,
+        ...(element.localName === "input" && {
+          glyphBoundaries: measureTextBoundaries(element, renderedInputValue(element, element.value)),
+          renderTextOriginX: x - (state.renderScrollLeft ?? 0),
+        }),
+      });
+    }
+    if (options.length) this.#updateTextAreas(options, false);
+  }
 
   _validateDocumentMaxConstraints(style = this.#document?.body?.style, property = null, value = undefined) {
     if (!this.#maximizable || !style) return;
@@ -577,6 +625,7 @@ export class Window extends native.Window {
   }
   presentDocument() {
     this._syncDragHitTest();
+    this.#syncDocumentTextControls();
     const isRendered = element => {
       for (let current = element; current; current = current.parentElement) {
         if (current.hidden || current.style.display === "none") return false;
@@ -2189,32 +2238,11 @@ function nearestFormControl(element) {
   return null;
 }
 
-function editFormControl(element, event) {
-  if (element.localName !== "input" && element.localName !== "textarea") return;
-  if (element.localName === "input" && !["text", "search", "url", "email", "password", "tel", ""].includes(element.type)) return;
-  if (event.ctrlKey || event.metaKey || event.altKey) return;
-  const value = element.value;
-  let start = element.selectionStart ?? value.length;
-  let end = element.selectionEnd ?? start;
-  let next = value;
-  let caret = start;
-  if (event.key === "Backspace" && start === end && start > 0) start--;
-  else if (event.key === "Delete" && start === end && end < value.length) end++;
-  if (event.key === "Backspace" || event.key === "Delete") {
-    next = value.slice(0, start) + value.slice(end);
-  } else if (event.key === "ArrowLeft") caret = Math.max(0, start - 1);
-  else if (event.key === "ArrowRight") caret = Math.min(value.length, end + 1);
-  else if (event.key === "Home") caret = 0;
-  else if (event.key === "End") caret = value.length;
-  else if (event.text && event.text.length && !/[\r\n]/.test(event.text)) {
-    next = value.slice(0, start) + event.text + value.slice(end);
-    caret = start + event.text.length;
-  } else return;
-  if (next !== value) {
-    element.value = next;
-    element.dispatchEvent(makeHostEvent("input", { data: next.slice(start, caret) || null, inputType: "insertText" }));
-  }
-  element.setSelectionRange(caret, caret);
+function renderedInputValue(element, value) {
+  const text = String(value ?? "");
+  return element.localName === "input" && element.type === "password" && text
+    ? "•".repeat(Array.from(text).length)
+    : text;
 }
 
 function insetBox(box, edges) {

@@ -2,11 +2,12 @@
 /native/
 /node/examples/*.svg
 /node/native/
-/node/runtime/
 /node/node_modules/
+/node/runtime/
 /packaging/android/.gradle/
 /packaging/android/app/build/
 /packaging/android/app/src/main/jniLibs/arm64-v8a/
 /rust/target
 /target/
+data/
 plan.md

@@ -26,8 +26,10 @@ export function parseColor(value) {
 function opacityFor(element) {
   let opacity = 1;
   for (let current = element; current; current = current.parentElement ?? current.parentNode ?? current.parent) {
-    const value = Number(computedStyleValue(current.style, "opacity"));
-    if (current.style.opacity !== undefined && Number.isFinite(value)) opacity *= Math.max(0, Math.min(1, value));
+    const style = current.style;
+    if (!style || style.opacity === undefined) continue;
+    const value = Number(computedStyleValue(style, "opacity"));
+    if (Number.isFinite(value)) opacity *= Math.max(0, Math.min(1, value));
   }
   return opacity;
 }
