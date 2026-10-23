@@ -1,6 +1,6 @@
 //! Small Node binding for Taffy. The document and frame clock live in JavaScript.
 
-use glyphon::cosmic_text::{Weight, Wrap};
+use glyphon::cosmic_text::{Align, Weight, Wrap};
 use glyphon::{
     Attrs, Buffer as TextBuffer, Cache as TextCache, Color as TextColor, Edit, Editor, Family,
     FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
@@ -1123,6 +1123,8 @@ pub struct TextRunOptions {
     pub font_family: Option<String>,
     #[napi(js_name = "fontWeight")]
     pub font_weight: Option<u16>,
+    #[napi(js_name = "textAlign")]
+    pub text_align: Option<String>,
     #[napi(js_name = "clipX")]
     pub clip_x: Option<f64>,
     #[napi(js_name = "clipY")]
@@ -1132,6 +1134,8 @@ pub struct TextRunOptions {
     #[napi(js_name = "clipHeight")]
     pub clip_height: Option<f64>,
     pub wrap: Option<bool>,
+    #[napi(js_name = "breakWords")]
+    pub break_words: Option<bool>,
 }
 
 fn text_bounds(run: &TextRunOptions, width: u32, height: u32) -> TextBounds {
@@ -1160,6 +1164,16 @@ fn text_bounds(run: &TextRunOptions, width: u32, height: u32) -> TextBounds {
         top,
         right: right.max(left),
         bottom: bottom.max(top),
+    }
+}
+
+fn text_run_align(value: Option<&str>) -> Option<Align> {
+    match value {
+        Some("right") => Some(Align::Right),
+        Some("center") => Some(Align::Center),
+        Some("justify") => Some(Align::Justified),
+        Some("end") => Some(Align::End),
+        _ => None,
     }
 }
 
@@ -2193,10 +2207,12 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Nasty quad shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                r#"
+        let quad_color_output = if format.is_srgb() {
+            "srgb_to_linear(input.color.rgb)"
+        } else {
+            "input.color.rgb"
+        };
+        let quad_shader_source = r#"
                 struct VertexInput {
                     @location(0) position: vec2<f32>,
                     @location(1) color: vec4<f32>,
@@ -2205,6 +2221,11 @@ impl Renderer {
                     @builtin(position) position: vec4<f32>,
                     @location(0) color: vec4<f32>,
                 };
+                fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
+                    let low = value / vec3<f32>(12.92);
+                    let high = pow((value + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
+                    return select(high, low, value <= vec3<f32>(0.04045));
+                }
                 @vertex fn vs_main(input: VertexInput) -> VertexOutput {
                     var output: VertexOutput;
                     output.position = vec4<f32>(input.position, 0.0, 1.0);
@@ -2212,11 +2233,13 @@ impl Renderer {
                     return output;
                 }
                 @fragment fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-                    return input.color;
+                    return vec4<f32>(__OUTPUT_RGB__, input.color.a);
                 }
                 "#
-                .into(),
-            ),
+            .replace("__OUTPUT_RGB__", quad_color_output);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty quad shader"),
+            source: wgpu::ShaderSource::Wgsl(quad_shader_source.into()),
         });
         const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
             wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
@@ -2274,9 +2297,12 @@ impl Renderer {
             layout: &canvas_viewport_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: canvas_viewport_buffer.as_entire_binding() }],
         });
-        let canvas_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Nasty canvas pixel-coordinate shader"),
-            source: wgpu::ShaderSource::Wgsl(r#"
+        let canvas_color_output = if format.is_srgb() {
+            "srgb_to_linear(input.color.rgb)"
+        } else {
+            "input.color.rgb"
+        };
+        let canvas_shader_source = r#"
                 struct Viewport { size: vec2<f32> };
                 @group(0) @binding(0) var<uniform> viewport: Viewport;
                 struct VertexInput {
@@ -2287,6 +2313,11 @@ impl Renderer {
                     @builtin(position) position: vec4<f32>,
                     @location(0) color: vec4<f32>,
                 };
+                fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
+                    let low = value / vec3<f32>(12.92);
+                    let high = pow((value + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
+                    return select(high, low, value <= vec3<f32>(0.04045));
+                }
                 @vertex fn vs_main(input: VertexInput) -> VertexOutput {
                     var output: VertexOutput;
                     let x = input.position.x / viewport.size.x * 2.0 - 1.0;
@@ -2296,9 +2327,13 @@ impl Renderer {
                     return output;
                 }
                 @fragment fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-                    return input.color;
+                    return vec4<f32>(__OUTPUT_RGB__, input.color.a);
                 }
-            "#.into()),
+            "#
+            .replace("__OUTPUT_RGB__", canvas_color_output);
+        let canvas_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty canvas pixel-coordinate shader"),
+            source: wgpu::ShaderSource::Wgsl(canvas_shader_source.into()),
         });
         let canvas_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Nasty canvas pipeline layout"),
@@ -2326,9 +2361,12 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
-        let canvas_circle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Nasty canvas radial circle shader"),
-            source: wgpu::ShaderSource::Wgsl(r#"
+        let circle_color_output = if format.is_srgb() {
+            "srgb_to_linear(color.rgb)"
+        } else {
+            "color.rgb"
+        };
+        let circle_shader_source = r#"
                 struct Viewport { size: vec2<f32> };
                 @group(0) @binding(0) var<uniform> viewport: Viewport;
                 struct CircleInput {
@@ -2351,6 +2389,11 @@ impl Renderer {
                     @location(6) inner_color: vec4<f32>,
                     @location(7) outer_color: vec4<f32>,
                 };
+                fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
+                    let low = value / vec3<f32>(12.92);
+                    let high = pow((value + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
+                    return select(high, low, value <= vec3<f32>(0.04045));
+                }
                 @vertex fn vs_main(input: CircleInput, @builtin(vertex_index) vertex_index: u32) -> CircleOutput {
                     let corners = array<vec2<f32>, 6>(
                         vec2<f32>(-1.0,-1.0), vec2<f32>(1.0,-1.0), vec2<f32>(-1.0,1.0),
@@ -2375,9 +2418,14 @@ impl Renderer {
                     if (circle_distance > input.outer_radius || (input.inner_radius >= 0.0 && circle_distance < input.inner_radius)) { discard; }
                     let gradient_distance = length(input.center + input.local - input.gradient_center);
                     let t = clamp((gradient_distance - input.gradient_radii.x) / max(0.0001, input.gradient_radii.y - input.gradient_radii.x), 0.0, 1.0);
-                    return mix(input.inner_color, input.outer_color, t);
+                    let color = mix(input.inner_color, input.outer_color, t);
+                    return vec4<f32>(__OUTPUT_RGB__, color.a);
                 }
-            "#.into()),
+            "#
+            .replace("__OUTPUT_RGB__", circle_color_output);
+        let canvas_circle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty canvas radial circle shader"),
+            source: wgpu::ShaderSource::Wgsl(circle_shader_source.into()),
         });
         const CIRCLE_ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
             0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x2,
@@ -2409,9 +2457,12 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
-        let canvas_bezier_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Nasty canvas bezier stroke shader"),
-            source: wgpu::ShaderSource::Wgsl(r#"
+        let bezier_color_output = if format.is_srgb() {
+            "srgb_to_linear(input.color.rgb)"
+        } else {
+            "input.color.rgb"
+        };
+        let bezier_shader_source = r#"
                 struct Viewport { size: vec2<f32> };
                 @group(0) @binding(0) var<uniform> viewport: Viewport;
                 struct BezierInput {
@@ -2423,6 +2474,11 @@ impl Renderer {
                     @builtin(position) position: vec4<f32>,
                     @location(0) color: vec4<f32>,
                 };
+                fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
+                    let low = value / vec3<f32>(12.92);
+                    let high = pow((value + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
+                    return select(high, low, value <= vec3<f32>(0.04045));
+                }
                 fn curve(input: BezierInput, t: f32) -> vec2<f32> {
                     let s = 1.0 - t;
                     return input.p0 * (s*s*s) + input.p1 * (3.0*s*s*t)
@@ -2448,8 +2504,14 @@ impl Renderer {
                     output.color = input.color;
                     return output;
                 }
-                @fragment fn fs_main(input: BezierOutput) -> @location(0) vec4<f32> { return input.color; }
-            "#.into()),
+                @fragment fn fs_main(input: BezierOutput) -> @location(0) vec4<f32> {
+                    return vec4<f32>(__OUTPUT_RGB__, input.color.a);
+                }
+            "#
+            .replace("__OUTPUT_RGB__", bezier_color_output);
+        let canvas_bezier_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty canvas bezier stroke shader"),
+            source: wgpu::ShaderSource::Wgsl(bezier_shader_source.into()),
         });
         const BEZIER_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
             0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2,
@@ -3573,11 +3635,13 @@ impl TextRuntime {
                 && previous.line_height == run.line_height
                 && previous.color == run.color
                 && previous.font_family == run.font_family
+                && previous.text_align == run.text_align
                 && previous.clip_x == run.clip_x
                 && previous.clip_y == run.clip_y
                 && previous.clip_width == run.clip_width
                 && previous.clip_height == run.clip_height
                 && previous.wrap == run.wrap
+                && previous.break_words == run.break_words
         });
         if same_style {
             let old_text = self.text_buffers[index]
@@ -3629,6 +3693,8 @@ impl TextRuntime {
                 font_system,
                 if run.wrap == Some(false) {
                     Wrap::None
+                } else if run.break_words == Some(true) {
+                    Wrap::WordOrGlyph
                 } else {
                     Wrap::Word
                 },
@@ -3646,6 +3712,14 @@ impl TextRuntime {
                     .weight(Weight(run.font_weight.unwrap_or(400))),
                 Shaping::Advanced,
             );
+            if let Some(align) = text_run_align(run.text_align.as_deref()) {
+                for line in &mut buffer.lines {
+                    line.set_align(Some(align));
+                }
+                for line_index in 0..buffer.lines.len() {
+                    buffer.line_layout(font_system, line_index);
+                }
+            }
             self.text_buffers[index] = PositionedText {
                 buffer,
                 x: x as f32,
@@ -3734,6 +3808,8 @@ impl TextRuntime {
                 font_system,
                 if run.wrap == Some(false) {
                     Wrap::None
+                } else if run.break_words == Some(true) {
+                    Wrap::WordOrGlyph
                 } else {
                     Wrap::Word
                 },
@@ -3747,6 +3823,14 @@ impl TextRuntime {
                     .weight(Weight(run.font_weight.unwrap_or(400))),
                 Shaping::Advanced,
             );
+            if let Some(align) = text_run_align(run.text_align.as_deref()) {
+                for line in &mut buffer.lines {
+                    line.set_align(Some(align));
+                }
+                for line_index in 0..buffer.lines.len() {
+                    buffer.line_layout(font_system, line_index);
+                }
+            }
             for layout_run in buffer.layout_runs() {
                 line_count += 1;
                 glyph_count += layout_run.glyphs.len() as u32;

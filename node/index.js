@@ -6,7 +6,7 @@ import { loadImage, unloadImage } from "./image-decoder.js";
 import { documentBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
 import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
-import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
+import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startInterpolableTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
 import { buildTransformedDisplayList, displayListElements, parseColor } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics } from "./internal/text-metrics.js";
@@ -993,7 +993,9 @@ const LAYOUT_STYLE_PROPERTIES = new Set([
 const styleData = new WeakMap();
 function refreshStyleValues(state) {
   const next = { ...state.baseValues, ...state.hostValues, ...state.classValues };
-  const keys = new Set([...Object.keys(state.values), ...Object.keys(next)]);
+  const transitionControls = new Set(["transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction"]);
+  const keys = [...new Set([...Object.keys(state.values), ...Object.keys(next)])]
+    .sort((a, b) => Number(transitionControls.has(b)) - Number(transitionControls.has(a)));
   const changed = new Set();
   // Transition rules need to be visible before color or opacity targets change.
   if (next.transition !== undefined) state.values.transition = next.transition;
@@ -1004,6 +1006,9 @@ function refreshStyleValues(state) {
     if (after !== undefined) {
       if (isPaintColorProperty(property)) startColorTransition(state, property, String(after));
       else if (property === "opacity") startNumberTransition(state, property, after);
+      else if (!["transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction"].includes(property)) {
+        startInterpolableTransition(state, property, after);
+      }
       state.values[property] = after;
     } else {
       state.transitions.delete(property);
@@ -1771,6 +1776,18 @@ export class Element extends EventTarget {
     if (this === this.document.body && (property === undefined || ["minWidth", "minHeight", "maxWidth", "maxHeight"].includes(property))) doc.defaultView?._syncDocumentSizeConstraints();
   }
 
+  _scheduleTransitionFrame(property) {
+    const doc = documentState(this.document);
+    doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
+    doc.paintDirtyElements ??= new Set();
+    doc.paintDirtyElements.add(this);
+    if (LAYOUT_STYLE_PROPERTIES.has(property)) {
+      doc.dirty = true;
+      doc.transitionLayoutDirty = true;
+      markGeometryDirty(doc);
+    }
+  }
+
   _refreshTailwind(width) {
     const state = styleData.get(this.style);
     if (!state.hasResponsiveUtilities) return false;
@@ -1790,6 +1807,7 @@ export class Element extends EventTarget {
 
   _taffyStyle() {
     const style = { ...styleData.get(this.style).values, ...(this.hidden && { display: "none" }) };
+    for (const property of Object.keys(style)) style[property] = computedStyleValue(this.style, property);
     const fontSize = Number.parseFloat(inheritedStyle(this, "fontSize", 16)) || 16;
     if (this.localName === "img") {
       const imageStyle = { ...style };
@@ -1964,6 +1982,7 @@ export class Document extends EventTarget {
       if (state.sentTextMetrics === metrics.key) continue;
       state.sentTextMetrics = metrics.key;
       doc.layoutTree.setTextMetrics(state.handle, { words: isTextControl ? [0] : metrics.words, space: metrics.space,
+        breakWords: isTextControl ? null : metrics.breakWords,
         lineHeight: metrics.style.line, wrap: isTextControl ? false : metrics.style.wrap });
       doc.dirty = true;
     }
@@ -2034,9 +2053,17 @@ export class Document extends EventTarget {
       documentState(this).dirty = true;
     }
     if (documentState(this).dirty || !documentState(this).layoutSnapshot) {
+      const state = documentState(this);
+      const transitionLayoutPass = !!state.transitionLayoutDirty;
+      state.transitionLayoutDirty = false;
+      if (transitionLayoutPass) {
+        for (const element of state.elements) {
+          state.layoutTree.setStyle(elementState(element).handle, element._taffyStyle());
+        }
+      }
       const result = documentState(this).layoutTree.layoutSync(width, height, elementState(this.body).handle);
       documentState(this).layoutSnapshot = result.boxes;
-      documentState(this).dirty = false;
+      documentState(this).dirty = !!state.transitionLayoutDirty;
       markGeometryDirty(documentState(this));
     }
     if (timings) timings.layout = performance.now() - started;

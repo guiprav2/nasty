@@ -15,7 +15,9 @@ function placementChanged(previous, next) {
 function sameShape(previous, next, allowProjectedWidthChange = false) {
   return previous && previous.text === next.text && (allowProjectedWidthChange || previous.width === next.width)
     && previous.fontSize === next.fontSize && previous.lineHeight === next.lineHeight
-    && previous.fontFamily === next.fontFamily && previous.fontWeight === next.fontWeight && previous.wrap === next.wrap;
+    && previous.fontFamily === next.fontFamily && previous.fontWeight === next.fontWeight
+    && previous.textAlign === next.textAlign && previous.wrap === next.wrap
+    && previous.breakWords === next.breakWords;
 }
 function sendPlacements(window, runs, indices) {
   window.updateTextPlacement(indices.map((index) => runs[index]), indices);
@@ -99,8 +101,10 @@ function textEntries(document, selectedElements = null) {
     const run = { text, x: textOrigin.x, y: textOrigin.y, width: transformedWidth, fontSize,
       lineHeight,
       fontFamily: fontFamilyForElement(element, inherited(element, 'fontFamily', 'sans-serif')),
-      fontWeight: Math.max(100, Math.min(900, parseInt(inherited(element, 'fontWeight', 400), 10) || 400)), color,
-      wrap: whiteSpace !== 'nowrap' };
+      fontWeight: Math.max(100, Math.min(900, parseInt(inherited(element, 'fontWeight', 400), 10) || 400)),
+      textAlign: inherited(element, 'textAlign', 'start'), color,
+      wrap: whiteSpace !== 'nowrap',
+      breakWords: ['anywhere', 'break-word'].includes(inherited(element, 'overflowWrap', 'normal')) };
     const visibleClip = textClip(box, element.style, clip);
     if (visibleClip) Object.assign(run, { clipX: visibleClip.x, clipY: visibleClip.y, clipWidth: visibleClip.width, clipHeight: visibleClip.height });
     entries.push({ element, run });
@@ -108,8 +112,8 @@ function textEntries(document, selectedElements = null) {
   return entries;
 }
 function textShape(runs) {
-  return JSON.stringify(runs.map(({ text, width, fontSize, lineHeight, fontFamily, fontWeight, wrap }) =>
-    ({ text, width, fontSize, lineHeight, fontFamily, fontWeight, wrap })));
+  return JSON.stringify(runs.map(({ text, width, fontSize, lineHeight, fontFamily, fontWeight, textAlign, wrap, breakWords }) =>
+    ({ text, width, fontSize, lineHeight, fontFamily, fontWeight, textAlign, wrap, breakWords })));
 }
 function prewarmRuns(runs, document) {
   const viewport = documentState(document).viewport;
@@ -192,6 +196,7 @@ export function syncDocumentText(window, document, selectedElements = null) {
         fontFamily: shaped.fontFamily,
         fontWeight: shaped.fontWeight,
         wrap: shaped.wrap,
+        breakWords: shaped.breakWords,
       };
       activeIndices.add(index);
       parked.delete(index);

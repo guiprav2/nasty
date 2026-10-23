@@ -38,6 +38,45 @@ function withOpacity(color, opacity) {
   return [color[0], color[1], color[2], color[3] * opacity];
 }
 
+function gradientStops(value) {
+  const match = /^linear-gradient\((to (?:top|right|bottom|left|top right|bottom right|bottom left|top left)|[-+]?[\d.]+deg),\s*(.+)\)$/i.exec(String(value ?? ""));
+  if (!match) return null;
+  const parts = [];
+  let depth = 0, start = 0;
+  for (let index = 0; index < match[2].length; index++) {
+    if (match[2][index] === "(") depth++;
+    else if (match[2][index] === ")") depth--;
+    else if (match[2][index] === "," && depth === 0) { parts.push(match[2].slice(start, index).trim()); start = index + 1; }
+  }
+  parts.push(match[2].slice(start).trim());
+  const stops = parts.map(part => {
+    const stop = /^(.*?)(?:\s+([\d.]+)%)?$/.exec(part);
+    const color = stop && parseColor(stop[1].trim());
+    return color ? { color, position: stop[2] === undefined ? null : Number(stop[2]) / 100 } : null;
+  });
+  if (stops.length < 2 || stops.some(stop => !stop)) return null;
+  if (stops[0].position === null) stops[0].position = 0;
+  if (stops.at(-1).position === null) stops.at(-1).position = 1;
+  for (let index = 0; index < stops.length;) {
+    if (stops[index].position !== null) { index++; continue; }
+    const first = index;
+    while (index < stops.length && stops[index].position === null) index++;
+    const left = stops[first - 1].position;
+    const right = stops[index].position;
+    for (let current = first; current < index; current++) stops[current].position = left + (right - left) * (current - first + 1) / (index - first + 1);
+  }
+  return { direction: match[1].toLowerCase(), stops };
+}
+
+function gradientColor(stops, at) {
+  let right = stops.findIndex(stop => stop.position >= at);
+  if (right < 0) return stops.at(-1).color;
+  if (right === 0) return stops[0].color;
+  const leftStop = stops[right - 1], rightStop = stops[right];
+  const t = Math.max(0, Math.min(1, (at - leftStop.position) / Math.max(1e-9, rightStop.position - leftStop.position)));
+  return leftStop.color.map((channel, index) => channel + (rightStop.color[index] - channel) * t);
+}
+
 function intersection(a, b) {
   const x = Math.max(a.x, b.x);
   const y = Math.max(a.y, b.y);
@@ -248,9 +287,9 @@ export function projectBoxPoint(box, x, y) {
 }
 
 function boxTransformMatrix(box) {
-  const source = box.element.style.transform;
+  const source = computedStyleValue(box.element.style, "transform");
   if (!source || source === "none") return IDENTITY_MATRIX;
-  const origin = transformOrigin(box.element.style.transformOrigin, box.width, box.height);
+  const origin = transformOrigin(computedStyleValue(box.element.style, "transformOrigin"), box.width, box.height);
   const matrix = parseTransform(source, box.width, box.height);
   return multiply4(
     multiply4(
@@ -266,11 +305,11 @@ function boxTransformMatrix(box) {
 
 function childPerspectiveMatrix(box) {
   const style = box.element.style;
-  const source = style.perspective;
+  const source = computedStyleValue(style, "perspective");
   if (!source || source === "none") return IDENTITY_MATRIX;
   const distance = lengthValue(String(source));
   if (distance <= 0) throw new TypeError("perspective must be positive");
-  const parts = String(style.perspectiveOrigin ?? "50% 50%").trim().split(/\s+/);
+  const parts = String(computedStyleValue(style, "perspectiveOrigin") ?? "50% 50%").trim().split(/\s+/);
   const origin = [lengthValue(parts[0] ?? "50%", box.width), lengthValue(parts[1] ?? "50%", box.height)];
   const perspective = identity4();
   perspective[3][2] = -1 / distance;
@@ -451,13 +490,16 @@ function paintOrder(boxes) {
   const result = [];
   const visit = (siblings) => {
     siblings.sort((a, b) => {
-      const az = Number(a.element.style.zIndex), bz = Number(b.element.style.zIndex);
+      const az = Number(computedStyleValue(a.element.style, "zIndex")), bz = Number(computedStyleValue(b.element.style, "zIndex"));
       return (Number.isFinite(az) ? az : 0) - (Number.isFinite(bz) ? bz : 0);
     });
     for (const box of siblings) {
-      result.push(box);
+      result.push({ box, after: false });
       const descendants = children.get(box.element);
       if (descendants) visit(descendants);
+      if (/^0 0 0 \d+(?:\.\d+)?px .+$/.test(String(computedStyleValue(box.element.style, "boxShadow") ?? ""))) {
+        result.push({ box, after: true });
+      }
     }
   };
   visit(roots);
@@ -465,7 +507,7 @@ function paintOrder(boxes) {
 }
 
 function objectPosition(style) {
-  const values = String(style.objectPosition ?? "50% 50%").trim().split(/\s+/);
+  const values = String(computedStyleValue(style, "objectPosition") ?? "50% 50%").trim().split(/\s+/);
   const fraction = (value, fallback) => {
     if (value === "left" || value === "top") return 0;
     if (value === "right" || value === "bottom") return 1;
@@ -593,7 +635,63 @@ export function buildTransformedDisplayList(boxes, width, height) {
       commandCount++;
     }
   };
-  for (const box of paintOrder(boxes)) {
+  const pushTriangle = (box, points, color, project, clipRegions) => {
+    let polygon = points.map(([x, y]) => project(x - box.x, y - box.y));
+    if (polygon.some(point => point === null)) return;
+    for (const region of clipRegions) polygon = clipConvexPolygon(polygon, region);
+    polygon = clipConvexPolygon(polygon, windowClip);
+    for (let index = 1; index < polygon.length - 1; index++) {
+      const a = polygon[0], b = polygon[index], c = polygon[index + 1];
+      values.push(0, a.x, a.y, b.x, b.y, c.x, c.y, color[0], color[1], color[2], color[3]);
+      commandCount++;
+    }
+  };
+  for (const entry of paintOrder(boxes)) {
+    const { box } = entry;
+    if (entry.after) {
+      const ring = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(String(computedStyleValue(box.element.style, "boxShadow") ?? ""));
+      const spread = Number(ring[1]);
+      const color = withOpacity(parseColor(ring[2]), opacityFor(box.element));
+      const project = (x, y) => {
+        const point = projectPoint(box, box.x + x, box.y + y);
+        return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
+      };
+      const { x, y, width: ringWidth, height } = box.borderBox;
+      const clipRegions = clipsFor(box);
+      const radiusText = String(computedStyleValue(box.element.style, "borderRadius") ?? "");
+      const rawRadius = Number.parseFloat(radiusText) || 0;
+      const radius = Math.max(0, Math.min(ringWidth / 2, height / 2,
+        radiusText.trim().endsWith("%") ? Math.min(ringWidth, height) * rawRadius / 100 : rawRadius));
+      if (!radius) {
+        push(box, { x, y, width: ringWidth, height: spread }, color, project, 0, clipRegions);
+        push(box, { x, y: y + height - spread, width: ringWidth, height: spread }, color, project, 0, clipRegions);
+        push(box, { x, y: y + spread, width: spread, height: Math.max(0, height - spread * 2) }, color, project, 0, clipRegions);
+        push(box, { x: x + ringWidth - spread, y: y + spread, width: spread, height: Math.max(0, height - spread * 2) }, color, project, 0, clipRegions);
+      } else {
+        const innerRadius = Math.max(0, radius - spread);
+        push(box, { x: x + radius, y, width: Math.max(0, ringWidth - radius * 2), height: spread }, color, project, 0, clipRegions);
+        push(box, { x: x + radius, y: y + height - spread, width: Math.max(0, ringWidth - radius * 2), height: spread }, color, project, 0, clipRegions);
+        push(box, { x, y: y + radius, width: spread, height: Math.max(0, height - radius * 2) }, color, project, 0, clipRegions);
+        push(box, { x: x + ringWidth - spread, y: y + radius, width: spread, height: Math.max(0, height - radius * 2) }, color, project, 0, clipRegions);
+        const corners = [
+          [x + radius, y + radius, Math.PI, Math.PI * 1.5],
+          [x + ringWidth - radius, y + radius, Math.PI * 1.5, Math.PI * 2],
+          [x + ringWidth - radius, y + height - radius, 0, Math.PI * 0.5],
+          [x + radius, y + height - radius, Math.PI * 0.5, Math.PI],
+        ];
+        for (const [cx, cy, start, end] of corners) for (let step = 0; step < 8; step++) {
+          const a = start + (end - start) * step / 8;
+          const b = start + (end - start) * (step + 1) / 8;
+          const outerA = [cx + Math.cos(a) * radius, cy + Math.sin(a) * radius];
+          const outerB = [cx + Math.cos(b) * radius, cy + Math.sin(b) * radius];
+          const innerA = [cx + Math.cos(a) * innerRadius, cy + Math.sin(a) * innerRadius];
+          const innerB = [cx + Math.cos(b) * innerRadius, cy + Math.sin(b) * innerRadius];
+          pushTriangle(box, [outerA, outerB, innerB], color, project, clipRegions);
+          pushTriangle(box, [outerA, innerB, innerA], color, project, clipRegions);
+        }
+      }
+      continue;
+    }
     const style = box.element.style;
     const clipRegions = clipsFor(box);
     const project = (x, y) => {
@@ -623,10 +721,29 @@ export function buildTransformedDisplayList(boxes, width, height) {
       continue;
     }
     const opacity = opacityFor(box.element);
-    const radiusText = String(style.borderRadius ?? "");
+      const radiusText = String(computedStyleValue(style, "borderRadius") ?? "");
     const radiusValue = Number.parseFloat(radiusText) || 0;
     const radius = radiusText.trim().endsWith("%") ? Math.min(box.width, box.height) * radiusValue / 100 : radiusValue;
     push(box, box.borderBox, withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity), project, radius, clipRegions);
+    const gradient = gradientStops(computedStyleValue(style, "backgroundImage"));
+    if (gradient) {
+      const direction = gradient.direction;
+      const horizontal = direction === "to right" || direction === "to left";
+      const reverse = direction === "to top" || direction === "to left";
+      // A dense set of GPU solid-color strips keeps gradient composition on the
+      // normal WGPU path while exposing a standard CSS linear-gradient value.
+      const strips = 64;
+      for (let strip = 0; strip < strips; strip++) {
+        const start = strip / strips, end = (strip + 1) / strips;
+        const a = reverse ? 1 - end : start;
+        const b = reverse ? 1 - start : end;
+        const position = (a + b) / 2;
+        const rect = horizontal
+          ? { x: box.borderBox.x + box.borderBox.width * start, y: box.borderBox.y, width: box.borderBox.width / strips + 0.25, height: box.borderBox.height }
+          : { x: box.borderBox.x, y: box.borderBox.y + box.borderBox.height * start, width: box.borderBox.width, height: box.borderBox.height / strips + 0.25 };
+        push(box, rect, withOpacity(gradientColor(gradient.stops, position), opacity), project, radius, clipRegions);
+      }
+    }
     if (box.element.localName === "canvas") {
       const state = elementState(box.element);
       const surface = canvasSurface(state.canvasContext);
@@ -749,24 +866,6 @@ export function buildTransformedDisplayList(boxes, width, height) {
       const color = computedStyleValue(style, style[property] === undefined ? "borderColor" : property) ?? "#000000";
       push(box, rect, withOpacity(parseColor(color), opacity), project, 0, clipRegions);
     }
-  }
-  // Paint zero-blur box-shadow rings after their image descendants. This is
-  // the standard box-shadow ordering and keeps the selected card's ring crisp.
-  for (const box of paintOrder(boxes)) {
-    const ring = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(String(box.element.style.boxShadow ?? ""));
-    if (!ring) continue;
-    const spread = Number(ring[1]);
-    const color = withOpacity(parseColor(ring[2]), opacityFor(box.element));
-    const project = (x, y) => {
-      const point = projectPoint(box, box.x + x, box.y + y);
-      return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
-    };
-    const { x, y, width, height } = box.borderBox;
-    const clipRegions = clipsFor(box);
-    push(box, { x, y, width, height: spread }, color, project, 0, clipRegions);
-    push(box, { x, y: y + height - spread, width, height: spread }, color, project, 0, clipRegions);
-    push(box, { x, y: y + spread, width: spread, height: Math.max(0, height - spread * 2) }, color, project, 0, clipRegions);
-    push(box, { x: x + width - spread, y: y + spread, width: spread, height: Math.max(0, height - spread * 2) }, color, project, 0, clipRegions);
   }
   values[1] = commandCount;
   const displayList = Buffer.from(new Float32Array(values).buffer);

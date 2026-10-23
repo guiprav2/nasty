@@ -101,6 +101,13 @@ function colorValue(value) {
 }
 function utilityStyle(utility) {
   if (utility.startsWith("[") && utility.endsWith("]")) return arbitraryValue(utility);
+  const gradient = /^bg-gradient-to-(t|tr|r|br|b|bl|l|tl)$/.exec(utility);
+  if (gradient) return ["__gradientDirection", ({ t: "to top", tr: "to top right", r: "to right", br: "to bottom right", b: "to bottom", bl: "to bottom left", l: "to left", tl: "to top left" })[gradient[1]]];
+  const gradientStop = /^(from|via|to)-(.+)$/.exec(utility);
+  if (gradientStop) {
+    const color = colorValue(gradientStop[2]);
+    if (color) return [`__gradient${gradientStop[1][0].toUpperCase()}${gradientStop[1].slice(1)}`, color];
+  }
   const translate = /^(-)?translate-([xy])-(.+)$/.exec(utility);
   if (translate) {
     const [, negative, axis, raw] = translate;
@@ -143,9 +150,12 @@ function utilityStyle(utility) {
     "rounded-sm": ["borderRadius", 2], "rounded-md": ["borderRadius", 6], "rounded-lg": ["borderRadius", 8], "rounded-xl": ["borderRadius", 12], "rounded-2xl": ["borderRadius", 16], "rounded-full": ["borderRadius", 9999],
     "cursor-pointer": ["cursor", "pointer"], "cursor-grab": ["cursor", "grab"], "cursor-grabbing": ["cursor", "grabbing"], "cursor-default": ["cursor", "default"],
     "pointer-events-none": ["pointerEvents", "none"], "pointer-events-auto": ["pointerEvents", "auto"],
+    "ease-linear": ["transitionTimingFunction", "linear"], "ease-in": ["transitionTimingFunction", "ease-in"], "ease-out": ["transitionTimingFunction", "ease-out"], "ease-in-out": ["transitionTimingFunction", "ease-in-out"],
     nf: [["fontFamily", "Symbols Nerd Font"], ["fontStyle", "normal"], ["fontWeight", 400], ["fontVariant", "normal"], ["textTransform", "none"], ["lineHeight", "1"]],
   };
   if (fixed[utility]) return fixed[utility];
+  const duration = /^duration-(\d+)$/.exec(utility);
+  if (duration) return ["transitionDuration", `${duration[1]}ms`];
   const caret = /^caret-(.+)$/.exec(utility);
   if (caret && colorValue(caret[1])) return ["caretColor", colorValue(caret[1])];
   const inset = /^(inset(?:-[xy])?|top|right|bottom|left)-(.+)$/.exec(utility);
@@ -244,12 +254,20 @@ export function resolveTailwind(className, width = 0) {
   const values = {};
   let translateX, translateY;
   let ringWidth, ringColor;
+  let gradientDirection;
+  let gradientFrom;
+  let gradientVia;
+  let gradientTo;
   for (const { declarations: pairs } of utilities) {
     if (pairs) for (const [property, value] of Array.isArray(pairs[0]) ? pairs : [pairs]) {
       if (property === "__translateX") translateX = value;
       else if (property === "__translateY") translateY = value;
       else if (property === "__ringWidth") ringWidth = value;
       else if (property === "__ringColor") ringColor = value;
+      else if (property === "__gradientDirection") gradientDirection = value;
+      else if (property === "__gradientFrom") gradientFrom = value;
+      else if (property === "__gradientVia") gradientVia = value;
+      else if (property === "__gradientTo") gradientTo = value;
       else values[property] = value;
     }
   }
@@ -260,6 +278,13 @@ export function resolveTailwind(className, width = 0) {
   if (translation) values.transform = [translation, values.transform].filter(Boolean).join(" ");
   if (ringWidth !== undefined || ringColor !== undefined) {
     values.boxShadow = `0 0 0 ${ringWidth ?? 3}px ${ringColor ?? "rgba(59, 130, 246, 0.5)"}`;
+  }
+  if (gradientDirection && (gradientFrom || gradientVia || gradientTo)) {
+    const stops = [];
+    if (gradientFrom) stops.push(`${gradientFrom} 0%`);
+    if (gradientVia) stops.push(`${gradientVia} ${gradientFrom && gradientTo ? "50%" : gradientFrom ? "100%" : "0%"}`);
+    if (gradientTo) stops.push(`${gradientTo} 100%`);
+    values.backgroundImage = `linear-gradient(${gradientDirection}, ${stops.join(", ")})`;
   }
   Object.freeze(values);
   classCache.set(key, values);

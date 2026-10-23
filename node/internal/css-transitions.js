@@ -26,8 +26,15 @@ export function registerStyleTransitionState(style, state) {
 export function computedStyleValue(style, property) {
   const state = styleTransitionStates.get(style);
   if (!state) return style[property];
+  const transition = state.transitions.get(property);
+  if (transition && performance.now() < transition.started + transition.duration) {
+    // Nasty renders only when a document is dirty. Keep the next display frame
+    // scheduled while this property is between its CSS transition endpoints.
+    state.element._scheduleTransitionFrame(property);
+  }
   if (COLOR_PROPERTIES.has(property)) return sampleColorTransition(state, property);
   if (NUMBER_PROPERTIES.has(property)) return sampleNumberTransition(state, property);
+  if (state.transitions.has(property)) return sampleInterpolableTransition(state, property);
   return style[property];
 }
 
@@ -63,17 +70,38 @@ function toMilliseconds(token) {
 
 function transitionOptions(state, property) {
   const targetName = kebab(property);
+  const shorthand = state.values.transition;
+  const properties = splitList(String(shorthand ?? state.values.transitionProperty ?? "all"));
+  const durations = splitList(String(state.values.transitionDuration ?? "0s"));
+  const delays = splitList(String(state.values.transitionDelay ?? "0s"));
+  const easings = splitList(String(state.values.transitionTimingFunction ?? "ease"));
+  const selectedProperty = properties.find((name) => name === "all" || name === targetName || name === property);
+  if (!selectedProperty) return null;
+  if (shorthand === undefined) {
+    const index = properties.indexOf(selectedProperty);
+    const duration = Math.max(0, toMilliseconds(durations[index % durations.length]) ?? 0);
+    if (!duration) return null;
+    return { duration, delay: toMilliseconds(delays[index % delays.length]) ?? 0, easing: easings[index % easings.length] ?? "ease" };
+  }
   let selected = null;
-  for (const entry of splitList(String(state.values.transition ?? ""))) {
+  let selectedIndex = -1;
+  for (const [entryIndex, entry] of splitList(String(shorthand)).entries()) {
     const properties = [...entry.matchAll(/(?:^|\s)(all|[a-zA-Z-]+)(?=\s|$)/g)].map((match) => match[1]);
     if (!properties.some((name) => name === "all" || name === targetName || name === property)) continue;
     const times = [...entry.matchAll(/-?\d*\.?\d+(?:ms|s)\b/g)].map((match) => match[0]);
     if (!times.length) continue;
     const duration = Math.max(0, toMilliseconds(times[0]));
-    if (duration === 0) continue;
     const delay = toMilliseconds(times[1]) ?? 0;
     const easing = entry.match(/cubic-bezier\([^)]*\)|steps\([^)]*\)|\b(?:linear|ease-in-out|ease-in|ease-out|ease)\b/);
     selected = { duration, delay, easing: easing?.[0] ?? "ease" };
+    selectedIndex = entryIndex;
+  }
+  if (selected) {
+    const index = Math.max(0, selectedIndex);
+    if (state.values.transitionDuration !== undefined) selected.duration = Math.max(0, toMilliseconds(durations[index % durations.length]) ?? 0);
+    if (state.values.transitionDelay !== undefined) selected.delay = toMilliseconds(delays[index % delays.length]) ?? 0;
+    if (state.values.transitionTimingFunction !== undefined) selected.easing = easings[index % easings.length] ?? selected.easing;
+    if (!selected.duration) return null;
   }
   return selected;
 }
@@ -149,6 +177,66 @@ export function startNumberTransition(state, property, target, now = performance
   }
   if (duration <= 0) { state.transitions.delete(property); return; }
   state.transitions.set(property, { from: current, to, started: now + options.delay, duration, easing: options.easing });
+}
+
+function interpolableParts(value) {
+  const source = String(value ?? "none");
+  const expression = /(-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-zA-Z%]+)?/gi;
+  const numbers = [];
+  const shape = source.replace(expression, (token) => {
+    const match = /^(-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-zA-Z%]+)?$/i.exec(token);
+    numbers.push({ value: Number(match[1]), unit: match[2] ?? "" });
+    return `#${match[2] ?? ""}`;
+  });
+  return { source, numbers, shape };
+}
+
+export function startInterpolableTransition(state, property, target, now = performance.now()) {
+  const options = transitionOptions(state, property);
+  if (!options) { state.transitions.delete(property); return; }
+  const previous = state.values[property];
+  if (typeof previous === "number" && typeof target === "number") {
+    state.transitions.set(property, { from: previous, to: target, numeric: true, started: now + options.delay, duration: options.duration, easing: options.easing });
+    return;
+  }
+  const from = interpolableParts(previous ?? "none");
+  const to = interpolableParts(target);
+  if (from.shape !== to.shape || from.numbers.length !== to.numbers.length || from.numbers.some((part, i) => part.unit !== to.numbers[i].unit)) {
+    state.transitions.delete(property);
+    return;
+  }
+  if (!from.numbers.length) { state.transitions.delete(property); return; }
+  state.transitions.set(property, { from, to, started: now + options.delay, duration: options.duration, easing: options.easing });
+}
+
+function sampleInterpolableTransition(state, property, now = performance.now()) {
+  const transition = state.transitions.get(property);
+  if (!transition) return state.values[property];
+  const progress = Math.max(0, Math.min(1, (now - transition.started) / transition.duration));
+  const t = timingProgress(transition.easing, progress);
+  if (transition.numeric) {
+    if (progress >= 1) {
+      state.transitions.delete(property);
+      queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
+        propertyName: kebab(property), elapsedTime: transition.duration / 1000,
+      })));
+      return state.values[property];
+    }
+    return transition.from + (transition.to - transition.from) * t;
+  }
+  if (progress >= 1) {
+    state.transitions.delete(property);
+    queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
+      propertyName: kebab(property), elapsedTime: transition.duration / 1000,
+    })));
+    return state.values[property];
+  }
+  let index = 0;
+  return transition.to.source.replace(/-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?[a-zA-Z%]*/gi, () => {
+    const from = transition.from.numbers[index];
+    const to = transition.to.numbers[index++];
+    return `${from.value + (to.value - from.value) * t}${to.unit}`;
+  });
 }
 
 function sampleNumberTransition(state, property, now = performance.now()) {

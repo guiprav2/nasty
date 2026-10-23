@@ -66,7 +66,7 @@ const seedPlaylists = [
   },
 ];
 
-const dataDir = process.env.DJGROK_DATA_DIR || join(here, "data");
+const dataDir = process.env.VITROLA_DATA_DIR || join(here, "data");
 const windowSizeFile = join(dataDir, "window-size.json");
 let initialWindowSize = { width: 1440, height: 900 };
 try {
@@ -366,7 +366,7 @@ function onChatScroll() {
 
 function traceCarousel(event, details = {}) {
   if (process.env.SWEET_MEDIA_TRACE == null) return;
-  console.error(`[djgrok-carousel ${new Date().toISOString()}] ${event}`, details);
+  console.error(`[vitrola-carousel ${new Date().toISOString()}] ${event}`, details);
 }
 
 async function unlock() {
@@ -416,6 +416,7 @@ function resetCarouselAfterPause() {
   cancelCarouselReset();
   carouselResetTimer = setTimeout(() => {
     carouselResetTimer = null;
+    carouselPointer = null;
     carouselCenterPreview = null;
     d.updateSync();
   }, 1000);
@@ -731,8 +732,7 @@ function coverCard(index) {
 
 function coverStage() {
   let gestureStart = null;
-  let wheelRemainder = 0;
-  const wheelStep = 70;
+  let wheelGestureTimer = null;
   const spacing = () => viewportWidth < 1024 ? 112 : 228;
   const showVolume = (value) => {
     const video = currentVideo();
@@ -750,8 +750,13 @@ function coverStage() {
     d.updateSync();
   };
   const onPointerDown = (event) => {
+    if (wheelGestureTimer !== null) clearTimeout(wheelGestureTimer);
+    wheelGestureTimer = null;
     carouselSuppressClickUntil = 0;
     cancelCarouselReset();
+    // Capture the standard pointer sequence so dragging keeps updating after
+    // the pointer crosses a card edge or leaves the carousel stage.
+    event.target?.setPointerCapture?.(event.pointerId);
     gestureStart = { x: event.x, y: event.y, center: carouselCenter(), volume: currentVideo()?.volume ?? state.volume, axis: null, moved: false };
     carouselPointer = gestureStart;
   };
@@ -798,18 +803,24 @@ function coverStage() {
     }
     const delta = event.deltaX;
     if (!delta) return;
-    wheelRemainder += delta;
-    const steps = Math.trunc(wheelRemainder / wheelStep);
-    if (!steps) return;
-    wheelRemainder -= steps * wheelStep;
-    rotateCarousel(carouselCenter() + steps);
+    if (wheelGestureTimer !== null) clearTimeout(wheelGestureTimer);
+    cancelCarouselReset();
+    // Keep trackpad/wheel movement continuous like a pointer drag. Once input
+    // pauses, snap to the nearest card and use the same settle path as release.
+    carouselPointer = { wheel: true };
+    rotateCarousel(carouselCenter() - delta / spacing());
+    wheelGestureTimer = setTimeout(() => {
+      wheelGestureTimer = null;
+      carouselPointer = null;
+      rotateCarousel(Math.round(carouselCenter()));
+      resetCarouselAfterPause();
+    }, 120);
   };
   const onMouseLeave = () => {
     traceCarousel("mouseleave", { preview: carouselCenterPreview, playingIndex: state.player.index });
     // Keep tracking an active drag across the stage boundary. Once released,
     // let the snapped preview linger just like it does after a touch swipe.
     if (gestureStart) return;
-    wheelRemainder = 0;
     if (carouselCenterPreview !== null) resetCarouselAfterPause();
   };
   return d.el(
@@ -826,10 +837,11 @@ function coverStage() {
         d.el(
           "div",
           {
-            class: "relative perspective-[1600px] h-[min(42vh,18rem)] w-full flex items-center justify-center md:h-[min(48vh,22rem)]",
-            onmousedown: onPointerDown,
-            onmousemove: onPointerMove,
-            onmouseup: onPointerUp,
+            class: "relative perspective-[1600px] h-[min(42vh,18rem)] w-full flex items-center justify-center [touch-action:none] md:h-[min(48vh,22rem)]",
+            onpointerdown: onPointerDown,
+            onpointermove: onPointerMove,
+            onpointerup: onPointerUp,
+            onpointercancel: onPointerUp,
             onmouseleave: onMouseLeave,
             onwheel: onWheel,
             onclick: () => {},
@@ -841,17 +853,15 @@ function coverStage() {
           ),
         ),
       ),
-      d.el("div", { class: "text-sm text-white/45" }, "Choose a playlist to start listening."),
+      d.el("div", { class: "w-full text-center text-sm text-white/45" }, "Choose a playlist to start listening."),
     ),
   );
 }
 
 function disc() {
-  return d.el(
-    "div",
-    { class: "relative h-9 w-9 shrink-0 rounded-full bg-gradient-to-br from-rose-200 via-rose-400 to-fuchsia-700" },
-    d.el("div", { class: "absolute left-1/2 top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/80 bg-[#070709]" }),
-  );
+  const image = d.el("img", { class: "h-9 w-9 shrink-0 object-contain animate-spin-slow" });
+  image.setAttribute("src", join(here, "logo.png"));
+  return image;
 }
 
 function iconButton(label, iconClass, action, size = "h-10 w-10", iconColor = "text-white/80") {
@@ -951,7 +961,7 @@ function header() {
       d.el("div", { class: "text-sm font-semibold" }, "Vitrola"),
       d.el("div", { class: "text-[11px] text-white/40" }, "Grok 4.3"),
     ),
-    d.el("button", { class: "shrink-0 rounded-lg px-3 py-2 text-xs text-white/45 hover:bg-white/10 hover:text-white cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API key"),
+    d.el("button", { class: "shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-xs text-white/45 hover:bg-white/10 hover:text-white cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API key"),
   );
 }
 
@@ -963,7 +973,7 @@ function chatMessage(message) {
   return d.el(
     "div",
     { class: `my-2.5 flex w-full ${mine ? "justify-end" : "justify-start"}` },
-    d.el("div", { class: `max-w-[92%] rounded-2xl px-3 py-2 text-sm whitespace-pre-wrap ${mine ? "bg-rose-600 text-white" : "bg-white/10 text-white/90"}` }, d.text(() => message.body?.trim?.() || "…")),
+    d.el("div", { class: `max-w-[92%] rounded-2xl px-3 py-2 text-sm whitespace-pre-wrap [overflow-wrap:anywhere] ${mine ? "bg-rose-600 text-white" : "bg-white/10 text-white/90"}` }, d.text(() => message.body?.trim?.() || "…")),
   );
 }
 
@@ -1049,7 +1059,7 @@ function playlistEntry(playlist) {
       onclick: () => { state.drawerOpen = false; void playAt(playlist.id, Number(cursor)); },
     },
       d.el("span", { class: "w-5 shrink-0 text-right text-white/30" }, d.text(() => String(Number(cursor) + 1))),
-      d.el("span", { class: "truncate" }, d.text(() => track.title)),
+      d.el("span", { class: "min-w-0 flex-1 truncate" }, d.text(() => track.title)),
     )),
   );
 }
@@ -1065,7 +1075,7 @@ function libraryPanel() {
     ),
     d.el("div", { class: "flex-1 min-h-0 overflow-y-auto" }, d.map(() => state.playlists, playlistEntry)),
     d.el("div", { class: "m-4 mt-auto flex shrink-0 flex-col gap-2 md:hidden" },
-      d.el("button", { class: "rounded-xl bg-red-600 px-4 py-3 text-left text-sm font-bold text-white shadow-lg hover:bg-red-500 cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API Key"),
+      d.el("button", { class: "whitespace-nowrap rounded-xl bg-red-600 px-4 py-3 text-left text-sm font-bold text-white shadow-lg hover:bg-red-500 cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API Key"),
       d.el("button", { class: "rounded-xl border border-white/15 bg-white/10 px-4 py-3 text-sm font-bold text-white shadow-lg hover:bg-white/15 cursor-pointer", onclick: startInspector }, "Inspector Mode"),
     ),
   );

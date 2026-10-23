@@ -43,8 +43,10 @@ export function textStyle(element) {
       : lineValue.endsWith('em') ? parseFloat(lineValue) * size
         : lineValue.endsWith('rem') ? parseFloat(lineValue) * 16
           : lineValue.endsWith('%') ? parseFloat(lineValue) * size / 100 : parseFloat(lineValue);
+  const overflowWrap = inherited(element, 'overflowWrap', 'normal');
   return { size, spacing, line, font, color: inherited(element, 'color', '#000'),
-    wrap: element.localName !== 'input' && !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')) };
+    wrap: element.localName !== 'input' && !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')),
+    breakWords: overflowWrap === 'anywhere' || overflowWrap === 'break-word' };
 }
 export function textMetrics(element) {
   const style = textStyle(element);
@@ -52,7 +54,7 @@ export function textMetrics(element) {
   if (!nerdIcon(element) && inherited(element, 'textTransform', '') === 'uppercase') text = text.toUpperCase();
   // Color affects paint only. Keeping it out of the measurement key prevents
   // animated text colors from invalidating Taffy's layout tree.
-  const key = JSON.stringify([text, style.size, style.spacing, style.line, style.font, style.wrap]);
+  const key = JSON.stringify([text, style.size, style.spacing, style.line, style.font, style.wrap, style.breakWords]);
   const state = elementState(element);
   if (state.textMetrics?.key === key) {
     state.textMetrics.style.color = style.color;
@@ -64,7 +66,8 @@ export function textMetrics(element) {
   const tokens = text.split(/(\n| +)/).filter(Boolean).filter(word => !/^ +$/.test(word));
   const words = tokens.map(word => word === '\n' ? -1 : context.measureText(word).width);
   const space = context.measureText(' ').width;
-  state.textMetrics = { key, style, tokens, words, space };
+  state.textMetrics = { key, style, tokens, words, space,
+    breakWords: style.breakWords ? tokens.map(word => word === '\n' ? null : [...word].map(character => context.measureText(character).width)) : null };
   return state.textMetrics;
 }
 export function measureText(element, text) {

@@ -12,13 +12,28 @@ const measurements = new Map();
 function measure({ node, knownWidth, knownHeight, availableWidth, minContent }) {
   const text = measurements.get(node);
   if (!text || !text.words.length) return { width: 0, height: 0 };
-  const limit = knownWidth ?? (text.wrap ? (minContent ? Math.max(0, ...text.words) : availableWidth ?? Infinity) : Infinity);
+  const longestWord = text.breakWords ? Math.max(0, ...text.breakWords.flatMap((characters) => characters ?? []))
+    : Math.max(0, ...text.words);
+  const limit = knownWidth ?? (text.wrap ? (minContent ? longestWord : availableWidth ?? Infinity) : Infinity);
   let line = 0, widest = 0, lines = 1;
-  for (const word of text.words) {
+  for (let wordIndex = 0; wordIndex < text.words.length; wordIndex++) {
+    const word = text.words[wordIndex];
     if (word < 0) { widest = Math.max(widest, line); line = 0; lines++; continue; }
     const next = line ? line + text.space + word : word;
     if (text.wrap && next > limit + .01 && line > 0) { widest = Math.max(widest, line); line = word; lines++; }
     else line = next;
+    const chars = text.breakWords?.[wordIndex];
+    if (text.wrap && chars && line > limit + .01) {
+      let fragment = 0;
+      for (const width of chars) {
+        if (fragment > 0 && fragment + width > limit + .01) {
+          widest = Math.max(widest, fragment);
+          lines++;
+          fragment = width;
+        } else fragment += width;
+      }
+      line = fragment;
+    }
   }
   return { width: knownWidth ?? Math.max(widest, line), height: knownHeight ?? lines * text.lineHeight };
 }

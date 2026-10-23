@@ -3,6 +3,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/display.h>
+#include <libavutil/dict.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/pixdesc.h>
@@ -587,7 +588,18 @@ static int ensure_swr(SweetMedia *media, char *err, size_t err_len) {
 }
 
 static int open_input(const char *path, AVFormatContext **fmt, char *err, size_t err_len) {
-    int ret = avformat_open_input(fmt, path, NULL, NULL);
+    AVDictionary *options = NULL;
+    int remote = strncmp(path, "https://", 8) == 0 || strncmp(path, "http://", 7) == 0;
+    int ret;
+    if (remote) {
+        // yt-dlp media URLs commonly require the same browser identity used to
+        // obtain the signed URL. FFmpeg's Lavf default can receive an HTML
+        // denial page, which is then reported as invalid media data.
+        av_dict_set(&options, "user_agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36", 0);
+        av_dict_set(&options, "referer", "https://www.youtube.com/", 0);
+    }
+    ret = avformat_open_input(fmt, path, NULL, &options);
+    av_dict_free(&options);
     if (ret < 0) {
         set_averr(err, err_len, "opening media", ret);
         return -1;

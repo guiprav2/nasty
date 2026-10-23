@@ -41,10 +41,10 @@ export async function ytdlpDownload(url) {
     return { ok: false, error: error.message || String(error) };
   }
   const formats = Array.isArray(info.formats) ? info.formats : [];
-  const playable = formats.some((format) => format?.url && format.ext === "mp4" && /^(avc1|hvc1|hev1|av01)/.test(format.vcodec || "") && format.protocol !== "m3u8" && format.protocol !== "m3u8_native");
+  const playable = formats.some((format) => format?.url && format.vcodec && format.vcodec !== "none" && format.acodec && format.acodec !== "none" && !["m3u8", "m3u8_native"].includes(format.protocol));
   return {
     ok: playable,
-    error: playable ? "" : "yt-dlp returned no supported MP4. Try another URL, or vanilla_download a file you found with grep_page.",
+    error: playable ? "" : "yt-dlp returned no combined audio/video stream. Try another URL, or vanilla_download a file you found with grep_page.",
     title: String(info.title || "").slice(0, 300),
     pageUrl: stablePage(info, target),
     channel: String(info.channel || info.uploader || info.extractor_key || "").slice(0, 200),
@@ -114,5 +114,5 @@ export async function resolvePlayback(track, fetchImpl = globalThis.fetch) {
     if (!downloaded.media || !downloaded.file) throw new Error("That URL is a page, not a media file");
     return downloaded.file;
   }
-  return target;
+  return playbackUrl(target);
 }

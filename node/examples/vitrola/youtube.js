@@ -37,7 +37,7 @@ function which(name) {
 export function ytdlBin() {
   if (!binPromise) {
     binPromise = (async () => {
-      if (process.env.DJGROK_YTDL) return process.env.DJGROK_YTDL;
+      if (process.env.VITROLA_YTDL) return process.env.VITROLA_YTDL;
       if (await which('yt-dlp')) return 'yt-dlp';
       if (await which('youtube-dl')) return 'youtube-dl';
       throw new Error('yt-dlp or youtube-dl is required. Install yt-dlp and ensure it is on PATH.');
@@ -53,6 +53,7 @@ export async function videoInfo(url) {
     '--no-warnings',
     '--skip-download',
     '--dump-single-json',
+    '--extractor-args', 'youtube:player_client=android',
     '--socket-timeout', '20',
     String(url),
   ], { timeout: 60000 });
@@ -63,7 +64,8 @@ export async function playbackUrl(url) {
   const bin = await ytdlBin();
   const raw = await runChecked(bin, [
     '--no-playlist', '--no-warnings', '--get-url',
-    '-f', 'best[ext=mp4][vcodec^=avc1][acodec!=none]/best[ext=mp4][acodec!=none]',
+    '-f', 'best[ext=mp4][vcodec^=avc1][acodec!=none]/best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]',
+    '--extractor-args', 'youtube:player_client=android',
     '--socket-timeout', '20', String(url),
   ], { timeout: 60000 });
   const result = raw.trim().split(/\r?\n/)[0];
