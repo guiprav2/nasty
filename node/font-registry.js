@@ -12,7 +12,8 @@ export const systemFontFamily = (() => {
   } catch { return 'DejaVu Sans'; }
 })();
 
-export const fontDirectory = fileURLToPath(new URL('../fonts/', import.meta.url));
+export const fontDirectory = process.env.NASTY_FONT_DIR || fileURLToPath(new URL('../fonts/', import.meta.url));
+const sharedFontDirectory = fileURLToPath(new URL('../fonts/', import.meta.url));
 export function fontFileStem(family) {
   return family.normalize('NFKD').replace(/[^\x20-\x7e]/g, '').toLowerCase().trim()
     .replace(/\s+/g, '_').replace(/[^a-z0-9_-]/g, '');
@@ -21,11 +22,21 @@ export function fontFamilies(value) {
   return String(value || '').split(',').map(name => name.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
 }
 export function findFontFiles(family) {
-  const stem = fontFileStem(family);
+  const stem = family === 'Symbols Nerd Font' ? 'nerd_symbols' : fontFileStem(family);
   if (!stem) return [];
-  return readdirSync(fontDirectory).filter(file => /\.(ttf|otf|woff2?)$/i.test(file)
-    && (file.replace(/\.[^.]+$/, '') === stem || file.startsWith(`${stem}_`)))
-    .sort().map(file => join(fontDirectory, file));
+  const directory = (() => {
+    const hasFamily = path => readdirSync(path).some(file => {
+      const lower = file.toLowerCase().replace(/\.[^.]+$/, '');
+      return lower === stem || lower.startsWith(`${stem}_`) || lower.startsWith(`${stem}-`);
+    });
+    return hasFamily(fontDirectory) ? fontDirectory : sharedFontDirectory;
+  })();
+  return readdirSync(directory).filter(file => {
+    const lower = file.toLowerCase();
+    return /\.(ttf|otf|woff2?)$/i.test(file)
+      && (lower.replace(/\.[^.]+$/, '') === stem || lower.startsWith(`${stem}_`) || lower.startsWith(`${stem}-`));
+  })
+    .sort().map(file => join(directory, file));
 }
 const nativeFonts = new Map();
 export function fontsForRuns(runs) {

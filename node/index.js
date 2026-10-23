@@ -11,10 +11,12 @@ import { buildTransformedDisplayList, displayListElements, parseColor } from "./
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics } from "./internal/text-metrics.js";
 import { documentImage } from "./internal/raster-document.js";
-import { blocksWindowDrag, elementsFromPoint as hitTestElementsFromPoint } from "./internal/dom-hit-testing.js";
+import { blocksWindowDrag, elementsFromPoint as hitTestElementsFromPoint, trackClickListener } from "./internal/dom-hit-testing.js";
 import { resolveTailwind, resolveTailwindSelection } from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
+import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
+import { renderedText } from "./internal/nerd-icon.js";
 
 export const VideoDecoder = native.VideoDecoder;
 export const AudioDecoder = native.AudioDecoder;
@@ -22,6 +24,7 @@ export const AudioPlayer = native.AudioPlayer;
 export const listAudioOutputs = native.listAudioOutputs;
 export { DOMRect };
 export { TransitionEvent };
+export { MutationObserver };
 let nextVideoAudioId = 1;
 let cachedAudioOutputs = null;
 let cachedAudioOutputsAt = 0;
@@ -51,6 +54,11 @@ export class Window extends native.Window {
   #dragBlocked = false;
   #lastDragClick = null;
   #presentationTimer = null;
+  #eventTarget = new EventTarget();
+  #eventTimer = null;
+  #closeNotified = false;
+  #pressedElement = null;
+  #hoveredElement = null;
   constructor(options = {}) {
     const initialWidth = options.width ?? 960;
     const initialHeight = options.height ?? 600;
@@ -212,6 +220,7 @@ export class Window extends native.Window {
     if (closed) {
       this.#stopMedia();
       this.#closeDocument();
+      this.#notifyClosed();
     }
     return closed;
   }
@@ -243,10 +252,118 @@ export class Window extends native.Window {
   close() {
     clearTimeout(this.#presentationTimer);
     this.#presentationTimer = null;
+    clearTimeout(this.#eventTimer);
+    this.#eventTimer = null;
     this.#stopMedia();
     const result = super.close();
     this.#closeDocument();
+    this.#notifyClosed();
     return result;
+  }
+
+  addEventListener(type, callback, options) {
+    this.#eventTarget.addEventListener(type, callback, options);
+    this.#startEventPolling();
+  }
+
+  removeEventListener(type, callback, options) {
+    this.#eventTarget.removeEventListener(type, callback, options);
+  }
+
+  dispatchEvent(event) { return this.#eventTarget.dispatchEvent(event); }
+
+  #notifyClosed() {
+    if (this.#closeNotified) return;
+    this.#closeNotified = true;
+    clearTimeout(this.#presentationTimer);
+    this.#presentationTimer = null;
+    clearTimeout(this.#eventTimer);
+    this.#eventTimer = null;
+    this.#stopMedia();
+    this.#closeDocument();
+    this.#dispatchWindowEvent(new Event("close"));
+  }
+
+  #dispatchWindowEvent(event) {
+    Object.defineProperty(event, "target", { configurable: true, value: this });
+    return this.#eventTarget.dispatchEvent(event);
+  }
+
+  #startEventPolling() {
+    if (this.#eventTimer !== null || super.closed) return;
+    const poll = () => {
+      this.#eventTimer = null;
+      if (super.closed) {
+        this.#notifyClosed();
+        return;
+      }
+      try {
+        for (const event of this.drainEvents()) this.#routeNativeEvent(event);
+      } catch (error) {
+        if (!super.closed) console.error("Nasty window event polling failed:", error);
+      }
+      if (!super.closed) {
+        const rate = this.refreshRate();
+        this.#eventTimer = setTimeout(poll, rate > 0 ? 1000 / rate : 1000 / 60);
+        this.#eventTimer.unref?.();
+      } else this.#notifyClosed();
+    };
+    this.#eventTimer = setTimeout(poll, 0);
+    this.#eventTimer.unref?.();
+  }
+
+  #routeNativeEvent(nativeEvent) {
+    const fields = { x: nativeEvent.x, y: nativeEvent.y, button: nativeEvent.button ?? 0, deltaX: nativeEvent.deltaX ?? 0, deltaY: nativeEvent.deltaY ?? 0 };
+    const key = normalizeWindowKey(nativeEvent.key, nativeEvent.text);
+    const modifiers = String(nativeEvent.modifiers || "");
+    Object.assign(fields, { key, text: nativeEvent.text ?? "", ctrlKey: /CTRL/i.test(modifiers), shiftKey: /SHIFT/i.test(modifiers), altKey: /ALT/i.test(modifiers), metaKey: /SUPER|META|LOGO/i.test(modifiers) });
+    const event = makeHostEvent(nativeEvent.type, fields);
+    this.#dispatchWindowEvent(event);
+
+    const document = this.#document;
+    if (!document || !["pointermove", "pointerdown", "pointerup", "wheel", "keydown", "keyup"].includes(nativeEvent.type)) return;
+    if (nativeEvent.type === "pointermove") {
+      const target = document.elementFromPoint(nativeEvent.x, nativeEvent.y);
+      const blocked = this.#dragAnywhere !== false && blocksWindowDrag(target);
+      if (blocked !== this.#dragBlocked) {
+        this.#dragBlocked = blocked;
+        super.setDragBlocked(blocked);
+      }
+      if (target !== this.#hoveredElement) {
+        if (this.#hoveredElement) dispatchDomEvent(this.#hoveredElement, "mouseleave", fields);
+        this.#hoveredElement = target;
+        if (target) dispatchDomEvent(target, "mouseenter", fields);
+      }
+      if (target) dispatchDomEvent(target, "mousemove", fields);
+      return;
+    }
+    if (nativeEvent.type === "pointerdown") {
+      const target = document.elementFromPoint(nativeEvent.x, nativeEvent.y);
+      this.#pressedElement = target;
+      const control = nearestFormControl(target);
+      if (control) control.focus();
+      else document.activeElement?.blur();
+      if (target) dispatchDomEvent(target, "mousedown", fields);
+      return;
+    }
+    if (nativeEvent.type === "pointerup") {
+      const target = document.elementFromPoint(nativeEvent.x, nativeEvent.y);
+      if (target) dispatchDomEvent(target, "mouseup", fields);
+      if (target && target === this.#pressedElement) dispatchDomEvent(target, "click", fields);
+      this.#pressedElement = null;
+      return;
+    }
+    if (nativeEvent.type === "wheel") {
+      const target = document.elementFromPoint(nativeEvent.x, nativeEvent.y);
+      if (target) dispatchDomEvent(target, "wheel", fields);
+      document.handleEvent(event);
+      return;
+    }
+    if (nativeEvent.type === "keydown" || nativeEvent.type === "keyup") {
+      const active = document.activeElement;
+      if (nativeEvent.type === "keydown" && active && !active.disabled) editFormControl(active, fields);
+      if (active) dispatchDomEvent(active, nativeEvent.type, fields);
+    }
   }
 
   #closeDocument() {
@@ -476,6 +593,7 @@ export class Window extends native.Window {
     this.#bodyAppearanceKey = null;
     if (document) {
       document._attachWindow(this);
+      this.#startEventPolling();
       this.#scheduleAutomaticPresentation();
     } else {
       clearTimeout(this.#presentationTimer);
@@ -603,16 +721,64 @@ export { buildOrderedDisplayList } from "./render.js";
 export { buildTransformedDisplayList } from "./render.js";
 export { closeImageDecoder } from "./image-decoder.js";
 
-function styleForTaffy(style, fontSize = 16) {
+function resolveCssLength(value, fontSize, viewport) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  const simple = /^([-+]?(?:\d+\.?\d*|\.\d+))(px|rem|em|vh|vw)?$/i.exec(text);
+  if (simple) {
+    const amount = Number(simple[1]);
+    switch ((simple[2] || "px").toLowerCase()) {
+      case "px": return amount;
+      case "rem": return amount * 16;
+      case "em": return amount * fontSize;
+      case "vh": return amount * viewport.height / 100;
+      case "vw": return amount * viewport.width / 100;
+    }
+  }
+  const fn = /^(min|max)\((.*)\)$/i.exec(text);
+  if (!fn) return undefined;
+  const args = [];
+  let depth = 0, start = 0;
+  for (let index = 0; index < fn[2].length; index++) {
+    if (fn[2][index] === "(") depth++;
+    else if (fn[2][index] === ")") depth--;
+    else if (fn[2][index] === "," && depth === 0) { args.push(fn[2].slice(start, index)); start = index + 1; }
+  }
+  args.push(fn[2].slice(start));
+  const resolved = args.map(argument => resolveCssLength(argument, fontSize, viewport));
+  if (resolved.some(amount => amount === undefined)) return undefined;
+  return fn[1].toLowerCase() === "min" ? Math.min(...resolved) : Math.max(...resolved);
+}
+
+function fixedInset(value, basis, fontSize, viewport) {
+  if (value === undefined || value === null || value === "auto") return undefined;
+  if (typeof value === "string" && value.trim().endsWith("%")) {
+    const percent = Number.parseFloat(value);
+    return Number.isFinite(percent) ? basis * percent / 100 : undefined;
+  }
+  return resolveCssLength(value, fontSize, viewport);
+}
+
+function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 }) {
   const result = { ...style };
   delete result.boxSizing;
+  if (typeof result.aspectRatio === "string") {
+    const ratio = /^\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*$/.exec(result.aspectRatio);
+    result.aspectRatio = ratio ? Number(ratio[1]) / Number(ratio[2]) : undefined;
+  }
   for (const name of ["width", "height"]) {
     if (typeof result[name] === "string" && result[name].endsWith("%")) {
       result[`${name}Percent`] = parseFloat(result[name]) / 100;
       delete result[name];
     } else if (result[name] === "auto") delete result[name];
   }
-  for (const name of ["top", "right", "bottom", "left"]) if (result[name] === "auto") delete result[name];
+  for (const name of ["top", "right", "bottom", "left"]) {
+    if (typeof result[name] === "string" && result[name].endsWith("%")) {
+      result[`${name}Percent`] = parseFloat(result[name]) / 100;
+      delete result[name];
+    } else if (result[name] === "auto") delete result[name];
+  }
   const pixelLengths = [
     "width", "height", "minWidth", "minHeight", "maxWidth", "maxHeight",
     "top", "right", "bottom", "left",
@@ -622,16 +788,16 @@ function styleForTaffy(style, fontSize = 16) {
   ];
   for (const property of pixelLengths) {
     const value = result[property];
-    if (typeof value === "string" && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:px)?$/.test(value.trim())) {
-      result[property] = Number.parseFloat(value);
-    } else if (typeof value === "string" && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:em|rem)$/.test(value.trim())) {
-      result[property] = Number.parseFloat(value) * (value.trim().endsWith("rem") ? 16 : fontSize);
-    } else if (typeof value === "string" && !(property.startsWith("margin") && value === "auto")) {
+    if (typeof value === "string" && !(property.startsWith("margin") && value === "auto")) {
+      const resolved = resolveCssLength(value, fontSize, viewport);
+      if (resolved !== undefined) result[property] = resolved;
+      else {
       // The current Taffy bridge accepts pixel lengths as numbers (and
       // width/height percentages through their dedicated fields). Keep
       // unsupported CSS values out of the native layout struct so an
       // unfinished or invalid utility can never take down the layout worker.
       delete result[property];
+      }
     }
   }
   for (const [property, value] of Object.entries(result)) {
@@ -661,6 +827,24 @@ function styleForTaffy(style, fontSize = 16) {
     result[edge] = borderStyle === "none" || borderStyle === "hidden"
       ? 0
       : (result[edge] ?? borderWidth);
+  }
+  if (style.position === "fixed") {
+    const left = fixedInset(style.left, viewport.width, fontSize, viewport);
+    const right = fixedInset(style.right, viewport.width, fontSize, viewport);
+    const top = fixedInset(style.top, viewport.height, fontSize, viewport);
+    const bottom = fixedInset(style.bottom, viewport.height, fontSize, viewport);
+    if (result.widthPercent !== undefined) {
+      result.width = viewport.width * result.widthPercent;
+      delete result.widthPercent;
+    } else if (result.width === undefined && left !== undefined && right !== undefined) {
+      result.width = Math.max(0, viewport.width - left - right);
+    }
+    if (result.heightPercent !== undefined) {
+      result.height = viewport.height * result.heightPercent;
+      delete result.heightPercent;
+    } else if (result.height === undefined && top !== undefined && bottom !== undefined) {
+      result.height = Math.max(0, viewport.height - top - bottom);
+    }
   }
   return result;
 }
@@ -795,6 +979,65 @@ export class Element extends EventTarget {
     state.handle = documentState(document).layoutTree.createNode(this._taffyStyle());
   }
 
+  addEventListener(type, callback, options) {
+    if (callback == null) return;
+    const eventType = String(type);
+    if (eventType !== "click") {
+      super.addEventListener(eventType, callback, options);
+      return;
+    }
+    const state = elementState(this);
+    const records = state.eventListeners ??= new Map();
+    const capture = typeof options === "boolean" ? options : Boolean(options?.capture);
+    const key = `${eventType}\0${capture ? 1 : 0}`;
+    let byCallback = records.get(key);
+    if (!byCallback) records.set(key, byCallback = new Map());
+    if (byCallback.has(callback)) return;
+    const once = typeof options === "object" && options !== null && Boolean(options.once);
+    const wrapped = function(event) {
+      if (once) {
+        byCallback.delete(callback);
+        if (byCallback.size === 0) records.delete(key);
+        trackClickListener(this, callback, capture, false);
+      }
+      if (typeof callback === "function") callback.call(this, event);
+      else callback.handleEvent?.call(callback, event);
+    };
+    byCallback.set(callback, wrapped);
+    trackClickListener(this, callback, capture, true);
+    super.addEventListener(eventType, wrapped, options);
+    if (typeof options === "object" && options?.signal) {
+      const signal = options.signal;
+      const forget = () => {
+        byCallback.delete(callback);
+        if (byCallback.size === 0) records.delete(key);
+        trackClickListener(this, callback, capture, false);
+      };
+      if (signal.aborted) forget();
+      else signal.addEventListener("abort", forget, { once: true });
+    }
+  }
+
+  removeEventListener(type, callback, options) {
+    const eventType = String(type);
+    if (eventType !== "click") {
+      super.removeEventListener(eventType, callback, options);
+      return;
+    }
+    const state = elementState(this);
+    const records = state.eventListeners;
+    const capture = typeof options === "boolean" ? options : Boolean(options?.capture);
+    const key = `${eventType}\0${capture ? 1 : 0}`;
+    const byCallback = records?.get(key);
+    const wrapped = byCallback?.get(callback);
+    if (wrapped) {
+      super.removeEventListener(eventType, wrapped, options);
+      byCallback.delete(callback);
+      if (byCallback.size === 0) records.delete(key);
+      trackClickListener(this, callback, capture, false);
+    }
+  }
+
   get textContent() {
     return (elementState(this).text ?? "") + this.children.map((child) => child.textContent).join("");
   }
@@ -810,6 +1053,14 @@ export class Element extends EventTarget {
     state.selectionStart = state.selectionEnd = Math.min(state.selectionStart, next.length);
     this._styleChanged();
   }
+  get type() { return this.localName === "input" || this.localName === "button" ? (this.getAttribute("type") || (this.localName === "input" ? "text" : "submit")) : undefined; }
+  set type(value) { if (this.localName === "input" || this.localName === "button") this.setAttribute("type", value); }
+  get placeholder() { return this.getAttribute("placeholder") || ""; }
+  set placeholder(value) { this.setAttribute("placeholder", value); }
+  get name() { return this.getAttribute("name") || ""; }
+  set name(value) { this.setAttribute("name", value); }
+  get title() { return this.getAttribute("title") || ""; }
+  set title(value) { this.setAttribute("title", value); }
 
   get disabled() {
     return ["button", "input", "select", "textarea", "fieldset", "option", "optgroup"].includes(this.localName)
@@ -823,6 +1074,57 @@ export class Element extends EventTarget {
 
   get parentElement() {
     return this.parent;
+  }
+
+  get selectionStart() { return this.localName === "input" || this.localName === "textarea" ? elementState(this).selectionStart : null; }
+  set selectionStart(value) { if (this.localName === "input" || this.localName === "textarea") elementState(this).selectionStart = Math.max(0, Math.min(this.value.length, Number(value) || 0)); }
+  get selectionEnd() { return this.localName === "input" || this.localName === "textarea" ? elementState(this).selectionEnd : null; }
+  set selectionEnd(value) { if (this.localName === "input" || this.localName === "textarea") elementState(this).selectionEnd = Math.max(0, Math.min(this.value.length, Number(value) || 0)); }
+  get selectionDirection() { return this.localName === "input" || this.localName === "textarea" ? elementState(this).selectionDirection : "none"; }
+  set selectionDirection(value) { if (this.localName === "input" || this.localName === "textarea") elementState(this).selectionDirection = String(value); }
+  setSelectionRange(start, end = start, direction = "none") {
+    if (this.localName !== "input" && this.localName !== "textarea") return;
+    const length = this.value.length;
+    elementState(this).selectionStart = Math.max(0, Math.min(length, Number(start) || 0));
+    elementState(this).selectionEnd = Math.max(elementState(this).selectionStart, Math.min(length, Number(end) || 0));
+    elementState(this).selectionDirection = direction;
+  }
+  focus() {
+    if (this.disabled) return;
+    const state = documentState(this.document);
+    const previous = state.activeElement;
+    if (previous === this) return;
+    previous?.dispatchEvent(new Event("blur"));
+    state.activeElement = this;
+    if (this.localName === "input" || this.localName === "textarea") {
+      elementState(this).selectionStart = elementState(this).selectionEnd = this.value.length;
+    }
+    this.dispatchEvent(new Event("focus"));
+  }
+  blur() {
+    const state = documentState(this.document);
+    if (state.activeElement !== this) return;
+    state.activeElement = null;
+    this.dispatchEvent(new Event("blur"));
+  }
+
+  get nodeType() { return 1; }
+  get nodeName() { return this.tagName; }
+  get parentNode() { return this.parent ?? (this === this.document.body ? this.document : null); }
+  get childNodes() { return this.children; }
+  get nextSibling() {
+    const parent = this.parent;
+    if (!parent) return null;
+    return parent.children[parent.children.indexOf(this) + 1] ?? null;
+  }
+  get previousSibling() {
+    const parent = this.parent;
+    if (!parent) return null;
+    return parent.children[parent.children.indexOf(this) - 1] ?? null;
+  }
+  contains(node) {
+    for (let current = node; current; current = current.parentNode) if (current === this) return true;
+    return false;
   }
 
   set textContent(value) {
@@ -920,6 +1222,10 @@ export class Element extends EventTarget {
   setPointerCapture(id) { (documentState(this.document).pointerCapture ??= new Map()).set(id, this); }
   releasePointerCapture(id) { documentState(this.document).pointerCapture?.delete(id); }
   hasPointerCapture(id) { return documentState(this.document).pointerCapture?.get(id) === this; }
+  click() {
+    if (this.disabled) return;
+    this.dispatchEvent(new Event("click", { bubbles: true, cancelable: true }));
+  }
   dispatchEvent(event) {
     const result = super.dispatchEvent(event);
     this[`on${event.type}`]?.call(this, event);
@@ -949,6 +1255,7 @@ export class Element extends EventTarget {
     const oldValue = this.attributes.get(name);
     if (name === "class" && oldValue === value) return;
     this.attributes.set(name, value);
+    recordMutation({ type: "attributes", target: this, attributeName: name, oldValue: oldValue ?? null, addedNodes: [], removedNodes: [] });
     if (name === "class") {
       const width = documentState(this.document).viewport.width;
       const state = styleData.get(this.style);
@@ -985,8 +1292,10 @@ export class Element extends EventTarget {
 
   removeAttribute(name) {
     name = String(name).toLowerCase();
-    if (name === "class" && !this.attributes.has(name)) return;
+    if (!this.attributes.has(name)) return;
+    const oldValue = this.attributes.get(name);
     this.attributes.delete(name);
+    recordMutation({ type: "attributes", target: this, attributeName: name, oldValue: oldValue ?? null, addedNodes: [], removedNodes: [] });
     if (name === "class") {
       const state = styleData.get(this.style);
       state.hasResponsiveUtilities = false;
@@ -1376,22 +1685,22 @@ export class Element extends EventTarget {
       const imageStyle = { ...style };
       if (imageStyle.width === undefined) imageStyle.width = parseDimension(this.getAttribute("width")) ?? elementState(this).image?.width;
       if (imageStyle.height === undefined) imageStyle.height = parseDimension(this.getAttribute("height")) ?? elementState(this).image?.height;
-      return styleForTaffy(imageStyle, fontSize);
+    return styleForTaffy(imageStyle, fontSize, documentState(this.document).viewport);
     }
     if (this.localName === "video") {
       const video = elementState(this).video;
       const videoStyle = { ...style };
       if (videoStyle.width === undefined) videoStyle.width = parseDimension(this.getAttribute("width")) ?? (video.width || undefined);
       if (videoStyle.height === undefined) videoStyle.height = parseDimension(this.getAttribute("height")) ?? (video.height || undefined);
-      return styleForTaffy(videoStyle, fontSize);
+      return styleForTaffy(videoStyle, fontSize, documentState(this.document).viewport);
     }
     if (this.localName === "canvas") {
       const canvasStyle = { ...style };
       if (canvasStyle.width === undefined) canvasStyle.width = this.width;
       if (canvasStyle.height === undefined) canvasStyle.height = this.height;
-      return styleForTaffy(canvasStyle, fontSize);
+      return styleForTaffy(canvasStyle, fontSize, documentState(this.document).viewport);
     }
-    return styleForTaffy(style, fontSize);
+    return styleForTaffy(style, fontSize, documentState(this.document).viewport);
   }
 
   get scrollLeft() { return elementState(this).scrollLeft; }
@@ -1431,16 +1740,39 @@ export class Element extends EventTarget {
     if (child.parent) child.parent.removeChild(child);
     this.children.push(child);
     child.parent = this;
+    recordMutation({ type: "childList", target: this, addedNodes: [child], removedNodes: [], previousSibling: this.children.at(-2) ?? null, nextSibling: null });
     child._styleChanged(undefined, true);
     this.#syncChildren();
     return child;
   }
 
+  insertBefore(child, referenceChild) {
+    if (referenceChild == null) return this.appendChild(child);
+    const index = this.children.indexOf(referenceChild);
+    if (index < 0) throw new Error("reference child not found");
+    if (!(child instanceof Element) || child.document !== this.document) throw new TypeError("child must belong to the same document");
+    if (child === this || this.isDescendantOf(child)) throw new Error("layout tree cycle");
+    if (child === referenceChild) return child;
+    if (child.parent) child.parent.removeChild(child);
+    const insertionIndex = this.children.indexOf(referenceChild);
+    this.children.splice(insertionIndex, 0, child);
+    child.parent = this;
+    recordMutation({ type: "childList", target: this, addedNodes: [child], removedNodes: [], previousSibling: this.children[insertionIndex - 1] ?? null, nextSibling: referenceChild });
+    child._styleChanged(undefined, true);
+    this.#syncChildren();
+    return child;
+  }
+
+  remove() { this.parent?.removeChild(this); }
+
   removeChild(child) {
     const index = this.children.indexOf(child);
     if (index < 0) throw new Error("child not found");
+    const previousSibling = this.children[index - 1] ?? null;
+    const nextSibling = this.children[index + 1] ?? null;
     this.children.splice(index, 1);
     child.parent = null;
+    recordMutation({ type: "childList", target: this, addedNodes: [], removedNodes: [child], previousSibling, nextSibling });
     if (child.localName === "video") child.pause();
     child._styleChanged(undefined, true);
     this.#syncChildren();
@@ -1465,6 +1797,9 @@ export class Element extends EventTarget {
 export class Document extends EventTarget {
   constructor() {
     super();
+    registerMutationDocument(this);
+    this.nodeType = 9;
+    this.nodeName = "#document";
     registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
     this.body = new Element(this, "body");
     registerDocument(this, {
@@ -1489,6 +1824,9 @@ export class Document extends EventTarget {
 
   get baseURI() { return documentState(this).baseURI; }
   get defaultView() { return documentState(this).defaultView; }
+  get activeElement() { return documentState(this).activeElement ?? this.body; }
+  get ownerDocument() { return null; }
+  contains(node) { return node === this || this.body.contains(node); }
   elementFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y)[0] ?? null; }
   elementsFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y); }
 
@@ -1511,7 +1849,7 @@ export class Document extends EventTarget {
     for (const element of doc.elements) {
       const state = elementState(element);
       const isTextControl = element.localName === "input" || element.localName === "textarea";
-      if (!state.text && !isTextControl) continue;
+      if (!renderedText(element) && !isTextControl) continue;
       const metrics = textMetrics(element);
       if (state.sentTextMetrics === metrics.key) continue;
       state.sentTextMetrics = metrics.key;
@@ -1540,6 +1878,11 @@ export class Document extends EventTarget {
       documentState(this).viewport = { width, height };
       setHostStyle(this.body, { width, height });
       for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(width);
+      for (const element of documentState(this).elements) {
+        const elementData = elementState(element);
+        documentState(this).layoutTree.setStyle(elementData.handle, element._taffyStyle());
+      }
+      documentState(this).dirty = true;
     }
     if (documentState(this).dirty || !documentState(this).layoutSnapshot) {
       const start = performance.now();
@@ -1574,6 +1917,11 @@ export class Document extends EventTarget {
         setHostStyle(this.body, { width, height });
       }
       for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(width);
+      for (const element of documentState(this).elements) {
+        const elementData = elementState(element);
+        documentState(this).layoutTree.setStyle(elementData.handle, element._taffyStyle());
+      }
+      documentState(this).dirty = true;
     }
     if (documentState(this).dirty || !documentState(this).layoutSnapshot) {
       const result = documentState(this).layoutTree.layoutSync(width, height, elementState(this.body).handle);
@@ -1607,21 +1955,44 @@ export class Document extends EventTarget {
       collect(this.body);
     }
     const assemblyStart = timings && performance.now();
+    const fixedOffsets = new WeakMap();
+    const offsetFor = element => {
+      const cached = fixedOffsets.get(element);
+      if (cached) return cached;
+      const parentOffset = element.parent ? offsetFor(element.parent) : { x: 0, y: 0, root: null };
+      if (element.style.position !== "fixed") {
+        fixedOffsets.set(element, parentOffset);
+        return parentOffset;
+      }
+      const layout = state.layoutSnapshot?.[elementState(element).handle] ?? { x: 0, y: 0, width: 0, height: 0 };
+      const fontSize = Number.parseFloat(inheritedStyle(element, "fontSize", 16)) || 16;
+      const viewport = state.viewport;
+      const left = fixedInset(element.style.left, viewport.width, fontSize, viewport);
+      const right = fixedInset(element.style.right, viewport.width, fontSize, viewport);
+      const top = fixedInset(element.style.top, viewport.height, fontSize, viewport);
+      const bottom = fixedInset(element.style.bottom, viewport.height, fontSize, viewport);
+      const x = left !== undefined ? left : right !== undefined ? viewport.width - right - layout.width : layout.x + parentOffset.x;
+      const y = top !== undefined ? top : bottom !== undefined ? viewport.height - bottom - layout.height : layout.y + parentOffset.y;
+      const offset = { x: x - layout.x, y: y - layout.y, root: element };
+      fixedOffsets.set(element, offset);
+      return offset;
+    };
     const raw = elements.map((element) => {
       const box = documentState(this).layoutSnapshot?.[elementState(element).handle] ?? { x: 0, y: 0, width: 0, height: 0 };
+      const fixed = offsetFor(element);
       const margin = { top: box.marginTop ?? 0, right: box.marginRight ?? 0, bottom: box.marginBottom ?? 0, left: box.marginLeft ?? 0 };
       const border = { top: box.borderTop ?? 0, right: box.borderRight ?? 0, bottom: box.borderBottom ?? 0, left: box.borderLeft ?? 0 };
       const padding = { top: box.paddingTop ?? 0, right: box.paddingRight ?? 0, bottom: box.paddingBottom ?? 0, left: box.paddingLeft ?? 0 };
-      const borderBox = { x: box.x, y: box.y, width: box.width, height: box.height };
+      const borderBox = { x: box.x + fixed.x, y: box.y + fixed.y, width: box.width, height: box.height };
       const paddingBox = insetBox(borderBox, border);
       const contentBox = insetBox(paddingBox, padding);
       const marginBox = {
-        x: box.x - margin.left,
-        y: box.y - margin.top,
+        x: borderBox.x - margin.left,
+        y: borderBox.y - margin.top,
         width: box.width + margin.left + margin.right,
         height: box.height + margin.top + margin.bottom,
       };
-      return { element, ...borderBox, margin, border, padding, marginBox, borderBox, paddingBox, contentBox };
+      return { element, ...borderBox, margin, border, padding, marginBox, borderBox, paddingBox, contentBox, fixedRoot: fixed.root };
     });
     const byElement = new Map(raw.map((box) => [box.element, box]));
     const extents = new Map();
@@ -1630,6 +2001,7 @@ export class Document extends EventTarget {
       let width = box.paddingBox.width;
       let height = box.paddingBox.height;
       for (const child of box.element.children) {
+        if (child.style.position === "fixed") continue;
         if (selectedElements && !byElement.has(child)) continue;
         const childBox = byElement.get(child);
         const childExtent = extents.get(child) ?? { width: childBox.width, height: childBox.height };
@@ -1643,6 +2015,7 @@ export class Document extends EventTarget {
       let y = box.y;
       let clip = null;
       for (let parent = box.element.parent; parent; parent = parent.parent) {
+        if (box.fixedRoot && parent === box.fixedRoot.parent) break;
         const parentBox = byElement.get(parent);
         if (parent.style.overflow === "hidden" || parent.style.overflow === "auto" || parent.style.overflow === "scroll") {
           x -= parent.scrollLeft;
@@ -1730,6 +2103,70 @@ export class Document extends EventTarget {
     state.closePromise = state.layoutTree.close();
     return state.closePromise;
   }
+}
+
+function normalizeWindowKey(key, text = "") {
+  const named = /^Named\((.*)\)$/.exec(String(key || ""));
+  if (named) return named[1];
+  if (text) return text;
+  const character = /^Character\('(.*)'\)$/.exec(String(key || ""));
+  return character ? character[1] : String(key || "");
+}
+
+function makeHostEvent(type, fields = {}) {
+  const event = new Event(type, { cancelable: true });
+  for (const [key, value] of Object.entries(fields)) {
+    Object.defineProperty(event, key, { configurable: true, enumerable: true, value });
+  }
+  return event;
+}
+
+function dispatchDomEvent(target, type, fields = {}) {
+  let stopped = false;
+  const path = [];
+  for (let current = target; current; current = current.parentNode) path.push(current);
+  for (const current of path) {
+    const event = makeHostEvent(type, fields);
+    Object.defineProperty(event, "target", { configurable: true, value: target });
+    event.stopPropagation = () => { stopped = true; };
+    current.dispatchEvent(event);
+    if (stopped) break;
+  }
+}
+
+function nearestFormControl(element) {
+  for (let current = element; current?.nodeType === 1; current = current.parentElement) {
+    if (current.localName === "input" || current.localName === "textarea" || current.localName === "button" || current.localName === "select") return current;
+  }
+  return null;
+}
+
+function editFormControl(element, event) {
+  if (element.localName !== "input" && element.localName !== "textarea") return;
+  if (element.localName === "input" && !["text", "search", "url", "email", "password", "tel", ""].includes(element.type)) return;
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  const value = element.value;
+  let start = element.selectionStart ?? value.length;
+  let end = element.selectionEnd ?? start;
+  let next = value;
+  let caret = start;
+  if (event.key === "Backspace" && start === end && start > 0) start--;
+  else if (event.key === "Delete" && start === end && end < value.length) end++;
+  if (event.key === "Backspace" || event.key === "Delete") {
+    next = value.slice(0, start) + value.slice(end);
+  } else if (event.key === "ArrowLeft") caret = Math.max(0, start - 1);
+  else if (event.key === "ArrowRight") caret = Math.min(value.length, end + 1);
+  else if (event.key === "Home") caret = 0;
+  else if (event.key === "End") caret = value.length;
+  else if (event.text && event.text.length && !/[\r\n]/.test(event.text)) {
+    next = value.slice(0, start) + event.text + value.slice(end);
+    caret = start + event.text.length;
+  } else return;
+  if (next !== value) {
+    element.value = next;
+    element.dispatchEvent(makeHostEvent("input", { data: next.slice(start, caret) || null, inputType: "insertText" }));
+  }
+  element.setSelectionRange(caret, caret);
 }
 
 function insetBox(box, edges) {

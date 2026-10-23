@@ -42,11 +42,16 @@ pub struct LayoutStyle {
     pub right: Option<f64>,
     pub bottom: Option<f64>,
     pub left: Option<f64>,
+    pub top_percent: Option<f64>,
+    pub right_percent: Option<f64>,
+    pub bottom_percent: Option<f64>,
+    pub left_percent: Option<f64>,
     pub direction: Option<String>,
     pub width: Option<f64>,
     pub height: Option<f64>,
     pub width_percent: Option<f64>,
     pub height_percent: Option<f64>,
+    pub aspect_ratio: Option<f64>,
     pub min_width: Option<f64>,
     pub min_height: Option<f64>,
     pub max_width: Option<f64>,
@@ -122,6 +127,12 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
     let mut style = Style::default();
     // Nasty uses reset-style border-box sizing. There is no public boxSizing option.
     style.box_sizing = BoxSizing::BorderBox;
+    if let Some(ratio) = input.aspect_ratio {
+        if !ratio.is_finite() || ratio <= 0.0 || ratio > f32::MAX as f64 {
+            return Err(Error::new(Status::InvalidArg, "aspectRatio must be finite and positive"));
+        }
+        style.aspect_ratio = Some(ratio as f32);
+    }
     if let Some(position) = input.position.as_deref() {
         style.position = match position {
             "static" | "relative" => Position::Relative,
@@ -137,6 +148,16 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
     ] {
         if let Some(value) = value {
             *target = LengthPercentageAuto::length(finite_signed(value, name)?);
+        }
+    }
+    for (name, value, target) in [
+        ("topPercent", input.top_percent, &mut style.inset.top),
+        ("rightPercent", input.right_percent, &mut style.inset.right),
+        ("bottomPercent", input.bottom_percent, &mut style.inset.bottom),
+        ("leftPercent", input.left_percent, &mut style.inset.left),
+    ] {
+        if let Some(value) = value {
+            *target = LengthPercentageAuto::percent(finite_signed(value, name)?);
         }
     }
     if let Some(display) = input.display.as_deref() {
@@ -4032,7 +4053,6 @@ impl ApplicationHandler for WindowApp {
             }
             OsWindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                let mut resize_edge = false;
                 if let Some(window) = self.window.as_ref() {
                     let scale = window.scale_factor();
                     let logical_size = window.inner_size().to_logical::<f64>(scale);
@@ -4043,7 +4063,6 @@ impl ApplicationHandler for WindowApp {
                         logical_size.width,
                         logical_size.height,
                     );
-                    resize_edge = direction.is_some();
                     let cursor = if let Some(direction) = direction {
                         CursorIcon::from(direction)
                     } else if self.drag_active {
@@ -4058,7 +4077,6 @@ impl ApplicationHandler for WindowApp {
                         self.cursor_icon = Some(cursor);
                     }
                 }
-                if !resize_edge && ((self.drag_key_is_down() && !self.drag_blocked) || self.drag_active) { return; }
                 self.events.push(NativeEvent {
                     kind: "pointermove".into(),
                     x: position.x,
@@ -4614,6 +4632,13 @@ impl Window {
         let maximized = !window.is_maximized();
         window.set_maximized(maximized);
         self.app.maximized = maximized;
+        Ok(())
+    }
+
+    #[napi]
+    pub fn minimize(&self) -> Result<()> {
+        let window = self.app.window.as_ref().ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+        window.set_minimized(true);
         Ok(())
     }
 

@@ -12,7 +12,6 @@ function ensureDecoder() {
   const workerStartedAt = performance.now();
   ready = new Promise((resolve, reject) => {
     worker = new Worker(new URL("./image-decode-worker.js", import.meta.url));
-    worker.unref();
     worker.on("message", (result) => {
       if (result.ready) {
         decoderStartupMs = performance.now() - workerStartedAt;
@@ -32,6 +31,10 @@ function ensureDecoder() {
       worker = undefined;
       ready = undefined;
     });
+    // Installing message handlers can re-reference the worker's port. Keep
+    // image decoding available while the app is running without making a
+    // completed window hold Node open after its documents are closed.
+    worker.unref();
   });
   return ready;
 }

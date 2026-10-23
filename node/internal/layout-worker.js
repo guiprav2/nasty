@@ -110,6 +110,9 @@ export class LayoutWorker {
   }
 
   close() {
+    // Closing a document must not keep Node alive while the worker is winding
+    // down, especially when close is initiated by the native window manager.
+    this.#worker.unref();
     return this.#worker.terminate();
   }
 }

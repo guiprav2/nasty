@@ -1,6 +1,28 @@
 import { documentBoxes, documentState } from './dom-state.js';
 import { createBoxProjector } from '../render.js';
 
+const clickListeners = new WeakMap();
+const DRAG_INTERACTIVE_CONTROLS = new Set(['input', 'textarea', 'button', 'select', 'option', 'optgroup', 'a', 'area', 'label', 'summary', 'audio', 'video']);
+
+export function trackClickListener(element, callback, capture, added) {
+  let listeners = clickListeners.get(element);
+  if (!listeners && added) clickListeners.set(element, listeners = new Map());
+  if (!listeners) return;
+  let captures = listeners.get(callback);
+  if (added) {
+    if (!captures) listeners.set(callback, captures = new Set());
+    captures.add(capture);
+  } else if (captures) {
+    captures.delete(capture);
+    if (captures.size === 0) listeners.delete(callback);
+    if (listeners.size === 0) clickListeners.delete(element);
+  }
+}
+
+function hasClickListener(element) {
+  return typeof element.onclick === 'function' || (clickListeners.get(element)?.size ?? 0) > 0;
+}
+
 function valueFor(element, property, inherited = false) {
   for (let current = element; current; current = inherited ? current.parent : null) {
     const value = current.style[property];
@@ -80,6 +102,46 @@ function insideClip(box, x, y) {
   return !clip || (x >= clip.x && y >= clip.y && x < clip.x + clip.width && y < clip.y + clip.height);
 }
 
+function createsStackingContext(element, parent) {
+  const style = element.style;
+  const position = String(style.position ?? 'static').toLowerCase();
+  const zIndex = style.zIndex;
+  const hasZIndex = zIndex !== undefined && zIndex !== '' && zIndex !== 'auto';
+  const parentDisplay = String(parent?.style.display ?? '').toLowerCase();
+  const isFlexOrGridItem = parentDisplay === 'flex' || parentDisplay === 'grid';
+  const opacity = Number(style.opacity ?? 1);
+  return position === 'fixed' || position === 'sticky'
+    || (hasZIndex && (position === 'absolute' || position === 'relative' || isFlexOrGridItem))
+    || (Number.isFinite(opacity) && opacity < 1)
+    || (style.transform !== undefined && style.transform !== '' && style.transform !== 'none')
+    || (style.perspective !== undefined && style.perspective !== '' && style.perspective !== 'none')
+    || String(style.isolation ?? '').toLowerCase() === 'isolate';
+}
+
+function stackingPath(element, root, order) {
+  const ancestors = [];
+  for (let current = element; current && current !== root; current = current.parent) ancestors.push(current);
+  ancestors.reverse();
+  return ancestors.filter((current, index) => createsStackingContext(current, ancestors[index - 1] ?? root))
+    .map(current => ({
+      level: Number.parseInt(current.style.zIndex, 10) || 0,
+      order: order.get(current) ?? 0,
+      element: current,
+    }));
+}
+
+function comparePaintOrder(left, right) {
+  const length = Math.min(left.path.length, right.path.length);
+  for (let index = 0; index < length; index++) {
+    const a = left.path[index], b = right.path[index];
+    if (a.element === b.element) continue;
+    if (a.level !== b.level) return a.level - b.level;
+    if (a.order !== b.order) return a.order - b.order;
+  }
+  if (left.path.length !== right.path.length) return left.path.length - right.path.length;
+  return left.order - right.order;
+}
+
 function isPaintedAndTargetable(element) {
   for (let current = element; current; current = current.parent) {
     if (current.hidden || String(current.style.display ?? '').toLowerCase() === 'none') return false;
@@ -108,12 +170,16 @@ export function elementsFromPoint(document, x, y) {
       byElement: new Map(boxes.map(box => [box.element, box])),
       project: createBoxProjector(boxes),
     };
+    const order = new Map(boxes.map((box, index) => [box.element, index]));
+    const root = document.body;
+    cache.paintOrder = boxes.map((box, index) => ({ box, order: index, path: stackingPath(box.element, root, order) }))
+      .sort(comparePaintOrder);
     state.hitTestCache = cache;
   }
-  const { boxes, byElement, project } = cache;
+  const { byElement, project, paintOrder } = cache;
   const hits = [];
-  for (let index = boxes.length - 1; index >= 0; index--) {
-    const box = boxes[index];
+  for (let index = paintOrder.length - 1; index >= 0; index--) {
+    const box = paintOrder[index].box;
     const element = box.element;
     if (!isPaintedAndTargetable(element) || box.width <= 0 || box.height <= 0 || !insideClip(box, x, y)) continue;
     try {
@@ -138,7 +204,6 @@ export function elementsFromPoint(document, x, y) {
 }
 
 export function blocksWindowDrag(target) {
-  const controls = new Set(['input', 'textarea', 'button', 'select', 'option', 'optgroup', 'a', 'area', 'label', 'summary', 'audio', 'video']);
   for (let element = target; element; element = element.parent) {
     if (!element.hasAttribute?.('contenteditable')) continue;
     const value = element.getAttribute('contenteditable').toLowerCase();
@@ -146,22 +211,15 @@ export function blocksWindowDrag(target) {
     break;
   }
   for (let element = target; element; element = element.parent) {
+    if (hasClickListener(element)) return true;
     const name = element.localName;
-    if (!controls.has(name)) {
+    if (!DRAG_INTERACTIVE_CONTROLS.has(name)) {
       if (element.getAttribute?.('draggable')?.toLowerCase() === 'true') return true;
       continue;
     }
     if (['a', 'area'].includes(name) && !element.hasAttribute('href')) continue;
     if (['audio', 'video'].includes(name) && !element.hasAttribute('controls')) continue;
-    if (element.disabled) continue;
-    let disabledByFieldset = false;
-    for (let ancestor = element.parent; ancestor; ancestor = ancestor.parent) {
-      if (['input', 'textarea', 'button', 'select', 'option', 'optgroup'].includes(name)
-        && ancestor.localName === 'fieldset' && ancestor.disabled) { disabledByFieldset = true; break; }
-      if (name === 'option' && ((ancestor.localName === 'optgroup' && ancestor.disabled)
-        || (ancestor.localName === 'select' && ancestor.disabled))) { disabledByFieldset = true; break; }
-    }
-    if (!disabledByFieldset) return true;
+    return true;
   }
   return false;
 }

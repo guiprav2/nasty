@@ -22,7 +22,7 @@ export function inherited(element, name, fallback) {
 export function textStyle(element) {
   const size = parseFloat(inherited(element, 'fontSize', 16));
   const weight = inherited(element, 'fontWeight', 400);
-  const requestedFamilies = (nerdIcon(element) ? ['Nerd Symbols'] : fontFamilies(inherited(element, 'fontFamily', 'sans-serif')))
+  const requestedFamilies = fontFamilies(inherited(element, 'fontFamily', 'sans-serif'))
     .map(name => ['sans-serif', 'ui-sans-serif', 'system-ui'].includes(name) ? systemFontFamily
       : name.toLowerCase() === 'monospace' ? 'Liberation Mono' : name);
   // Skia does not inherit the host system's CSS font fallback list. Keep the

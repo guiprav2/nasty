@@ -55,6 +55,8 @@ function parseToken(token) {
 function parseLength(value) {
   const arbitrary = value.startsWith("[") && value.endsWith("]");
   if (arbitrary) value = value.slice(1, -1);
+  const containerWidths = { xs: 320, sm: 384, md: 448, lg: 512, xl: 576, "2xl": 672, "3xl": 768, "4xl": 896, "5xl": 1024, "6xl": 1152, "7xl": 1280 };
+  if (Object.hasOwn(containerWidths, value)) return containerWidths[value];
   if (value === "full") return "100%";
   if (value === "screen") return "100vw";
   if (value === "auto" || value === "min-content" || value === "max-content" || value === "fit-content") return value;
@@ -103,6 +105,7 @@ function utilityStyle(utility) {
     "flex-row": ["flexDirection", "row"], "flex-row-reverse": ["flexDirection", "row-reverse"], "flex-col": ["flexDirection", "column"], "flex-col-reverse": ["flexDirection", "column-reverse"],
     "flex-wrap": ["flexWrap", "wrap"], "flex-nowrap": ["flexWrap", "nowrap"], "flex-wrap-reverse": ["flexWrap", "wrap-reverse"],
     "flex-1": ["flex", 1], "flex-auto": ["flex", "auto"], "flex-initial": ["flex", "initial"], "flex-none": ["flex", "none"],
+    "aspect-auto": ["aspectRatio", "auto"], "aspect-square": ["aspectRatio", "1 / 1"], "aspect-video": ["aspectRatio", "16 / 9"],
     grow: ["flexGrow", 1], shrink: ["flexShrink", 1], relative: ["position", "relative"], absolute: ["position", "absolute"], fixed: ["position", "fixed"],
     "items-start": ["alignItems", "flex-start"], "items-end": ["alignItems", "flex-end"], "items-center": ["alignItems", "center"], "items-stretch": ["alignItems", "stretch"],
     "justify-start": ["justifyContent", "flex-start"], "justify-end": ["justifyContent", "flex-end"], "justify-center": ["justifyContent", "center"], "justify-between": ["justifyContent", "space-between"], "justify-around": ["justifyContent", "space-around"], "justify-evenly": ["justifyContent", "space-evenly"],
@@ -115,10 +118,23 @@ function utilityStyle(utility) {
     "rounded": ["borderRadius", 4], "border-solid": ["borderStyle", "solid"], "border-dashed": ["borderStyle", "dashed"], "border-dotted": ["borderStyle", "dotted"], "border-none": ["borderStyle", "none"],
     "rounded-sm": ["borderRadius", 2], "rounded-md": ["borderRadius", 6], "rounded-lg": ["borderRadius", 8], "rounded-xl": ["borderRadius", 12], "rounded-2xl": ["borderRadius", 16], "rounded-full": ["borderRadius", 9999],
     "cursor-pointer": ["cursor", "pointer"], "cursor-grab": ["cursor", "grab"], "cursor-grabbing": ["cursor", "grabbing"], "cursor-default": ["cursor", "default"],
+    "pointer-events-none": ["pointerEvents", "none"], "pointer-events-auto": ["pointerEvents", "auto"],
+    nf: [["fontFamily", "Symbols Nerd Font"], ["fontStyle", "normal"], ["fontWeight", 400], ["fontVariant", "normal"], ["textTransform", "none"], ["lineHeight", "1"]],
   };
   if (fixed[utility]) return fixed[utility];
   const caret = /^caret-(.+)$/.exec(utility);
   if (caret && colorValue(caret[1])) return ["caretColor", colorValue(caret[1])];
+  const inset = /^(inset(?:-[xy])?|top|right|bottom|left)-(.+)$/.exec(utility);
+  if (inset) {
+    const amount = parseLength(inset[2]);
+    if (amount === undefined) return null;
+    const sides = {
+      inset: ["top", "right", "bottom", "left"],
+      "inset-x": ["right", "left"],
+      "inset-y": ["top", "bottom"],
+    }[inset[1]] || [inset[1]];
+    return sides.map(side => [side, amount]);
+  }
   if (utility === "border") return [["borderWidth", 1], ["borderStyle", "solid"]];
   const autoMargin = /^m([xytrbl]?)-auto$/.exec(utility);
   if (autoMargin) {
