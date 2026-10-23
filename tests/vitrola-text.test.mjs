@@ -117,7 +117,14 @@ test('input glyphs clip vertically and horizontally to the content area', { time
 });
 
 test('vertically overflowing input text shows the top of the line instead of clipping both ends', { timeout: 15000 }, async t => {
-  const f = await fixture(t), state = await f.report(), image = await f.capture('vertical-overflow');
+  const f = await fixture(t);
+  f.app.send({ type: 'vertical-short' });
+  await delay(400);
+  const state = await f.report(), image = await f.capture('vertical-overflow');
+  for (const bubble of state.bubbles) {
+    assert.ok(inkOutside(image, bubble.rect, { x: 0, y: 0, width: 0, height: 0 }) > 20,
+      'editing a control must preserve the surrounding chat text');
+  }
   const b = state.input, reference = state.tallReference;
   let mismatches = 0, ink = 0;
   for (let y = 0; y < b.height - 16; y++) for (let x = 0; x < b.width - 40; x++) {

@@ -253,9 +253,13 @@ visualTest('long input scrolls horizontally and caret aligns with its selection 
     // change the viewport between the caret and selection screenshots.
     run('xdotool', ['key', '--repeat', '30', '--delay', '5', '--window', windowId, 'Left']);
     await waitFor(state, current => current.input.selectionStart === 130 && current.input.selectionEnd === 130);
-    const caretViews = [await capture(windowId, 'long-input-caret')];
-    await delay(80);
-    caretViews.push(await capture(windowId, 'long-input-caret-next'));
+    const caretViews = [];
+    // Cover a full blink cycle; two adjacent snapshots can both land in the
+    // off phase even when the caret is correctly positioned.
+    for (let frame = 0; frame < 5; frame++) {
+      caretViews.push(await capture(windowId, `long-input-caret-${frame}`));
+      await delay(200);
+    }
     run('xdotool', ['key', '--repeat', '5', '--delay', '5', '--window', windowId, 'shift+Right']);
     await waitFor(state, current => current.input.selectionStart === 130 && current.input.selectionEnd === 135);
     const selection = await capture(windowId, 'long-short-selection');

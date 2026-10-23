@@ -40,6 +40,7 @@ const win = new Window({ title: 'Vitrola text regression', width: 960, height: 7
 win.document = doc;
 const rect = element => { const b = element.getBoundingClientRect(); return { x: b.x, y: b.y, width: b.width, height: b.height }; };
 process.on('message', message => {
+  if (message.type === 'vertical-short') { input.value = 'MgMg'; tallReference.value = 'MgMg'; }
   if (message.type === 'scroll') scroller.scrollTop = message.top;
   if (message.type === 'append-log') scroller.append(d.el('div', { class: 'shrink-0 h-8 text-sm' }, 'New chat message'));
   if (message.type === 'widen') dynamic.classList.replace('w-[110px]', 'w-[300px]');

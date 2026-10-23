@@ -466,8 +466,8 @@ export function rasterizeDocument(document, width, height, surface = createCanva
       const lines = textLines(metrics, content.width);
       const editor = state.textAreaState;
       const textX = state.renderTextOriginX ?? editor?.textOriginX ?? content.x;
-      const textY = editor?.textOriginY ?? (element.localName === 'input'
-        ? content.y + Math.max(0, (content.height - text.line) / 2) : content.y);
+      const textY = element.localName === 'input'
+        ? content.y + Math.max(0, (content.height - text.line) / 2) : editor?.textOriginY ?? content.y;
       const selectionRects = [];
       if ((element.localName === 'input' || element.localName === 'textarea') && editor?.focused
         && editor.selectionEnd > editor.selectionStart) {
