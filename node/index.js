@@ -54,6 +54,18 @@ export class Window extends native.Window {
   #documentStopped = false;
   #dragBlocked = false;
   #lastDragClick = null;
+  #lastWheelDocument = null;
+  #lastWheelTarget = null;
+  #lastWheelX = NaN;
+  #lastWheelY = NaN;
+  #lastWheelSceneGeneration = -1;
+  #pendingWheelScroll = null;
+  #dragHitTestDocument = null;
+  #dragHitTestX = NaN;
+  #dragHitTestY = NaN;
+  #dragHitTestControlGeneration = -1;
+  #dragHitTestGeneration = -1;
+  #dragHitTestGeometryGeneration = -1;
   #presentationTimer = null;
   #eventTarget = new EventTarget();
   #eventTimer = null;
@@ -173,8 +185,18 @@ export class Window extends native.Window {
 
   _syncDragHitTest() {
     const position = super.cursorPosition();
-    const target = this.#document?.elementFromPoint(position.x, position.y) ?? null;
+    const document = this.#document;
+    const state = document ? documentState(document) : null;
+    if (this.#dragHitTestDocument === document && this.#dragHitTestX === position.x && this.#dragHitTestY === position.y
+      && this.#dragHitTestControlGeneration === state?.controlGeometryGeneration
+      && this.#dragHitTestGeneration === state?.hitTestGeneration) return;
+    const target = document?.elementFromPoint(position.x, position.y) ?? null;
     const blocked = this.#dragAnywhere !== false && blocksWindowDrag(target);
+    this.#dragHitTestDocument = document;
+    this.#dragHitTestX = position.x;
+    this.#dragHitTestY = position.y;
+    this.#dragHitTestControlGeneration = state?.controlGeometryGeneration ?? -1;
+    this.#dragHitTestGeneration = state?.hitTestGeneration ?? -1;
     if (blocked === this.#dragBlocked) return;
     this.#dragBlocked = blocked;
     super.setDragBlocked(blocked);
@@ -308,6 +330,13 @@ export class Window extends native.Window {
     for (const event of this.drainEvents()) this.#routeNativeEvent(event);
   }
 
+  #commitPendingWheelScroll() {
+    const pending = this.#pendingWheelScroll;
+    if (!pending) return;
+    this.#pendingWheelScroll = null;
+    if (this.#document && !this.closed) this.#document.handleEvent({ type: "wheel", target: this.#lastWheelTarget, ...pending });
+  }
+
   #startEventPolling() {
     if (this.#eventTimer !== null || super.closed) return;
     const poll = () => {
@@ -333,6 +362,7 @@ export class Window extends native.Window {
   }
 
   #routeNativeEvent(nativeEvent) {
+    if (nativeEvent.type !== "wheel") this.#commitPendingWheelScroll();
     const cursor = Number.isFinite(nativeEvent.x) && Number.isFinite(nativeEvent.y)
       ? { x: nativeEvent.x, y: nativeEvent.y }
       : super.cursorPosition();
@@ -353,9 +383,16 @@ export class Window extends native.Window {
     const document = this.#document;
     if (!document || !["pointermove", "pointerdown", "pointerup", "pointercancel", "wheel", "keydown", "keyup"].includes(nativeEvent.type)) return;
     if (nativeEvent.type === "pointermove") {
+      this.#lastWheelDocument = null;
       const target = document.elementFromPoint(fields.clientX, fields.clientY);
       const capture = documentState(document).pointerCapture?.get(1);
       const blocked = this.#dragAnywhere !== false && blocksWindowDrag(target);
+      const state = documentState(document);
+      this.#dragHitTestDocument = document;
+      this.#dragHitTestX = fields.clientX;
+      this.#dragHitTestY = fields.clientY;
+      this.#dragHitTestControlGeneration = state.controlGeometryGeneration;
+      this.#dragHitTestGeneration = state.hitTestGeneration;
       if (blocked !== this.#dragBlocked) {
         this.#dragBlocked = blocked;
         super.setDragBlocked(blocked);
@@ -411,9 +448,22 @@ export class Window extends native.Window {
       return;
     }
     if (nativeEvent.type === "wheel") {
-      const target = document.elementFromPoint(fields.clientX, fields.clientY);
+      const pending = this.#pendingWheelScroll;
+      if (pending && (pending.x !== fields.clientX || pending.y !== fields.clientY)) this.#commitPendingWheelScroll();
+      const sceneGeneration = documentState(document).sceneGeneration;
+      if (this.#lastWheelDocument !== document || this.#lastWheelX !== fields.clientX
+        || this.#lastWheelY !== fields.clientY || this.#lastWheelSceneGeneration !== sceneGeneration) {
+        this.#lastWheelDocument = document;
+        this.#lastWheelX = fields.clientX;
+        this.#lastWheelY = fields.clientY;
+        this.#lastWheelSceneGeneration = sceneGeneration;
+        this.#lastWheelTarget = document.elementFromPoint(fields.clientX, fields.clientY);
+      }
+      const target = this.#lastWheelTarget;
       if (target) dispatchDomEvent(target, "wheel", fields);
-      document.handleEvent(event);
+      const next = this.#pendingWheelScroll ??= { x: fields.clientX, y: fields.clientY, deltaX: 0, deltaY: 0 };
+      next.deltaX += fields.deltaX;
+      next.deltaY += fields.deltaY;
       return;
     }
     if (nativeEvent.type === "keydown" || nativeEvent.type === "keyup") {
@@ -427,6 +477,7 @@ export class Window extends native.Window {
     this.#documentStopped = true;
     const document = this.#document;
     this.#document = null;
+    this.#pendingWheelScroll = null;
     const state = documentState(document);
     if (state.defaultView === this) state.defaultView = null;
     document.close();
@@ -572,18 +623,43 @@ export class Window extends native.Window {
   #syncDocumentTextControls() {
     const document = this.#document;
     if (!document) return;
+    const documentStateValue = documentState(document);
     const visible = element => {
       for (let current = element; current; current = current.parentElement) {
         if (current.hidden || current.style.display === "none") return false;
       }
       return true;
     };
+    const controls = [...documentStateValue.elements].filter(element =>
+      (element.localName === "input" || element.localName === "textarea")
+      && !this.#managedTextControls.has(element) && !element.disabled && visible(element)
+      && (element.localName !== "input" || ["text", "search", "url", "email", "password", "tel", ""].includes(element.type)));
+    if (!controls.length) {
+      documentStateValue.textControlGeometryGeneration = documentStateValue.controlGeometryGeneration;
+      return;
+    }
+    const geometryGeneration = documentStateValue.controlGeometryGeneration;
+    const scrollSignature = element => {
+      const offsets = [];
+      for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        if (canScroll(ancestor, "x") || canScroll(ancestor, "y")) offsets.push(`${ancestor.scrollLeft},${ancestor.scrollTop}`);
+      }
+      return offsets.join(";");
+    };
+    const signatures = new Map(controls.map(element => [element, scrollSignature(element)]));
+    const needsSync = controls.some(element => {
+      const state = elementState(element);
+      const previous = state.textControlSync;
+      const focused = document.activeElement === element;
+      return focused || !previous || previous.value !== element.value
+        || previous.focused !== focused || previous.disabled !== element.disabled
+        || previous.scrollSignature !== signatures.get(element)
+        || documentStateValue.textControlGeometryGeneration !== geometryGeneration;
+    });
+    if (!needsSync) return;
     const boxes = new Map(documentBoxes(document).map(box => [box.element, box]));
     const options = [];
-    for (const element of documentState(document).elements) {
-      if ((element.localName !== "input" && element.localName !== "textarea")
-        || this.#managedTextControls.has(element) || !visible(element) || element.disabled) continue;
-      if (element.localName === "input" && !["text", "search", "url", "email", "password", "tel", ""].includes(element.type)) continue;
+    for (const element of controls) {
       const box = boxes.get(element);
       if (!box) continue;
       let id = this.#textControlIds.get(element);
@@ -616,9 +692,10 @@ export class Window extends native.Window {
           renderTextOriginX: x - (state.renderScrollLeft ?? 0),
         }),
       });
-      state.textControlSync = { value: element.value, x, y, width, height };
+      state.textControlSync = { value: element.value, x, y, width, height, focused, disabled: element.disabled, scrollSignature: signatures.get(element) };
     }
     if (options.length) this.#updateTextAreas(options, false);
+    documentStateValue.textControlGeometryGeneration = documentStateValue.controlGeometryGeneration;
   }
 
   _validateDocumentMaxConstraints(style = this.#document?.body?.style, property = null, value = undefined) {
@@ -672,29 +749,52 @@ export class Window extends native.Window {
     catch (error) { if (super.closed) this.#stopMedia(); throw error; }
   }
   presentDocument() {
+    const benchmarkStages = process.env.NASTY_BENCH_PROFILE ? {} : null;
+    let benchmarkStageStart = benchmarkStages ? performance.now() : 0;
+    const benchmarkMark = name => {
+      if (!benchmarkStages) return;
+      const now = performance.now();
+      benchmarkStages[name] = now - benchmarkStageStart;
+      benchmarkStageStart = now;
+    };
     this._syncDragHitTest();
+    benchmarkMark("dragHitTest");
     try {
       this.#flushNativeEvents();
     } catch (error) {
       if (!super.closed) console.error("Nasty window event polling failed:", error);
     }
+    benchmarkMark("flushEvents");
+    this.#commitPendingWheelScroll();
+    benchmarkMark("wheelCommit");
     this.#syncDocumentTextControls();
+    benchmarkMark("textControls");
     const isRendered = element => {
       for (let current = element; current; current = current.parentElement) {
         if (current.hidden || current.style.display === "none") return false;
       }
       return true;
     };
-    const visibleElements = this.#document
-      ? [this.#document.body, ...this.#document.querySelectorAll("*")].filter(isRendered)
-      : [];
+    let hasTransformedContent = false;
+    const inspectVisibleTree = element => {
+      if (element.hidden || element.style.display === "none") return false;
+      if (element.localName === "video" || (element.style.transform && element.style.transform !== "none")) return true;
+      for (const child of element.children) if (inspectVisibleTree(child)) return true;
+      return false;
+    };
+    if (this.#document) hasTransformedContent = inspectVisibleTree(this.#document.body);
+    benchmarkMark("visibleTree");
     let result;
-    if (visibleElements.some(element =>
-      element.localName === "video" || (element.style.transform && element.style.transform !== "none"))) {
+    if (hasTransformedContent) {
       const size = this.size();
       const boxes = documentBoxes(this.#document);
+      benchmarkMark("documentBoxes");
       const overlays = inputDecorationOverlays(this.#document);
-      result = this.presentTransformed(buildTransformedDisplayList(boxes, size.width, size.height, overlays));
+      benchmarkMark("overlays");
+      const list = buildTransformedDisplayList(boxes, size.width, size.height, overlays);
+      benchmarkMark("displayList");
+      result = this.presentTransformed(list);
+      benchmarkMark("nativePresent");
     } else {
       const frame = documentImage(this, this.#document);
       const size = this.size();
@@ -717,6 +817,7 @@ export class Window extends native.Window {
       }
     }
     this._syncDragHitTest();
+    benchmarkMark("finalDragHitTest");
     // Native present pumps OS events into the queue; route them before the next
     // timer tick so rapid typing is not gated on refresh-rate polling alone.
     try {
@@ -724,6 +825,7 @@ export class Window extends native.Window {
     } catch (error) {
       if (!super.closed) console.error("Nasty window event polling failed:", error);
     }
+    if (benchmarkStages) this._benchmarkStages = benchmarkStages;
     return result;
   }
 
@@ -1069,9 +1171,47 @@ function defaultElementStyle(name) {
   return reset;
 }
 
-function markGeometryDirty(document) {
+function markGeometryDirty(document, affectsControls = true) {
   document.geometryDirty = true;
   document.geometryGeneration = (document.geometryGeneration ?? 0) + 1;
+  if (affectsControls) document.controlGeometryGeneration = (document.controlGeometryGeneration ?? 0) + 1;
+}
+
+function applyScrollDeltaToBoxes(scroller, deltaX, deltaY) {
+  if (!deltaX && !deltaY) return true;
+  const doc = documentState(scroller.document);
+  const boxes = doc.boxesSnapshot;
+  if (!boxes || doc.geometryDirty) return false;
+  const byElement = new Map(boxes.map((box) => [box.element, box]));
+  const hostBox = byElement.get(scroller);
+  if (!hostBox) return false;
+  // Translate descendants in the retained snapshot. The scroller's own box and
+  // clip stay put; this keeps hit-testing correct without a full layout walk.
+  for (let index = 0; index < boxes.length; index++) {
+    const box = boxes[index];
+    let ancestor = box.element.parentElement ?? box.element.parent;
+    let under = false;
+    while (ancestor) {
+      if (ancestor === scroller) { under = true; break; }
+      ancestor = ancestor.parentElement ?? ancestor.parent;
+    }
+    if (!under) continue;
+    const next = {
+      ...box,
+      x: box.x - deltaX,
+      y: box.y - deltaY,
+      borderBox: { ...box.borderBox, x: box.borderBox.x - deltaX, y: box.borderBox.y - deltaY },
+      paddingBox: { ...box.paddingBox, x: box.paddingBox.x - deltaX, y: box.paddingBox.y - deltaY },
+      contentBox: { ...box.contentBox, x: box.contentBox.x - deltaX, y: box.contentBox.y - deltaY },
+      marginBox: { ...box.marginBox, x: box.marginBox.x - deltaX, y: box.marginBox.y - deltaY },
+      clip: box.clip ? { ...box.clip } : null,
+    };
+    boxes[index] = next;
+    byElement.set(box.element, next);
+  }
+  doc.geometryGeneration = (doc.geometryGeneration ?? 0) + 1;
+  doc.hitTestCache = null;
+  return true;
 }
 
 function queueScrollEvent(element) {
@@ -1104,6 +1244,7 @@ const LAYOUT_STYLE_PROPERTIES = new Set([
   "font", "fontFamily", "fontSize", "fontStyle", "fontWeight", "lineHeight", "letterSpacing", "whiteSpace",
   "textAlign", "textOverflow", "textTransform",
 ]);
+const HIT_TEST_TRANSITION_PROPERTIES = new Set(["transform", "perspective", "zIndex", "display", "visibility"]);
 
 const styleData = new WeakMap();
 function refreshStyleValues(state) {
@@ -1174,19 +1315,26 @@ class CSSStyleDeclaration {
   }
 }
 
+const cssValueResolvers = new Map();
 function cssStyleValue(values, property) {
   if (Object.hasOwn(values, property)) return values[property];
-  const side = /^(padding|margin|border)(Top|Right|Bottom|Left)(Width|Color|Style)?$/.exec(property);
-  if (!side) return undefined;
-  const [, family, direction, suffix = ""] = side;
-  if (family === "border") {
-    const specific = `border${direction}${suffix || "Width"}`;
-    if (Object.hasOwn(values, specific)) return values[specific];
-    const shorthand = suffix === "Color" ? "borderColor" : suffix === "Style" ? "borderStyle" : "borderWidth";
-    return values[shorthand];
+  let resolver = cssValueResolvers.get(property);
+  if (resolver === undefined) {
+    const side = /^(padding|margin|border)(Top|Right|Bottom|Left)(Width|Color|Style)?$/.exec(property);
+    if (!side) {
+      cssValueResolvers.set(property, null);
+      return undefined;
+    }
+    const [, family, direction, suffix = ""] = side;
+    resolver = family === "border"
+      ? ["border", `border${direction}${suffix || "Width"}`, suffix === "Color" ? "borderColor" : suffix === "Style" ? "borderStyle" : "borderWidth"]
+      : [family, property, family];
+    cssValueResolvers.set(property, resolver);
   }
-  const shorthand = family;
-  return values[property] ?? values[shorthand];
+  if (!resolver) return undefined;
+  const [family, specific, shorthand] = resolver;
+  if (family === "border") return Object.hasOwn(values, specific) ? values[specific] : values[shorthand];
+  return values[specific] ?? values[shorthand];
 }
 
 export class Element extends EventTarget {
@@ -1853,7 +2001,12 @@ export class Element extends EventTarget {
 
   _styleChanged(property, inheritedFontChanged = false) {
     const doc = documentState(this.document);
-    if (property !== "value") doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
+    doc.scrollSceneContentGeneration = (doc.scrollSceneContentGeneration ?? 0) + 1;
+    if (property !== "value") {
+      doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
+      doc.staticPaintGeneration = (doc.staticPaintGeneration ?? 0) + 1;
+      doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
+    }
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
     doc.paintDirtyElements ??= new Set();
     doc.paintDirtyElements.add(this);
@@ -1877,13 +2030,35 @@ export class Element extends EventTarget {
 
   _scheduleTransitionFrame(property) {
     const doc = documentState(this.document);
+    // Opacity/transform transitions on unrelated chrome must not invalidate
+    // scroll-layer scene reuse; layout-affecting transitions still do.
+    if (LAYOUT_STYLE_PROPERTIES.has(property)) {
+      doc.scrollSceneContentGeneration = (doc.scrollSceneContentGeneration ?? 0) + 1;
+    }
     doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
+    doc.transitionFrameGeneration = (doc.transitionFrameGeneration ?? 0) + 1;
+    doc.activeTransitionElements ??= new Set();
+    doc.activeTransitionElements.add(this);
     doc.paintDirtyElements ??= new Set();
     doc.paintDirtyElements.add(this);
+    if (LAYOUT_STYLE_PROPERTIES.has(property) || HIT_TEST_TRANSITION_PROPERTIES.has(property)) {
+      doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
+    }
     if (LAYOUT_STYLE_PROPERTIES.has(property)) {
       doc.dirty = true;
       doc.transitionLayoutDirty = true;
+      doc.transitionLayoutDirtyElements ??= new Set();
+      doc.transitionLayoutDirtyElements.add(this);
+      if (["fontSize", "lineHeight", "fontFamily", "fontWeight", "whiteSpace", "wordBreak", "overflowWrap"].includes(property)) {
+        const addDescendants = element => {
+          for (const child of element.children) {
+            doc.transitionLayoutDirtyElements.add(child);
+            addDescendants(child);
+          }
+        };
+        addDescendants(this);
+      }
       markGeometryDirty(doc);
     }
   }
@@ -1936,8 +2111,11 @@ export class Element extends EventTarget {
     const next = Math.max(0, Number(value) || 0);
     const state = elementState(this);
     if (next === state.scrollLeft) return;
+    const previous = state.scrollLeft;
     state.scrollLeft = next;
-    markGeometryDirty(documentState(this.document));
+    if (!applyScrollDeltaToBoxes(this, next - previous, 0)) {
+      markGeometryDirty(documentState(this.document), false);
+    }
     queueScrollEvent(this);
   }
 
@@ -1946,8 +2124,11 @@ export class Element extends EventTarget {
     const next = Math.max(0, Number(value) || 0);
     const state = elementState(this);
     if (next === state.scrollTop) return;
+    const previous = state.scrollTop;
     state.scrollTop = next;
-    markGeometryDirty(documentState(this.document));
+    if (!applyScrollDeltaToBoxes(this, 0, next - previous)) {
+      markGeometryDirty(documentState(this.document), false);
+    }
     queueScrollEvent(this);
   }
 
@@ -2030,7 +2211,7 @@ export class Document extends EventTarget {
     registerMutationDocument(this);
     this.nodeType = 9;
     this.nodeName = "#document";
-    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
+    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, sceneGeneration: 0, staticPaintGeneration: 0, hitTestGeneration: 0, transitionFrameGeneration: 0, activeTransitionElements: new Set(), paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
     this.body = new Element(this, "body");
     registerDocument(this, {
       layout: (width, height, timings) => this.#layout(width, height, timings),
@@ -2161,7 +2342,9 @@ export class Document extends EventTarget {
       const transitionLayoutPass = !!state.transitionLayoutDirty;
       state.transitionLayoutDirty = false;
       if (transitionLayoutPass) {
-        for (const element of state.elements) {
+        const changedElements = state.transitionLayoutDirtyElements;
+        state.transitionLayoutDirtyElements = new Set();
+        for (const element of changedElements?.size ? changedElements : state.elements) {
           state.layoutTree.setStyle(elementState(element).handle, element._taffyStyle());
         }
       }
@@ -2239,6 +2422,7 @@ export class Document extends EventTarget {
       return { element, ...borderBox, margin, border, padding, marginBox, borderBox, paddingBox, contentBox, fixedRoot: fixed.root };
     });
     const byElement = new Map(raw.map((box) => [box.element, box]));
+    const overflowBehaviors = new Map();
     const extents = new Map();
     for (let i = raw.length - 1; i >= 0; i--) {
       const box = raw[i];
@@ -2261,16 +2445,31 @@ export class Document extends EventTarget {
       for (let parent = box.element.parent; parent; parent = parent.parent) {
         if (box.fixedRoot && parent === box.fixedRoot.parent) break;
         const parentBox = byElement.get(parent);
-        const clipX = clipsOverflow(parent, 'x'), clipY = clipsOverflow(parent, 'y');
-        const scrollX = canScroll(parent, 'x'), scrollY = canScroll(parent, 'y');
+        let behavior = overflowBehaviors.get(parent);
+        if (!behavior) {
+          behavior = {
+            clipX: clipsOverflow(parent, 'x'), clipY: clipsOverflow(parent, 'y'),
+            scrollX: canScroll(parent, 'x'), scrollY: canScroll(parent, 'y'),
+          };
+          overflowBehaviors.set(parent, behavior);
+        }
+        const { clipX, clipY, scrollX, scrollY } = behavior;
         if (scrollX) x -= parent.scrollLeft;
         if (scrollY) y -= parent.scrollTop;
         if ((clipX || clipY) && parentBox) {
           let clipLeft = parentBox.paddingBox.x;
           let clipTop = parentBox.paddingBox.y;
           for (let ancestor = parent.parent; ancestor; ancestor = ancestor.parent) {
-            if (canScroll(ancestor, 'x')) clipLeft -= ancestor.scrollLeft;
-            if (canScroll(ancestor, 'y')) clipTop -= ancestor.scrollTop;
+            let ancestorBehavior = overflowBehaviors.get(ancestor);
+            if (!ancestorBehavior) {
+              ancestorBehavior = {
+                clipX: clipsOverflow(ancestor, 'x'), clipY: clipsOverflow(ancestor, 'y'),
+                scrollX: canScroll(ancestor, 'x'), scrollY: canScroll(ancestor, 'y'),
+              };
+              overflowBehaviors.set(ancestor, ancestorBehavior);
+            }
+            if (ancestorBehavior.scrollX) clipLeft -= ancestor.scrollLeft;
+            if (ancestorBehavior.scrollY) clipTop -= ancestor.scrollTop;
           }
           const next = {
             x: clipX ? clipLeft : 0,
@@ -2302,8 +2501,43 @@ export class Document extends EventTarget {
     return boxes;
   }
 
-  scrollAt(x, y, deltaX = 0, deltaY = 0) {
+  scrollAt(x, y, deltaX = 0, deltaY = 0, target = null) {
     if (![x, y, deltaX, deltaY].every(Number.isFinite)) return false;
+    const state = documentState(this);
+    const cache = state.hitTestCache;
+    const tryCachedTarget = target => {
+      if (!target || !cache || cache.sceneGeneration !== state.sceneGeneration
+        || cache.controlGeometryGeneration !== state.controlGeometryGeneration) return null;
+      for (let element = target; element; element = element.parentElement) {
+        const scrollX = canScrollByUser(element, "x"), scrollY = canScrollByUser(element, "y");
+        if ((!scrollX || !deltaX) && (!scrollY || !deltaY)) continue;
+        const box = cache.byElement.get(element);
+        if (!box || x < box.x || y < box.y || x >= box.x + box.width || y >= box.y + box.height) continue;
+        if (box.clip && (x < box.clip.x || y < box.clip.y || x >= box.clip.x + box.clip.width || y >= box.clip.y + box.clip.height)) continue;
+        let ancestorsCurrent = true;
+        for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+          if (!canScroll(ancestor, "x") && !canScroll(ancestor, "y")) continue;
+          const old = cache.scrollOffsets.get(ancestor);
+          if (!old || old[0] !== ancestor.scrollLeft || old[1] !== ancestor.scrollTop) {
+            ancestorsCurrent = false;
+            break;
+          }
+        }
+        if (!ancestorsCurrent) return null;
+        const maxX = Math.max(0, box.scrollWidth - box.paddingBox.width);
+        const maxY = Math.max(0, box.scrollHeight - box.paddingBox.height);
+        const nextX = scrollX ? Math.max(0, Math.min(maxX, element.scrollLeft + deltaX)) : element.scrollLeft;
+        const nextY = scrollY ? Math.max(0, Math.min(maxY, element.scrollTop + deltaY)) : element.scrollTop;
+        if (nextX !== element.scrollLeft || nextY !== element.scrollTop) {
+          element.scrollLeft = nextX;
+          element.scrollTop = nextY;
+          return true;
+        }
+      }
+      return false;
+    };
+    const cachedResult = tryCachedTarget(target);
+    if (cachedResult !== null) return cachedResult;
     const boxes = documentBoxes(this);
     for (let i = boxes.length - 1; i >= 0; i--) {
       const box = boxes[i];
@@ -2319,7 +2553,6 @@ export class Document extends EventTarget {
       if (nextX === box.element.scrollLeft && nextY === box.element.scrollTop) continue;
       box.element.scrollLeft = nextX;
       box.element.scrollTop = nextY;
-      markGeometryDirty(documentState(this));
       return true;
     }
     return false;
@@ -2327,7 +2560,7 @@ export class Document extends EventTarget {
 
   handleEvent(event) {
     if (event?.type !== "wheel") return false;
-    return this.scrollAt(event.x, event.y, event.deltaX ?? 0, event.deltaY ?? 0);
+    return this.scrollAt(event.x, event.y, event.deltaX ?? 0, event.deltaY ?? 0, event.target ?? null);
   }
 
   close() {

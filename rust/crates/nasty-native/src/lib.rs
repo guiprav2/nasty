@@ -9,6 +9,7 @@ use glyphon::{
 use napi::bindgen_prelude::{Buffer, Either, Function};
 use napi::{Error, Result, Status};
 use napi_derive::napi;
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 #[cfg(target_os = "android")]
@@ -681,8 +682,6 @@ struct BackdropResources {
     downsample_pipeline: wgpu::RenderPipeline,
     blur_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
-    width: u32,
-    height: u32,
     small_width: u32,
     small_height: u32,
 }
@@ -800,7 +799,7 @@ impl BackdropResources {
             horizontal_bind: make_bind(&small_view, Some(&horizontal_params)),
             vertical_bind: make_bind(&horizontal_view, Some(&vertical_params)),
             composite_bind: make_simple_bind(&blurred_view), horizontal_params, vertical_params,
-            downsample_pipeline, blur_pipeline, composite_pipeline, width, height, small_width, small_height }
+            downsample_pipeline, blur_pipeline, composite_pipeline, small_width, small_height }
     }
 }
 
@@ -1297,7 +1296,7 @@ struct Renderer {
     format_name: String,
     present_mode_name: String,
     supported_present_modes: Vec<wgpu::PresentMode>,
-    backdrop: BackdropResources,
+    backdrop: HashMap<(u32, u32), BackdropResources>,
     surface_copy_src: bool,
 }
 
@@ -2722,7 +2721,6 @@ impl Renderer {
             })
             .map_err(|error| format!("start text worker: {error}"))?;
 
-        let backdrop = BackdropResources::new(&device, format, config.width, config.height);
         Ok(Self {
             surface,
             device,
@@ -2762,7 +2760,7 @@ impl Renderer {
             format_name,
             present_mode_name,
             supported_present_modes,
-            backdrop,
+            backdrop: HashMap::new(),
             surface_copy_src,
         })
     }
@@ -2804,6 +2802,19 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let row_bytes = width as usize * 4;
+        let padded_row_bytes = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+        let upload = if padded_row_bytes == row_bytes {
+            None
+        } else {
+            let mut padded = vec![0u8; padded_row_bytes * height as usize];
+            for row in 0..height as usize {
+                let source = &pixels[row * row_bytes..(row + 1) * row_bytes];
+                padded[row * padded_row_bytes..row * padded_row_bytes + row_bytes].copy_from_slice(source);
+            }
+            Some(padded)
+        };
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -2811,10 +2822,10 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            pixels,
+            upload.as_deref().unwrap_or(pixels),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(width * 4),
+                bytes_per_row: Some(padded_row_bytes as u32),
                 rows_per_image: Some(height),
             },
             wgpu::Extent3d {
@@ -2869,7 +2880,7 @@ impl Renderer {
         self.queue.write_buffer(&self.canvas_viewport_buffer, 0,
             bytemuck::cast_slice(&[width as f32, height as f32]));
         self.surface.configure(&self.device, &self.config);
-        self.backdrop = BackdropResources::new(&self.device, self.config.format, width, height);
+        self.backdrop.clear();
         if let Some(runtime) = self.text_runtime.as_mut() {
             runtime
                 .text_viewport
@@ -3197,14 +3208,19 @@ impl Renderer {
                     depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
                 });
             }
-            for command in draw_order {
-                if let DrawOrder::BackdropBlur { x, y, width, height, radius } = command {
+            let mut segment_start = 0;
+            while segment_start < draw_order.len() {
+                if let DrawOrder::BackdropBlur { x, y, width, height, radius } = &draw_order[segment_start] {
                     if !self.surface_copy_src {
                         return Err("GPU surface does not support copy-out required for backdrop-filter".into());
                     }
                     self.encode_backdrop_blur(&mut encoder, &frame.texture, *x, *y, *width, *height, *radius)?;
+                    segment_start += 1;
                     continue;
                 }
+                let segment_end = draw_order[segment_start..].iter().position(|command|
+                    matches!(command, DrawOrder::BackdropBlur { .. }))
+                    .map_or(draw_order.len(), |offset| segment_start + offset);
                 let attachments = [Some(wgpu::RenderPassColorAttachment {
                     view: &view, resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
@@ -3213,6 +3229,7 @@ impl Renderer {
                     label: Some("Nasty ordered display command"), color_attachments: &attachments,
                     depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
                 });
+                for command in &draw_order[segment_start..segment_end] {
                 match command {
                     DrawOrder::Solids(range) => {
                         pass.set_pipeline(&self.pipeline); pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
@@ -3252,6 +3269,7 @@ impl Renderer {
                                     _ => {}
                                 }
                             }
+                            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                         }
                     }
                     DrawOrder::CanvasTriangles { range, clip_x, clip_y, clip_width, clip_height } => {
@@ -3264,15 +3282,19 @@ impl Renderer {
                             pass.set_vertex_buffer(0, self.canvas_vertex_buffer.slice(..));
                             pass.set_scissor_rect(left, top, right-left, bottom-top);
                             pass.draw(range.clone(), 0..1);
+                            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                         }
                     }
                     DrawOrder::Image(index) => if let Some((texture_id, range, x, y, w, h)) = image_batches.get(*index).and_then(Option::as_ref) {
                         pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
                         pass.set_scissor_rect(*x, *y, *w, *h);
                         pass.set_bind_group(0, &self.image(texture_id).expect("prepared image texture").bind_group, &[]); pass.draw(range.clone(), 0..1);
+                        pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                     },
                     DrawOrder::BackdropBlur { .. } => unreachable!(),
                 }
+                }
+                segment_start = segment_end;
             }
             if let Some(runtime) = self.text_runtime.as_ref().filter(|runtime| !runtime.text_buffers.is_empty()) {
                 if let Some(text_renderer) = runtime.text_renderer.as_ref() {
@@ -3352,7 +3374,7 @@ impl Renderer {
     }
 
     fn encode_backdrop_blur(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         surface: &wgpu::Texture,
         x: f32,
@@ -3362,11 +3384,27 @@ impl Renderer {
         radius: f32,
     ) -> std::result::Result<(), String> {
         if width <= 0.0 || height <= 0.0 { return Ok(()); }
-        let resources = &self.backdrop;
+        let left = x.floor().clamp(0.0, self.config.width as f32) as u32;
+        let top = y.floor().clamp(0.0, self.config.height as f32) as u32;
+        let right = (x + width).ceil().clamp(0.0, self.config.width as f32) as u32;
+        let bottom = (y + height).ceil().clamp(0.0, self.config.height as f32) as u32;
+        if right <= left || bottom <= top { return Ok(()); }
+        let margin = radius.max(0.0).ceil() as u32 + 2;
+        let source_left = left.saturating_sub(margin);
+        let source_top = top.saturating_sub(margin);
+        let source_right = right.saturating_add(margin).min(self.config.width);
+        let source_bottom = bottom.saturating_add(margin).min(self.config.height);
+        let source_width = source_right - source_left;
+        let source_height = source_bottom - source_top;
+        let key = (source_width, source_height);
+        if !self.backdrop.contains_key(&key) {
+            self.backdrop.insert(key, BackdropResources::new(&self.device, self.config.format, source_width, source_height));
+        }
+        let resources = self.backdrop.get(&key).expect("backdrop resources were just cached");
         encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo { texture: surface, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: surface, mip_level: 0, origin: wgpu::Origin3d { x: source_left, y: source_top, z: 0 }, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &resources.source, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: resources.width, height: resources.height, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: source_width, height: source_height, depth_or_array_layers: 1 },
         );
         let sigma = (radius.max(0.0) / 12.0).max(0.5);
         self.queue.write_buffer(&resources.horizontal_params, 0, bytemuck::cast_slice(&[1.0_f32, 0.0, sigma, 0.0]));
@@ -3384,16 +3422,13 @@ impl Renderer {
             pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
             pass.set_pipeline(pipeline); pass.set_bind_group(0, bind_group, &[]); pass.draw(0..3, 0..1);
         }
-        let left = x.floor().clamp(0.0, self.config.width as f32) as u32;
-        let top = y.floor().clamp(0.0, self.config.height as f32) as u32;
-        let right = (x + width).ceil().clamp(0.0, self.config.width as f32) as u32;
-        let bottom = (y + height).ceil().clamp(0.0, self.config.height as f32) as u32;
         if right > left && bottom > top {
             let surface_view = surface.create_view(&wgpu::TextureViewDescriptor::default());
             let attachments = [Some(wgpu::RenderPassColorAttachment { view: &surface_view, resolve_target: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty backdrop composite"), color_attachments: &attachments,
                 depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+            pass.set_viewport(source_left as f32, source_top as f32, source_width as f32, source_height as f32, 0.0, 1.0);
             pass.set_scissor_rect(left, top, right-left, bottom-top);
             pass.set_pipeline(&resources.composite_pipeline); pass.set_bind_group(0, &resources.composite_bind, &[]); pass.draw(0..3, 0..1);
         }
@@ -5246,10 +5281,24 @@ impl Window {
         if pixels.len() != image.width as usize * image.height as usize * 4 {
             return Err(Error::new(Status::InvalidArg, "image update must match the texture dimensions"));
         }
+        let row_bytes = image.width as usize * 4;
+        let padded_row_bytes = row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+        let pixels = pixels.as_ref();
+        let upload = if padded_row_bytes == row_bytes {
+            None
+        } else {
+            let mut padded = vec![0u8; padded_row_bytes * image.height as usize];
+            for row in 0..image.height as usize {
+                let source = &pixels[row * row_bytes..(row + 1) * row_bytes];
+                padded[row * padded_row_bytes..row * padded_row_bytes + row_bytes].copy_from_slice(source);
+            }
+            Some(padded)
+        };
         renderer.queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &image._texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            pixels.as_ref(),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(image.width * 4), rows_per_image: Some(image.height) },
+            upload.as_deref().unwrap_or(pixels),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded_row_bytes as u32), rows_per_image: Some(image.height) },
             wgpu::Extent3d { width: image.width, height: image.height, depth_or_array_layers: 1 },
         );
         Ok(())

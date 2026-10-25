@@ -34,6 +34,7 @@ function stackingOrder(boxes) {
   const cached = stackingOrders.get(boxes);
   if (cached) return cached;
   const byElement = new Map(boxes.map(box => [box.element, box]));
+  const members = new Set(byElement.keys());
   const order = [];
   function visit(box) {
     if (!box || box.element.hidden || box.element.style.display === 'none') return;
@@ -42,7 +43,12 @@ function stackingOrder(boxes) {
     children.sort((a, b) => (Number(a.element.style.zIndex) || 0) - (Number(b.element.style.zIndex) || 0));
     for (const child of children) visit(child);
   }
-  visit(boxes[0]); stackingOrders.set(boxes, order); return order;
+  const roots = boxes.filter(box => {
+    const parent = box.element.parentElement ?? box.element.parent;
+    return !parent || !members.has(parent);
+  });
+  for (const root of roots.length ? roots : boxes.slice(0, 1)) visit(root);
+  stackingOrders.set(boxes, order); return order;
 }
 function canvasLayer(document, width, height) {
   const boxes = documentBoxes(document), body = document.body;
@@ -115,6 +121,11 @@ function deleteTextures(window, state) {
     if (state[key] !== null && state[key] !== undefined) window.deleteImageTexture(state[key]);
   }
 }
+/** Straight-alpha RGBA for GPU ALPHA_BLENDING. canvas.data() is premultiplied. */
+function surfaceStraightRGBA(surface) {
+  const data = surface.getContext('2d').getImageData(0, 0, surface.width, surface.height).data;
+  return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
 function uploadTexture(window, state, textureKey, sizeKey, width, height, pixels) {
   const previous = state[sizeKey];
   if (state[textureKey] === null || previous?.width !== width || previous?.height !== height) {
@@ -129,7 +140,7 @@ function uploadTextureRegion(window, state, textureKey, sizeKey, width, height, 
   const previous = state[sizeKey];
   const layerKey = textureKey.slice(0, -'TextureId'.length);
   if (state[textureKey] === null || previous?.width !== width || previous?.height !== height || state[`${layerKey}FullPaint`]) {
-    uploadTexture(window, state, textureKey, sizeKey, width, height, surface.data());
+    uploadTexture(window, state, textureKey, sizeKey, width, height, surfaceStraightRGBA(surface));
     return;
   }
   if (!regions?.length) return;
@@ -357,8 +368,8 @@ export function rasterizeDocument(document, width, height, surface = createCanva
     ctx.clearRect(dirty.x, dirty.y, dirty.width, dirty.height);
     ctx.save(); ctx.beginPath(); ctx.rect(dirty.x, dirty.y, dirty.width, dirty.height); ctx.clip();
   } else ctx.clearRect(0, 0, width, height);
-  const boxes = documentBoxes(document);
-  const documentBox = boxes.find(box => box.element === document.body);
+  const boxes = options.boxes ?? documentBoxes(document);
+  const documentBox = options.skipDocumentClip ? null : boxes.find(box => box.element === document.body);
   const documentRadius = documentBox ? radius(document.body.style.borderRadius, documentBox.width, documentBox.height) : 0;
   for (const box of stackingOrder(boxes)) {
     if (box.width <= 0 || box.height <= 0) continue;
@@ -603,8 +614,8 @@ export function documentImage(window, document) {
         skipElements, skipBodyBackground: true, skipBackdropFilter: true,
       });
     }
-    const basePixels = baseDirty || !state.baseSize ? state.baseSurface.data() : null;
-    const fieldPixels = fieldTriangles ? null : layer.field.surface.data();
+    const basePixels = baseDirty || !state.baseSize ? surfaceStraightRGBA(state.baseSurface) : null;
+    const fieldPixels = fieldTriangles ? null : surfaceStraightRGBA(layer.field.surface);
     if (basePixels) uploadTexture(window, state, 'baseTextureId', 'baseSize', width, height, basePixels);
     if (fieldPixels) uploadTexture(window, state, 'fieldTextureId', 'fieldSize',
       layer.field.surface.width, layer.field.surface.height, fieldPixels);
@@ -623,7 +634,7 @@ export function documentImage(window, document) {
       images.push({ textureId: state.postBlurTextureId, x: 0, y: 0, width, height });
     } else {
       if (state.overlayChanged) {
-        uploadTexture(window, state, 'overlayTextureId', 'overlaySize', width, height, state.surface.data());
+        uploadTexture(window, state, 'overlayTextureId', 'overlaySize', width, height, surfaceStraightRGBA(state.surface));
       }
       images.push({ textureId: state.overlayTextureId, x: 0, y: 0, width, height });
     }
@@ -649,8 +660,8 @@ export function documentImage(window, document) {
       { onlyElements: new Set(order.slice(0, backdropIndex).map(box => box.element)) });
     const postChanged = rasterizeCachedLayer(document, width, height, state.postBlurSurface, state, 'postBlur',
       { onlyElements: new Set(order.slice(backdropIndex).map(box => box.element)) });
-    if (preChanged) uploadTexture(window, state, 'preBlurTextureId', 'preBlurSize', width, height, state.preBlurSurface.data());
-    if (postChanged) uploadTexture(window, state, 'postBlurTextureId', 'postBlurSize', width, height, state.postBlurSurface.data());
+    if (preChanged) uploadTexture(window, state, 'preBlurTextureId', 'preBlurSize', width, height, surfaceStraightRGBA(state.preBlurSurface));
+    if (postChanged) uploadTexture(window, state, 'postBlurTextureId', 'postBlurSize', width, height, surfaceStraightRGBA(state.postBlurSurface));
     documentState(document).paintDirtyElements.clear();
     return { ...orderedImageList([
       { textureId: state.preBlurTextureId, x: 0, y: 0, width, height },
@@ -671,7 +682,7 @@ export function documentImage(window, document) {
     state.textureId = null;
   }
   const changed = rasterizeCachedLayer(document, width, height, state.surface, state, 'full');
-  if (changed) uploadTexture(window, state, 'textureId', 'size', width, height, state.surface.data());
+  if (changed) uploadTexture(window, state, 'textureId', 'size', width, height, surfaceStraightRGBA(state.surface));
   documentState(document).paintDirtyElements.clear();
   return { list: empty, images: [{ textureId: state.textureId, x: 0, y: 0, width, height }] };
 }

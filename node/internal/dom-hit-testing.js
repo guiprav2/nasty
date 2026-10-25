@@ -162,16 +162,18 @@ export function elementsFromPoint(document, x, y) {
   const viewport = state.defaultView?.size() ?? state.viewport;
   if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) return [];
   let cache = state.hitTestCache;
-  // Caret blink, selection, and input values repaint without changing any hit
-  // regions. Rebuild only when layout or the styled scene changes.
-  if (!cache || cache.geometryGeneration !== state.geometryGeneration || cache.sceneGeneration !== state.sceneGeneration) {
+  // Paint-only animation frames do not move hit targets. Geometry mutations,
+  // scrolling, and target-affecting style changes have dedicated generations.
+  if (!cache || cache.geometryGeneration !== state.geometryGeneration || cache.hitTestGeneration !== state.hitTestGeneration) {
     const boxes = documentBoxes(document);
     cache = {
       geometryGeneration: state.geometryGeneration,
-      sceneGeneration: state.sceneGeneration,
+      controlGeometryGeneration: state.controlGeometryGeneration,
+      hitTestGeneration: state.hitTestGeneration,
       boxes,
       byElement: new Map(boxes.map(box => [box.element, box])),
       project: createBoxProjector(boxes),
+      scrollOffsets: new Map(boxes.map(box => [box.element, [box.element.scrollLeft, box.element.scrollTop]])),
     };
     const order = new Map(boxes.map((box, index) => [box.element, index]));
     const root = document.body;
