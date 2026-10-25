@@ -12,6 +12,11 @@ const clipRegionCache = new WeakMap();
 const paintSegments = new WeakMap();
 const paintSegmentDiagnostics = { frames: 0, cacheable: 0, exact: 0, translated: 0, outside: 0, missed: 0 };
 
+/** Drop cached paint commands for one element after a local paint-only change. */
+export function clearPaintSegments(element) {
+  paintSegments.delete(element);
+}
+
 function translatePaintSegment(source, dx, dy) {
   const values = source.slice();
   for (let offset = 0; offset < values.length;) {

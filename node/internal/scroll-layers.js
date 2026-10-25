@@ -106,14 +106,28 @@ function ensureHostState(element) {
 
 /** Mark the nearest promoted scroll host's content dirty without a full-document wipe. */
 export function markScrollLayerContentDirty(element) {
+  return noteScrollLayerPaintChange(element) !== null;
+}
+
+/**
+ * Classify a paint/style change relative to promoted scroll hosts.
+ * - "content": descendant inside a baked scroll texture; only the texture needs work
+ * - "host": the scroll container's own chrome changed; the transformed scene must rebuild
+ * - null: no promoted scroll host in the ancestry
+ */
+export function noteScrollLayerPaintChange(element) {
   for (let current = element; current; current = current.parentElement ?? current.parent) {
     const state = hosts.get(current);
     if (!state) continue;
+    if (current === element) {
+      state.contentDirty = true;
+      return "host";
+    }
     state.contentDirty = true;
     state.dirtyElements.add(element);
-    return true;
+    return "content";
   }
-  return false;
+  return null;
 }
 
 function uploadHostTexture(window, state, textureWidth, textureHeight, logicalWidth, logicalHeight, pixels) {
@@ -307,6 +321,7 @@ export function prepareScrollLayers(window, document, boxes) {
     }
 
     if (dirtyRegions.length) {
+      const bakeStarted = process.env.NASTY_BENCH_PROFILE ? performance.now() : 0;
       if (!state.surface || state.surface.width !== width || state.surface.height !== height) {
         state.surface = createCanvas(width, height);
       }
@@ -325,6 +340,13 @@ export function prepareScrollLayers(window, document, boxes) {
           rasterizeDocument(document, width, height, state.surface, { ...paintOptions, dirtyRegion });
         }
         uploadHostRegions(window, state, width, height, logicalWidth, logicalHeight, state.surface, dirtyRegions);
+      }
+      if (process.env.NASTY_BENCH_PROFILE) {
+        console.error("NASTY_SCROLL_BAKE", {
+          full, width, height, logicalWidth, logicalHeight,
+          descendants: descendants.size, regions: dirtyRegions.length,
+          ms: performance.now() - bakeStarted,
+        });
       }
       const paintBounds = new Map();
       for (const [element, box] of contentBoxMap) paintBounds.set(element, paintBoundsContent(box, element));

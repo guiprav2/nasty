@@ -73,11 +73,17 @@ test('Vitrola chat scrolls with drag-anywhere enabled and keeps the composer fix
     app.on('message', listener); app.send({ type: 'report', id: wanted });
   });
   const id = execFileSync('xdotool', ['search', '--name', '^Vitrola$']).toString().trim().split('\n').at(-1);
-  const before = await report(), b = before.scroller;
-  assert.ok(before.scrollHeight > b.height + 300, 'chat has enough history to scroll');
+  const initial = await report(), b = initial.scroller;
+  assert.ok(initial.scrollHeight > b.height + 300, 'chat has enough history to scroll');
   execFileSync('import', ['-window', id, join(artifacts, 'before-scroll.png')]);
   execFileSync('xdotool', ['mousemove', '--window', id, String(Math.round(b.x + 100)), String(Math.round(b.y + 200))]);
   await delay(100);
+  // Overflow anchoring can pin a fresh chat log to the end. Move up first so
+  // the downward wheel assertion has room to run.
+  execFileSync('xdotool', ['click', '--repeat', '24', '--delay', '20', '4']);
+  await delay(300);
+  const before = await report();
+  assert.ok(before.scrollTop < initial.scrollTop - 50, `chat should leave the anchored end (${initial.scrollTop} -> ${before.scrollTop})`);
   execFileSync('xdotool', ['click', '--repeat', '8', '--delay', '50', '5']);
   await delay(350);
   const after = await report();
@@ -85,5 +91,5 @@ test('Vitrola chat scrolls with drag-anywhere enabled and keeps the composer fix
   assert.ok(after.scrollTop > before.scrollTop + 100, `chat offset ${before.scrollTop} -> ${after.scrollTop}`);
   assert.deepEqual(after.scroller, before.scroller, 'scrolling must not resize or move the chat panel');
   assert.deepEqual(after.composer, before.composer, 'the composer must remain fixed below the scrolling log');
-  t.diagnostic(`Chat offset ${before.scrollTop} -> ${after.scrollTop}; screenshots: ${artifacts}`);
+  t.diagnostic(`Chat offset ${initial.scrollTop} -> ${before.scrollTop} -> ${after.scrollTop}; screenshots: ${artifacts}`);
 });

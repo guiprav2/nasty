@@ -7,6 +7,12 @@ export class LayoutWorker {
   #version = 0;
   #nodeCount = 0;
   #workerError = null;
+  // Coalesce style/children/textMetrics until the next layout so building a large
+  // DOM does not flood the worker with thousands of one-off postMessage calls.
+  #pendingStyles = new Map();
+  #pendingChildren = new Map();
+  #pendingTextMetrics = new Map();
+  #pendingCreates = [];
 
   constructor() {
     this.#worker = new Worker(new URL("../workers/layout.js", import.meta.url));
@@ -38,31 +44,52 @@ export class LayoutWorker {
     });
   }
 
+  #takeMutations() {
+    const mutations = {
+      creates: this.#pendingCreates.length ? this.#pendingCreates.splice(0) : [],
+      styles: this.#pendingStyles.size ? [...this.#pendingStyles].map(([node, style]) => ({ node, style })) : [],
+      textMetrics: this.#pendingTextMetrics.size
+        ? [...this.#pendingTextMetrics].map(([node, metrics]) => ({ node, ...metrics }))
+        : [],
+      children: this.#pendingChildren.size
+        ? [...this.#pendingChildren].map(([node, children]) => ({ node, children }))
+        : [],
+    };
+    this.#pendingStyles.clear();
+    this.#pendingTextMetrics.clear();
+    this.#pendingChildren.clear();
+    return mutations;
+  }
+
   initialize(nodes, root = 0) {
     this.#nodeCount = nodes.length;
+    this.#pendingCreates.length = 0;
+    this.#pendingStyles.clear();
+    this.#pendingChildren.clear();
+    this.#pendingTextMetrics.clear();
     return this.#send("init", { nodes, root });
   }
 
   createNode(style) {
     const handle = this.#nodeCount++;
     this.#version++;
-    this.#worker.postMessage({ id: 0, type: "create", payload: { handle, style } });
+    this.#pendingCreates.push({ handle, style });
     return handle;
   }
 
   setStyle(node, style) {
     this.#version++;
-    this.#worker.postMessage({ id: 0, type: "style", payload: { node, style } });
+    this.#pendingStyles.set(node, style);
   }
 
   setTextMetrics(node, metrics) {
     this.#version++;
-    this.#worker.postMessage({ id: 0, type: "textMetrics", payload: { node, ...metrics } });
+    this.#pendingTextMetrics.set(node, metrics);
   }
 
   setChildren(node, children) {
     this.#version++;
-    this.#worker.postMessage({ id: 0, type: "children", payload: { node, children } });
+    this.#pendingChildren.set(node, children);
   }
 
   async layout(width, height, root = 0) {
@@ -72,7 +99,9 @@ export class LayoutWorker {
       throw error;
     }
     const requestedVersion = this.#version;
-    const result = await this.#send("layout", { width, height, root, version: requestedVersion });
+    const result = await this.#send("layout", {
+      width, height, root, version: requestedVersion, mutations: this.#takeMutations(),
+    });
     return { ...result, stale: result.version !== this.#version };
   }
 
@@ -86,9 +115,12 @@ export class LayoutWorker {
     const header = new Int32Array(shared, 0, 4);
     this.#worker.postMessage({
       id: 0, type: "layoutSync",
-      payload: { width, height, root, version: this.#version, shared },
+      payload: {
+        width, height, root, version: this.#version, shared,
+        mutations: this.#takeMutations(),
+      },
     });
-    const waitResult = Atomics.wait(header, 0, 0, 10000);
+    const waitResult = Atomics.wait(header, 0, 0, 30000);
     if (waitResult === "timed-out") throw new Error("synchronous layout worker timed out");
     if (Atomics.load(header, 0) !== 1) throw new Error("synchronous layout worker failed");
     const count = Atomics.load(header, 1);

@@ -7,7 +7,7 @@ import { documentBoxes, documentState, elementRect, elementState, registerDocume
 import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
 import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startInterpolableTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
-import { buildTransformedDisplayList, displayListElements, parseColor } from "./render.js";
+import { buildTransformedDisplayList, clearPaintSegments, displayListElements, parseColor } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics } from "./internal/text-metrics.js";
 import { documentImage } from "./internal/raster-document.js";
@@ -18,6 +18,7 @@ import { resolveWindowDimension, validateWindowDimension } from "./internal/wind
 import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
 import { renderedText } from "./internal/nerd-icon.js";
 import { canScroll, canScrollByUser, clipsOverflow, overflowAnchorPolicy, overflowMode } from "./internal/overflow.js";
+import { noteScrollLayerPaintChange } from "./internal/scroll-layers.js";
 
 export const VideoDecoder = native.VideoDecoder;
 export const AudioDecoder = native.AudioDecoder;
@@ -67,6 +68,7 @@ export class Window extends native.Window {
   #dragHitTestGeneration = -1;
   #dragHitTestGeometryGeneration = -1;
   #presentationTimer = null;
+  #documentPresented = false;
   #eventTarget = new EventTarget();
   #eventTimer = null;
   #closeNotified = false;
@@ -339,6 +341,7 @@ export class Window extends native.Window {
 
   #startEventPolling() {
     if (this.#eventTimer !== null || super.closed) return;
+    if (this.#document && !this.#documentPresented) return;
     const poll = () => {
       this.#eventTimer = null;
       if (super.closed) {
@@ -630,10 +633,19 @@ export class Window extends native.Window {
       }
       return true;
     };
-    const controls = [...documentStateValue.elements].filter(element =>
-      (element.localName === "input" || element.localName === "textarea")
-      && !this.#managedTextControls.has(element) && !element.disabled && visible(element)
-      && (element.localName !== "input" || ["text", "search", "url", "email", "password", "tel", ""].includes(element.type)));
+    // Prefer the retained text-control registry when present so long documents
+    // (Vitrola chat) do not scan every element on every animation frame.
+    const registered = documentStateValue.textControls;
+    const candidates = registered?.size
+      ? registered
+      : documentStateValue.elements;
+    const controls = [];
+    for (const element of candidates) {
+      if (!(element.localName === "input" || element.localName === "textarea")) continue;
+      if (this.#managedTextControls.has(element) || element.disabled || !visible(element)) continue;
+      if (element.localName === "input" && !["text", "search", "url", "email", "password", "tel", ""].includes(element.type)) continue;
+      controls.push(element);
+    }
     if (!controls.length) {
       documentStateValue.textControlGeometryGeneration = documentStateValue.controlGeometryGeneration;
       return;
@@ -757,7 +769,16 @@ export class Window extends native.Window {
       benchmarkStages[name] = now - benchmarkStageStart;
       benchmarkStageStart = now;
     };
-    this._syncDragHitTest();
+    if (this.#document) {
+      const doc = documentState(this.#document);
+      if (doc.pendingScrollSceneInvalidation) {
+        doc.scrollSceneContentGeneration = (doc.scrollSceneContentGeneration ?? 0) + 1;
+        doc.pendingScrollSceneInvalidation = false;
+      }
+    }
+    // Skip the pre-layout hit-test on the very first present; documentBoxes will
+    // perform layout, and hit-testing before that only duplicates the cost.
+    if (this.#documentPresented) this._syncDragHitTest();
     benchmarkMark("dragHitTest");
     try {
       this.#flushNativeEvents();
@@ -769,20 +790,9 @@ export class Window extends native.Window {
     benchmarkMark("wheelCommit");
     this.#syncDocumentTextControls();
     benchmarkMark("textControls");
-    const isRendered = element => {
-      for (let current = element; current; current = current.parentElement) {
-        if (current.hidden || current.style.display === "none") return false;
-      }
-      return true;
-    };
-    let hasTransformedContent = false;
-    const inspectVisibleTree = element => {
-      if (element.hidden || element.style.display === "none") return false;
-      if (element.localName === "video" || (element.style.transform && element.style.transform !== "none")) return true;
-      for (const child of element.children) if (inspectVisibleTree(child)) return true;
-      return false;
-    };
-    if (this.#document) hasTransformedContent = inspectVisibleTree(this.#document.body);
+    const hasTransformedContent = this.#document
+      ? documentHasTransformedContent(this.#document)
+      : false;
     benchmarkMark("visibleTree");
     let result;
     if (hasTransformedContent) {
@@ -826,6 +836,10 @@ export class Window extends native.Window {
       if (!super.closed) console.error("Nasty window event polling failed:", error);
     }
     if (benchmarkStages) this._benchmarkStages = benchmarkStages;
+    if (!this.#documentPresented) {
+      this.#documentPresented = true;
+      this.#startEventPolling();
+    }
     return result;
   }
 
@@ -834,10 +848,18 @@ export class Window extends native.Window {
     this.#presentationTimer = setTimeout(() => {
       this.#presentationTimer = null;
       if (this.closed || !this.#document) return;
+      const frameStarted = performance.now();
       this.presentDocument();
+      if (this.closed || !this.#document) return;
+      // Pace from the frame start. When Fifo vsync blocks inside native present,
+      // elapsed already covers most of the refresh period and delay stays near 0.
+      // A fixed post-present refresh delay was dropping every other vsync (~30–50 FPS).
       const refreshRate = this.refreshRate();
-      this.#scheduleAutomaticPresentation(refreshRate > 0 ? 1000 / refreshRate : 1000 / 60);
+      const period = refreshRate > 0 ? 1000 / refreshRate : 1000 / 60;
+      const elapsed = performance.now() - frameStarted;
+      this.#scheduleAutomaticPresentation(Math.max(0, period - elapsed));
     }, delay);
+    this.#presentationTimer.unref?.();
   }
 
   get document() {
@@ -854,7 +876,15 @@ export class Window extends native.Window {
     this.#bodyAppearanceKey = null;
     if (document) {
       document._attachWindow(this);
-      this.#startEventPolling();
+      this.#documentPresented = false;
+      // Warm layout as soon as the document attaches so the first present does
+      // not pay the full create/style/children apply cost on the event path.
+      queueMicrotask(() => {
+        try { if (this.#document === document && !this.closed) documentBoxes(document); }
+        catch (error) { if (!this.closed) console.error("Nasty initial layout failed:", error); }
+      });
+      // Present before event polling. Hit-testing during the initial create/style
+      // burst otherwise blocks the main thread on a synchronous layoutSync.
       this.#scheduleAutomaticPresentation();
     } else {
       clearTimeout(this.#presentationTimer);
@@ -867,7 +897,6 @@ export class Window extends native.Window {
       this._syncDocumentSizeConstraints();
       this._syncBodyWindowAppearance();
     }
-    this._syncDragHitTest();
   }
 
   _syncBodyWindowAppearance() {
@@ -1177,6 +1206,26 @@ function markGeometryDirty(document, affectsControls = true) {
   if (affectsControls) document.controlGeometryGeneration = (document.controlGeometryGeneration ?? 0) + 1;
 }
 
+function invalidateTransformedContentCache(document) {
+  document.transformedContentCache = null;
+}
+
+function documentHasTransformedContent(document) {
+  const state = documentState(document);
+  const cache = state.transformedContentCache;
+  const generation = state.sceneGeneration ?? 0;
+  if (cache && cache.generation === generation) return cache.value;
+  const inspect = element => {
+    if (element.hidden || element.style.display === "none") return false;
+    if (element.localName === "video" || (element.style.transform && element.style.transform !== "none")) return true;
+    for (const child of element.children) if (inspect(child)) return true;
+    return false;
+  };
+  const value = document.body ? inspect(document.body) : false;
+  state.transformedContentCache = { generation, value };
+  return value;
+}
+
 function applyScrollDeltaToBoxes(scroller, deltaX, deltaY) {
   if (!deltaX && !deltaY) return true;
   const doc = documentState(scroller.document);
@@ -1187,15 +1236,16 @@ function applyScrollDeltaToBoxes(scroller, deltaX, deltaY) {
   if (!hostBox) return false;
   // Translate descendants in the retained snapshot. The scroller's own box and
   // clip stay put; this keeps hit-testing correct without a full layout walk.
+  const under = new Set();
+  const stack = [...scroller.children];
+  while (stack.length) {
+    const element = stack.pop();
+    under.add(element);
+    for (let index = 0; index < element.children.length; index++) stack.push(element.children[index]);
+  }
   for (let index = 0; index < boxes.length; index++) {
     const box = boxes[index];
-    let ancestor = box.element.parentElement ?? box.element.parent;
-    let under = false;
-    while (ancestor) {
-      if (ancestor === scroller) { under = true; break; }
-      ancestor = ancestor.parentElement ?? ancestor.parent;
-    }
-    if (!under) continue;
+    if (!under.has(box.element)) continue;
     const next = {
       ...box,
       x: box.x - deltaX,
@@ -1352,7 +1402,12 @@ export class Element extends EventTarget {
       renderScrollLeft: null, renderTextOriginX: null, renderCaretX: null,
       video: { audioId: nextVideoAudioId++, audioGeneration: 0, audioStartPromise: null, seekPending: false, paused: true, ended: false, currentTime: 0, duration: NaN, width: 0, height: 0, timer: null, token: 0, source: "", frameRequest: null, resolveFrame: null, rejectFrame: null, textureId: null, volume: 1, metadataLoaded: false, dataLoaded: false } };
     registerElementState(this, state);
-    documentState(document).elements.add(this);
+    const docState = documentState(document);
+    docState.elements.add(this);
+    if (this.localName === "input" || this.localName === "textarea") {
+      docState.textControls ??= new Set();
+      docState.textControls.add(this);
+    }
     Object.defineProperty(this, "style", { value: new CSSStyleDeclaration(this, { ...defaultElementStyle(this.localName) }), enumerable: true });
     state.handle = documentState(document).layoutTree.createNode(this._taffyStyle());
   }
@@ -1972,7 +2027,8 @@ export class Element extends EventTarget {
         return;
       }
       elementState(this).image = { textureId: result.textureId, width: result.width, height: result.height, pixels: result.pixels };
-      this._styleChanged();
+      clearPaintSegments(this);
+      this._styleChanged("image");
       elementState(this).imageLoadState = "loaded";
       elementState(this).resolveImageLoad?.(result);
       this.dispatchEvent(new Event("load"));
@@ -2001,10 +2057,21 @@ export class Element extends EventTarget {
 
   _styleChanged(property, inheritedFontChanged = false) {
     const doc = documentState(this.document);
-    doc.scrollSceneContentGeneration = (doc.scrollSceneContentGeneration ?? 0) + 1;
+    // Scroll-texture descendants only dirty their host bake. Unrelated chrome
+    // (carousel, progress, etc.) must still invalidate the reusable scroll scene.
+    // Coalesce to one generation bump per present so many image loads in the same
+    // turn (Vitrola cover art) do not each force a full display-list rebuild.
+    if (noteScrollLayerPaintChange(this) !== "content") {
+      doc.pendingScrollSceneInvalidation = true;
+    }
     if (property !== "value") {
       doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
-      doc.staticPaintGeneration = (doc.staticPaintGeneration ?? 0) + 1;
+      // Per-element paint caches miss via paintDirtyElements / clearPaintSegments.
+      // Only bump the global static generation for broad or layout-affecting changes
+      // so one image load cannot invalidate every carousel card's cached commands.
+      if (property === undefined || inheritedFontChanged || LAYOUT_STYLE_PROPERTIES.has(property)) {
+        doc.staticPaintGeneration = (doc.staticPaintGeneration ?? 0) + 1;
+      }
       doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
     }
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
@@ -2033,7 +2100,7 @@ export class Element extends EventTarget {
     // Opacity/transform transitions on unrelated chrome must not invalidate
     // scroll-layer scene reuse; layout-affecting transitions still do.
     if (LAYOUT_STYLE_PROPERTIES.has(property)) {
-      doc.scrollSceneContentGeneration = (doc.scrollSceneContentGeneration ?? 0) + 1;
+      doc.pendingScrollSceneInvalidation = true;
     }
     doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
@@ -2211,7 +2278,7 @@ export class Document extends EventTarget {
     registerMutationDocument(this);
     this.nodeType = 9;
     this.nodeName = "#document";
-    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, sceneGeneration: 0, staticPaintGeneration: 0, hitTestGeneration: 0, transitionFrameGeneration: 0, activeTransitionElements: new Set(), paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null });
+    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), textControls: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, sceneGeneration: 0, staticPaintGeneration: 0, hitTestGeneration: 0, transitionFrameGeneration: 0, activeTransitionElements: new Set(), paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null, transformedContentCache: null });
     this.body = new Element(this, "body");
     registerDocument(this, {
       layout: (width, height, timings) => this.#layout(width, height, timings),

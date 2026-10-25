@@ -44,6 +44,37 @@ function rebuildParents() {
   });
 }
 
+function setChildrenParents(node, children) {
+  const previous = childLists[node] || [];
+  for (const child of previous) {
+    if (parents[child] === node) parents[child] = -1;
+  }
+  childLists[node] = [...children];
+  for (const child of children) parents[child] = node;
+}
+
+function applyMutations(mutations) {
+  if (!mutations) return;
+  for (const payload of mutations.creates || []) {
+    const handle = tree.createNode(payload.style);
+    if (handle !== payload.handle) throw new Error(`layout handle mismatch: ${handle} != ${payload.handle}`);
+    handles.push(handle);
+    childLists.push([]);
+    parents.push(-1);
+  }
+  for (const payload of mutations.styles || []) {
+    tree.setStyle(handles[payload.node], payload.style);
+  }
+  for (const payload of mutations.textMetrics || []) {
+    measurements.set(handles[payload.node], payload);
+    tree.invalidate(handles[payload.node]);
+  }
+  for (const payload of mutations.children || []) {
+    setChildrenParents(payload.node, payload.children);
+    tree.setChildren(handles[payload.node], payload.children.map((child) => handles[child]));
+  }
+}
+
 parentPort.on("message", ({ id, type, payload }) => {
   try {
     if (type === "init") {
@@ -58,30 +89,24 @@ parentPort.on("message", ({ id, type, payload }) => {
       return;
     }
     if (type === "create") {
-      const handle = tree.createNode(payload.style);
-      if (handle !== payload.handle) throw new Error(`layout handle mismatch: ${handle} != ${payload.handle}`);
-      handles.push(handle);
-      childLists.push([]);
-      parents.push(-1);
+      applyMutations({ creates: [payload] });
       return;
     }
     if (type === "style") {
-      tree.setStyle(handles[payload.node], payload.style);
+      applyMutations({ styles: [payload] });
       return;
     }
     if (type === "textMetrics") {
-      measurements.set(handles[payload.node], payload);
-      tree.invalidate(handles[payload.node]);
+      applyMutations({ textMetrics: [payload] });
       return;
     }
     if (type === "children") {
-      childLists[payload.node] = [...payload.children];
-      tree.setChildren(handles[payload.node], payload.children.map((child) => handles[child]));
-      rebuildParents();
+      applyMutations({ children: [payload] });
       return;
     }
     if (type === "layout" || type === "layoutSync") {
       const start = performance.now();
+      applyMutations(payload.mutations);
       const layoutRoot = handles[payload.root] ?? root;
       tree.compute(layoutRoot, payload.width, payload.height, measure);
       const localBoxes = tree.layouts(handles);
