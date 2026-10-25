@@ -17,7 +17,7 @@ import { decodeVideoFrame, getVideoAudioClock, hasVideoAudio, pauseVideoAudio, s
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
 import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
 import { renderedText } from "./internal/nerd-icon.js";
-import { canScroll, canScrollByUser, clipsOverflow, overflowMode } from "./internal/overflow.js";
+import { canScroll, canScrollByUser, clipsOverflow, overflowAnchorPolicy, overflowMode } from "./internal/overflow.js";
 
 export const VideoDecoder = native.VideoDecoder;
 export const AudioDecoder = native.AudioDecoder;
@@ -2481,10 +2481,46 @@ export class Document extends EventTarget {
         }
       }
       const extent = extents.get(box.element);
+      const clientWidth = box.paddingBox.width;
+      const clientHeight = box.paddingBox.height;
+      const oldScrollWidth = Number(box.element.scrollWidth) || 0;
+      const oldScrollHeight = Number(box.element.scrollHeight) || 0;
+      const oldMaxLeft = Math.max(0, oldScrollWidth - clientWidth);
+      const oldMaxTop = Math.max(0, oldScrollHeight - clientHeight);
+      const oldScrollLeft = Number(box.element.scrollLeft) || 0;
+      const oldScrollTop = Number(box.element.scrollTop) || 0;
       box.element.scrollWidth = extent.width;
       box.element.scrollHeight = extent.height;
-      box.element.scrollLeft = Math.min(box.element.scrollLeft, Math.max(0, box.element.scrollWidth - box.paddingBox.width));
-      box.element.scrollTop = Math.min(box.element.scrollTop, Math.max(0, box.element.scrollHeight - box.paddingBox.height));
+      const newMaxLeft = Math.max(0, extent.width - clientWidth);
+      const newMaxTop = Math.max(0, extent.height - clientHeight);
+      // csswg-drafts#14598: pin to the active anchor edge while within the margin.
+      const anchor = overflowAnchorPolicy(box.element, state.viewport);
+      if (anchor?.axis === "horizontal") {
+        const overflowChanged = Math.abs(newMaxLeft - oldMaxLeft) > 1e-6;
+        const distance = anchor.edge === "end"
+          ? Math.max(0, oldMaxLeft - oldScrollLeft)
+          : Math.max(0, oldScrollLeft);
+        if (overflowChanged && distance <= anchor.margin) {
+          box.element.scrollLeft = anchor.edge === "end" ? newMaxLeft : 0;
+        } else {
+          box.element.scrollLeft = Math.min(oldScrollLeft, newMaxLeft);
+        }
+        box.element.scrollTop = Math.min(oldScrollTop, newMaxTop);
+      } else if (anchor?.axis === "vertical") {
+        const overflowChanged = Math.abs(newMaxTop - oldMaxTop) > 1e-6;
+        const distance = anchor.edge === "end"
+          ? Math.max(0, oldMaxTop - oldScrollTop)
+          : Math.max(0, oldScrollTop);
+        if (overflowChanged && distance <= anchor.margin) {
+          box.element.scrollTop = anchor.edge === "end" ? newMaxTop : 0;
+        } else {
+          box.element.scrollTop = Math.min(oldScrollTop, newMaxTop);
+        }
+        box.element.scrollLeft = Math.min(oldScrollLeft, newMaxLeft);
+      } else {
+        box.element.scrollLeft = Math.min(oldScrollLeft, newMaxLeft);
+        box.element.scrollTop = Math.min(oldScrollTop, newMaxTop);
+      }
       const translatedBorderBox = { ...box.borderBox, x, y };
       const translatedPaddingBox = { ...box.paddingBox, x: box.paddingBox.x + (x - box.x), y: box.paddingBox.y + (y - box.y) };
       const translatedContentBox = { ...box.contentBox, x: box.contentBox.x + (x - box.x), y: box.contentBox.y + (y - box.y) };

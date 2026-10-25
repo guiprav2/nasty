@@ -28,6 +28,8 @@ const CSS_PROPERTIES = new Set([
   "boxShadow", "filter", "backdropFilter", "objectFit", "objectPosition", "visibility",
   "cursor", "pointerEvents", "userSelect", "touchAction",
   "caretColor",
+  // csswg-drafts#14598: separate edge + margin (threshold) longhands.
+  "overflowAnchorEdge", "overflowAnchorMargin",
 ]);
 const BREAKPOINTS = { sm: 640, md: 768, lg: 1024, xl: 1280, "2xl": 1536 };
 const kebabToCamel = value => value.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -145,6 +147,11 @@ function utilityStyle(utility) {
     "overflow-hidden": ["overflow", "hidden"], "overflow-auto": ["overflow", "auto"], "overflow-scroll": ["overflow", "scroll"], "overflow-visible": ["overflow", "visible"],
     "overflow-x-hidden": ["overflowX", "hidden"], "overflow-x-auto": ["overflowX", "auto"], "overflow-x-scroll": ["overflowX", "scroll"], "overflow-x-visible": ["overflowX", "visible"],
     "overflow-y-hidden": ["overflowY", "hidden"], "overflow-y-auto": ["overflowY", "auto"], "overflow-y-scroll": ["overflowY", "scroll"], "overflow-y-visible": ["overflowY", "visible"],
+    "overflow-anchor-edge-none": ["overflowAnchorEdge", "none"],
+    "overflow-anchor-edge-auto": ["overflowAnchorEdge", "auto"],
+    "overflow-anchor-edge-start": ["overflowAnchorEdge", "start"],
+    "overflow-anchor-edge-end": ["overflowAnchorEdge", "end"],
+    "overflow-anchor-margin-auto": ["overflowAnchorMargin", "auto"],
     "object-cover": ["objectFit", "cover"], "object-contain": ["objectFit", "contain"], "object-fill": ["objectFit", "fill"],
     "object-center": ["objectPosition", "50% 50%"], "object-bottom": ["objectPosition", "50% 100%"],
     "object-top": ["objectPosition", "50% 0%"], "object-left": ["objectPosition", "0% 50%"],
@@ -159,6 +166,18 @@ function utilityStyle(utility) {
     nf: [["fontFamily", "Symbols Nerd Font"], ["fontStyle", "normal"], ["fontWeight", 400], ["fontVariant", "normal"], ["textTransform", "none"], ["lineHeight", "1"]],
   };
   if (fixed[utility]) return fixed[utility];
+  // csswg-drafts#14598: overflow-anchor-margin-[120px] / [10%]
+  const anchorMargin = /^overflow-anchor-margin-(.+)$/.exec(utility);
+  if (anchorMargin) {
+    let raw = anchorMargin[1];
+    if (raw === "auto") return ["overflowAnchorMargin", "auto"];
+    if (raw.startsWith("[") && raw.endsWith("]")) raw = raw.slice(1, -1);
+    if (/^-?(?:\d+\.?\d*|\.\d+)%$/.test(raw)) return ["overflowAnchorMargin", raw];
+    if (/^-?(?:\d+\.?\d*|\.\d+)(?:px)?$/.test(raw) || raw === "0") {
+      return ["overflowAnchorMargin", /px$/.test(raw) ? raw : `${raw}px`];
+    }
+    return null;
+  }
   const duration = /^duration-(\d+)$/.exec(utility);
   if (duration) return ["transitionDuration", `${duration[1]}ms`];
   const caret = /^caret-(.+)$/.exec(utility);
