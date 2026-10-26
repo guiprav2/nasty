@@ -70,10 +70,60 @@ assert.equal(textareaDefaults.borderWidth, 0);
 assert.equal(textareaDefaults.backgroundColor, "transparent");
 assert.equal(textareaDefaults.justifyContent, "start");
 assert.equal(textareaDefaults.alignItems, "start");
+const buttonDefaults = scrollDoc.createElement("button").style;
+assert.equal(buttonDefaults.display, "flex");
+assert.equal(buttonDefaults.justifyContent, "center");
+assert.equal(buttonDefaults.alignItems, "center");
+assert.equal(buttonDefaults.textAlign, "center");
+assert.equal(buttonDefaults.borderStyle, "none");
+assert.equal(buttonDefaults.borderWidth, 0);
 scroller.scrollTop = 40;
 assert.equal(scroller.scrollTop, 40);
 window.document = null;
 await scrollDoc.close();
+
+// Default / color-only / Start-like classes must not invent border flow geometry.
+const borderDoc = new Document();
+window.document = borderDoc;
+const bare = borderDoc.createElement("button");
+bare.className = "rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black";
+bare.textContent = "Start";
+borderDoc.body.appendChild(bare);
+const colorOnly = borderDoc.createElement("div");
+colorOnly.className = "border-white/10 w-20 h-10 bg-white/5";
+borderDoc.body.appendChild(colorOnly);
+const framed = borderDoc.createElement("div");
+framed.className = "rounded-xl border border-white/10 w-20 h-10";
+borderDoc.body.appendChild(framed);
+const bareTaffy = bare._taffyStyle();
+const colorOnlyTaffy = colorOnly._taffyStyle();
+const framedTaffy = framed._taffyStyle();
+for (const edge of ["borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth"]) {
+  assert.equal(bareTaffy[edge], 0, `Start-like ${edge}`);
+  assert.equal(colorOnlyTaffy[edge], 0, `color-only ${edge}`);
+  assert.equal(framedTaffy[edge], 1, `framed ${edge}`);
+}
+assert.equal(framed.style.borderTopColor, "rgba(255, 255, 255, 0.1)");
+// Button label flex centering: dominant text span must sit in the content box middle.
+const { dominant } = await import("../dominant.js");
+const d = dominant(borderDoc);
+const start = d.el("button", { class: "rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black" }, d.text("Start"));
+borderDoc.body.appendChild(start);
+// Dominant bindText runs from MutationObserver (microtask); flush before layout.
+await Promise.resolve();
+d.updateSync();
+const label = start.children[0];
+const startRect = start.getBoundingClientRect();
+const labelRect = label.getBoundingClientRect();
+assert.ok(labelRect.height > 8, `Start label height ${labelRect.height}`);
+assert.ok(Math.abs((labelRect.y + labelRect.height / 2) - (startRect.y + startRect.height / 2)) < 1,
+  `Start label not vertically centered (dy=${(labelRect.y + labelRect.height / 2) - (startRect.y + startRect.height / 2)})`);
+assert.ok(Math.abs((labelRect.x + labelRect.width / 2) - (startRect.x + startRect.width / 2)) < 1,
+  `Start label not horizontally centered`);
+assert.equal(start.style.borderStyle, "none");
+assert.equal(start._taffyStyle().borderTopWidth, 0);
+window.document = null;
+await borderDoc.close();
 window.document = doc;
 
 // Geometry reads use the public DOM API and synchronously flush pending layout.

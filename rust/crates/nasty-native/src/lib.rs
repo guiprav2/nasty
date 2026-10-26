@@ -3424,6 +3424,7 @@ impl Renderer {
                     let (texture_id, range, x, y, w, h) = batch;
                     pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
                     pass.set_scissor_rect(*x, *y, *w, *h); pass.set_bind_group(0, &self.image(texture_id).expect("prepared image texture").bind_group, &[]); pass.draw(range.clone(), 0..1);
+                    pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                 }
             } else {
                 for command in draw_order {
@@ -3463,7 +3464,17 @@ impl Renderer {
                                 pass.set_scissor_rect(0,0,self.config.width,self.config.height);
                             }
                         }
-                        DrawOrder::Image(index) => if let Some((texture_id,range,x,y,w,h))=image_batches.get(*index).and_then(Option::as_ref) { pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0,self.image_vertex_buffer.slice(..)); pass.set_scissor_rect(*x,*y,*w,*h); pass.set_bind_group(0,&self.image(texture_id).expect("prepared image texture").bind_group,&[]); pass.draw(range.clone(),0..1); },
+                        DrawOrder::Image(index) => if let Some((texture_id,range,x,y,w,h))=image_batches.get(*index).and_then(Option::as_ref) {
+                            pass.set_pipeline(&self.image_pipeline);
+                            pass.set_vertex_buffer(0,self.image_vertex_buffer.slice(..));
+                            pass.set_scissor_rect(*x,*y,*w,*h);
+                            pass.set_bind_group(0,&self.image(texture_id).expect("prepared image texture").bind_group,&[]);
+                            pass.draw(range.clone(),0..1);
+                            // Match the BackdropBlur path: restore full-frame scissor so
+                            // later Solids/Triangles (title form fills under a spinning logo)
+                            // are not clipped to the image rect.
+                            pass.set_scissor_rect(0,0,self.config.width,self.config.height);
+                        },
                         DrawOrder::BackdropBlur { .. } => unreachable!(),
                     }
                 }

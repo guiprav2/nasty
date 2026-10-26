@@ -27,7 +27,7 @@ let windowMaximized = false;
 function updateBodyFrame(maximized = windowMaximized) {
   windowMaximized = maximized;
   const open = process.env.SWEET_ANDROID_APK || maximized || doc.fullscreenElement;
-  const frame = open ? "" : "rounded-2xl border border-white/10 ";
+  const frame = open ? "" : "rounded-2xl border border-zinc-600/25 ";
   doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[#070709] text-white font-[Inter]`;
 }
 updateBodyFrame();
@@ -315,12 +315,12 @@ function inspectorLayer() {
     }),
     inspectorOutlineClip,
     d.if(() => !!state.inspectedNode, d.el("div", {
-      class: "inspector-footer pointer-events-auto absolute inset-x-0 bottom-0 z-[210] flex items-stretch gap-2 border-t border-white/20 bg-[#111114]/95 p-2 shadow-2xl backdrop-blur",
+      class: "inspector-footer pointer-events-auto absolute inset-x-0 bottom-0 z-[210] flex items-stretch gap-2 border-t border-zinc-500/20 bg-[#111114]/95 p-2 shadow-2xl backdrop-blur",
       onattach: (node) => { markInspectorControl(node); inspectorFooter = node; },
     },
       d.el("input", {
         type: "text",
-        class: "min-w-0 flex-1 rounded-xl border border-white/15 bg-black/70 px-3 py-3 font-mono text-sm text-white focus:border-rose-300/80",
+        class: "min-w-0 flex-1 rounded-xl border border-zinc-500/20 bg-black/70 px-3 py-3 font-mono text-sm text-white focus:border-rose-300/80",
         placeholder: "className",
         value: d.binding({
           get: () => state.inspectedNode?.className || "",
@@ -329,7 +329,7 @@ function inspectorLayer() {
           },
         }),
       }),
-      d.el("button", { class: "shrink-0 rounded-xl border border-white/15 px-4 text-sm font-semibold text-white hover:bg-white/10 cursor-pointer", onattach: (node) => { revertButton = node; }, onclick: revertInspectedClass }, "Revert"),
+      d.el("button", { class: "shrink-0 rounded-xl border border-zinc-500/20 px-4 text-sm font-semibold text-white hover:bg-white/10 cursor-pointer", onattach: (node) => { revertButton = node; }, onclick: revertInspectedClass }, "Revert"),
       d.el("button", { class: "shrink-0 rounded-xl bg-white px-4 text-sm font-bold text-black hover:bg-zinc-200 cursor-pointer", onattach: (node) => { saveButton = node; }, onclick: saveInspector }, "Save"),
     )),
   ));
@@ -731,7 +731,7 @@ function coverCard(index) {
         class: () => {
           const active = Number(index) === state.player.index && state.player.track;
           if (!active) return "hidden";
-          return "absolute right-2 top-2 z-30 flex items-center justify-center h-8 w-8 rounded-full border border-white/20 bg-black/75 text-lg text-white cursor-pointer opacity-0 transition duration-200 ease-out group-hover:opacity-100";
+          return "absolute right-2 top-2 z-30 flex items-center justify-center h-8 w-8 rounded-full border border-zinc-500/20 bg-black/75 text-lg text-white cursor-pointer opacity-0 transition duration-200 ease-out group-hover:opacity-100";
         },
         "aria-label": "Full screen",
         title: "Full screen",
@@ -928,7 +928,7 @@ function seekBar() {
 function transport() {
   return d.el(
     "div",
-    { class: "flex w-full shrink-0 flex-col items-center justify-center border-t border-white/10 bg-black/35 px-4 py-3 md:py-4" },
+    { class: "flex w-full shrink-0 flex-col items-center justify-center border-t border-zinc-600/25 bg-black/35 px-4 py-3 md:py-4" },
     d.el("div", { class: "w-full max-w-xl text-center text-lg font-semibold truncate" }, d.text(() => state.player.track?.title || "Nothing playing")),
     d.el("div", { class: "mt-1 w-full max-w-xl text-center text-sm text-white/50 truncate" }, d.text(() => state.player.track ? `${state.player.track.channel || "Unknown artist"} · ${state.player.playlistName || "Single"}` : "Pick a playlist from your library")),
     d.el(
@@ -964,7 +964,7 @@ function stage() {
     coverStage(),
     transport(),
     d.if(() => state.volumeVisible, d.el("div", {
-      class: "pointer-events-none absolute left-1/2 top-1/2 z-30 flex h-[min(38vh,16rem)] w-16 -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-3 rounded-full border border-white/20 bg-black/65 px-2 py-5 text-white shadow-2xl backdrop-blur transition-opacity",
+      class: "pointer-events-none absolute left-1/2 top-1/2 z-30 flex h-[min(38vh,16rem)] w-16 -translate-x-1/2 -translate-y-1/2 flex-col items-center justify-center gap-3 rounded-full border border-zinc-500/20 bg-black/65 px-2 py-5 text-white shadow-2xl backdrop-blur transition-opacity",
     },
       d.el("div", { class: "relative h-full w-2 overflow-hidden rounded-full bg-white/20" },
         d.el("div", { class: ["absolute inset-x-0 bottom-0 rounded-full bg-rose-300 transition-[height] duration-100", () => `h-[${Math.round(state.volume * 100)}%]`] }),
@@ -977,7 +977,7 @@ function stage() {
 function header() {
   return d.el(
     "div",
-    { class: "hidden shrink-0 items-center gap-3 border-b border-white/10 px-4 py-4 md:flex" },
+    { class: "hidden shrink-0 items-center gap-3 border-b border-zinc-600/25 px-4 py-4 md:flex" },
     disc(),
     d.el("div", { class: "min-w-0 flex-1" },
       d.el("div", { class: "text-sm font-semibold" }, "Vitrola"),
@@ -1066,7 +1066,7 @@ async function sendMessage() {
 }
 
 function chatPanel() {
-  const chatScroller = d.el("div", { class: () => `w-full shrink-0 overflow-x-hidden overflow-y-auto overflow-anchor-edge-auto overflow-anchor-margin-auto rounded-t-2xl border border-white/10 bg-[#101012]/95 px-3 py-2 backdrop-blur transition-[height,opacity] duration-300 ${state.chatOpen ? "h-[30vh] opacity-100" : "h-0 border-0 p-0 opacity-0"} md:h-auto md:flex-1 md:rounded-none md:border-0 md:bg-black/30 md:p-3 md:opacity-100 md:backdrop-blur-none`, onscroll: onChatScroll, onwheel: onChatScroll },
+  const chatScroller = d.el("div", { class: () => `w-full shrink-0 overflow-x-hidden overflow-y-auto overflow-anchor-edge-auto overflow-anchor-margin-auto rounded-t-2xl border border-zinc-600/25 bg-[#101012]/95 px-3 py-2 backdrop-blur transition-[height,opacity] duration-300 ${state.chatOpen ? "h-[30vh] opacity-100" : "h-0 border-0 p-0 opacity-0"} md:h-auto md:flex-1 md:rounded-none md:border-0 md:bg-black/30 md:p-3 md:opacity-100 md:backdrop-blur-none`, onscroll: onChatScroll, onwheel: onChatScroll },
     d.if(() => state.messages.length === 0, d.el("div", { class: "mt-6 text-center text-sm text-white/35" }, "Ask Vitrola to find a video or set a mood.")),
     d.map(() => state.messages, chatMessage),
   );
@@ -1076,8 +1076,8 @@ function chatPanel() {
     header(),
     chatScroller,
     d.if(() => !!state.error, d.el("div", { class: "absolute inset-x-0 bottom-[5.7rem] bg-black/80 px-3 pb-2 text-xs text-rose-300 md:static" }, d.text(() => state.error))),
-    d.el("div", { class: "relative z-40 shrink-0 border-t border-white/10 bg-[#09090b]/95 p-3 md:bg-black/30" },
-      d.el("div", { class: "flex w-full items-stretch overflow-hidden rounded-2xl border border-white/10 bg-black/40" },
+    d.el("div", { class: "relative z-40 shrink-0 border-t border-zinc-600/25 bg-[#09090b]/95 p-3 md:bg-black/30" },
+      d.el("div", { class: "flex w-full items-stretch overflow-hidden rounded-2xl border border-zinc-600/25 bg-black/40" },
       d.el("input", {
         type: "text",
         class: "min-h-0 min-w-0 flex-1 rounded-l-2xl rounded-r-none bg-transparent px-3 py-2 text-sm text-white focus:border-rose-300/60",
@@ -1094,7 +1094,7 @@ function chatPanel() {
 function playlistEntry(playlist) {
   return d.el(
     "div",
-    { class: "border-b border-white/10" },
+    { class: "border-b border-zinc-600/25" },
     d.el("button", {
       class: ["flex flex-col items-start w-full px-4 py-2 text-left hover:bg-white/5 cursor-pointer", () => playlist.id === state.player.playlistId ? "bg-white/10" : ""],
       onclick: () => { state.drawerOpen = false; void playAt(playlist.id, 0); },
@@ -1115,8 +1115,8 @@ function playlistEntry(playlist) {
 function libraryPanel() {
   return d.el(
     "aside",
-    { class: () => `pointer-events-auto absolute inset-y-0 left-0 z-50 flex h-full min-h-0 w-[min(82vw,20rem)] flex-col border-r border-white/15 bg-black/95 shadow-2xl transition-transform duration-300 ${state.drawerOpen ? "translate-x-0" : "-translate-x-full"} md:static md:w-full md:translate-x-0 md:border-0 md:bg-black/30 md:shadow-none` },
-    d.el("div", { class: "flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-4 py-5" },
+    { class: () => `pointer-events-auto absolute inset-y-0 left-0 z-50 flex h-full min-h-0 w-[min(82vw,20rem)] flex-col border-r border-zinc-500/20 bg-black/95 shadow-2xl transition-transform duration-300 ${state.drawerOpen ? "translate-x-0" : "-translate-x-full"} md:static md:w-full md:translate-x-0 md:border-0 md:bg-black/30 md:shadow-none` },
+    d.el("div", { class: "flex shrink-0 items-center justify-between gap-2 border-b border-zinc-600/25 px-4 py-5" },
       d.el("div", { class: "min-w-0 flex-1" },
         d.el("div", { class: "text-[11px] font-medium text-white/40" }, "PLAYLISTS"),
       ),
@@ -1124,7 +1124,7 @@ function libraryPanel() {
     d.el("div", { class: "flex-1 min-h-0 overflow-y-auto" }, d.map(() => state.playlists, playlistEntry)),
     d.el("div", { class: "m-4 mt-auto flex shrink-0 flex-col gap-2 md:hidden" },
       d.el("button", { class: "whitespace-nowrap rounded-xl bg-red-600 px-4 py-3 text-left text-sm font-bold text-white shadow-lg hover:bg-red-500 cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API Key"),
-      d.el("button", { class: "rounded-xl border border-white/15 bg-white/10 px-4 py-3 text-sm font-bold text-white shadow-lg hover:bg-white/15 cursor-pointer", onclick: startInspector }, "Inspector Mode"),
+      d.el("button", { class: "rounded-xl border border-zinc-500/20 bg-white/10 px-4 py-3 text-sm font-bold text-white shadow-lg hover:bg-white/15 cursor-pointer", onclick: startInspector }, "Inspector Mode"),
     ),
   );
 }
@@ -1225,7 +1225,7 @@ function cookieDialog() {
   return d.if(
     () => !!state.cookiePrompt,
     d.el("div", { class: "absolute inset-0 z-[110] flex items-center justify-center bg-black/70 p-4" },
-      d.el("div", { class: "w-full max-w-sm rounded-2xl border border-white/10 bg-[#18181b] p-5" },
+      d.el("div", { class: "w-full max-w-sm rounded-2xl border border-zinc-600/25 bg-[#18181b] p-5" },
         d.el("div", { class: "text-base font-semibold" }, "YouTube cookies"),
         d.if(
           () => !state.cookiePrompt?.browsers?.length,
@@ -1260,7 +1260,7 @@ function forgetDialog() {
   return d.if(
     () => state.forget,
     d.el("div", { class: "absolute inset-0 z-[100] flex items-center justify-center bg-black/70 p-4" },
-      d.el("div", { class: "w-full max-w-sm rounded-2xl border border-white/10 bg-[#18181b] p-5" },
+      d.el("div", { class: "w-full max-w-sm rounded-2xl border border-zinc-600/25 bg-[#18181b] p-5" },
         d.el("div", { class: "text-base font-semibold" }, "Forget this API key?"),
         d.el("div", { class: "mt-2 text-sm text-white/60" }, "Playback stops, the key is cleared, and Vitrola returns to the title screen."),
         d.el("div", { class: "mt-5 flex justify-end gap-2" },
@@ -1357,9 +1357,9 @@ async function transportAction(action) {
 
 function playerScreen() {
   return d.el("div", { class: "relative flex h-full min-h-0 w-full flex-col-reverse md:flex-row" },
-    d.el("div", { class: "min-h-0 min-w-0 shrink-0 md:h-full md:w-1/4 md:max-w-[352px] md:border-r md:border-white/10" }, chatPanel()),
+    d.el("div", { class: "min-h-0 min-w-0 shrink-0 md:h-full md:w-1/4 md:max-w-[352px] md:border-r md:border-zinc-600/25" }, chatPanel()),
     d.el("div", { class: "flex min-h-0 min-w-0 flex-1 flex-col" }, stage()),
-    d.el("div", { class: "pointer-events-none absolute inset-0 z-40 border-0 md:pointer-events-auto md:static md:w-[22%] md:max-w-[296px] md:shrink-0 md:border-l md:border-white/10" }, libraryPanel()),
+    d.el("div", { class: "pointer-events-none absolute inset-0 z-40 border-0 md:pointer-events-auto md:static md:w-[22%] md:max-w-[296px] md:shrink-0 md:border-l md:border-zinc-600/25" }, libraryPanel()),
     d.if(() => state.drawerOpen, d.el("button", { class: "absolute inset-0 z-30 bg-black/60 cursor-pointer md:hidden", "aria-label": "Close playlists", onclick: () => { state.drawerOpen = false; d.updateSync(); } })),
     forgetDialog(),
     cookieDialog(),
@@ -1389,7 +1389,7 @@ function titleScreen() {
       d.el("div", { class: "mt-7 w-full text-left text-[11px] font-medium text-white/40" }, "GROK API KEY"),
       d.el("input", {
         type: "password", placeholder: "xai-…",
-        class: "mt-2 w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white focus:border-rose-300/70",
+        class: "mt-2 w-full rounded-2xl border border-zinc-600/25 bg-white/5 px-4 py-3 text-sm text-white focus:border-rose-300/70",
         value: d.binding({ get: () => state.apiKey, set: (value) => { state.apiKey = value; } }),
         onkeydown: (event) => { if (event.key === "Enter") { event.preventDefault?.(); startButton?.click(); } },
       }),
@@ -1407,7 +1407,7 @@ function windowControls(position = "fixed right-2 top-2 z-50") {
     title: label,
     onclick: action,
   }, d.el("span", { class: ["nf", iconClass] }));
-  return d.el("div", { class: `${position} flex items-center gap-1 rounded-xl border border-white/10 bg-[#17171bcc] p-1` },
+  return d.el("div", { class: `${position} flex items-center gap-1 rounded-xl border border-zinc-600/25 bg-[#17171bcc] p-1` },
     control("Minimize window", "nf-md-window_minimize", () => win.minimize()),
     control("Maximize or restore window", "nf-md-window_maximize", () => { win.maximized = !win.maximized; }),
     control("Close window", "nf-md-window_close", () => win.close(), "hover:bg-rose-600"),
@@ -1415,7 +1415,7 @@ function windowControls(position = "fixed right-2 top-2 z-50") {
 }
 
 doc.body.appendChild(d.el("div", { class: "relative flex h-screen w-full flex-col overflow-hidden bg-transparent" },
-  d.if(() => state.entered && !state.drawerOpen, d.el("button", { class: "absolute left-2 top-2 z-50 flex items-center justify-center h-10 w-10 rounded-full border border-white/15 bg-black/70 text-lg text-white cursor-pointer md:hidden", "aria-label": "Open playlists", onclick: () => { state.drawerOpen = !state.drawerOpen; d.updateSync(); } }, d.el("span", { class: "nf nf-md-menu" }))),
+  d.if(() => state.entered && !state.drawerOpen, d.el("button", { class: "absolute left-2 top-2 z-50 flex items-center justify-center h-10 w-10 rounded-full border border-zinc-500/20 bg-black/70 text-lg text-white cursor-pointer md:hidden", "aria-label": "Open playlists", onclick: () => { state.drawerOpen = !state.drawerOpen; d.updateSync(); } }, d.el("span", { class: "nf nf-md-menu" }))),
   windowControls(),
   d.el("div", { class: "relative min-h-0 flex-1" },
     d.if(() => !state.entered, titleScreen()),

@@ -68,6 +68,52 @@ const sheenB = computedStyleValue(sheen.style, "transform");
 assert.notEqual(sheenA, sheenB, "sheen transform should advance");
 assert.match(String(sheenA ?? ""), /skewX\(-18deg\)/);
 
+// Sheen nested under animate-float must share the parent's world Y (composed transforms),
+// including when an overflow:hidden rounded clip sits between them (Vitrola vinyl).
+{
+  const { createBoxProjector, buildTransformedDisplayList } = await import("../render.js");
+  const { layoutDocument, documentBoxes } = await import("../internal/dom-state.js");
+  const nest = new Document();
+  nest.body.className = "relative w-[400px] h-[400px]";
+  const floatParent = nest.createElement("div");
+  floatParent.className = "absolute left-[100px] top-[100px] animate-float";
+  const wrap = nest.createElement("div");
+  wrap.className = "relative h-44 w-44";
+  const clip = nest.createElement("div");
+  clip.className = "absolute inset-[8%] overflow-hidden rounded-full";
+  const sheenChild = nest.createElement("div");
+  sheenChild.className = "absolute inset-y-[-10%] w-1/3 animate-sheen bg-white/40";
+  nest.body.appendChild(floatParent);
+  floatParent.appendChild(wrap);
+  wrap.appendChild(clip);
+  clip.appendChild(sheenChild);
+  await layoutDocument(nest, 400, 400);
+  const sample = () => {
+    const boxes = documentBoxes(nest);
+    buildTransformedDisplayList(boxes, 400, 400, []);
+    const project = createBoxProjector(boxes);
+    const fb = boxes.find((box) => box.element === floatParent);
+    const cb = boxes.find((box) => box.element === clip);
+    const sb = boxes.find((box) => box.element === sheenChild);
+    return {
+      floatY: project(fb, fb.x + fb.width / 2, fb.y + fb.height / 2).y,
+      clipY: project(cb, cb.paddingBox.x + cb.paddingBox.width / 2, cb.paddingBox.y + cb.paddingBox.height / 2).y,
+      sheenY: project(sb, sb.x + sb.width / 2, sb.y + sb.height / 2).y,
+      layoutY: fb.y + fb.height / 2,
+      transform: computedStyleValue(floatParent.style, "transform"),
+    };
+  };
+  const first = sample();
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const second = sample();
+  assert.match(String(second.transform ?? ""), /translateY\(/);
+  assert.ok(Math.abs(second.floatY - second.layoutY) > 1, "float world Y should leave layout Y");
+  assert.ok(Math.abs(second.sheenY - second.floatY) < 0.05, `sheen must follow float world Y (dy=${second.sheenY - second.floatY})`);
+  assert.ok(Math.abs(second.clipY - second.floatY) < 0.05, `overflow clip must follow float world Y (dy=${second.clipY - second.floatY})`);
+  assert.ok(Math.abs(second.floatY - first.floatY) > 1, "float must advance between samples");
+  await nest.close();
+}
+
 const programmed = doc.createElement("div");
 doc.body.appendChild(programmed);
 const animation = doc.createElementAnimation(programmed, [

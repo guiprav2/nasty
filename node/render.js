@@ -95,6 +95,14 @@ function withOpacity(color, opacity) {
   return [color[0], color[1], color[2], color[3] * opacity];
 }
 
+/** Border color: longhand → borderColor. Missing color stays unset for callers. */
+function borderColorFor(style, side) {
+  const property = `border${side}Color`;
+  return computedStyleValue(style, property)
+    ?? computedStyleValue(style, "borderColor")
+    ?? null;
+}
+
 function splitGradientArgs(body) {
   const parts = [];
   let depth = 0, start = 0;
@@ -191,6 +199,9 @@ export function buildBoxDisplayList(boxes, width, height) {
       const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
       if (borderStyle === "none" || borderStyle === "hidden") continue;
       const thickness = border[edge];
+      if (!(thickness > 0)) continue;
+      const color = borderColorFor(style, side);
+      if (!color) continue;
       const rect = side === "Top"
         ? { x: borderBox.x, y: borderBox.y, width: borderBox.width, height: thickness }
         : side === "Right"
@@ -198,8 +209,6 @@ export function buildBoxDisplayList(boxes, width, height) {
           : side === "Bottom"
             ? { x: borderBox.x, y: borderBox.y + borderBox.height - thickness, width: borderBox.width, height: thickness }
             : { x: borderBox.x, y: borderBox.y, width: thickness, height: borderBox.height };
-      const property = `border${side}Color`;
-      const color = computedStyleValue(style, style[property] === undefined ? "borderColor" : property) ?? "#000000";
       push(rect, parseColor(color), clip);
     }
   }
@@ -265,6 +274,9 @@ export function buildOrderedDisplayList(boxes, width, height) {
       const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
       if (borderStyle === "none" || borderStyle === "hidden") continue;
       const thickness = border[edge];
+      if (!(thickness > 0)) continue;
+      const color = borderColorFor(style, side);
+      if (!color) continue;
       const rect = side === "Top"
         ? { x: borderBox.x, y: borderBox.y, width: borderBox.width, height: thickness }
         : side === "Right"
@@ -272,8 +284,6 @@ export function buildOrderedDisplayList(boxes, width, height) {
           : side === "Bottom"
             ? { x: borderBox.x, y: borderBox.y + borderBox.height - thickness, width: borderBox.width, height: thickness }
             : { x: borderBox.x, y: borderBox.y, width: thickness, height: borderBox.height };
-      const property = `border${side}Color`;
-      const color = computedStyleValue(style, style[property] === undefined ? "borderColor" : property) ?? "#000000";
       pushQuad(rect, parseColor(color), clip);
     }
   }
@@ -660,25 +670,74 @@ function cachedPaintOrder(document, boxes) {
   return paintOrders.get(document).entries;
 }
 
-function roundedRectPolygon(rect, radius) {
-  const r = Math.max(0, Math.min(radius, rect.width / 2, rect.height / 2));
-  if (r === 0) return [
-    { x: rect.x, y: rect.y }, { x: rect.x + rect.width, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y + rect.height }, { x: rect.x, y: rect.y + rect.height },
-  ];
-  if (!r) return [
-    { x: rect.x, y: rect.y }, { x: rect.x + rect.width, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y + rect.height }, { x: rect.x, y: rect.y + rect.height },
-  ];
+function lengthOrPercent(raw, percentBase) {
+  const text = String(raw ?? "").trim();
+  if (!text) return 0;
+  const value = Number.parseFloat(text);
+  if (!Number.isFinite(value)) return 0;
+  return text.endsWith("%") ? percentBase * value / 100 : value;
+}
+
+/** Resolve CSS border-radius into clamped per-corner radii { tl, tr, br, bl }. */
+function cornerRadiiFor(style, width, height) {
+  const shorthand = computedStyleValue(style, "borderRadius") ?? style.borderRadius;
+  const base = lengthOrPercent(shorthand, Math.min(width, height));
+  const tl = lengthOrPercent(computedStyleValue(style, "borderTopLeftRadius") ?? style.borderTopLeftRadius ?? shorthand, Math.min(width, height));
+  const tr = lengthOrPercent(computedStyleValue(style, "borderTopRightRadius") ?? style.borderTopRightRadius ?? shorthand, Math.min(width, height));
+  const br = lengthOrPercent(computedStyleValue(style, "borderBottomRightRadius") ?? style.borderBottomRightRadius ?? shorthand, Math.min(width, height));
+  const bl = lengthOrPercent(computedStyleValue(style, "borderBottomLeftRadius") ?? style.borderBottomLeftRadius ?? shorthand, Math.min(width, height));
+  // Prefer explicit longhands when present; otherwise the shorthand fills all corners.
+  const hasLonghand = ["borderTopLeftRadius", "borderTopRightRadius", "borderBottomRightRadius", "borderBottomLeftRadius"]
+    .some((name) => style[name] !== undefined);
+  const corners = hasLonghand
+    ? { tl, tr, br, bl }
+    : { tl: base, tr: base, br: base, bl: base };
+  const clampCorner = (value) => Math.max(0, Math.min(value, width / 2, height / 2));
+  return {
+    tl: clampCorner(corners.tl),
+    tr: clampCorner(corners.tr),
+    br: clampCorner(corners.br),
+    bl: clampCorner(corners.bl),
+  };
+}
+
+function uniformCornerRadius(corners) {
+  if (!corners) return 0;
+  const { tl, tr, br, bl } = corners;
+  return tl === tr && tr === br && br === bl ? tl : 0;
+}
+
+function roundedRectPolygon(rect, radius, corners = null) {
+  const radii = corners ?? { tl: radius, tr: radius, br: radius, bl: radius };
+  const tl = Math.max(0, Math.min(radii.tl || 0, rect.width / 2, rect.height / 2));
+  const tr = Math.max(0, Math.min(radii.tr || 0, rect.width / 2, rect.height / 2));
+  const br = Math.max(0, Math.min(radii.br || 0, rect.width / 2, rect.height / 2));
+  const bl = Math.max(0, Math.min(radii.bl || 0, rect.width / 2, rect.height / 2));
+  if (tl === 0 && tr === 0 && br === 0 && bl === 0) {
+    return [
+      { x: rect.x, y: rect.y }, { x: rect.x + rect.width, y: rect.y },
+      { x: rect.x + rect.width, y: rect.y + rect.height }, { x: rect.x, y: rect.y + rect.height },
+    ];
+  }
   const polygon = [];
-  for (const [cx, cy, start] of [
-    [rect.x + rect.width - r, rect.y + r, -Math.PI / 2],
-    [rect.x + rect.width - r, rect.y + rect.height - r, 0],
-    [rect.x + r, rect.y + rect.height - r, Math.PI / 2],
-    [rect.x + r, rect.y + r, Math.PI],
-  ]) for (let step = 0; step <= 6; step++) {
-    const angle = start + step / 6 * Math.PI / 2;
-    polygon.push({ x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r });
+  for (const [cx, cy, r, start] of [
+    [rect.x + rect.width - tr, rect.y + tr, tr, -Math.PI / 2],
+    [rect.x + rect.width - br, rect.y + rect.height - br, br, 0],
+    [rect.x + bl, rect.y + rect.height - bl, bl, Math.PI / 2],
+    [rect.x + tl, rect.y + tl, tl, Math.PI],
+  ]) {
+    if (r <= 0) {
+      // Sharp corner: emit the actual corner point once.
+      if (start === -Math.PI / 2) polygon.push({ x: rect.x + rect.width, y: rect.y });
+      else if (start === 0) polygon.push({ x: rect.x + rect.width, y: rect.y + rect.height });
+      else if (start === Math.PI / 2) polygon.push({ x: rect.x, y: rect.y + rect.height });
+      else polygon.push({ x: rect.x, y: rect.y });
+      continue;
+    }
+    for (let step = 0; step <= 6; step++) {
+      const angle = start + step / 6 * Math.PI / 2;
+      polygon.push({ x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r });
+    }
   }
   return polygon;
 }
@@ -842,9 +901,15 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     const cached = transformedAncestors.get(element);
     if (cached !== undefined) return cached;
     const style = element.style;
-    const own = (style?.transform && style.transform !== "none")
-      || (style?.perspective && style.perspective !== "none");
-    const transformed = !!own || !!(element.parentElement && hasTransform(element.parentElement));
+    // CSS animations (animate-float / sheen / spin) write transform through
+    // computedStyleValue only — style.transform stays unset. Read computed so
+    // animated ancestors still mark the subtree transformed for culling/clips.
+    const transform = computedStyleValue(style, "transform");
+    const perspective = computedStyleValue(style, "perspective");
+    const own = (transform && transform !== "none")
+      || (perspective && perspective !== "none");
+    const parent = element.parentElement ?? element.parent;
+    const transformed = !!own || !!(parent && hasTransform(parent));
     transformedAncestors.set(element, transformed);
     return transformed;
   };
@@ -860,8 +925,9 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   const hasTransitionInPaintAncestry = element => {
     const cached = transitionAncestryCache.get(element);
     if (cached !== undefined) return cached;
+    const parent = element.parentElement ?? element.parent;
     const transitioning = !!activeTransitionElements?.has(element)
-      || !!(element.parentElement && hasTransitionInPaintAncestry(element.parentElement));
+      || !!(parent && hasTransitionInPaintAncestry(parent));
     transitionAncestryCache.set(element, transitioning);
     return transitioning;
   };
@@ -879,7 +945,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       const radiusText = String(ancestorStyle.borderRadius ?? "");
       clippingAncestors.push({ ancestor, ancestorBox, rect, radiusText });
     }
-    const previous = clipRegionCache.get(box.element);
+    // Projected overflow clips bake ancestor CSS transforms into screen space.
+    // staticPaintGeneration does not advance for animate-float/sheen, so caching
+    // those polygons froze the sheen window while the vinyl kept floating.
+    const clipsTransforming = hasTransform(box.element)
+      || clippingAncestors.some(({ ancestor }) => hasTransform(ancestor));
+    const previous = !clipsTransforming ? clipRegionCache.get(box.element) : null;
     if (previous?.generation === generation && previous.ancestors.length === clippingAncestors.length
       && previous.ancestors.every((entry, index) => {
         const next = clippingAncestors[index];
@@ -902,9 +973,11 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         regions.push(polygon);
       }
     }
-    clipRegionCache.set(box.element, { generation, ancestors: clippingAncestors.map(({ ancestor, rect, radiusText }) => ({
-      ancestor, x: rect.x, y: rect.y, width: rect.width, height: rect.height, radiusText,
-    })), regions });
+    if (!clipsTransforming) {
+      clipRegionCache.set(box.element, { generation, ancestors: clippingAncestors.map(({ ancestor, rect, radiusText }) => ({
+        ancestor, x: rect.x, y: rect.y, width: rect.width, height: rect.height, radiusText,
+      })), regions });
+    }
     return regions;
   };
   const bodyBox = boxes.find(box => box.element.localName === "body");
@@ -1038,6 +1111,55 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       const a = polygon[0], b = polygon[index], c = polygon[index + 1];
       values.push(0, a.x, a.y, b.x, b.y, c.x, c.y, color[0], color[1], color[2], color[3]);
       commandCount++;
+    }
+  };
+  // Stroke a rounded rect as the band between outer and inner corner radii.
+  // Used for CSS borders and box-shadow rings so corners follow border-radius.
+  const pushRoundedRing = (box, rect, thickness, color, corners, project, clipRegions) => {
+    if (!color || thickness <= 0 || rect.width <= 0 || rect.height <= 0) return;
+    const { x, y, width: rw, height: rh } = rect;
+    const outer = {
+      tl: Math.max(0, Math.min(corners.tl, rw / 2, rh / 2)),
+      tr: Math.max(0, Math.min(corners.tr, rw / 2, rh / 2)),
+      br: Math.max(0, Math.min(corners.br, rw / 2, rh / 2)),
+      bl: Math.max(0, Math.min(corners.bl, rw / 2, rh / 2)),
+    };
+    const inner = {
+      tl: Math.max(0, outer.tl - thickness),
+      tr: Math.max(0, outer.tr - thickness),
+      br: Math.max(0, outer.br - thickness),
+      bl: Math.max(0, outer.bl - thickness),
+    };
+    const hasCurve = outer.tl > 0 || outer.tr > 0 || outer.br > 0 || outer.bl > 0;
+    if (!hasCurve) {
+      push(box, { x, y, width: rw, height: thickness }, color, project, 0, clipRegions);
+      push(box, { x, y: y + rh - thickness, width: rw, height: thickness }, color, project, 0, clipRegions);
+      push(box, { x, y: y + thickness, width: thickness, height: Math.max(0, rh - thickness * 2) }, color, project, 0, clipRegions);
+      push(box, { x: x + rw - thickness, y: y + thickness, width: thickness, height: Math.max(0, rh - thickness * 2) }, color, project, 0, clipRegions);
+      return;
+    }
+    push(box, { x: x + outer.tl, y, width: Math.max(0, rw - outer.tl - outer.tr), height: thickness }, color, project, 0, clipRegions);
+    push(box, { x: x + outer.bl, y: y + rh - thickness, width: Math.max(0, rw - outer.bl - outer.br), height: thickness }, color, project, 0, clipRegions);
+    push(box, { x, y: y + outer.tl, width: thickness, height: Math.max(0, rh - outer.tl - outer.bl) }, color, project, 0, clipRegions);
+    push(box, { x: x + rw - thickness, y: y + outer.tr, width: thickness, height: Math.max(0, rh - outer.tr - outer.br) }, color, project, 0, clipRegions);
+    const arcs = [
+      [x + outer.tl, y + outer.tl, outer.tl, inner.tl, Math.PI, Math.PI * 1.5],
+      [x + rw - outer.tr, y + outer.tr, outer.tr, inner.tr, Math.PI * 1.5, Math.PI * 2],
+      [x + rw - outer.br, y + rh - outer.br, outer.br, inner.br, 0, Math.PI * 0.5],
+      [x + outer.bl, y + rh - outer.bl, outer.bl, inner.bl, Math.PI * 0.5, Math.PI],
+    ];
+    for (const [cx, cy, outerR, innerR, start, end] of arcs) {
+      if (outerR <= 0) continue;
+      for (let step = 0; step < 8; step++) {
+        const a = start + (end - start) * step / 8;
+        const b = start + (end - start) * (step + 1) / 8;
+        const outerA = [cx + Math.cos(a) * outerR, cy + Math.sin(a) * outerR];
+        const outerB = [cx + Math.cos(b) * outerR, cy + Math.sin(b) * outerR];
+        const innerA = [cx + Math.cos(a) * innerR, cy + Math.sin(a) * innerR];
+        const innerB = [cx + Math.cos(b) * innerR, cy + Math.sin(b) * innerR];
+        pushTriangle(box, [outerA, outerB, innerB], color, project, clipRegions);
+        pushTriangle(box, [outerA, innerB, innerA], color, project, clipRegions);
+      }
     }
   };
   const roundedClipCache = new WeakMap();
@@ -1201,38 +1323,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       };
       const { x, y, width: ringWidth, height } = box.borderBox;
       const clipRegions = clipsFor(box);
-      const radiusText = String(computedStyleValue(box.element.style, "borderRadius") ?? "");
-      const rawRadius = Number.parseFloat(radiusText) || 0;
-      const radius = Math.max(0, Math.min(ringWidth / 2, height / 2,
-        radiusText.trim().endsWith("%") ? Math.min(ringWidth, height) * rawRadius / 100 : rawRadius));
-      if (!radius) {
-        push(box, { x, y, width: ringWidth, height: spread }, color, project, 0, clipRegions);
-        push(box, { x, y: y + height - spread, width: ringWidth, height: spread }, color, project, 0, clipRegions);
-        push(box, { x, y: y + spread, width: spread, height: Math.max(0, height - spread * 2) }, color, project, 0, clipRegions);
-        push(box, { x: x + ringWidth - spread, y: y + spread, width: spread, height: Math.max(0, height - spread * 2) }, color, project, 0, clipRegions);
-      } else {
-        const innerRadius = Math.max(0, radius - spread);
-        push(box, { x: x + radius, y, width: Math.max(0, ringWidth - radius * 2), height: spread }, color, project, 0, clipRegions);
-        push(box, { x: x + radius, y: y + height - spread, width: Math.max(0, ringWidth - radius * 2), height: spread }, color, project, 0, clipRegions);
-        push(box, { x, y: y + radius, width: spread, height: Math.max(0, height - radius * 2) }, color, project, 0, clipRegions);
-        push(box, { x: x + ringWidth - spread, y: y + radius, width: spread, height: Math.max(0, height - radius * 2) }, color, project, 0, clipRegions);
-        const corners = [
-          [x + radius, y + radius, Math.PI, Math.PI * 1.5],
-          [x + ringWidth - radius, y + radius, Math.PI * 1.5, Math.PI * 2],
-          [x + ringWidth - radius, y + height - radius, 0, Math.PI * 0.5],
-          [x + radius, y + height - radius, Math.PI * 0.5, Math.PI],
-        ];
-        for (const [cx, cy, start, end] of corners) for (let step = 0; step < 8; step++) {
-          const a = start + (end - start) * step / 8;
-          const b = start + (end - start) * (step + 1) / 8;
-          const outerA = [cx + Math.cos(a) * radius, cy + Math.sin(a) * radius];
-          const outerB = [cx + Math.cos(b) * radius, cy + Math.sin(b) * radius];
-          const innerA = [cx + Math.cos(a) * innerRadius, cy + Math.sin(a) * innerRadius];
-          const innerB = [cx + Math.cos(b) * innerRadius, cy + Math.sin(b) * innerRadius];
-          pushTriangle(box, [outerA, outerB, innerB], color, project, clipRegions);
-          pushTriangle(box, [outerA, innerB, innerA], color, project, clipRegions);
-        }
-      }
+      const corners = cornerRadiiFor(box.element.style, ringWidth, height);
+      pushRoundedRing(box, { x, y, width: ringWidth, height }, spread, color, corners, project, clipRegions);
       saveSegment(element, box, after, segmentStart, beforeCommands, false);
       if (values.length) pushScenePart(Float32Array.from(values), element, commandCount - beforeCommands);
       values = [];
@@ -1252,8 +1344,10 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       const state = elementState(element);
       const hasBackground = style.backgroundColor && style.backgroundColor !== "transparent";
       const hasGradient = style.backgroundImage && style.backgroundImage !== "none";
-      const hasBorder = SIDES.some(side => style[`border${side.toLowerCase()}Style`] !== "none"
-        && box.border[side.toLowerCase()] > 0);
+      const hasBorder = SIDES.some(side => {
+        const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
+        return borderStyle !== "none" && borderStyle !== "hidden" && box.border[side.toLowerCase()] > 0;
+      });
       const hasImage = state.image ?? state.video?.image;
       if (!hasBackground && !hasGradient && !hasBorder && !hasImage && element.localName !== "canvas") {
         const visibleRect = box.clip ? intersection(box.clip, viewport) : viewport;
@@ -1303,9 +1397,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       continue;
     }
     const opacity = opacityFor(box.element, documentData?.paintGeneration ?? 0);
-      const radiusText = String(computedStyleValue(style, "borderRadius") ?? "");
-    const radiusValue = Number.parseFloat(radiusText) || 0;
-    const radius = radiusText.trim().endsWith("%") ? Math.min(box.width, box.height) * radiusValue / 100 : radiusValue;
+    const borderCorners = cornerRadiiFor(style, box.borderBox.width, box.borderBox.height);
+    const radius = uniformCornerRadius(borderCorners) || Math.max(borderCorners.tl, borderCorners.tr, borderCorners.br, borderCorners.bl);
     const backgroundColor = withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity);
     const filterBlur = parseFilterBlur(computedStyleValue(style, "filter") ?? style.filter);
     const gradient = gradientStops(computedStyleValue(style, "backgroundImage"));
@@ -1549,21 +1642,46 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         }
       }
     }
-    for (const side of SIDES) {
-      const edge = side.toLowerCase();
-      const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
-      if (borderStyle === "none" || borderStyle === "hidden") continue;
-      const thickness = border[edge];
-      const rect = side === "Top"
-        ? { x: borderBox.x, y: borderBox.y, width: borderBox.width, height: thickness }
-        : side === "Right"
-          ? { x: borderBox.x + borderBox.width - thickness, y: borderBox.y, width: thickness, height: borderBox.height }
-          : side === "Bottom"
-            ? { x: borderBox.x, y: borderBox.y + borderBox.height - thickness, width: borderBox.width, height: thickness }
-            : { x: borderBox.x, y: borderBox.y, width: thickness, height: borderBox.height };
-      const property = `border${side}Color`;
-      const color = computedStyleValue(style, style[property] === undefined ? "borderColor" : property) ?? "#000000";
-      push(box, rect, withOpacity(parseColor(color), opacity), project, 0, clipRegions);
+    {
+      const thicknesses = SIDES.map((side) => {
+        const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
+        if (borderStyle === "none" || borderStyle === "hidden") return 0;
+        const thickness = border[side.toLowerCase()] || 0;
+        return thickness > 0 ? thickness : 0;
+      });
+      const active = thicknesses.map((thickness) => thickness > 0);
+      if (active.some(Boolean)) {
+      const colors = SIDES.map((side) => borderColorFor(style, side));
+      const uniformWidth = thicknesses.filter((_, i) => active[i]).every((t) => t === thicknesses.find((v, i) => active[i] && v > 0));
+      const firstColor = colors.find((color, i) => active[i] && color);
+      const uniformColor = !!firstColor && colors.every((color, i) => !active[i] || color === firstColor);
+      const anyRadius = borderCorners.tl > 0 || borderCorners.tr > 0 || borderCorners.br > 0 || borderCorners.bl > 0;
+      if (anyRadius && uniformWidth && uniformColor && firstColor) {
+        const thickness = thicknesses.find((value, i) => active[i]) || 0;
+        pushRoundedRing(box, borderBox, thickness, withOpacity(parseColor(firstColor), opacity), borderCorners, project, clipRegions);
+      } else {
+        for (let index = 0; index < SIDES.length; index++) {
+          if (!active[index] || !colors[index]) continue;
+          const side = SIDES[index];
+          const thickness = thicknesses[index];
+          const rect = side === "Top"
+            ? { x: borderBox.x, y: borderBox.y, width: borderBox.width, height: thickness }
+            : side === "Right"
+              ? { x: borderBox.x + borderBox.width - thickness, y: borderBox.y, width: thickness, height: borderBox.height }
+              : side === "Bottom"
+                ? { x: borderBox.x, y: borderBox.y + borderBox.height - thickness, width: borderBox.width, height: thickness }
+                : { x: borderBox.x, y: borderBox.y, width: thickness, height: borderBox.height };
+          // With radius, square strips would stick out past rounded fills; clip
+          // each strip to the rounded outer polygon so corners stay round.
+          if (anyRadius) {
+            const rounded = roundedRectPolygon(borderBox, 0, borderCorners);
+            push(box, rect, withOpacity(parseColor(colors[index]), opacity), project, 0, [...clipRegions, rounded]);
+          } else {
+            push(box, rect, withOpacity(parseColor(colors[index]), opacity), project, 0, clipRegions);
+          }
+        }
+      }
+      }
     }
     saveSegment(element, box, after, segmentStart, beforeCommands, true);
     if (values.length) pushScenePart(Float32Array.from(values), element, commandCount - beforeCommands);

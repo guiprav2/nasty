@@ -39,7 +39,11 @@ function fontMetrics(element) {
   if (rawLineHeight === 'normal' || rawLineHeight === undefined || rawLineHeight === null) {
     lineHeight = fontSize * 1.2;
   } else if (typeof rawLineHeight === 'number') {
-    lineHeight = rawLineHeight;
+    // Unitless numbers are CSS multipliers (line-height: 1). Absolute px lengths
+    // are authored as strings like "24px" or via Tailwind leading-[24px] → 24
+    // only when the value is clearly a pixel length (>= fontSize, or from px).
+    // Treat small numbers as multipliers so UA `lineHeight: 1` cannot become 1px.
+    lineHeight = rawLineHeight > 0 && rawLineHeight <= 4 ? rawLineHeight * fontSize : rawLineHeight;
   } else {
     const value = String(rawLineHeight).trim();
     const parsed = Number.parseFloat(value);
@@ -129,10 +133,20 @@ function textEntries(document, selectedElements = null) {
     const color = '#' + rgba.map((v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0')).join('');
     const { fontSize, lineHeight } = resolvedStyle;
     const textState = element.localName === 'input' ? elementState(element) : null;
-    const textY = textState
+    // Inputs vertically center the value; buttons center their label in the
+    // content box when the text run is on the button itself (not a child).
+    // Flex-centered button children (dominant `d.text()` → span) are positioned
+    // by layout; their text origin stays at the span content top.
+    const parentAlign = element.parent?.style?.alignItems;
+    const flexCentered = parentAlign === 'center' || parentAlign === 'safe center';
+    const verticallyCentered = !!(textState || element.localName === 'button' || flexCentered);
+    const textY = (textState || element.localName === 'button')
       ? bounds.y + Math.max(0, (bounds.height - lineHeight) / 2)
       : bounds.y;
-    const textOrigin = projectPoint(box, textState?.renderTextOriginX ?? bounds.x, textY);
+    // Optical 1px down-shift: Taffy flex centering sits glyphs a hair high in
+    // vertically centered containers (buttons, inputs, align-items center).
+    const textOrigin = projectPoint(box, textState?.renderTextOriginX ?? bounds.x,
+      textY + (verticallyCentered ? 1 : 0));
     const transformedWidth = bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
     if (![textOrigin.x, textOrigin.y, transformedWidth, fontSize, lineHeight].every(Number.isFinite)
         || transformedWidth < 0 || fontSize <= 0 || lineHeight <= 0) continue;

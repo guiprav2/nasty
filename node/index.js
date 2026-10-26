@@ -1243,14 +1243,18 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
       result[side] = value;
     }
   }
+  // Borders take layout space only when style is visible and width > 0.
+  // Default UA (borderStyle none / width 0), color-only utilities, and
+  // border-0 must leave every edge at 0 so flow geometry matches paint.
   const borderWidth = result.borderWidth ?? 0;
   result.borderWidth = 0;
   for (const side of ["Top", "Right", "Bottom", "Left"]) {
     const edge = `border${side}Width`;
     const borderStyle = result[`border${side}Style`] ?? result.borderStyle ?? "none";
-    result[edge] = borderStyle === "none" || borderStyle === "hidden"
+    const width = borderStyle === "none" || borderStyle === "hidden"
       ? 0
       : (result[edge] ?? borderWidth);
+    result[edge] = width > 0 ? width : 0;
   }
   if (style.position === "fixed") {
     const left = fixedInset(style.left, viewport.width, fontSize, viewport);
@@ -1274,12 +1278,22 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
 }
 
 function defaultElementStyle(name) {
+  // borderStyle none + width 0: no paint and no border box geometry until a
+  // utility sets a positive width (and typically solid). Do not use preflight
+  // solid-by-default here — it made uncolored/hairline borders show up as
+  // whiteish frames across Vitrola.
   const reset = { display: "block", padding: 0, margin: 0, borderWidth: 0, borderStyle: "none", backgroundColor: "transparent" };
   if (name === "input") {
     return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "center", overflow: "hidden", whiteSpace: "nowrap" };
   }
   if (name === "textarea") {
     return { ...reset, display: "flex", minHeight: "1em", justifyContent: "start", alignItems: "start", overflow: "hidden", whiteSpace: "pre-wrap" };
+  }
+  // Match common UA button layout: center label text in both axes.
+  // overflow:hidden keeps pill fills clipped; layout measure must still give
+  // label spans intrinsic size under the min-size:0 overflow translation.
+  if (name === "button") {
+    return { ...reset, display: "flex", justifyContent: "center", alignItems: "center", textAlign: "center", overflow: "hidden" };
   }
   return reset;
 }
@@ -1302,11 +1316,17 @@ function clearPaintSegmentSubtree(element) {
 function documentHasTransformedContent(document) {
   const state = documentState(document);
   const cache = state.transformedContentCache;
-  const generation = state.sceneGeneration ?? 0;
+  // Include transition frames: CSS animations bump transitionFrameGeneration
+  // while leaving staticPaintGeneration alone, and animate-float/sheen only
+  // appear through computedStyleValue (style.transform stays unset).
+  const generation = `${state.sceneGeneration ?? 0}:${state.transitionFrameGeneration ?? 0}`;
   if (cache && cache.generation === generation) return cache.value;
   const inspect = element => {
     if (element.hidden || element.style.display === "none") return false;
-    if (element.localName === "video" || (element.style.transform && element.style.transform !== "none")) return true;
+    if (element.localName === "video") return true;
+    const transform = computedStyleValue(element.style, "transform");
+    const perspective = computedStyleValue(element.style, "perspective");
+    if ((transform && transform !== "none") || (perspective && perspective !== "none")) return true;
     for (const child of element.children) if (inspect(child)) return true;
     return false;
   };
@@ -1469,14 +1489,24 @@ function cssStyleValue(values, property) {
   let resolver = cssValueResolvers.get(property);
   if (resolver === undefined) {
     const side = /^(padding|margin|border)(Top|Right|Bottom|Left)(Width|Color|Style)?$/.exec(property);
-    if (!side) {
+    const radius = /^border(TopLeft|TopRight|BottomRight|BottomLeft)Radius$/.exec(property);
+    const axis = /^(overflow)(X|Y)$/.exec(property);
+    const gap = /^(row|column)Gap$/.exec(property);
+    if (side) {
+      const [, family, direction, suffix = ""] = side;
+      resolver = family === "border"
+        ? ["border", `border${direction}${suffix || "Width"}`, suffix === "Color" ? "borderColor" : suffix === "Style" ? "borderStyle" : "borderWidth"]
+        : [family, property, family];
+    } else if (radius) {
+      resolver = ["borderRadius", property, "borderRadius"];
+    } else if (axis) {
+      resolver = ["overflow", property, "overflow"];
+    } else if (gap) {
+      resolver = ["gap", property, "gap"];
+    } else {
       cssValueResolvers.set(property, null);
       return undefined;
     }
-    const [, family, direction, suffix = ""] = side;
-    resolver = family === "border"
-      ? ["border", `border${direction}${suffix || "Width"}`, suffix === "Color" ? "borderColor" : suffix === "Style" ? "borderStyle" : "borderWidth"]
-      : [family, property, family];
     cssValueResolvers.set(property, resolver);
   }
   if (!resolver) return undefined;
@@ -1799,7 +1829,11 @@ export class Element extends EventTarget {
       state.selectionValues = resolveTailwindSelection(value, width);
       elementState(this).selectionStyle = state.selectionValues;
       const changed = refreshStyleValues(state);
-      this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
+      // Marker-only class tokens (no resolved CSS change) must not bump paint
+      // or layout — same short-circuit as setHostStyle when nothing changed.
+      if (changed.size) {
+        this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
+      }
     } else if (name === "hidden") this._styleChanged();
     if (name === "muted" && this.localName === "video") {
       updateVideoVolume(this);

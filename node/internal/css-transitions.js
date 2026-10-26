@@ -39,7 +39,12 @@ export function computedStyleValue(style, property) {
     // scheduled while this property is between its CSS transition endpoints.
     state.element._scheduleTransitionFrame(property);
   }
-  if (COLOR_PROPERTIES.has(property)) return sampleColorTransition(state, property);
+  if (COLOR_PROPERTIES.has(property)) {
+    const sampled = sampleColorTransition(state, property);
+    if (sampled !== undefined) return sampled;
+    // Proxy longhand getters (and Tailwind-expanded classValues) both feed here.
+    return style[property];
+  }
   if (NUMBER_PROPERTIES.has(property)) return sampleNumberTransition(state, property);
   if (state.transitions.has(property)) return sampleInterpolableTransition(state, property);
   return style[property];
@@ -269,9 +274,18 @@ function sampleNumberTransition(state, property, now = performance.now()) {
   return transition.from + (transition.to - transition.from) * t;
 }
 
+function authoredColorValue(state, property) {
+  if (Object.hasOwn(state.values, property)) return state.values[property];
+  // Match CSSStyleDeclaration / cssStyleValue: borderXxxColor falls back to borderColor.
+  if (/^border(?:Top|Right|Bottom|Left)Color$/.test(property) && Object.hasOwn(state.values, "borderColor")) {
+    return state.values.borderColor;
+  }
+  return undefined;
+}
+
 export function sampleColorTransition(state, property, now = performance.now()) {
   const transition = state.transitions.get(property);
-  if (!transition) return state.values[property];
+  if (!transition) return authoredColorValue(state, property);
   const progress = Math.max(0, Math.min(1, (now - transition.started) / transition.duration));
   const t = timingProgress(transition.easing, progress);
   if (progress >= 1) {
@@ -279,7 +293,7 @@ export function sampleColorTransition(state, property, now = performance.now()) 
     queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
       propertyName: kebab(property), elapsedTime: transition.duration / 1000,
     })));
-    return state.values[property];
+    return authoredColorValue(state, property);
   }
   const rgba = transition.from.map((value, index) => value + (transition.to[index] - value) * t);
   return `rgba(${Math.round(rgba[0] * 255)}, ${Math.round(rgba[1] * 255)}, ${Math.round(rgba[2] * 255)}, ${rgba[3]})`;

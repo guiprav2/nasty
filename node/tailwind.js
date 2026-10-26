@@ -145,9 +145,12 @@ function utilityStyle(utility) {
     "origin-right": ["transformOrigin", "100% 50%"], "origin-bottom-right": ["transformOrigin", "100% 100%"], "origin-bottom": ["transformOrigin", "50% 100%"],
     "origin-bottom-left": ["transformOrigin", "0% 100%"], "origin-left": ["transformOrigin", "0% 50%"], "origin-top-left": ["transformOrigin", "0% 0%"],
     "content-center": ["alignContent", "center"], "whitespace-nowrap": ["whiteSpace", "nowrap"],
-    truncate: [["overflow", "hidden"], ["textOverflow", "ellipsis"], ["whiteSpace", "nowrap"]],
+    truncate: [["overflow", "hidden"], ["overflowX", "hidden"], ["overflowY", "hidden"], ["textOverflow", "ellipsis"], ["whiteSpace", "nowrap"]],
     "text-left": ["textAlign", "left"], "text-center": ["textAlign", "center"], "text-right": ["textAlign", "right"],
-    "overflow-hidden": ["overflow", "hidden"], "overflow-auto": ["overflow", "auto"], "overflow-scroll": ["overflow", "scroll"], "overflow-visible": ["overflow", "visible"],
+    "overflow-hidden": [["overflow", "hidden"], ["overflowX", "hidden"], ["overflowY", "hidden"]],
+    "overflow-auto": [["overflow", "auto"], ["overflowX", "auto"], ["overflowY", "auto"]],
+    "overflow-scroll": [["overflow", "scroll"], ["overflowX", "scroll"], ["overflowY", "scroll"]],
+    "overflow-visible": [["overflow", "visible"], ["overflowX", "visible"], ["overflowY", "visible"]],
     "overflow-x-hidden": ["overflowX", "hidden"], "overflow-x-auto": ["overflowX", "auto"], "overflow-x-scroll": ["overflowX", "scroll"], "overflow-x-visible": ["overflowX", "visible"],
     "overflow-y-hidden": ["overflowY", "hidden"], "overflow-y-auto": ["overflowY", "auto"], "overflow-y-scroll": ["overflowY", "scroll"], "overflow-y-visible": ["overflowY", "visible"],
     "overflow-anchor-edge-none": ["overflowAnchorEdge", "none"],
@@ -164,8 +167,19 @@ function utilityStyle(utility) {
     "object-right-bottom": ["objectPosition", "100% 100%"],
     transition: ["transition", "all 150ms ease"], "transition-none": ["transition", "none"],
     "leading-none": ["lineHeight", "1"], "leading-tight": ["lineHeight", "1.25"], "leading-snug": ["lineHeight", "1.375"], "leading-normal": ["lineHeight", "normal"], "leading-relaxed": ["lineHeight", "1.625"], "leading-loose": ["lineHeight", "2"],
-    "rounded": ["borderRadius", 4], "border-solid": ["borderStyle", "solid"], "border-dashed": ["borderStyle", "dashed"], "border-dotted": ["borderStyle", "dotted"], "border-none": ["borderStyle", "none"],
-    "rounded-sm": ["borderRadius", 2], "rounded-md": ["borderRadius", 6], "rounded-lg": ["borderRadius", 8], "rounded-xl": ["borderRadius", 12], "rounded-2xl": ["borderRadius", 16], "rounded-full": ["borderRadius", 9999],
+    // Radius shorthands expand to corner longhands for read-only CSSOM parity.
+    "rounded": [["borderRadius", 4], ["borderTopLeftRadius", 4], ["borderTopRightRadius", 4], ["borderBottomRightRadius", 4], ["borderBottomLeftRadius", 4]],
+    "border-solid": [["borderStyle", "solid"], ["borderTopStyle", "solid"], ["borderRightStyle", "solid"], ["borderBottomStyle", "solid"], ["borderLeftStyle", "solid"]],
+    "border-dashed": [["borderStyle", "dashed"], ["borderTopStyle", "dashed"], ["borderRightStyle", "dashed"], ["borderBottomStyle", "dashed"], ["borderLeftStyle", "dashed"]],
+    "border-dotted": [["borderStyle", "dotted"], ["borderTopStyle", "dotted"], ["borderRightStyle", "dotted"], ["borderBottomStyle", "dotted"], ["borderLeftStyle", "dotted"]],
+    "border-none": [["borderStyle", "none"], ["borderTopStyle", "none"], ["borderRightStyle", "none"], ["borderBottomStyle", "none"], ["borderLeftStyle", "none"],
+      ["borderWidth", 0], ["borderTopWidth", 0], ["borderRightWidth", 0], ["borderBottomWidth", 0], ["borderLeftWidth", 0]],
+    "rounded-sm": [["borderRadius", 2], ["borderTopLeftRadius", 2], ["borderTopRightRadius", 2], ["borderBottomRightRadius", 2], ["borderBottomLeftRadius", 2]],
+    "rounded-md": [["borderRadius", 6], ["borderTopLeftRadius", 6], ["borderTopRightRadius", 6], ["borderBottomRightRadius", 6], ["borderBottomLeftRadius", 6]],
+    "rounded-lg": [["borderRadius", 8], ["borderTopLeftRadius", 8], ["borderTopRightRadius", 8], ["borderBottomRightRadius", 8], ["borderBottomLeftRadius", 8]],
+    "rounded-xl": [["borderRadius", 12], ["borderTopLeftRadius", 12], ["borderTopRightRadius", 12], ["borderBottomRightRadius", 12], ["borderBottomLeftRadius", 12]],
+    "rounded-2xl": [["borderRadius", 16], ["borderTopLeftRadius", 16], ["borderTopRightRadius", 16], ["borderBottomRightRadius", 16], ["borderBottomLeftRadius", 16]],
+    "rounded-full": [["borderRadius", 9999], ["borderTopLeftRadius", 9999], ["borderTopRightRadius", 9999], ["borderBottomRightRadius", 9999], ["borderBottomLeftRadius", 9999]],
     "cursor-pointer": ["cursor", "pointer"], "cursor-grab": ["cursor", "grab"], "cursor-grabbing": ["cursor", "grabbing"], "cursor-default": ["cursor", "default"],
     "pointer-events-none": ["pointerEvents", "none"], "pointer-events-auto": ["pointerEvents", "auto"],
     "ease-linear": ["transitionTimingFunction", "linear"], "ease-in": ["transitionTimingFunction", "ease-in"], "ease-out": ["transitionTimingFunction", "ease-out"], "ease-in-out": ["transitionTimingFunction", "ease-in-out"],
@@ -238,22 +252,64 @@ function utilityStyle(utility) {
     }[inset[1]] || [inset[1]];
     return sides.map(side => [side, amount]);
   }
-  if (utility === "border") return [["borderWidth", 1], ["borderStyle", "solid"]];
+  // Border shorthands expand to edge longhands so read-only CSSOM / paint see
+  // borderTopColor etc. when Tailwind only authored border-white/10.
+  if (utility === "border") {
+    return [
+      ["borderWidth", 1], ["borderTopWidth", 1], ["borderRightWidth", 1], ["borderBottomWidth", 1], ["borderLeftWidth", 1],
+      ["borderStyle", "solid"], ["borderTopStyle", "solid"], ["borderRightStyle", "solid"], ["borderBottomStyle", "solid"], ["borderLeftStyle", "solid"],
+    ];
+  }
+  // Side-only width utilities (border-t / border-r / …) match Tailwind: 1px solid on that edge.
+  const borderSideOnly = /^border-([trbl])$/.exec(utility);
+  if (borderSideOnly) {
+    const edge = ({ t: "Top", r: "Right", b: "Bottom", l: "Left" })[borderSideOnly[1]];
+    return [
+      [`border${edge}Width`, 1],
+      [`border${edge}Style`, "solid"],
+      ["borderStyle", "solid"],
+    ];
+  }
   const autoMargin = /^m([xytrbl]?)-auto$/.exec(utility);
   if (autoMargin) {
     const map = {
-      "": ["margin"], x: ["marginLeft", "marginRight"], y: ["marginTop", "marginBottom"],
+      "": ["margin", "marginTop", "marginRight", "marginBottom", "marginLeft"],
+      x: ["marginLeft", "marginRight"], y: ["marginTop", "marginBottom"],
       t: ["marginTop"], r: ["marginRight"], b: ["marginBottom"], l: ["marginLeft"],
     }[autoMargin[1]];
     return map.map(property => [property, "auto"]);
   }
-  const borderWidth = /^border(?:-([trbl]))?-(.+)$/.exec(utility);
-  if (borderWidth) {
-    const [, side, value] = borderWidth;
+  const borderEdge = /^border(?:-([trbl]))?-(.+)$/.exec(utility);
+  if (borderEdge) {
+    const [, side, value] = borderEdge;
+    const edge = side ? ({ t: "Top", r: "Right", b: "Bottom", l: "Left" })[side] : null;
     const color = colorValue(value);
-    if (color) return [side ? `border${({ t: "Top", r: "Right", b: "Bottom", l: "Left" })[side]}Color` : "borderColor", color];
+    if (color) {
+      if (edge) return [`border${edge}Color`, color];
+      return [
+        ["borderColor", color],
+        ["borderTopColor", color], ["borderRightColor", color],
+        ["borderBottomColor", color], ["borderLeftColor", color],
+      ];
+    }
     const width = /^\d+$/.test(value) ? Number(value) : parseLength(value);
-    if (width !== undefined && typeof width === "number") return [side ? `border${({ t: "Top", r: "Right", b: "Bottom", l: "Left" })[side]}Width` : "borderWidth", width];
+    if (width !== undefined && typeof width === "number") {
+      // Width utilities also force solid style (Tailwind preflight assumes solid).
+      if (edge) {
+        return [
+          [`border${edge}Width`, width],
+          [`border${edge}Style`, "solid"],
+          ["borderStyle", "solid"],
+        ];
+      }
+      return [
+        ["borderWidth", width],
+        ["borderTopWidth", width], ["borderRightWidth", width],
+        ["borderBottomWidth", width], ["borderLeftWidth", width],
+        ["borderStyle", "solid"], ["borderTopStyle", "solid"], ["borderRightStyle", "solid"],
+        ["borderBottomStyle", "solid"], ["borderLeftStyle", "solid"],
+      ];
+    }
   }
   const pair = /^(p[xytrbl]?|m[xytrbl]?|gap(?:-[xy])?|w|h|min-w|min-h|max-w|max-h|basis|grow|shrink)-(.+)$/.exec(utility);
   if (pair) {
@@ -263,10 +319,18 @@ function utilityStyle(utility) {
         : value === "screen" && ["h", "min-h", "max-h"].includes(prefix) ? "100vh"
           : spacing(value);
     if (amount === undefined) return null;
+    // Padding/margin/gap shorthands expand to their CSS longhands so read-only
+    // CSSOM reports paddingTop etc. when Tailwind only authored p-4 / m-2 / gap-4.
     const map = {
-      p: ["padding"], px: ["paddingLeft", "paddingRight"], py: ["paddingTop", "paddingBottom"], pt: ["paddingTop"], pr: ["paddingRight"], pb: ["paddingBottom"], pl: ["paddingLeft"],
-      m: ["margin"], mx: ["marginLeft", "marginRight"], my: ["marginTop", "marginBottom"], mt: ["marginTop"], mr: ["marginRight"], mb: ["marginBottom"], ml: ["marginLeft"],
-      gap: ["gap"], "gap-x": ["columnGap"], "gap-y": ["rowGap"], w: ["width"], h: ["height"], "min-w": ["minWidth"], "min-h": ["minHeight"], "max-w": ["maxWidth"], "max-h": ["maxHeight"], basis: ["flexBasis"], grow: ["flexGrow"], shrink: ["flexShrink"],
+      p: ["padding", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft"],
+      px: ["paddingLeft", "paddingRight"], py: ["paddingTop", "paddingBottom"],
+      pt: ["paddingTop"], pr: ["paddingRight"], pb: ["paddingBottom"], pl: ["paddingLeft"],
+      m: ["margin", "marginTop", "marginRight", "marginBottom", "marginLeft"],
+      mx: ["marginLeft", "marginRight"], my: ["marginTop", "marginBottom"],
+      mt: ["marginTop"], mr: ["marginRight"], mb: ["marginBottom"], ml: ["marginLeft"],
+      gap: ["gap", "rowGap", "columnGap"], "gap-x": ["columnGap"], "gap-y": ["rowGap"],
+      w: ["width"], h: ["height"], "min-w": ["minWidth"], "min-h": ["minHeight"],
+      "max-w": ["maxWidth"], "max-h": ["maxHeight"], basis: ["flexBasis"], grow: ["flexGrow"], shrink: ["flexShrink"],
     }[prefix];
     return map?.map(property => [property, amount]) ?? null;
   }
@@ -285,7 +349,14 @@ function utilityStyle(utility) {
       if (/^\[(?:\d+(?:\.\d+)?(?:px|rem|em))\]$/.test(value)) return ["fontSize", parseLength(value.slice(1, -1))];
       if (colorValue(value)) return ["color", colorValue(value)];
     }
-    if (prefix === "border" && colorValue(value)) return ["borderColor", colorValue(value)];
+    if (prefix === "border" && colorValue(value)) {
+      const color = colorValue(value);
+      return [
+        ["borderColor", color],
+        ["borderTopColor", color], ["borderRightColor", color],
+        ["borderBottomColor", color], ["borderLeftColor", color],
+      ];
+    }
     if (prefix === "opacity") return ["opacity", Number(value) / 100];
     if (prefix === "z") {
       const raw = value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;

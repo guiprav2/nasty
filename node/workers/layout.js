@@ -14,7 +14,12 @@ function measure({ node, knownWidth, knownHeight, availableWidth, minContent }) 
   if (!text || !text.words.length) return { width: 0, height: 0 };
   const longestWord = text.breakWords ? Math.max(0, ...text.breakWords.flatMap((characters) => characters ?? []))
     : Math.max(0, ...text.words);
-  const limit = knownWidth ?? (text.wrap ? (minContent ? longestWord : availableWidth ?? Infinity) : Infinity);
+  // knownWidth/Height of 0 is not a usable definite size for text leaves — it
+  // shows up with overflow:hidden flex parents (min-size:0) and was collapsing
+  // button labels to 0×0. Only positive known sizes lock the measure.
+  const definiteWidth = knownWidth > 0 ? knownWidth : undefined;
+  const definiteHeight = knownHeight > 0 ? knownHeight : undefined;
+  const limit = definiteWidth ?? (text.wrap ? (minContent ? longestWord : availableWidth ?? Infinity) : Infinity);
   let line = 0, widest = 0, lines = 1;
   for (let wordIndex = 0; wordIndex < text.words.length; wordIndex++) {
     const word = text.words[wordIndex];
@@ -34,7 +39,7 @@ function measure({ node, knownWidth, knownHeight, availableWidth, minContent }) 
       line += fragment;
     } else line += (line ? text.space : 0) + word;
   }
-  return { width: knownWidth ?? Math.max(widest, line), height: knownHeight ?? lines * text.lineHeight };
+  return { width: definiteWidth ?? Math.max(widest, line), height: definiteHeight ?? lines * text.lineHeight };
 }
 
 function rebuildParents() {
