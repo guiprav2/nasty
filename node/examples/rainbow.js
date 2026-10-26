@@ -429,7 +429,7 @@ const browser = {
   setInterval(callback, delay, ...args) { const id = setInterval(callback, delay, ...args); intervals.add(id); return id; },
   clearInterval(id) { intervals.delete(id); clearInterval(id); },
   EventSource: DirectEventSource,
-  Image: function Image() { return document.createElement('img'); },
+  Image: function Image(width, height) { return new window.Image(width, height); },
 };
 browser.window = browser; browser.self = browser;
 const source = await readFile(new URL('./rainbow/app.js', import.meta.url), 'utf8');

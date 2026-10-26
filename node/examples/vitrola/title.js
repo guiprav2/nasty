@@ -371,6 +371,17 @@ function traceCarousel(event, details = {}) {
 
 async function unlock() {
   if (state.keyBusy) return;
+  if (process.env.VITROLA_UI_ONLY) {
+    state.keyError = "";
+    state.entered = true;
+    applyState(await library.publicState(), { forcePaused: true });
+    if (!state.player.track && state.playlists[0]?.tracks.length) {
+      state.player = playerFor(state.playlists[0], 0, "paused");
+    }
+    syncCarouselMedia();
+    d.updateSync();
+    return;
+  }
   const key = state.apiKey.trim();
   if (key.length < 20) {
     state.keyError = "Enter a Grok API key.";
@@ -552,11 +563,10 @@ function syncCarouselMedia() {
     const src = imageFor(state.player.tracks[index]);
     if ((image.getAttribute("src") || "") !== src) image.setAttribute("src", src);
   }
-  const generation = ++mediaGeneration;
   const active = currentVideo();
   const track = state.player.track;
   const key = mediaKey(track);
-  const apply = (src) => {
+  const apply = (src, generation = mediaGeneration) => {
     if (generation !== mediaGeneration) return;
     traceCarousel("media sync", {
       activeIndex: carouselVideos.find((item) => item.video === active)?.index ?? null,
@@ -586,28 +596,40 @@ function syncCarouselMedia() {
     }
   };
   if (!key) {
+    if (resolvedMediaKey || resolvedMediaSrc) mediaGeneration += 1;
     resolvedMediaKey = "";
     resolvedMediaSrc = "";
     apply("");
     return;
   }
   if (key === resolvedMediaKey) {
+    // Same track: refresh src/play state without invalidating an in-flight resolve.
     apply(resolvedMediaSrc);
     return;
   }
+  // Defer yt-dlp until the user plays. Restore boots with forcePaused and would
+  // otherwise pay ~3s resolvePlayback before any play intent.
+  if (state.player.status !== "playing") {
+    if (resolvedMediaKey || resolvedMediaSrc) mediaGeneration += 1;
+    resolvedMediaKey = "";
+    resolvedMediaSrc = "";
+    apply("");
+    return;
+  }
+  const generation = ++mediaGeneration;
   resolvePlayback(track).then((src) => {
     if (generation !== mediaGeneration) return;
     resolvedMediaKey = key;
     resolvedMediaSrc = src;
     state.mediaError = "";
-    apply(src);
+    apply(src, generation);
   }).catch((error) => {
     if (generation !== mediaGeneration) return;
     resolvedMediaKey = "";
     resolvedMediaSrc = "";
     state.mediaError = error.message || "Could not open this video.";
     d.updateSync();
-    apply("");
+    apply("", generation);
   });
 }
 
@@ -859,7 +881,7 @@ function coverStage() {
 }
 
 function disc() {
-  const image = d.el("img", { class: "h-9 w-9 shrink-0 object-contain animate-spin-slow" });
+  const image = d.el("img", { class: "h-9 w-9 shrink-0 object-contain animate-spin [animation-duration:16s]" });
   image.setAttribute("src", join(here, "logo.png"));
   return image;
 }
@@ -991,6 +1013,16 @@ async function sendMessage() {
   const controller = new AbortController();
   chatController = controller;
   const timeout = setTimeout(() => controller.abort(new Error("Vitrola timed out")), 180000);
+  // Stream deltas arrive many times per frame. Syncing the whole Vitrola tree on
+  // every token pegs the Node event loop; paint chat text at display cadence.
+  let chatUiFrame = null;
+  const scheduleChatUi = () => {
+    if (chatUiFrame !== null) return;
+    chatUiFrame = requestAnimationFrame(() => {
+      chatUiFrame = null;
+      d.updateSync();
+    });
+  };
   try {
     await runTurn({
       library,
@@ -999,16 +1031,32 @@ async function sendMessage() {
       text,
       signal: controller.signal,
       onEvent: (event, data) => {
-        if (event === "delta") pending.body += data.text || "";
-        else if (event === "reset") pending.body = "";
-        else if (event === "state") applyState(data);
-        d.updateSync();
+        if (event === "delta") {
+          pending.body += data.text || "";
+          scheduleChatUi();
+          return;
+        }
+        if (event === "reset") {
+          pending.body = "";
+          scheduleChatUi();
+          return;
+        }
+        if (event === "state") {
+          // applyState already updateSyncs; avoid a second full tree walk.
+          applyState(data);
+          return;
+        }
+        scheduleChatUi();
       },
     });
   } catch (error) {
     state.error = error.message || "Vitrola could not answer.";
   } finally {
     clearTimeout(timeout);
+    if (chatUiFrame !== null) {
+      cancelAnimationFrame(chatUiFrame);
+      chatUiFrame = null;
+    }
     if (chatController === controller) chatController = null;
     state.busy = false;
     state.pending = null;
@@ -1111,6 +1159,13 @@ function mergeMessages(incoming) {
 }
 
 function applyState(next, { forcePaused = false } = {}) {
+  const previousMedia = {
+    key: mediaKey(state.player.track),
+    status: state.player.status,
+    playlistId: state.player.playlistId,
+    index: state.player.index,
+    trackCount: state.player.tracks?.length || 0,
+  };
   if (Array.isArray(next.playlists)
       && (next.playlists.length > 0 || (!state.player.playlistId && !next.player?.playlistId))) {
     mergePlaylists(next.playlists);
@@ -1146,7 +1201,22 @@ function applyState(next, { forcePaused = false } = {}) {
     pendingSeek = null;
   }
   if (currentVideoId) progressVideoId = currentVideoId;
-  syncCarouselMedia();
+  // Chat/tool state floods applyState. Only touch media when the playing identity
+  // or transport status changed; otherwise each message cancels in-flight yt-dlp.
+  const nextMedia = {
+    key: mediaKey(state.player.track),
+    status: state.player.status,
+    playlistId: state.player.playlistId,
+    index: state.player.index,
+    trackCount: state.player.tracks?.length || 0,
+  };
+  if (previousMedia.key !== nextMedia.key
+      || previousMedia.status !== nextMedia.status
+      || previousMedia.playlistId !== nextMedia.playlistId
+      || previousMedia.index !== nextMedia.index
+      || previousMedia.trackCount !== nextMedia.trackCount) {
+    syncCarouselMedia();
+  }
   d.updateSync();
 }
 
@@ -1297,10 +1367,14 @@ function playerScreen() {
 }
 
 function titleScreen() {
-  const logo = d.el("img", { class: "h-full w-full animate-spin-slow" });
+  const logo = d.el("img", { class: "h-full w-full animate-spin [animation-duration:16s]" });
   logo.setAttribute("src", join(here, "logo.png"));
+  // Sweet uses grid place-items-center; Nasty's Taffy bridge is flex/block only, so
+  // flex centering preserves the same title lockup without an unsupported display.
+  // Glow: radial rose fading to transparency, plus blur-3xl. animate-glow keyframes
+  // bake translate(-50%,-50%) with the scale pulse so centering stays put.
   return d.el("div", { class: "relative flex h-full w-full items-center justify-center overflow-hidden bg-[#070709] px-6" },
-    d.el("div", { class: "pointer-events-none absolute left-1/2 top-[34%] h-72 w-72 -translate-x-1/2 -translate-y-1/2 rounded-full bg-rose-400/30 blur-3xl animate-glow" }),
+    d.el("div", { class: "pointer-events-none absolute left-1/2 top-[34%] h-144 w-144 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[radial-gradient(circle,rgba(251,113,133,0.45)_0%,transparent_70%)] blur-3xl animate-glow" }),
     d.el("div", { class: "relative z-10 flex w-full max-w-sm flex-col items-center" },
       d.el("div", { class: "animate-float" },
         d.el("div", { class: "relative h-44 w-44" },
@@ -1419,6 +1493,10 @@ win.addEventListener("maximize", (event) => {
   updateBodyFrame(event.x > 0);
   d.updateSync();
 });
+
+
+
+if (process.env.VITROLA_UI_ONLY) queueMicrotask(() => { void unlock(); });
 
 await closed;
 if (windowSizeSaveTimer) clearTimeout(windowSizeSaveTimer);

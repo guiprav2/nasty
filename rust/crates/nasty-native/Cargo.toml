@@ -15,12 +15,16 @@ egui = "=0.31.1"
 egui-winit = { version = "=0.31.1", default-features = false, features = ["clipboard", "wayland", "x11"] }
 fontdb = "=0.16.2"
 glyphon = "0.8"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 pollster = "0.4"
 wgpu = { version = "24", default-features = false, features = ["wgsl"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "android-native-activity"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15"
 
 [build-dependencies]
 napi-build = "2"

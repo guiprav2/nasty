@@ -1,4 +1,5 @@
 import { parseColor } from "../render.js";
+import { hasActiveStyleAnimation, sampleAnimationProperty } from "./css-animations.js";
 
 const COLOR_PROPERTIES = new Set([
   "color", "backgroundColor", "borderColor", "borderTopColor", "borderRightColor", "borderBottomColor", "borderLeftColor",
@@ -23,9 +24,15 @@ export function registerStyleTransitionState(style, state) {
   styleTransitionStates.set(style, state);
 }
 
+export function getStyleTransitionState(style) {
+  return styleTransitionStates.get(style);
+}
+
 export function computedStyleValue(style, property) {
   const state = styleTransitionStates.get(style);
   if (!state) return style[property];
+  const animated = sampleAnimationProperty(state, property);
+  if (animated !== undefined) return animated;
   const transition = state.transitions.get(property);
   if (transition && performance.now() < transition.started + transition.duration) {
     // Nasty renders only when a document is dirty. Keep the next display frame
@@ -40,6 +47,7 @@ export function computedStyleValue(style, property) {
 
 export function hasActiveStyleTransition(style, now = performance.now()) {
   const state = styleTransitionStates.get(style);
+  if (hasActiveStyleAnimation(style, now)) return true;
   if (!state?.transitions.size) return false;
   let active = false;
   for (const [property, transition] of state.transitions) {

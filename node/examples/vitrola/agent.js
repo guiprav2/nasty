@@ -41,7 +41,7 @@ export async function runTurn({ library, youtube, memory, text, signal, onEvent 
   }
 
   await library.addMessage('user', prompt);
-  onEvent?.('state', await library.publicState());
+  // library.addMessage already notifies onChange → applyState; do not rebuild UI twice.
 
   let logs = await library.loadLogs();
   logs.push({ type: 'message', role: 'user', content: [prompt] });
@@ -62,7 +62,6 @@ export async function runTurn({ library, youtube, memory, text, signal, onEvent 
         let summary = describeTool(name, result);
         await library.addMessage('tool', summary);
         onEvent?.('tool', { name, summary, ok: !!result?.ok });
-        onEvent?.('state', await library.publicState());
         return result;
       },
     };

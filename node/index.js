@@ -7,6 +7,7 @@ import { documentBoxes, documentState, elementRect, elementState, registerDocume
 import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
 import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startInterpolableTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
+import { createElementAnimation, isAnimationControlProperty, syncCssAnimations } from "./internal/css-animations.js";
 import { buildTransformedDisplayList, clearPaintSegments, displayListElements, parseColor } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics } from "./internal/text-metrics.js";
@@ -19,6 +20,13 @@ import { MutationObserver, registerMutationDocument, recordMutation } from "./in
 import { renderedText } from "./internal/nerd-icon.js";
 import { canScroll, canScrollByUser, clipsOverflow, overflowAnchorPolicy, overflowMode } from "./internal/overflow.js";
 import { noteScrollLayerPaintChange } from "./internal/scroll-layers.js";
+import {
+  clearImageLoadSticky,
+  isDetachedImage,
+  markImageConstructor,
+  markImageLoadSticky,
+  requestImageLoadSchedule,
+} from "./internal/image-load-scheduler.js";
 
 export const VideoDecoder = native.VideoDecoder;
 export const AudioDecoder = native.AudioDecoder;
@@ -27,6 +35,34 @@ export const listAudioOutputs = native.listAudioOutputs;
 export { DOMRect };
 export { TransitionEvent };
 export { MutationObserver };
+
+const directoryPickerStarts = new Map();
+const WELL_KNOWN_DIRECTORY_STARTS = new Set([
+  "desktop", "documents", "downloads", "music", "pictures", "videos",
+]);
+
+/** File System Access directory handle. Nasty adds `.path` for Node-side folder watching. */
+export class FileSystemDirectoryHandle {
+  #path;
+  constructor(path) {
+    if (typeof path !== "string" || !path.trim()) {
+      throw new TypeError("FileSystemDirectoryHandle requires an absolute path");
+    }
+    this.#path = resolve(path);
+  }
+  get kind() { return "directory"; }
+  get name() {
+    const base = this.#path.split(sep).filter(Boolean).pop();
+    return base || this.#path;
+  }
+  /** Absolute filesystem path (Nasty extension for chokidar and other Node watchers). */
+  get path() { return this.#path; }
+  async queryPermission() { return "granted"; }
+  async requestPermission() { return "granted"; }
+  async isSameEntry(other) {
+    return other instanceof FileSystemDirectoryHandle && other.path === this.#path;
+  }
+}
 let nextVideoAudioId = 1;
 let cachedAudioOutputs = null;
 let cachedAudioOutputsAt = 0;
@@ -42,6 +78,7 @@ export class Window extends native.Window {
   #document = null;
   #documentSizeConstraintsKey = null;
   #bodyAppearanceKey = null;
+  #ImageCtor = null;
   #width;
   #height;
   #resizable;
@@ -119,11 +156,38 @@ export class Window extends native.Window {
     this.#maximizable = initialMaximizable;
     this.#vsync = initialVsync;
     this.DOMRect = DOMRect;
+    this.FileSystemDirectoryHandle = FileSystemDirectoryHandle;
     this.#applyWindowDimensions();
     if (showAfterSizing) {
       super.show();
       this.#applyWindowDimensions();
     }
+  }
+
+  /**
+   * Standard directory picker. Cancellation rejects with AbortError.
+   * The returned handle includes a Nasty-only `.path` absolute filesystem path;
+   * file-access methods on the handle are not implemented — list and watch the
+   * folder from Node with that path (for example with chokidar).
+   */
+  async showDirectoryPicker(options = {}) {
+    const opts = options && typeof options === "object" ? options : {};
+    if (opts.mode != null && opts.mode !== "read" && opts.mode !== "readwrite") {
+      throw new TypeError(`Failed to execute 'showDirectoryPicker' on 'Window': The provided value '${opts.mode}' is not a valid enum value of type FileSystemPermissionMode.`);
+    }
+    let startIn = null;
+    if (opts.startIn instanceof FileSystemDirectoryHandle) {
+      startIn = opts.startIn.path;
+    } else if (typeof opts.startIn === "string" && opts.startIn && !WELL_KNOWN_DIRECTORY_STARTS.has(opts.startIn)) {
+      startIn = resolve(opts.startIn);
+    }
+    if (!startIn && typeof opts.id === "string" && opts.id) {
+      startIn = directoryPickerStarts.get(opts.id) || null;
+    }
+    const path = this.pickFolder("Open a folder of photos", startIn ?? undefined);
+    if (!path) throw new DOMException("The user aborted a request.", "AbortError");
+    if (typeof opts.id === "string" && opts.id) directoryPickerStarts.set(opts.id, path);
+    return new FileSystemDirectoryHandle(path);
   }
 
   get width() { return this.#width; }
@@ -866,6 +930,26 @@ export class Window extends native.Window {
     return this.#document;
   }
 
+  /**
+   * Browser-like `new Image()` for detached `<img>` elements. Loads immediately
+   * at visible priority (always admitted), even before the first in-tree reflow.
+   */
+  get Image() {
+    if (this.#ImageCtor) return this.#ImageCtor;
+    const windowRef = this;
+    function Image(width, height) {
+      const document = windowRef.document;
+      if (!document) throw new TypeError("Window.Image requires an attached document");
+      const img = document.createElement("img");
+      markImageConstructor(img);
+      if (width !== undefined && width !== null) img.width = width;
+      if (height !== undefined && height !== null) img.height = height;
+      return img;
+    }
+    this.#ImageCtor = Image;
+    return Image;
+  }
+
   set document(document) {
     if (document) this._validateDocumentMaxConstraints(document.body.style);
     const nativeClosed = super.closed;
@@ -1210,6 +1294,11 @@ function invalidateTransformedContentCache(document) {
   document.transformedContentCache = null;
 }
 
+function clearPaintSegmentSubtree(element) {
+  clearPaintSegments(element);
+  for (const child of element.children) clearPaintSegmentSubtree(child);
+}
+
 function documentHasTransformedContent(document) {
   const state = documentState(document);
   const cache = state.transformedContentCache;
@@ -1300,8 +1389,12 @@ const styleData = new WeakMap();
 function refreshStyleValues(state) {
   const next = { ...state.baseValues, ...state.hostValues, ...state.classValues };
   const transitionControls = new Set(["transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction"]);
+  const animationControls = new Set([
+    "animation", "animationName", "animationDuration", "animationTimingFunction",
+    "animationDelay", "animationIterationCount", "animationDirection", "animationFillMode", "animationPlayState",
+  ]);
   const keys = [...new Set([...Object.keys(state.values), ...Object.keys(next)])]
-    .sort((a, b) => Number(transitionControls.has(b)) - Number(transitionControls.has(a)));
+    .sort((a, b) => Number(transitionControls.has(b) || animationControls.has(b)) - Number(transitionControls.has(a) || animationControls.has(a)));
   const changed = new Set();
   // Transition rules need to be visible before color or opacity targets change.
   if (next.transition !== undefined) state.values.transition = next.transition;
@@ -1310,6 +1403,10 @@ function refreshStyleValues(state) {
     if (Object.is(before, after)) continue;
     changed.add(property);
     if (after !== undefined) {
+      if (isAnimationControlProperty(property) || animationControls.has(property)) {
+        state.values[property] = after;
+        continue;
+      }
       if (isPaintColorProperty(property)) startColorTransition(state, property, String(after));
       else if (property === "opacity") startNumberTransition(state, property, after);
       else if (!["transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction"].includes(property)) {
@@ -1321,6 +1418,7 @@ function refreshStyleValues(state) {
       delete state.values[property];
     }
   }
+  syncCssAnimations(state);
   return changed;
 }
 
@@ -1396,7 +1494,7 @@ export class Element extends EventTarget {
     this.parent = null;
     this.children = [];
     this.attributes = new Map();
-    const state = { image: null, imageLoad: null, imageLoadState: "empty", currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null,
+    const state = { image: null, imageLoad: null, imageLoadState: "empty", imageLoadSticky: false, imageConstructor: false, imageAwaySince: null, currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null,
       selectionStyle: {}, textAreaState: null, inputValue: "", selectionStart: 0, selectionEnd: 0, selectionDirection: "none",
       scrollLeft: 0, scrollTop: 0,
       renderScrollLeft: null, renderTextOriginX: null, renderCaretX: null,
@@ -2002,6 +2100,18 @@ export class Element extends EventTarget {
   decode() {
     if (this.localName !== "img") return Promise.reject(new TypeError("decode() is only available on img elements"));
     if (!this.hasAttribute("src") || this.getAttribute("src") === "") return Promise.reject(new DOMException("The image has no source", "EncodingError"));
+    markImageLoadSticky(this);
+    if (!elementState(this).imageLoad) {
+      elementState(this).imageLoad = new Promise((resolve, reject) => {
+        elementState(this).resolveImageLoad = resolve;
+        elementState(this).rejectImageLoad = reject;
+      });
+      elementState(this).imageLoad.catch(() => {});
+    }
+    if (elementState(this).imageLoadState === "empty" && this.hasAttribute("src")) {
+      elementState(this).imageLoadState = "pending";
+    }
+    requestImageLoadSchedule(this.document);
     return elementState(this).imageLoad.then(() => undefined);
   }
 
@@ -2014,7 +2124,13 @@ export class Element extends EventTarget {
     elementState(this).imageLoadState = "pending";
     elementState(this).imageLoad = new Promise((resolve, reject) => { elementState(this).resolveImageLoad = resolve; elementState(this).rejectImageLoad = reject; });
     elementState(this).imageLoad.catch(() => {});
-    if (this.document.defaultView) this._beginImageLoad(source, this.document.defaultView, elementState(this).imageRequest);
+    // Detached Image() instances load immediately at visible priority; in-tree
+    // imgs wait for a reflow so the visibility pool can admit them.
+    if (isDetachedImage(this) && this.document.defaultView) {
+      this._beginImageLoad(source, this.document.defaultView, elementState(this).imageRequest);
+      return;
+    }
+    requestImageLoadSchedule(this.document);
   }
 
   _beginImageLoad(source, window, request) {
@@ -2024,21 +2140,33 @@ export class Element extends EventTarget {
     loadImage(source, window).then((result) => {
       if (request !== elementState(this).imageRequest) {
         window.deleteImageTexture(result.textureId);
+        requestImageLoadSchedule(this.document);
         return;
       }
-      elementState(this).image = { textureId: result.textureId, width: result.width, height: result.height, pixels: result.pixels };
+      elementState(this).image = {
+        textureId: result.textureId,
+        width: result.width,
+        height: result.height,
+        pixels: result.pixels,
+      };
       clearPaintSegments(this);
       this._styleChanged("image");
       elementState(this).imageLoadState = "loaded";
       elementState(this).resolveImageLoad?.(result);
       this.dispatchEvent(new Event("load"));
       elementState(this).resolveImageLoad = elementState(this).rejectImageLoad = null;
+      // Free a pool slot for the next local/network prefetch candidate.
+      requestImageLoadSchedule(this.document);
     }, (error) => {
-      if (request !== elementState(this).imageRequest) return;
+      if (request !== elementState(this).imageRequest) {
+        requestImageLoadSchedule(this.document);
+        return;
+      }
       elementState(this).imageLoadState = "error";
       elementState(this).rejectImageLoad?.(new DOMException(error.message, "EncodingError"));
       this.dispatchEvent(new Event("error"));
       elementState(this).resolveImageLoad = elementState(this).rejectImageLoad = null;
+      requestImageLoadSchedule(this.document);
     });
   }
 
@@ -2046,6 +2174,7 @@ export class Element extends EventTarget {
     elementState(this).imageRequest = (elementState(this).imageRequest ?? 0) + 1;
     if (elementState(this).image && this.document.defaultView) unloadImage(this, this.document.defaultView);
     elementState(this).image = null;
+    clearImageLoadSticky(this);
     if (elementState(this).handle !== undefined) this._styleChanged();
     if (elementState(this).rejectImageLoad) elementState(this).rejectImageLoad(new DOMException("The image source changed", "EncodingError"));
     elementState(this).resolveImageLoad = elementState(this).rejectImageLoad = null;
@@ -2059,16 +2188,15 @@ export class Element extends EventTarget {
     const doc = documentState(this.document);
     // Scroll-texture descendants only dirty their host bake. Unrelated chrome
     // (carousel, progress, etc.) must still invalidate the reusable scroll scene.
-    // Coalesce to one generation bump per present so many image loads in the same
-    // turn (Vitrola cover art) do not each force a full display-list rebuild.
     if (noteScrollLayerPaintChange(this) !== "content") {
       doc.pendingScrollSceneInvalidation = true;
     }
-    if (property !== "value") {
+    // Image decode completion clears only that img's paint segment. Bumping
+    // sceneGeneration per cover would rebuild the whole transformed chrome and
+    // starve sidebar text during boot — keep image loads paint-local.
+    if (property === "class") clearPaintSegmentSubtree(this);
+    if (property !== "value" && property !== "image") {
       doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
-      // Per-element paint caches miss via paintDirtyElements / clearPaintSegments.
-      // Only bump the global static generation for broad or layout-affecting changes
-      // so one image load cannot invalidate every carousel card's cached commands.
       if (property === undefined || inheritedFontChanged || LAYOUT_STYLE_PROPERTIES.has(property)) {
         doc.staticPaintGeneration = (doc.staticPaintGeneration ?? 0) + 1;
       }
@@ -2184,6 +2312,7 @@ export class Element extends EventTarget {
       markGeometryDirty(documentState(this.document), false);
     }
     queueScrollEvent(this);
+    requestImageLoadSchedule(this.document);
   }
 
   get scrollTop() { return elementState(this).scrollTop; }
@@ -2197,6 +2326,7 @@ export class Element extends EventTarget {
       markGeometryDirty(documentState(this.document), false);
     }
     queueScrollEvent(this);
+    requestImageLoadSchedule(this.document);
   }
 
   scrollBy(x = 0, y = 0) {
@@ -2318,6 +2448,13 @@ export class Document extends EventTarget {
     return new Element(this, name);
   }
 
+  createElementAnimation(element, keyframes, options) {
+    if (!(element instanceof Element) || element.document !== this) {
+      throw new TypeError("createElementAnimation requires an Element from this document");
+    }
+    return createElementAnimation(element, keyframes, options);
+  }
+
   querySelector(selector) { return this.body.matches(selector) ? this.body : this.body.querySelector(selector); }
   querySelectorAll(selector) { return [...(this.body.matches(selector) ? [this.body] : []), ...this.body.querySelectorAll(selector)]; }
   getElementById(id) { return [...documentState(this).elements].find(element => element.id === String(id)) ?? null; }
@@ -2345,9 +2482,9 @@ export class Document extends EventTarget {
     window._syncDocumentSizeConstraints();
     window._syncBodyWindowAppearance();
     for (const element of documentState(this).elements) {
-      if (element.localName === "img" && elementState(element).imageLoadState === "pending") element._beginImageLoad(element.src, window, elementState(element).imageRequest);
-      else if (element.localName === "video" && element.autoplay && element.src) element.play().catch(() => {});
+      if (element.localName === "video" && element.autoplay && element.src) element.play().catch(() => {});
     }
+    requestImageLoadSchedule(this);
   }
 
   async #layout(width, height, timings) {
@@ -2383,7 +2520,8 @@ export class Document extends EventTarget {
         markGeometryDirty(state);
       }
     }
-    return this.#boxes(timings);
+    const boxes = this.#boxes(timings);
+    return boxes;
   }
 
   #layoutSync(timings) {
@@ -2392,6 +2530,7 @@ export class Document extends EventTarget {
     const size = documentState(this).defaultView?.size();
     const width = size?.width ?? documentState(this).viewport.width;
     const height = size?.height ?? documentState(this).viewport.height;
+    let didReflow = false;
     if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height) {
       documentState(this).viewport = { width, height };
       if (documentState(this).defaultView) {
@@ -2403,6 +2542,7 @@ export class Document extends EventTarget {
         documentState(this).layoutTree.setStyle(elementData.handle, element._taffyStyle());
       }
       documentState(this).dirty = true;
+      didReflow = true;
     }
     if (documentState(this).dirty || !documentState(this).layoutSnapshot) {
       const state = documentState(this);
@@ -2419,8 +2559,10 @@ export class Document extends EventTarget {
       documentState(this).layoutSnapshot = result.boxes;
       documentState(this).dirty = !!state.transitionLayoutDirty;
       markGeometryDirty(documentState(this));
+      didReflow = true;
     }
     if (timings) timings.layout = performance.now() - started;
+    if (didReflow) requestImageLoadSchedule(this);
   }
 
   #boxes(timings, selectedElements = null) {
@@ -2598,6 +2740,8 @@ export class Document extends EventTarget {
     if (!selectedElements) {
       documentState(this).boxesSnapshot = boxes;
       documentState(this).geometryDirty = false;
+      // Fresh scroll-adjusted boxes after reflow — recompute the image pool.
+      requestImageLoadSchedule(this);
     } else {
       documentState(this).renderBoxCache.set(selectedElements, { generation: documentState(this).geometryGeneration, boxes });
     }

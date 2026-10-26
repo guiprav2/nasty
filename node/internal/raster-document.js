@@ -5,6 +5,7 @@ import { textMetrics, textLines, inherited } from './text-metrics.js';
 import { isPlaceholderText, renderedText } from './nerd-icon.js';
 import { clipsOverflow } from './overflow.js';
 import { computedStyleValue, hasActiveStyleTransition } from './css-transitions.js';
+import { objectFitLayout, objectPositionFractions } from './object-fit.js';
 import { parseColor } from '../render.js';
 const windows = new WeakMap();
 const stackingOrders = new WeakMap();
@@ -421,15 +422,43 @@ export function rasterizeDocument(document, width, height, surface = createCanva
       const image = backgrounds.get(url);
       if (image) { ctx.fillStyle = ctx.createPattern(image, 'repeat'); ctx.fillRect(box.x, box.y, box.width, box.height); }
     }
-    const gradient = /^linear-gradient\(([-\d.]+)deg,\s*(#[\da-f]+),\s*(#[\da-f]+)\)$/i.exec(style.backgroundImage || '');
-    if (gradient) {
-      const angle = Number(gradient[1]) * Math.PI / 180;
+    const gradientImage = String(style.backgroundImage || '');
+    const linear = /^linear-gradient\(([-\d.]+)deg,\s*(#[\da-f]+),\s*(#[\da-f]+)\)$/i.exec(gradientImage);
+    if (linear) {
+      const angle = Number(linear[1]) * Math.PI / 180;
       const dx = Math.sin(angle), dy = -Math.cos(angle);
       const distance = (Math.abs(box.width * dx) + Math.abs(box.height * dy)) / 2;
       const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
       const fill = ctx.createLinearGradient(cx - dx * distance, cy - dy * distance, cx + dx * distance, cy + dy * distance);
-      fill.addColorStop(0, gradient[2]); fill.addColorStop(1, gradient[3]);
+      fill.addColorStop(0, linear[2]); fill.addColorStop(1, linear[3]);
       ctx.fillStyle = fill; round(ctx, box.x, box.y, box.width, box.height, r); ctx.fill();
+    } else {
+      const radial = /^radial-gradient\((?:circle(?:\s+at\s+center)?,\s*)?(.+)\)$/i.exec(gradientImage);
+      if (radial) {
+        const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
+        const radius = Math.max(box.width, box.height) / 2;
+        const fill = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+        const parts = [];
+        let depth = 0, start = 0;
+        const body = radial[1];
+        for (let i = 0; i < body.length; i++) {
+          if (body[i] === '(') depth++;
+          else if (body[i] === ')') depth--;
+          else if (body[i] === ',' && depth === 0) { parts.push(body.slice(start, i).trim()); start = i + 1; }
+        }
+        parts.push(body.slice(start).trim());
+        let added = 0;
+        for (const part of parts) {
+          const stop = /^(.*?)\s+([\d.]+)%$/.exec(part) || /^(.+)$/.exec(part);
+          if (!stop) continue;
+          const color = stop[1].trim() === 'transparent' ? 'rgba(0,0,0,0)' : stop[1].trim();
+          const pos = stop[2] !== undefined ? Number(stop[2]) / 100 : (added === 0 ? 0 : 1);
+          try { fill.addColorStop(Math.max(0, Math.min(1, pos)), color); added++; } catch {}
+        }
+        if (added >= 2) {
+          ctx.fillStyle = fill; round(ctx, box.x, box.y, box.width, box.height, r); ctx.fill();
+        }
+      }
     }
     const border = box.border;
     const uniform = border.top === border.right && border.top === border.bottom && border.top === border.left;
@@ -444,7 +473,21 @@ export function rasterizeDocument(document, width, height, surface = createCanva
     const state = elementState(element), content = box.contentBox;
     if (state.canvasContext || state.image) {
       const image = state.canvasContext ? canvasSurface(state.canvasContext) : imageSurface(element);
-      if (image && content.width > 0 && content.height > 0) ctx.drawImage(image, content.x, content.y, content.width, content.height);
+      if (image && content.width > 0 && content.height > 0) {
+        if (state.canvasContext) {
+          ctx.drawImage(image, content.x, content.y, content.width, content.height);
+        } else {
+          const fit = style.objectFit ?? 'fill';
+          const [positionX, positionY] = objectPositionFractions(computedStyleValue(style, 'objectPosition'));
+          const layout = objectFitLayout(image.width, image.height, content.width, content.height, fit, positionX, positionY);
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(content.x, content.y, content.width, content.height);
+          ctx.clip();
+          ctx.drawImage(image, content.x + layout.x, content.y + layout.y, layout.width, layout.height);
+          ctx.restore();
+        }
+      }
     }
     if (renderedText(element)) {
       const metrics = textMetrics(element), text = metrics.style;

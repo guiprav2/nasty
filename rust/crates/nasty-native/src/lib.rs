@@ -658,6 +658,14 @@ enum DrawOrder {
         clip_width: f64,
         clip_height: f64,
     },
+    /// CSS/background radial-gradient discs (same instance layout as canvas circles).
+    RadialCircles {
+        range: std::ops::Range<u32>,
+        clip_x: f64,
+        clip_y: f64,
+        clip_width: f64,
+        clip_height: f64,
+    },
     Image(usize),
     BackdropBlur { x: f32, y: f32, width: f32, height: f32, radius: f32 },
 }
@@ -831,6 +839,84 @@ pub struct WindowSize {
 pub struct WindowPoint {
     pub x: f64,
     pub y: f64,
+}
+
+#[napi(object)]
+pub struct DecodedImageTexture {
+    #[napi(js_name = "textureId")]
+    pub texture_id: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[napi(object)]
+pub struct DecodedImageRgba {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Buffer,
+}
+
+/// Longest edge for `<img>` GPU textures. Larger sources are scaled down,
+/// preserving aspect ratio, before upload.
+pub const IMAGE_TEXTURE_MAX_EDGE: u32 = 4096;
+
+fn decode_image_rgba(
+    encoded: &[u8],
+    max_edge: u32,
+) -> std::result::Result<(u32, u32, Vec<u8>), String> {
+    let max_edge = max_edge.max(1);
+    let image = image::load_from_memory(encoded)
+        .map_err(|error| format!("decode image: {error}"))?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err("decoded image has no dimensions".into());
+    }
+    let longest = width.max(height);
+    if longest <= max_edge {
+        return Ok((width, height, image.into_raw()));
+    }
+    let scale = f64::from(max_edge) / f64::from(longest);
+    let next_width = ((f64::from(width) * scale).round() as u32).max(1);
+    let next_height = ((f64::from(height) * scale).round() as u32).max(1);
+    let resized = image::imageops::resize(
+        &image,
+        next_width,
+        next_height,
+        image::imageops::FilterType::Triangle,
+    );
+    Ok((next_width, next_height, resized.into_raw()))
+}
+
+/// CPU-only decode for worker threads. Does not touch the GPU.
+#[napi(js_name = "decodeImageRgba")]
+pub fn decode_image_rgba_bytes(
+    encoded: Buffer,
+    max_edge: Option<u32>,
+) -> Result<DecodedImageRgba> {
+    let (width, height, pixels) =
+        decode_image_rgba(encoded.as_ref(), max_edge.unwrap_or(IMAGE_TEXTURE_MAX_EDGE))
+            .map_err(|error| Error::new(Status::InvalidArg, error))?;
+    Ok(DecodedImageRgba {
+        width,
+        height,
+        pixels: pixels.into(),
+    })
+}
+
+/// CPU-only decode from a filesystem path for worker threads.
+#[napi(js_name = "decodeImageRgbaFromPath")]
+pub fn decode_image_rgba_from_path(
+    path: String,
+    max_edge: Option<u32>,
+) -> Result<DecodedImageRgba> {
+    let encoded = std::fs::read(&path).map_err(|error| {
+        Error::new(
+            Status::GenericFailure,
+            format!("read image {path}: {error}"),
+        )
+    })?;
+    decode_image_rgba_bytes(encoded.into(), max_edge)
 }
 
 #[napi(object)]
@@ -2967,6 +3053,20 @@ impl Renderer {
             if !triangles.is_empty() {
                 self.queue.write_buffer(&self.canvas_vertex_buffer, 0, bytemuck::cast_slice(triangles));
             }
+        } else {
+            for vertex in triangles.chunks_exact(6) {
+                let x = vertex[0] / width * 2.0 - 1.0;
+                let y = 1.0 - vertex[1] / height * 2.0;
+                vertices.push(Vertex {
+                    position: [x, y],
+                    color: [vertex[2], vertex[3], vertex[4], vertex[5]],
+                });
+            }
+        }
+        // CSS radial-gradient (DrawOrder::RadialCircles) and canvas circle/bezier
+        // strokes share these instance buffers. Upload whenever present — not only
+        // for CanvasProgram — so presentTransformed radials actually reach the GPU.
+        if !circles.is_empty() {
             let circle_bytes = std::mem::size_of_val(circles);
             if circle_bytes > self.canvas_circle_vertex_capacity {
                 self.canvas_circle_vertex_capacity = circle_bytes.next_power_of_two();
@@ -2977,9 +3077,9 @@ impl Renderer {
                     mapped_at_creation: false,
                 });
             }
-            if !circles.is_empty() {
-                self.queue.write_buffer(&self.canvas_circle_vertex_buffer, 0, bytemuck::cast_slice(circles));
-            }
+            self.queue.write_buffer(&self.canvas_circle_vertex_buffer, 0, bytemuck::cast_slice(circles));
+        }
+        if !beziers.is_empty() {
             let bezier_bytes = std::mem::size_of_val(beziers);
             if bezier_bytes > self.canvas_bezier_vertex_capacity {
                 self.canvas_bezier_vertex_capacity = bezier_bytes.next_power_of_two();
@@ -2988,18 +3088,7 @@ impl Renderer {
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
                 });
             }
-            if !beziers.is_empty() {
-                self.queue.write_buffer(&self.canvas_bezier_vertex_buffer, 0, bytemuck::cast_slice(beziers));
-            }
-        } else {
-            for vertex in triangles.chunks_exact(6) {
-                let x = vertex[0] / width * 2.0 - 1.0;
-                let y = 1.0 - vertex[1] / height * 2.0;
-                vertices.push(Vertex {
-                    position: [x, y],
-                    color: [vertex[2], vertex[3], vertex[4], vertex[5]],
-                });
-            }
+            self.queue.write_buffer(&self.canvas_bezier_vertex_buffer, 0, bytemuck::cast_slice(beziers));
         }
         let bytes = bytemuck::cast_slice(&vertices);
         if bytes.len() > self.vertex_capacity {
@@ -3285,6 +3374,20 @@ impl Renderer {
                             pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                         }
                     }
+                    DrawOrder::RadialCircles { range, clip_x, clip_y, clip_width, clip_height } => {
+                        let left = clip_x.floor().clamp(0.0, width as f64) as u32;
+                        let top = clip_y.floor().clamp(0.0, height as f64) as u32;
+                        let right = (*clip_x + *clip_width).ceil().clamp(0.0, width as f64) as u32;
+                        let bottom = (*clip_y + *clip_height).ceil().clamp(0.0, height as f64) as u32;
+                        if right > left && bottom > top && !range.is_empty() {
+                            pass.set_pipeline(&self.canvas_circle_pipeline);
+                            pass.set_bind_group(0, &self.canvas_viewport_bind_group, &[]);
+                            pass.set_vertex_buffer(0, self.canvas_circle_vertex_buffer.slice(..));
+                            pass.set_scissor_rect(left, top, right-left, bottom-top);
+                            pass.draw(0..6, range.clone());
+                            pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                        }
+                    }
                     DrawOrder::Image(index) => if let Some((texture_id, range, x, y, w, h)) = image_batches.get(*index).and_then(Option::as_ref) {
                         pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
                         pass.set_scissor_rect(*x, *y, *w, *h);
@@ -3347,6 +3450,18 @@ impl Renderer {
                             let left=clip_x.floor().clamp(0.0,width as f64) as u32; let top=clip_y.floor().clamp(0.0,height as f64) as u32;
                             let right=(*clip_x+*clip_width).ceil().clamp(0.0,width as f64) as u32; let bottom=(*clip_y+*clip_height).ceil().clamp(0.0,height as f64) as u32;
                             if right>left && bottom>top { pass.set_pipeline(&self.canvas_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_vertex_buffer.slice(..)); pass.set_scissor_rect(left,top,right-left,bottom-top); pass.draw(range.clone(),0..1); pass.set_scissor_rect(0,0,self.config.width,self.config.height); }
+                        }
+                        DrawOrder::RadialCircles { range, clip_x, clip_y, clip_width, clip_height } => {
+                            let left=clip_x.floor().clamp(0.0,width as f64) as u32; let top=clip_y.floor().clamp(0.0,height as f64) as u32;
+                            let right=(*clip_x+*clip_width).ceil().clamp(0.0,width as f64) as u32; let bottom=(*clip_y+*clip_height).ceil().clamp(0.0,height as f64) as u32;
+                            if right>left && bottom>top && !range.is_empty() {
+                                pass.set_pipeline(&self.canvas_circle_pipeline);
+                                pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]);
+                                pass.set_vertex_buffer(0,self.canvas_circle_vertex_buffer.slice(..));
+                                pass.set_scissor_rect(left,top,right-left,bottom-top);
+                                pass.draw(0..6, range.clone());
+                                pass.set_scissor_rect(0,0,self.config.width,self.config.height);
+                            }
                         }
                         DrawOrder::Image(index) => if let Some((texture_id,range,x,y,w,h))=image_batches.get(*index).and_then(Option::as_ref) { pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0,self.image_vertex_buffer.slice(..)); pass.set_scissor_rect(*x,*y,*w,*h); pass.set_bind_group(0,&self.image(texture_id).expect("prepared image texture").bind_group,&[]); pass.draw(range.clone(),0..1); },
                         DrawOrder::BackdropBlur { .. } => unreachable!(),
@@ -4843,6 +4958,41 @@ impl Window {
         Ok(())
     }
 
+    /// Host bridge for Window.showDirectoryPicker. Returns an absolute path, or null when cancelled.
+    #[napi(js_name = "pickFolder")]
+    pub fn pick_folder(
+        &self,
+        title: Option<String>,
+        start_in: Option<String>,
+    ) -> Result<Option<String>> {
+        #[cfg(target_os = "android")]
+        {
+            let _ = (title, start_in);
+            return Err(Error::new(
+                Status::GenericFailure,
+                "folder picker is unavailable on Android",
+            ));
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = self
+                .app
+                .window
+                .as_ref()
+                .ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+                dialog = dialog.set_title(title);
+            }
+            if let Some(start_in) = start_in.filter(|value| !value.trim().is_empty()) {
+                dialog = dialog.set_directory(start_in);
+            }
+            Ok(dialog
+                .pick_folder()
+                .map(|path| path.to_string_lossy().into_owned()))
+        }
+    }
+
     #[napi(js_name = "setSizeConstraints")]
     pub fn set_size_constraints(
         &mut self,
@@ -5264,6 +5414,50 @@ impl Window {
             .map_err(|error| Error::new(Status::InvalidArg, error))
     }
 
+    /// Decode encoded image bytes (JPEG/PNG/GIF/WebP/BMP) into a full-resolution
+    /// GPU texture, scaling down only when the longest edge exceeds `maxEdge`
+    /// (default 4096) while preserving aspect ratio.
+    #[napi(js_name = "createImageTextureFromEncoded")]
+    pub fn create_image_texture_from_encoded(
+        &mut self,
+        encoded: Buffer,
+        max_edge: Option<u32>,
+    ) -> Result<DecodedImageTexture> {
+        let (width, height, pixels) =
+            decode_image_rgba(encoded.as_ref(), max_edge.unwrap_or(IMAGE_TEXTURE_MAX_EDGE))
+                .map_err(|error| Error::new(Status::InvalidArg, error))?;
+        let renderer = self
+            .app
+            .renderer
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        let texture_id = renderer
+            .upload_image(width, height, &pixels)
+            .map_err(|error| Error::new(Status::InvalidArg, error))?;
+        Ok(DecodedImageTexture {
+            texture_id,
+            width,
+            height,
+        })
+    }
+
+    /// Read a local image file and decode it into a GPU texture. Same sizing
+    /// rules as `createImageTextureFromEncoded`.
+    #[napi(js_name = "createImageTextureFromPath")]
+    pub fn create_image_texture_from_path(
+        &mut self,
+        path: String,
+        max_edge: Option<u32>,
+    ) -> Result<DecodedImageTexture> {
+        let encoded = std::fs::read(&path).map_err(|error| {
+            Error::new(
+                Status::GenericFailure,
+                format!("read image {path}: {error}"),
+            )
+        })?;
+        self.create_image_texture_from_encoded(encoded.into(), max_edge)
+    }
+
     #[napi(js_name = "deleteImageTexture")]
     pub fn delete_image_texture(&mut self, texture_id: u32) -> bool {
         let referenced = self.app.image_draws.iter().any(|image| image.texture_id == texture_id);
@@ -5395,8 +5589,8 @@ impl Window {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
-        let (triangles, images, order) = parse_transformed_display_list(display_list.as_ref())?;
-        self.present_parsed(Vec::new(), triangles, Vec::new(), Vec::new(), images, order)
+        let (triangles, circles, images, order) = parse_transformed_display_list(display_list.as_ref())?;
+        self.present_parsed(Vec::new(), triangles, circles, Vec::new(), images, order)
     }
 }
 
@@ -5683,7 +5877,7 @@ fn parse_canvas_operations(values: &[f32], triangle_vertex_count: u32, circle_co
 
 fn parse_transformed_display_list(
     bytes: &[u8],
-) -> Result<(Vec<f32>, Vec<ImageDraw>, Vec<DrawOrder>)> {
+) -> Result<(Vec<f32>, Vec<f32>, Vec<ImageDraw>, Vec<DrawOrder>)> {
     if bytes.len() < 8 || bytes.len() % 4 != 0 {
         return Err(Error::new(
             Status::InvalidArg,
@@ -5741,7 +5935,7 @@ fn parse_transformed_display_list(
         } else {
             vec![DrawOrder::Triangles(0..(triangle_count * 3) as u32)]
         };
-        return Ok((vertices, Vec::new(), order));
+        return Ok((vertices, Vec::new(), Vec::new(), order));
     }
     let triangle_count = values[1] as usize;
     if triangle_count > 1_000_000 {
@@ -5751,6 +5945,7 @@ fn parse_transformed_display_list(
         ));
     }
     let mut vertices = Vec::with_capacity(values.len().saturating_mul(2));
+    let mut circles = Vec::<f32>::new();
     let mut images = Vec::new();
     // Most adjacent triangle records collapse into a single GPU range.
     let mut order = Vec::with_capacity(triangle_count.min(64));
@@ -5921,6 +6116,61 @@ fn parse_transformed_display_list(
             });
             order.push(DrawOrder::Image(images.len() - 1));
             cursor = end;
+        } else if tag == 3.0 {
+            // CSS radial-gradient instance: clip rect + canvas-compatible circle (16 floats).
+            let end = cursor.checked_add(20).ok_or_else(|| {
+                Error::new(Status::InvalidArg, "transformed radial gradient is too large")
+            })?;
+            let record = values.get(cursor..end).ok_or_else(|| {
+                Error::new(Status::InvalidArg, "truncated transformed radial gradient")
+            })?;
+            if record.iter().any(|value| !value.is_finite())
+                || record[2] < 0.0
+                || record[3] < 0.0
+                || record[6] < 0.0
+                || record[12..16]
+                    .iter()
+                    .chain(record[16..20].iter())
+                    .any(|value| !(0.0..=1.0).contains(value))
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "transformed radial gradient is invalid",
+                ));
+            }
+            let (clip_x, clip_y, clip_width, clip_height) =
+                (record[0] as f64, record[1] as f64, record[2] as f64, record[3] as f64);
+            let start = (circles.len() / 16) as u32;
+            circles.extend_from_slice(&record[4..20]);
+            let finish = (circles.len() / 16) as u32;
+            let extends_previous = matches!(
+                order.last(),
+                Some(DrawOrder::RadialCircles {
+                    range,
+                    clip_x: prev_x,
+                    clip_y: prev_y,
+                    clip_width: prev_w,
+                    clip_height: prev_h,
+                }) if range.end == start
+                    && (*prev_x - clip_x).abs() < 1e-3
+                    && (*prev_y - clip_y).abs() < 1e-3
+                    && (*prev_w - clip_width).abs() < 1e-3
+                    && (*prev_h - clip_height).abs() < 1e-3
+            );
+            if extends_previous {
+                if let Some(DrawOrder::RadialCircles { range, .. }) = order.last_mut() {
+                    range.end = finish;
+                }
+            } else {
+                order.push(DrawOrder::RadialCircles {
+                    range: start..finish,
+                    clip_x,
+                    clip_y,
+                    clip_width,
+                    clip_height,
+                });
+            }
+            cursor = end;
         } else {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -5934,7 +6184,7 @@ fn parse_transformed_display_list(
             "transformed display list contains trailing data",
         ));
     }
-    Ok((vertices, images, order))
+    Ok((vertices, circles, images, order))
 }
 
 impl LayoutTree {

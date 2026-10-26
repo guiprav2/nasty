@@ -2,6 +2,7 @@ import { documentState, elementState } from "./internal/dom-state.js";
 import { computedStyleValue, hasActiveStyleTransition } from "./internal/css-transitions.js";
 import { canvasCommands, canvasSurface } from "./canvas-2d.js";
 import { prepareScrollLayers } from "./internal/scroll-layers.js";
+import { objectFitLayout, objectPositionFractions } from "./internal/object-fit.js";
 
 const SIDES = ["Top", "Right", "Bottom", "Left"];
 const transformedListElements = new WeakMap();
@@ -34,6 +35,15 @@ function translatePaintSegment(source, dx, dy) {
         values[offset + 8 + index * 5] += dy;
       }
       offset += 7 + triangles * 5;
+    } else if (kind === 3) {
+      // Radial-gradient instance: clip x/y + circle center; keep radii/colors.
+      values[offset + 1] += dx;
+      values[offset + 2] += dy;
+      values[offset + 5] += dx;
+      values[offset + 6] += dy;
+      values[offset + 9] += dx;
+      values[offset + 10] += dy;
+      offset += 21;
     } else return null;
   }
   return values;
@@ -57,6 +67,16 @@ export function parseColor(value) {
   return [Number(match[1]) / 255, Number(match[2]) / 255, Number(match[3]) / 255, alpha];
 }
 
+function parseGradientStopColor(text) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed || trimmed === "transparent") return [0, 0, 0, 0];
+  try {
+    return parseColor(trimmed);
+  } catch {
+    return null;
+  }
+}
+
 function opacityFor(element, generation = 0) {
   const cached = opacityCache.get(element);
   if (cached?.generation === generation) return cached.value;
@@ -75,23 +95,28 @@ function withOpacity(color, opacity) {
   return [color[0], color[1], color[2], color[3] * opacity];
 }
 
-function gradientStops(value) {
-  const match = /^linear-gradient\((to (?:top|right|bottom|left|top right|bottom right|bottom left|top left)|[-+]?[\d.]+deg),\s*(.+)\)$/i.exec(String(value ?? ""));
-  if (!match) return null;
+function splitGradientArgs(body) {
   const parts = [];
   let depth = 0, start = 0;
-  for (let index = 0; index < match[2].length; index++) {
-    if (match[2][index] === "(") depth++;
-    else if (match[2][index] === ")") depth--;
-    else if (match[2][index] === "," && depth === 0) { parts.push(match[2].slice(start, index).trim()); start = index + 1; }
+  for (let index = 0; index < body.length; index++) {
+    if (body[index] === "(") depth++;
+    else if (body[index] === ")") depth--;
+    else if (body[index] === "," && depth === 0) {
+      parts.push(body.slice(start, index).trim());
+      start = index + 1;
+    }
   }
-  parts.push(match[2].slice(start).trim());
-  const stops = parts.map(part => {
+  parts.push(body.slice(start).trim());
+  return parts.filter(Boolean);
+}
+
+function normalizeGradientStops(parts) {
+  const stops = parts.map((part) => {
     const stop = /^(.*?)(?:\s+([\d.]+)%)?$/.exec(part);
-    const color = stop && parseColor(stop[1].trim());
+    const color = stop && parseGradientStopColor(stop[1]);
     return color ? { color, position: stop[2] === undefined ? null : Number(stop[2]) / 100 } : null;
   });
-  if (stops.length < 2 || stops.some(stop => !stop)) return null;
+  if (stops.length < 2 || stops.some((stop) => !stop)) return null;
   if (stops[0].position === null) stops[0].position = 0;
   if (stops.at(-1).position === null) stops.at(-1).position = 1;
   for (let index = 0; index < stops.length;) {
@@ -100,9 +125,34 @@ function gradientStops(value) {
     while (index < stops.length && stops[index].position === null) index++;
     const left = stops[first - 1].position;
     const right = stops[index].position;
-    for (let current = first; current < index; current++) stops[current].position = left + (right - left) * (current - first + 1) / (index - first + 1);
+    for (let current = first; current < index; current++) {
+      stops[current].position = left + (right - left) * (current - first + 1) / (index - first + 1);
+    }
   }
-  return { direction: match[1].toLowerCase(), stops };
+  return stops;
+}
+
+function gradientStops(value) {
+  const text = String(value ?? "").trim();
+  const linear = /^linear-gradient\((to (?:top|right|bottom|left|top right|bottom right|bottom left|top left)|[-+]?[\d.]+deg),\s*(.+)\)$/i.exec(text);
+  if (linear) {
+    const stops = normalizeGradientStops(splitGradientArgs(linear[2]));
+    return stops ? { kind: "linear", direction: linear[1].toLowerCase(), stops } : null;
+  }
+  const radial = /^radial-gradient\((.+)\)$/i.exec(text);
+  if (!radial) return null;
+  const args = splitGradientArgs(radial[1]);
+  if (!args.length) return null;
+  // Drop an optional leading shape/size/position clause when the first arg is not a color stop.
+  const firstColor = parseGradientStopColor(args[0].replace(/\s+[\d.]+%$/, "").trim());
+  let shape = "ellipse";
+  if (!firstColor) {
+    const leading = args[0].toLowerCase();
+    if (/\bcircle\b/.test(leading)) shape = "circle";
+  }
+  const stopArgs = firstColor ? args : args.slice(1);
+  const stops = normalizeGradientStops(stopArgs);
+  return stops ? { kind: "radial", shape, stops } : null;
 }
 
 function gradientColor(stops, at) {
@@ -252,12 +302,13 @@ function translation(x, y, z) {
 function lengthValue(value, basis = 0) {
   value = value.trim();
   if (value.endsWith("%")) return Number.parseFloat(value) * basis / 100;
-  if (/^-?(?:\d+\.?\d*|\.\d+)(?:px)?$/.test(value)) return Number.parseFloat(value);
+  // Accept plain numbers, px, and scientific notation from interpolated transforms.
+  if (/^-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?(?:px)?$/i.test(value)) return Number.parseFloat(value);
   throw new TypeError(`unsupported CSS transform length: ${value}`);
 }
 
 function angleValue(value) {
-  const match = /^([-+]?(?:\d+\.?\d*|\.\d+))(deg|rad|turn)?$/.exec(value.trim());
+  const match = /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)(deg|rad|turn)?$/i.exec(value.trim());
   if (!match) throw new TypeError(`unsupported CSS transform angle: ${value}`);
   const amount = Number(match[1]);
   return match[2] === "rad" ? amount : match[2] === "turn" ? amount * Math.PI * 2 : amount * Math.PI / 180;
@@ -293,6 +344,11 @@ function parseTransform(source, width, height) {
       if (name === "rotateX") { fn[1][1] = c; fn[1][2] = -s; fn[2][1] = s; fn[2][2] = c; }
       else if (name === "rotateY") { fn[0][0] = c; fn[0][2] = s; fn[2][0] = -s; fn[2][2] = c; }
       else { fn[0][0] = c; fn[0][1] = -s; fn[1][0] = s; fn[1][1] = c; }
+    } else if (name === "skew" || name === "skewX" || name === "skewY") {
+      const x = Math.tan(angleValue(name === "skewY" ? "0deg" : (args[0] ?? "0deg")));
+      const y = Math.tan(angleValue(name === "skewX" ? "0deg" : (name === "skew" ? (args[1] ?? "0deg") : (args[0] ?? "0deg"))));
+      fn[0][1] = x;
+      fn[1][0] = y;
     } else if (name === "perspective") {
       const distance = lengthValue(args[0]);
       if (distance <= 0) throw new TypeError("perspective() distance must be positive");
@@ -492,6 +548,35 @@ function lineAtY(a, b, y) {
   return { x: a.x + (b.x - a.x) * t, y };
 }
 
+function screenSpaceBounds(points, clip = null) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const point of points) {
+    if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) continue;
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+    return { x: 0, y: 0, width: 0, height: 0 };
+  }
+  let x = minX, y = minY, right = maxX, bottom = maxY;
+  if (clip) {
+    x = Math.max(x, clip.x);
+    y = Math.max(y, clip.y);
+    right = Math.min(right, clip.x + clip.width);
+    bottom = Math.min(bottom, clip.y + clip.height);
+  }
+  return { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) };
+}
+
+function parseFilterBlur(value) {
+  const match = /blur\(\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)\s*(px)?\s*\)/i.exec(String(value ?? ""));
+  if (!match) return 0;
+  const radius = Number(match[1]);
+  return Number.isFinite(radius) && radius > 0 ? radius : 0;
+}
+
 function clipTexturedPolygon(polygon, rect) {
   const inside = [
     (point) => point.x >= rect.x,
@@ -575,18 +660,6 @@ function cachedPaintOrder(document, boxes) {
   return paintOrders.get(document).entries;
 }
 
-function objectPosition(style) {
-  const values = String(computedStyleValue(style, "objectPosition") ?? "50% 50%").trim().split(/\s+/);
-  const fraction = (value, fallback) => {
-    if (value === "left" || value === "top") return 0;
-    if (value === "right" || value === "bottom") return 1;
-    if (value === "center") return 0.5;
-    if (value?.endsWith("%")) return Math.max(0, Math.min(1, Number.parseFloat(value) / 100));
-    return fallback;
-  };
-  return [fraction(values[0], 0.5), fraction(values[1] ?? values[0], 0.5)];
-}
-
 function roundedRectPolygon(rect, radius) {
   const r = Math.max(0, Math.min(radius, rect.width / 2, rect.height / 2));
   if (r === 0) return [
@@ -641,11 +714,17 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   }
   const scrollSceneCache = documentData?.scrollSceneCache;
   const scrollSceneContentGeneration = documentData?.scrollSceneContentGeneration ?? 0;
-  if (scrollLayers.size && scrollSceneCache
+  // Reuse the scroll-scene base whenever contentGeneration matches. Live
+  // transition/animation chrome is excluded from that base and repainted below
+  // when hasActiveTransitions is set (carousel settle, animate-spin disc, …).
+  const scrollSceneReusable = !!(scrollLayers.size && scrollSceneCache
       && scrollSceneCache.contentGeneration === scrollSceneContentGeneration
       && scrollSceneCache.width === width && scrollSceneCache.height === height
       && scrollSceneCache.hostKeys.length === scrollLayers.size
-      && scrollSceneCache.hostKeys.every((element) => scrollLayers.has(element))) {
+      && scrollSceneCache.hostKeys.every((element) => scrollLayers.has(element)));
+  // Quiet frames need a complete base (stripsAnimated false). Animated frames
+  // need a base that already omitted live chrome (stripsAnimated true).
+  if (scrollSceneReusable && !hasActiveTransitions && !scrollSceneCache.stripsAnimated) {
     const boxesByElement = new Map(boxes.map((box) => [box.element, box]));
     const projectPoint = createBoxProjector(boxes);
     const viewport = { x: 0, y: 0, width, height };
@@ -853,6 +932,67 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       visibleElements.add(current);
     }
   };
+  // Seed from the scroll-scene base, then repaint only live chrome below.
+  let reusedScrollBase = false;
+  const scenePartOwners = [];
+  const scenePartCommands = [];
+  const pushScenePart = (part, owner, commands = 1) => {
+    sceneParts.push(part);
+    scenePartOwners.push(owner);
+    scenePartCommands.push(commands);
+  };
+  if (scrollSceneReusable && hasActiveTransitions && scrollSceneCache?.stripsAnimated) {
+    for (const part of scrollSceneCache.baseParts) {
+      sceneParts.push(part);
+      scenePartOwners.push(null);
+      scenePartCommands.push(0);
+    }
+    commandCount = scrollSceneCache.baseCommands;
+    for (const element of scrollSceneCache.visibleElements) visibleElements.add(element);
+    reusedScrollBase = true;
+    // Refresh scroll-layer quads in their cached slots (same as the quiet hit path).
+    for (const [hostElement, layer] of scrollLayers) {
+      const hostBox = boxesByElement.get(hostElement) ?? layer.hostBox;
+      const view = hostBox.paddingBox;
+      if (!layer.textureId || view.width <= 0 || view.height <= 0) continue;
+      const scrollLeft = Math.max(0, Math.min(Math.max(0, layer.contentWidth - view.width), hostElement.scrollLeft || 0));
+      const scrollTop = Math.max(0, Math.min(Math.max(0, layer.contentHeight - view.height), hostElement.scrollTop || 0));
+      const textureWidth = layer.textureWidth || layer.contentWidth;
+      const textureHeight = layer.textureHeight || layer.contentHeight;
+      const u0 = scrollLeft / textureWidth, v0 = scrollTop / textureHeight;
+      const u1 = (scrollLeft + view.width) / textureWidth, v1 = (scrollTop + view.height) / textureHeight;
+      const corners = [
+        [view.x, view.y, u0, v0], [view.x + view.width, view.y, u1, v0],
+        [view.x + view.width, view.y + view.height, u1, v1], [view.x, view.y + view.height, u0, v1],
+      ].map(([x, y, u, v]) => {
+        const point = projectPoint(hostBox, x, y);
+        return Number.isFinite(point.x) && Number.isFinite(point.y)
+          ? { x: point.x, y: point.y, u, v, reciprocalW: point.reciprocalW ?? 1 } : null;
+      });
+      if (!corners.every(Boolean)) continue;
+      const imageClip = intersection(hostBox.clip ?? viewport, viewport);
+      if (imageClip.width <= 0 || imageClip.height <= 0) continue;
+      let clipped = clipTexturedPolygon(corners, imageClip);
+      if (windowClip?.length) {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const point of windowClip) {
+          minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
+          maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
+        }
+        clipped = clipTexturedPolygon(clipped, { x: minX, y: minY, width: maxX - minX, height: maxY - minY });
+      }
+      if (clipped.length < 3) continue;
+      const triangles = [];
+      for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
+      const layerValues = [1, layer.textureId, imageClip.x, imageClip.y, imageClip.width, imageClip.height, triangles.length];
+      for (const point of triangles) layerValues.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+      const slot = scrollSceneCache.layerSlots.get(hostElement);
+      if (slot !== undefined) sceneParts[slot] = Float32Array.from(layerValues);
+      else pushScenePart(Float32Array.from(layerValues), null, 1);
+      commandCount += 1;
+      addVisibleAncestors(hostElement);
+    }
+  }
   const push = (box, rect, color, project, radius = 0, clipRegions = null) => {
     if (!color || rect.width <= 0 || rect.height <= 0) return;
     let localPoints;
@@ -1002,6 +1142,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     const { box } = entry;
     const element = box.element;
     const after = !!entry.after;
+    // Reused scroll base already has static chrome + scroll quads; only emit live
+    // transition/animation chrome (and skip re-emitting scroll layer hosts).
+    if (reusedScrollBase) {
+      if (scrollLayers.has(element)) continue;
+      if (!hasTransitionInPaintAncestry(element)) continue;
+    }
     const beforeCommands = commandCount;
     const segmentStart = values.length;
     const transformed = hasTransform(element);
@@ -1021,7 +1167,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         && previousSegment.status === status
         && previousSegment.clip?.x === box.clip?.x && previousSegment.clip?.y === box.clip?.y
         && previousSegment.clip?.width === box.clip?.width && previousSegment.clip?.height === box.clip?.height) {
-        sceneParts.push(previousSegment.values);
+        pushScenePart(previousSegment.values, element, previousSegment.commands);
         if (process.env.NASTY_BENCH_PROFILE) paintSegmentDiagnostics.exact++;
         commandCount += previousSegment.commands;
         if (previousSegment.visible) addVisibleAncestors(element);
@@ -1030,7 +1176,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       if (!after && status === "inside" && previousSegment.status === "inside") {
         const translated = translatePaintSegment(previousSegment.values, box.x - previousSegment.x, box.y - previousSegment.y);
         if (translated) {
-          sceneParts.push(translated);
+          pushScenePart(translated, element, previousSegment.commands);
           if (process.env.NASTY_BENCH_PROFILE) paintSegmentDiagnostics.translated++;
           commandCount += previousSegment.commands;
           addVisibleAncestors(element);
@@ -1088,7 +1234,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         }
       }
       saveSegment(element, box, after, segmentStart, beforeCommands, false);
-      if (values.length) sceneParts.push(Float32Array.from(values));
+      if (values.length) pushScenePart(Float32Array.from(values), element, commandCount - beforeCommands);
       values = [];
       continue;
     }
@@ -1118,7 +1264,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         } else {
           saveSegment(element, box, after, segmentStart, beforeCommands, false);
         }
-        if (values.length) sceneParts.push(Float32Array.from(values));
+        if (values.length) pushScenePart(Float32Array.from(values), element, commandCount - beforeCommands);
         values = [];
         continue;
       }
@@ -1160,9 +1306,138 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       const radiusText = String(computedStyleValue(style, "borderRadius") ?? "");
     const radiusValue = Number.parseFloat(radiusText) || 0;
     const radius = radiusText.trim().endsWith("%") ? Math.min(box.width, box.height) * radiusValue / 100 : radiusValue;
-    push(box, box.borderBox, withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity), project, radius, clipRegions);
+    const backgroundColor = withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity);
+    const filterBlur = parseFilterBlur(computedStyleValue(style, "filter") ?? style.filter);
     const gradient = gradientStops(computedStyleValue(style, "backgroundImage"));
-    if (gradient) {
+    if (gradient?.kind === "radial") {
+      // Native WGPU radial-gradient: one circle instance per adjacent color-stop
+      // pair, with per-pixel mix(t) along radius (CSS color-stop interpolation).
+      const localCx = (box.borderBox.x - box.x) + box.borderBox.width * 0.5;
+      const localCy = (box.borderBox.y - box.y) + box.borderBox.height * 0.5;
+      const center = project(localCx, localCy);
+      const right = project((box.borderBox.x - box.x) + box.borderBox.width, localCy);
+      const top = project(localCx, box.borderBox.y - box.y);
+      const corner = project(
+        (box.borderBox.x - box.x) + box.borderBox.width,
+        (box.borderBox.y - box.y) + box.borderBox.height,
+      );
+      if (center && right && top && corner) {
+        const axisX = Math.hypot(right.x - center.x, right.y - center.y);
+        const axisY = Math.hypot(top.x - center.x, top.y - center.y);
+        const cornerR = Math.hypot(corner.x - center.x, corner.y - center.y);
+        // Default CSS size is farthest-corner; `circle` keeps equal radii.
+        const baseRadius = Math.max(1, gradient.shape === "circle"
+          ? Math.max(axisX, axisY, cornerR)
+          : Math.max(axisX, axisY, cornerR));
+        const feather = filterBlur > 0 ? filterBlur : 0;
+        const drawRadius = baseRadius + feather;
+        // Scissor to the drawable circle AABB, intersected with clip ancestors / viewport.
+        let clipX = center.x - drawRadius;
+        let clipY = center.y - drawRadius;
+        let clipW = drawRadius * 2;
+        let clipH = drawRadius * 2;
+        const clipBounds = (x0, y0, x1, y1) => {
+          const left = Math.max(clipX, x0);
+          const top = Math.max(clipY, y0);
+          const right = Math.min(clipX + clipW, x1);
+          const bottom = Math.min(clipY + clipH, y1);
+          clipX = left; clipY = top;
+          clipW = Math.max(0, right - left);
+          clipH = Math.max(0, bottom - top);
+        };
+        clipBounds(0, 0, width, height);
+        if (clipRegions?.length) {
+          for (const region of clipRegions) {
+            if (!region || region.length < 3) continue;
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const point of region) {
+              minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
+              maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
+            }
+            clipBounds(minX, minY, maxX, maxY);
+          }
+        }
+        if (windowClip?.length) {
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const point of windowClip) {
+            minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
+            maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
+          }
+          clipBounds(minX, minY, maxX, maxY);
+        }
+        const stops = gradient.stops;
+        const emitSegment = (r0, r1, c0, c1) => {
+          if (!(r1 > r0) || clipW <= 0 || clipH <= 0) return;
+          const inner = withOpacity(c0, opacity);
+          const outer = withOpacity(c1, opacity);
+          if ((!inner || inner[3] <= 1e-4) && (!outer || outer[3] <= 1e-4)) return;
+          values.push(
+            3,
+            clipX, clipY, clipW, clipH,
+            center.x, center.y, r1, r0 <= 0 ? -1 : r0,
+            center.x, center.y, r0, r1,
+            inner[0], inner[1], inner[2], inner[3],
+            outer[0], outer[1], outer[2], outer[3],
+          );
+          commandCount++;
+        };
+        for (let index = 0; index < stops.length - 1; index++) {
+          const a = stops[index], b = stops[index + 1];
+          emitSegment(a.position * baseRadius, b.position * baseRadius, a.color, b.color);
+        }
+        if (feather > 0 && drawRadius > baseRadius) {
+          // filter:blur soft pad — only when the last stop still has alpha.
+          // A transparent final stop already cleared the edge; reinjecting
+          // color past that radius paints a second ring (Vitrola title glow).
+          const last = stops.at(-1);
+          const startR = last.position * baseRadius;
+          if (last.color[3] > 1e-4 && drawRadius > startR + 1e-3) {
+            emitSegment(
+              startR,
+              drawRadius,
+              last.color,
+              [last.color[0], last.color[1], last.color[2], 0],
+            );
+          }
+        }
+      }
+    } else if (filterBlur > 0 && backgroundColor && backgroundColor[3] > 0) {
+      // Match Sweet fill_radial for blurred solid fills (title glow orb): a
+      // gaussian falloff from the ellipse center, padded by the blur radius.
+      // Concentric discs with source-over delta alphas rebuild that profile on WGPU.
+      const rx = Math.max(1, box.borderBox.width * 0.5);
+      const ry = Math.max(1, box.borderBox.height * 0.5);
+      const feather = filterBlur / Math.min(rx, ry);
+      const outer = 1 + feather;
+      const sigma = 0.55 + 0.35 * (feather / (1 + feather));
+      const keepAt = (normR) => Math.exp(-(normR * normR) / (2 * sigma * sigma));
+      const layers = Math.max(16, Math.min(48, Math.ceil(filterBlur / 1.5)));
+      const cx = box.borderBox.x + rx;
+      const cy = box.borderBox.y + ry;
+      let covered = 0;
+      for (let layer = layers; layer >= 0; layer--) {
+        const normR = (layer / layers) * outer;
+        if (normR <= 0) continue;
+        const keep = keepAt(normR);
+        const denom = 1 - covered;
+        const alphaScale = denom > 1e-6 ? Math.max(0, (keep - covered) / denom) : 0;
+        covered = keep;
+        if (alphaScale <= 1e-4) continue;
+        const width = rx * normR * 2;
+        const height = ry * normR * 2;
+        push(
+          box,
+          { x: cx - width / 2, y: cy - height / 2, width, height },
+          [backgroundColor[0], backgroundColor[1], backgroundColor[2], backgroundColor[3] * alphaScale],
+          project,
+          Math.min(width, height) / 2,
+          clipRegions,
+        );
+      }
+    } else {
+      push(box, box.borderBox, backgroundColor, project, radius, clipRegions);
+    }
+    if (gradient?.kind === "linear") {
       const direction = gradient.direction;
       const horizontal = direction === "to right" || direction === "to left";
       const reverse = direction === "to top" || direction === "to left";
@@ -1238,34 +1513,16 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     const image = state.image ?? state.video?.image;
     const content = box.contentBox;
     if (image && content.width > 0 && content.height > 0) {
-      const imageClip = viewport;
-      const imageRect = { ...content };
-      let u0 = 0, v0 = 0, u1 = 1, v1 = 1;
       const fit = style.objectFit ?? "fill";
-      const [positionX, positionY] = objectPosition(style);
-      if (fit === "cover" || fit === "contain") {
-        const sourceRatio = image.width / image.height;
-        const targetRatio = content.width / content.height;
-        if ((fit === "cover" && sourceRatio > targetRatio) || (fit === "contain" && sourceRatio < targetRatio)) {
-          const fraction = targetRatio / sourceRatio;
-          if (fit === "cover") {
-            u0 = (1 - fraction) * positionX;
-            u1 = u0 + fraction;
-          } else {
-            imageRect.width = content.width * fraction;
-            imageRect.x += (content.width - imageRect.width) * positionX;
-          }
-        } else if ((fit === "cover" && sourceRatio < targetRatio) || (fit === "contain" && sourceRatio > targetRatio)) {
-          const fraction = sourceRatio / targetRatio;
-          if (fit === "cover") {
-            v0 = (1 - fraction) * positionY;
-            v1 = v0 + fraction;
-          } else {
-            imageRect.height = content.height * fraction;
-            imageRect.y += (content.height - imageRect.height) * positionY;
-          }
-        }
-      }
+      const [positionX, positionY] = objectPositionFractions(computedStyleValue(style, "objectPosition"));
+      const layout = objectFitLayout(image.width, image.height, content.width, content.height, fit, positionX, positionY);
+      const imageRect = {
+        x: content.x + layout.x,
+        y: content.y + layout.y,
+        width: layout.width,
+        height: layout.height,
+      };
+      const { u0, v0, u1, v1 } = layout;
       const corners = [
         [imageRect.x, imageRect.y, u0, v0], [imageRect.x + imageRect.width, imageRect.y, u1, v0],
         [imageRect.x + imageRect.width, imageRect.y + imageRect.height, u1, v1], [imageRect.x, imageRect.y + imageRect.height, u0, v1],
@@ -1273,16 +1530,22 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         const point = projectPoint(box, x, y);
         return Number.isFinite(point.x) && Number.isFinite(point.y) ? { ...point, u, v } : null;
       });
-      if (corners.every(Boolean) && imageClip.width > 0 && imageClip.height > 0) {
-        let clipped = clipTexturedPolygon(corners, imageClip);
+      if (corners.every(Boolean)) {
+        // Corners are already in screen space (including CSS transforms). Clip in
+        // that same space: viewport first, then overflow/window regions. Using the
+        // untransformed content box here used to chop floating/spinning images.
+        let clipped = clipTexturedPolygon(corners, viewport);
         for (const region of clipRegions) clipped = clipConvexPolygon(clipped, region);
         clipped = clipConvexPolygon(clipped, windowClip);
         if (clipped.length >= 3) {
           const triangles = [];
           for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
-          values.push(1, image.textureId, imageClip.x, imageClip.y, imageClip.width, imageClip.height, triangles.length);
-          for (const point of triangles) values.push(point.x, point.y, point.u, point.v, point.reciprocalW);
-          commandCount++;
+          const scissor = screenSpaceBounds(clipped, viewport);
+          if (scissor.width > 0 && scissor.height > 0) {
+            values.push(1, image.textureId, scissor.x, scissor.y, scissor.width, scissor.height, triangles.length);
+            for (const point of triangles) values.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+            commandCount++;
+          }
         }
       }
     }
@@ -1303,14 +1566,19 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       push(box, rect, withOpacity(parseColor(color), opacity), project, 0, clipRegions);
     }
     saveSegment(element, box, after, segmentStart, beforeCommands, true);
-    if (values.length) sceneParts.push(Float32Array.from(values));
+    if (values.length) pushScenePart(Float32Array.from(values), element, commandCount - beforeCommands);
     values = [];
     } finally {
-      if (!after && scrollLayers.has(element)) {
+      if (!reusedScrollBase && !after && scrollLayers.has(element)) {
         const clip = intersection(box.clip ?? viewport, viewport);
         if (box.x + box.width > clip.x && box.y + box.height > clip.y
             && box.x < clip.x + clip.width && box.y < clip.y + clip.height) {
+          const beforeParts = sceneParts.length;
           emitScrollContent(element, box);
+          if (sceneParts.length > beforeParts) {
+            scenePartOwners.push(null);
+            scenePartCommands.push(1);
+          }
         }
       }
     }
@@ -1361,32 +1629,44 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   return displayList;
   };
   if (fullSceneCacheable && !activeTransitionElements?.size) transformedScenes.set(boxes, { generation, transitionGeneration, width, height, compose });
+  // Publish a reusable scroll-scene base that omits live transition/animation
+  // chrome. Those elements are repainted on top of the reused base each frame.
   if (documentData && scrollLayers.size) {
     const baseParts = [];
     const layerSlots = new Map();
+    const activeLayerSlots = reusedScrollBase && scrollSceneCache
+      ? scrollSceneCache.layerSlots
+      : scrollLayerSlots;
     let baseCommands = 0;
-    // Re-walk sceneParts: keep non-layer parts as the reusable base; remember
-    // slot indices so scroll-only frames can replace just those commands.
+    let stripsAnimated = false;
     for (let index = 0; index < sceneParts.length; index++) {
       let isLayer = false;
-      for (const [host, slot] of scrollLayerSlots) {
+      for (const [host, slot] of activeLayerSlots) {
         if (slot === index) { layerSlots.set(host, baseParts.length); isLayer = true; break; }
       }
-      baseParts.push(sceneParts[index]);
-      if (!isLayer) {
-        // Count solid/image commands roughly from part header when possible.
+      const owner = scenePartOwners[index];
+      if (!isLayer && owner && hasTransitionInPaintAncestry(owner)) {
+        stripsAnimated = true;
+        continue;
       }
+      baseParts.push(sceneParts[index]);
+      if (!isLayer) baseCommands += scenePartCommands[index] || 0;
     }
-    // commandCount includes layer quads; store base command count excluding them.
+    // When reusing a prior stripped base, keep its command total for static chrome.
+    if (reusedScrollBase && scrollSceneCache) {
+      baseCommands = scrollSceneCache.baseCommands;
+      stripsAnimated = true;
+    }
     documentData.scrollSceneCache = {
       contentGeneration: scrollSceneContentGeneration,
       width,
       height,
       baseParts,
-      baseCommands: commandCount - scrollLayerSlots.size,
+      baseCommands,
       layerSlots,
       hostKeys: [...scrollLayers.keys()],
       visibleElements: [...visibleElements],
+      stripsAnimated,
     };
   }
   return compose(overlays);

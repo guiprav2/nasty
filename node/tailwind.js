@@ -16,7 +16,8 @@ const CSS_PROPERTIES = new Set([
   ...LENGTHS, ...UNITLESS,
   "display", "position", "inset", "boxSizing", "overflow", "overflowX", "overflowY",
   "flex", "flexBasis", "flexDirection", "flexWrap", "alignItems", "alignSelf", "alignContent",
-  "justifyContent", "justifyItems", "justifySelf", "gridTemplateColumns", "gridTemplateRows",
+  "justifyContent", "justifyItems", "justifySelf", "placeItems", "placeContent",
+  "gridTemplateColumns", "gridTemplateRows",
   "gridColumn", "gridRow", "gridAutoFlow", "gridAutoColumns", "gridAutoRows",
   "color", "background", "backgroundColor", "backgroundImage", "backgroundSize", "backgroundPosition",
   "backgroundRepeat", "border", "borderStyle", "borderColor", "borderTopColor", "borderRightColor",
@@ -25,6 +26,8 @@ const CSS_PROPERTIES = new Set([
   "textTransform", "textDecoration", "textShadow", "wordBreak", "overflowWrap", "direction",
   "transform", "transformOrigin", "transformStyle", "perspective", "perspectiveOrigin", "backfaceVisibility",
   "transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction",
+  "animation", "animationName", "animationDuration", "animationTimingFunction", "animationDelay",
+  "animationIterationCount", "animationDirection", "animationFillMode", "animationPlayState",
   "boxShadow", "filter", "backdropFilter", "objectFit", "objectPosition", "visibility",
   "cursor", "pointerEvents", "userSelect", "touchAction",
   "caretColor",
@@ -153,9 +156,12 @@ function utilityStyle(utility) {
     "overflow-anchor-edge-end": ["overflowAnchorEdge", "end"],
     "overflow-anchor-margin-auto": ["overflowAnchorMargin", "auto"],
     "object-cover": ["objectFit", "cover"], "object-contain": ["objectFit", "contain"], "object-fill": ["objectFit", "fill"],
-    "object-center": ["objectPosition", "50% 50%"], "object-bottom": ["objectPosition", "50% 100%"],
-    "object-top": ["objectPosition", "50% 0%"], "object-left": ["objectPosition", "0% 50%"],
-    "object-right": ["objectPosition", "100% 50%"],
+    "object-none": ["objectFit", "none"], "object-scale-down": ["objectFit", "scale-down"],
+    "object-center": ["objectPosition", "50% 50%"], "object-top": ["objectPosition", "50% 0%"],
+    "object-bottom": ["objectPosition", "50% 100%"], "object-left": ["objectPosition", "0% 50%"],
+    "object-right": ["objectPosition", "100% 50%"], "object-left-top": ["objectPosition", "0% 0%"],
+    "object-left-bottom": ["objectPosition", "0% 100%"], "object-right-top": ["objectPosition", "100% 0%"],
+    "object-right-bottom": ["objectPosition", "100% 100%"],
     transition: ["transition", "all 150ms ease"], "transition-none": ["transition", "none"],
     "leading-none": ["lineHeight", "1"], "leading-tight": ["lineHeight", "1.25"], "leading-snug": ["lineHeight", "1.375"], "leading-normal": ["lineHeight", "normal"], "leading-relaxed": ["lineHeight", "1.625"], "leading-loose": ["lineHeight", "2"],
     "rounded": ["borderRadius", 4], "border-solid": ["borderStyle", "solid"], "border-dashed": ["borderStyle", "dashed"], "border-dotted": ["borderStyle", "dotted"], "border-none": ["borderStyle", "none"],
@@ -163,6 +169,45 @@ function utilityStyle(utility) {
     "cursor-pointer": ["cursor", "pointer"], "cursor-grab": ["cursor", "grab"], "cursor-grabbing": ["cursor", "grabbing"], "cursor-default": ["cursor", "default"],
     "pointer-events-none": ["pointerEvents", "none"], "pointer-events-auto": ["pointerEvents", "auto"],
     "ease-linear": ["transitionTimingFunction", "linear"], "ease-in": ["transitionTimingFunction", "ease-in"], "ease-out": ["transitionTimingFunction", "ease-out"], "ease-in-out": ["transitionTimingFunction", "ease-in-out"],
+    // Animation utilities set longhands separately (name, duration, easing, iteration).
+    "animate-spin": [
+      ["animationName", "spin"],
+      ["animationDuration", "1s"],
+      ["animationTimingFunction", "linear"],
+      ["animationIterationCount", "infinite"],
+    ],
+    "animate-float": [
+      ["animationName", "float"],
+      ["animationDuration", "5.5s"],
+      ["animationTimingFunction", "ease-in-out"],
+      ["animationIterationCount", "infinite"],
+    ],
+    "animate-glow": [
+      ["animationName", "glow"],
+      ["animationDuration", "5.5s"],
+      ["animationTimingFunction", "ease-in-out"],
+      ["animationIterationCount", "infinite"],
+    ],
+    "animate-sheen": [
+      ["animationName", "sheen"],
+      ["animationDuration", "5.5s"],
+      // Linear: smoothstep is baked into sheen keyframe offsets (Sweet Motion::Sheen).
+      ["animationTimingFunction", "linear"],
+      ["animationIterationCount", "infinite"],
+    ],
+    "animate-none": [["animationName", "none"], ["animationDuration", "0s"]],
+    "place-items-center": [["alignItems", "center"], ["justifyItems", "center"], ["placeItems", "center"]],
+    "place-items-start": [["alignItems", "start"], ["justifyItems", "start"], ["placeItems", "start"]],
+    "place-items-end": [["alignItems", "end"], ["justifyItems", "end"], ["placeItems", "end"]],
+    "place-items-stretch": [["alignItems", "stretch"], ["justifyItems", "stretch"], ["placeItems", "stretch"]],
+    blur: ["filter", "blur(8px)"],
+    "blur-none": ["filter", "none"],
+    "blur-sm": ["filter", "blur(4px)"],
+    "blur-md": ["filter", "blur(12px)"],
+    "blur-lg": ["filter", "blur(16px)"],
+    "blur-xl": ["filter", "blur(24px)"],
+    "blur-2xl": ["filter", "blur(40px)"],
+    "blur-3xl": ["filter", "blur(64px)"],
     nf: [["fontFamily", "Symbols Nerd Font"], ["fontStyle", "normal"], ["fontWeight", 400], ["fontVariant", "normal"], ["textTransform", "none"], ["lineHeight", "1"]],
   };
   if (fixed[utility]) return fixed[utility];
@@ -228,7 +273,13 @@ function utilityStyle(utility) {
   const simple = /^(bg|text|border|opacity|z|leading|font)-(.+)$/.exec(utility);
   if (simple) {
     const [, prefix, value] = simple;
-    if (prefix === "bg") return colorValue(value) ? ["backgroundColor", colorValue(value)] : null;
+    if (prefix === "bg") {
+      if (value.startsWith("[") && value.endsWith("]")) {
+        const raw = value.slice(1, -1).replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_").trim();
+        if (/^(?:radial|linear)-gradient\(/i.test(raw)) return ["backgroundImage", raw];
+      }
+      return colorValue(value) ? ["backgroundColor", colorValue(value)] : null;
+    }
     if (prefix === "text") {
       if (/^(xs|sm|base|lg|xl|[2-9]xl)$/.test(value)) return ["fontSize", ({ xs: 12, sm: 14, base: 16, lg: 18, xl: 20 })[value] ?? 24 + (Number.parseInt(value, 10) - 2) * 8];
       if (/^\[(?:\d+(?:\.\d+)?(?:px|rem|em))\]$/.test(value)) return ["fontSize", parseLength(value.slice(1, -1))];
