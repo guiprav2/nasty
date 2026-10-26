@@ -1,5 +1,5 @@
 import { documentState, elementState } from "./internal/dom-state.js";
-import { computedStyleValue, hasActiveStyleTransition } from "./internal/css-transitions.js";
+import { computedStyleValue, getStyleTransitionState, hasActiveStyleTransition, styleHasAnimations, styleMeshRevision } from "./internal/css-transitions.js";
 import { canvasCommands, canvasSurface } from "./canvas-2d.js";
 import { prepareScrollLayers } from "./internal/scroll-layers.js";
 import { objectFitLayout, objectPositionFractions } from "./internal/object-fit.js";
@@ -11,7 +11,329 @@ const paintOrders = new WeakMap();
 const opacityCache = new WeakMap();
 const clipRegionCache = new WeakMap();
 const paintSegments = new WeakMap();
+// Layout-space meshes for transformed elements whose pixels do not change when
+// the CSS transform or opacity does (carousel poses, disc spin). The first
+// frame tessellates in document space; later frames only reproject vertices.
+const layoutMeshCache = new WeakMap();
 const paintSegmentDiagnostics = { frames: 0, cacheable: 0, exact: 0, translated: 0, outside: 0, missed: 0 };
+
+function layoutMeshElementOk(element, style) {
+  if (element.localName === "canvas") return false;
+  if (parseFilterBlur(computedStyleValue(style, "filter") ?? style.filter) > 0) return false;
+  return gradientStops(computedStyleValue(style, "backgroundImage"))?.kind !== "radial";
+}
+
+function layoutStreamReplayable(values) {
+  let offset = 0;
+  while (offset < values.length) {
+    const kind = values[offset];
+    if (kind === 0) offset += 11;
+    else if (kind === 1) {
+      const count = values[offset + 6];
+      if (!Number.isFinite(count) || count < 0 || count % 3 !== 0) return false;
+      offset += 7 + count * 5;
+    } else return false;
+    if (offset > values.length) return false;
+  }
+  return true;
+}
+
+// Reproject a document-space command buffer. `polygons` are screen-space clips
+// for overflow ancestors that do not share this element's transform (stage
+// overflow, window radius). Same-transform rounded clips are already baked in.
+const replayClipX = new Float32Array(16);
+const replayClipY = new Float32Array(16);
+const replayClipU = new Float32Array(16);
+const replayClipV = new Float32Array(16);
+const replayClipW = new Float32Array(16);
+const replayClipX2 = new Float32Array(16);
+const replayClipY2 = new Float32Array(16);
+const replayClipU2 = new Float32Array(16);
+const replayClipV2 = new Float32Array(16);
+const replayClipW2 = new Float32Array(16);
+let replayScratch = new Float32Array(1 << 16);
+let replayArena = new Float32Array(1 << 18);
+let replayArenaUsed = 0;
+const replayPoint = new Float32Array(9);
+let replayImage = new Float32Array(384);
+
+function resetReplayArena() {
+  replayArenaUsed = 0;
+}
+
+// One arena for every replay in the frame. Scroll-scene retention must copy
+// before the next frame resets it; live carousel parts are not retained.
+function replayArenaPart(source, length) {
+  if (replayArenaUsed + length > replayArena.length) {
+    const next = new Float32Array(Math.max(replayArena.length * 2, replayArenaUsed + length));
+    next.set(replayArena.subarray(0, replayArenaUsed));
+    replayArena = next;
+  }
+  replayArena.set(source.subarray(0, length), replayArenaUsed);
+  const part = replayArena.subarray(replayArenaUsed, replayArenaUsed + length);
+  replayArenaUsed += length;
+  return part;
+}
+
+function retainedScenePart(part) {
+  return part?.buffer === replayArena.buffer ? part.slice() : part;
+}
+
+function replayScratchRoom(needed) {
+  if (replayScratch.length >= needed) return;
+  const next = new Float32Array(Math.max(needed, replayScratch.length * 2));
+  next.set(replayScratch);
+  replayScratch = next;
+}
+
+function replayEdgeInside(edge, x, y, left, top, right, bottom) {
+  if (edge === 0) return x >= left - 1e-4;
+  if (edge === 1) return x <= right + 1e-4;
+  if (edge === 2) return y >= top - 1e-4;
+  return y <= bottom + 1e-4;
+}
+
+// Clip one triangle to an axis-aligned rect. Result is in replayClipX/Y and the
+// return value is the point count (0..8). Four edges land back on the first buffer.
+function replayClipTriangle(ax, ay, bx, by, cx, cy, left, top, right, bottom) {
+  replayClipX[0] = ax; replayClipY[0] = ay;
+  replayClipX[1] = bx; replayClipY[1] = by;
+  replayClipX[2] = cx; replayClipY[2] = cy;
+  let srcX = replayClipX, srcY = replayClipY, dstX = replayClipX2, dstY = replayClipY2;
+  let count = 3;
+  for (let edge = 0; edge < 4; edge++) {
+    if (!count) return 0;
+    let out = 0;
+    let px = srcX[count - 1], py = srcY[count - 1];
+    let previousInside = replayEdgeInside(edge, px, py, left, top, right, bottom);
+    for (let index = 0; index < count; index++) {
+      const x = srcX[index], y = srcY[index];
+      const inside = replayEdgeInside(edge, x, y, left, top, right, bottom);
+      if (inside !== previousInside) {
+        const t = edge < 2
+          ? ((edge === 0 ? left : right) - px) / (x - px)
+          : ((edge === 2 ? top : bottom) - py) / (y - py);
+        dstX[out] = px + (x - px) * t;
+        dstY[out] = py + (y - py) * t;
+        out++;
+      }
+      if (inside) { dstX[out] = x; dstY[out] = y; out++; }
+      px = x; py = y; previousInside = inside;
+    }
+    count = out;
+    const swapX = srcX; srcX = dstX; dstX = swapX;
+    const swapY = srcY; srcY = dstY; dstY = swapY;
+  }
+  return count;
+}
+
+function replayLayoutMesh(mesh, matrix, opacityScale, clipRect, polygons, windowClip = null, windowRadius = 0, viewWidth = 0, viewHeight = 0) {
+  const src = mesh.values;
+  if (!src?.length) return { part: src ?? new Float32Array(0), commands: 0 };
+  if (polygons?.length) return replayLayoutMeshGeneral(mesh, matrix, opacityScale, clipRect, polygons);
+  const m00 = matrix[0][0], m01 = matrix[0][1], m03 = matrix[0][3];
+  const m10 = matrix[1][0], m11 = matrix[1][1], m13 = matrix[1][3];
+  const m30 = matrix[3][0], m31 = matrix[3][1], m33 = matrix[3][3];
+  const projectAt = (x, y, slot) => {
+    const qw = m30 * x + m31 * y + m33;
+    if (qw <= 0.0001) return false;
+    const inv = 1 / qw;
+    replayPoint[slot] = (m00 * x + m01 * y + m03) * inv;
+    replayPoint[slot + 1] = (m10 * x + m11 * y + m13) * inv;
+    replayPoint[slot + 2] = inv;
+    return true;
+  };
+  const left = clipRect.x, top = clipRect.y;
+  const right = left + clipRect.width, bottom = top + clipRect.height;
+  const inside = (x, y) => x >= left && x <= right && y >= top && y <= bottom;
+  const alphaOf = (alpha) => {
+    const scaled = alpha * opacityScale;
+    return scaled < 0 ? 0 : scaled > 1 ? 1 : scaled;
+  };
+  replayScratchRoom(src.length + 64);
+  let write = 0;
+  let commands = 0;
+  let offset = 0;
+  const pushTriangle = (ax, ay, bx, by, cx, cy, red, green, blue, alpha) => {
+    replayScratchRoom(write + 11);
+    replayScratch[write++] = 0;
+    replayScratch[write++] = ax; replayScratch[write++] = ay;
+    replayScratch[write++] = bx; replayScratch[write++] = by;
+    replayScratch[write++] = cx; replayScratch[write++] = cy;
+    replayScratch[write++] = red; replayScratch[write++] = green;
+    replayScratch[write++] = blue; replayScratch[write++] = alpha;
+    commands++;
+  };
+  while (offset < src.length) {
+    const kind = src[offset];
+    if (kind === 0) {
+      const okA = projectAt(src[offset + 1], src[offset + 2], 0);
+      const okB = projectAt(src[offset + 3], src[offset + 4], 3);
+      const okC = projectAt(src[offset + 5], src[offset + 6], 6);
+      const red = src[offset + 7], green = src[offset + 8], blue = src[offset + 9];
+      const alpha = alphaOf(src[offset + 10]);
+      offset += 11;
+      if (!okA || !okB || !okC || alpha <= 1e-4) continue;
+      const ax = replayPoint[0], ay = replayPoint[1], bx = replayPoint[3], by = replayPoint[4], cx = replayPoint[6], cy = replayPoint[7];
+      const reachesWindowCorner = windowRadius > 0 && windowClip
+        && (ax < windowRadius || bx < windowRadius || cx < windowRadius || ax > viewWidth - windowRadius || bx > viewWidth - windowRadius || cx > viewWidth - windowRadius)
+        && (ay < windowRadius || by < windowRadius || cy < windowRadius || ay > viewHeight - windowRadius || by > viewHeight - windowRadius || cy > viewHeight - windowRadius);
+      if (inside(ax, ay) && inside(bx, by) && inside(cx, cy) && !reachesWindowCorner) {
+        pushTriangle(ax, ay, bx, by, cx, cy, red, green, blue, alpha);
+        continue;
+      }
+      if ((ax < left && bx < left && cx < left) || (ax > right && bx > right && cx > right)
+        || (ay < top && by < top && cy < top) || (ay > bottom && by > bottom && cy > bottom)) continue;
+      const count = replayClipTriangle(ax, ay, bx, by, cx, cy, left, top, right, bottom);
+      const minX = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx);
+      const maxX = ax > bx ? (ax > cx ? ax : cx) : (bx > cx ? bx : cx);
+      const minY = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy);
+      const maxY = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);
+      const corner = windowRadius > 0 && windowClip
+        && ((minX < windowRadius) || (maxX > viewWidth - windowRadius))
+        && ((minY < windowRadius) || (maxY > viewHeight - windowRadius));
+      if (!corner) {
+        for (let index = 1; index < count - 1; index++) {
+          pushTriangle(replayClipX[0], replayClipY[0], replayClipX[index], replayClipY[index], replayClipX[index + 1], replayClipY[index + 1], red, green, blue, alpha);
+        }
+      } else {
+        const poly = [];
+        for (let index = 0; index < count; index++) poly.push({ x: replayClipX[index], y: replayClipY[index] });
+        const clipped = clipConvexPolygon(poly, windowClip);
+        for (let index = 1; index < clipped.length - 1; index++) {
+          pushTriangle(clipped[0].x, clipped[0].y, clipped[index].x, clipped[index].y, clipped[index + 1].x, clipped[index + 1].y, red, green, blue, alpha);
+        }
+      }
+    } else if (kind === 1) {
+      const textureId = src[offset + 1];
+      const count = src[offset + 6];
+      const header = offset;
+      offset += 7;
+      if (replayImage.length < count * 3) replayImage = new Float32Array(Math.max(count * 3, replayImage.length * 2));
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      let allInside = true;
+      let allFinite = true;
+      for (let index = 0; index < count; index++) {
+        const qw = m30 * src[offset + index * 5] + m31 * src[offset + index * 5 + 1] + m33;
+        if (qw <= 0.0001) { allFinite = false; break; }
+        const inv = 1 / qw;
+        const x = (m00 * src[offset + index * 5] + m01 * src[offset + index * 5 + 1] + m03) * inv;
+        const y = (m10 * src[offset + index * 5] + m11 * src[offset + index * 5 + 1] + m13) * inv;
+        replayImage[index * 3] = x; replayImage[index * 3 + 1] = y; replayImage[index * 3 + 2] = inv;
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+        if (!inside(x, y)) allInside = false;
+      }
+      if (!allFinite) { offset += count * 5; continue; }
+      if (maxX < left || minX > right || maxY < top || minY > bottom) { offset += count * 5; continue; }
+      if (allInside) {
+        const sx = Math.max(left, minX), sy = Math.max(top, minY);
+        const sw = Math.min(right, maxX) - sx, sh = Math.min(bottom, maxY) - sy;
+        replayScratchRoom(write + 7 + count * 5);
+        replayScratch[write++] = 1;
+        replayScratch[write++] = textureId;
+        replayScratch[write++] = sx; replayScratch[write++] = sy;
+        replayScratch[write++] = sw; replayScratch[write++] = sh;
+        replayScratch[write++] = count;
+        for (let index = 0; index < count; index++) {
+          replayScratch[write++] = replayImage[index * 3];
+          replayScratch[write++] = replayImage[index * 3 + 1];
+          replayScratch[write++] = src[offset + 2];
+          replayScratch[write++] = src[offset + 3];
+          replayScratch[write++] = replayImage[index * 3 + 2];
+          offset += 5;
+        }
+        commands++;
+        continue;
+      }
+      offset = header;
+      return replayLayoutMeshGeneral(mesh, matrix, opacityScale, clipRect, polygons);
+    } else return null;
+  }
+  return { part: replayArenaPart(replayScratch, write), commands };
+}
+
+function replayLayoutMeshGeneral(mesh, matrix, opacityScale, clipRect, polygons) {
+  const src = mesh.values;
+  const m00 = matrix[0][0], m01 = matrix[0][1], m03 = matrix[0][3];
+  const m10 = matrix[1][0], m11 = matrix[1][1], m13 = matrix[1][3];
+  const m30 = matrix[3][0], m31 = matrix[3][1], m33 = matrix[3][3];
+  const project = (x, y) => {
+    const qw = m30 * x + m31 * y + m33;
+    if (qw <= 0.0001) return null;
+    const inv = 1 / qw;
+    return { x: (m00 * x + m01 * y + m03) * inv, y: (m10 * x + m11 * y + m13) * inv, reciprocalW: inv };
+  };
+  const right = clipRect.x + clipRect.width;
+  const bottom = clipRect.y + clipRect.height;
+  const insideRect = (point) => point.x >= clipRect.x && point.x <= right && point.y >= clipRect.y && point.y <= bottom;
+  const alphaOf = (alpha) => {
+    const scaled = alpha * opacityScale;
+    return scaled < 0 ? 0 : scaled > 1 ? 1 : scaled;
+  };
+  const out = [];
+  let commands = 0;
+  let offset = 0;
+  while (offset < src.length) {
+    const kind = src[offset];
+    if (kind === 0) {
+      const pa = project(src[offset + 1], src[offset + 2]);
+      const pb = project(src[offset + 3], src[offset + 4]);
+      const pc = project(src[offset + 5], src[offset + 6]);
+      const red = src[offset + 7], green = src[offset + 8], blue = src[offset + 9];
+      const alpha = alphaOf(src[offset + 10]);
+      offset += 11;
+      if (!pa || !pb || !pc || alpha <= 1e-4) continue;
+      if (!polygons?.length && insideRect(pa) && insideRect(pb) && insideRect(pc)) {
+        out.push(0, pa.x, pa.y, pb.x, pb.y, pc.x, pc.y, red, green, blue, alpha);
+        commands++;
+        continue;
+      }
+      let poly = clipPolygon([pa, pb, pc], clipRect);
+      if (polygons) for (const region of polygons) poly = clipConvexPolygon(poly, region);
+      for (let index = 1; index < poly.length - 1; index++) {
+        const a = poly[0], b = poly[index], c = poly[index + 1];
+        out.push(0, a.x, a.y, b.x, b.y, c.x, c.y, red, green, blue, alpha);
+        commands++;
+      }
+    } else if (kind === 1) {
+      const textureId = src[offset + 1];
+      const count = src[offset + 6];
+      offset += 7;
+      const projected = new Array(count);
+      for (let index = 0; index < count; index++) {
+        const point = project(src[offset], src[offset + 1]);
+        projected[index] = point
+          ? { x: point.x, y: point.y, u: src[offset + 2], v: src[offset + 3], reciprocalW: point.reciprocalW }
+          : null;
+        offset += 5;
+      }
+      const triangles = [];
+      for (let index = 0; index + 2 < count; index += 3) {
+        const a = projected[index], b = projected[index + 1], c = projected[index + 2];
+        if (!a || !b || !c) continue;
+        let poly = [a, b, c];
+        if (polygons?.length || !insideRect(a) || !insideRect(b) || !insideRect(c)) {
+          poly = clipTexturedPolygon(poly, clipRect);
+          if (polygons) for (const region of polygons) poly = clipConvexPolygon(poly, region);
+        }
+        for (let vertex = 1; vertex < poly.length - 1; vertex++) triangles.push(poly[0], poly[vertex], poly[vertex + 1]);
+      }
+      if (triangles.length >= 3) {
+        const scissor = screenSpaceBounds(triangles, clipRect);
+        if (scissor.width > 0 && scissor.height > 0) {
+          out.push(1, textureId, scissor.x, scissor.y, scissor.width, scissor.height, triangles.length);
+          for (const point of triangles) out.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+          commands++;
+        }
+      }
+    } else return null;
+  }
+  const part = replayArenaPart(Float32Array.from(out), out.length);
+  return { part, commands };
+}
 
 /** Drop cached paint commands for one element after a local paint-only change. */
 export function clearPaintSegments(element) {
@@ -80,16 +402,49 @@ function parseGradientStopColor(text) {
 function opacityFor(element, generation = 0) {
   const cached = opacityCache.get(element);
   if (cached?.generation === generation) return cached.value;
-  let opacity = 1;
-  for (let current = element; current; current = current.parentElement ?? current.parentNode ?? current.parent) {
-    const style = current.style;
-    if (!style || style.opacity === undefined) continue;
-    const value = Number(computedStyleValue(style, "opacity"));
-    if (Number.isFinite(value)) opacity *= Math.max(0, Math.min(1, value));
+  const parent = element.parentElement ?? element.parentNode ?? element.parent;
+  let opacity = parent?.nodeType === 1 ? opacityFor(parent, generation) : 1;
+  const style = element.style;
+  if (style && style.opacity !== undefined && style.opacity !== "") {
+    const state = getStyleTransitionState(style);
+    const transition = state?.transitions.get("opacity");
+    const transitioning = !!transition && performance.now() < transition.started + transition.duration;
+    // Spin and pose classes leave a static opacity on the element. Only sample
+    // computed opacity while an opacity transition or animation is running.
+    const raw = transitioning || styleHasAnimations(style)
+      ? Number(computedStyleValue(style, "opacity"))
+      : Number(style.opacity);
+    if (Number.isFinite(raw)) opacity *= Math.max(0, Math.min(1, raw));
   }
   opacityCache.set(element, { generation, value: opacity });
   return opacity;
 }
+function meshNear(a, b) {
+  return Math.abs(a - b) <= 0.05;
+}
+
+function meshBoxMatch(cached, box) {
+  return meshNear(cached.x, box.x) && meshNear(cached.y, box.y)
+    && meshNear(cached.w, box.width) && meshNear(cached.h, box.height)
+    && meshNear(cached.cw, box.contentBox.width) && meshNear(cached.ch, box.contentBox.height)
+    && meshNear(cached.bt, box.border.top) && meshNear(cached.br, box.border.right)
+    && meshNear(cached.bb, box.border.bottom) && meshNear(cached.bl, box.border.left);
+}
+
+// Box-shadow and background transitions still change tessellation. Transform and
+// opacity do not: replay applies the live matrix and scales stored alpha.
+function meshTransitionsSettled(style) {
+  const state = getStyleTransitionState(style);
+  if (!state?.transitions?.size) return true;
+  const now = performance.now();
+  for (const [property, transition] of state.transitions) {
+    if (property === "opacity" || property === "transform" || property === "perspective"
+      || property === "transformOrigin" || property === "perspectiveOrigin") continue;
+    if (now < transition.started + transition.duration) return false;
+  }
+  return true;
+}
+
 function withOpacity(color, opacity) {
   if (!color || opacity === 1) return color;
   return [color[0], color[1], color[2], color[3] * opacity];
@@ -389,10 +744,27 @@ export function projectBoxPoint(box, x, y) {
   return createBoxProjector([box])(box, x, y);
 }
 
+function samplesComputedStyle(style, property) {
+  if (styleHasAnimations(style)) return true;
+  const transition = getStyleTransitionState(style)?.transitions.get(property);
+  return !!transition && performance.now() < transition.started + transition.duration;
+}
+
+function paintStyleValue(style, property) {
+  return samplesComputedStyle(style, property) ? computedStyleValue(style, property) : style[property];
+}
+
 function boxTransformMatrix(box) {
-  const source = computedStyleValue(box.element.style, "transform");
+  const style = box.element.style;
+  const source = samplesComputedStyle(style, "transform")
+    ? computedStyleValue(style, "transform")
+    : style.transform;
   if (!source || source === "none") return IDENTITY_MATRIX;
-  const origin = transformOrigin(computedStyleValue(box.element.style, "transformOrigin"), box.width, box.height);
+  const origin = transformOrigin(
+    samplesComputedStyle(style, "transformOrigin") ? computedStyleValue(style, "transformOrigin") : style.transformOrigin,
+    box.width,
+    box.height,
+  );
   const matrix = parseTransform(source, box.width, box.height);
   return multiply4(
     multiply4(
@@ -408,11 +780,16 @@ function boxTransformMatrix(box) {
 
 function childPerspectiveMatrix(box) {
   const style = box.element.style;
-  const source = computedStyleValue(style, "perspective");
+  const source = samplesComputedStyle(style, "perspective")
+    ? computedStyleValue(style, "perspective")
+    : style.perspective;
   if (!source || source === "none") return IDENTITY_MATRIX;
   const distance = lengthValue(String(source));
   if (distance <= 0) throw new TypeError("perspective must be positive");
-  const parts = String(computedStyleValue(style, "perspectiveOrigin") ?? "50% 50%").trim().split(/\s+/);
+  const originSource = samplesComputedStyle(style, "perspectiveOrigin")
+    ? computedStyleValue(style, "perspectiveOrigin")
+    : style.perspectiveOrigin;
+  const parts = String(originSource ?? "50% 50%").trim().split(/\s+/);
   const origin = [lengthValue(parts[0] ?? "50%", box.width), lengthValue(parts[1] ?? "50%", box.height)];
   const perspective = identity4();
   perspective[3][2] = -1 / distance;
@@ -635,14 +1012,14 @@ function paintOrder(boxes) {
   const result = [];
   const visit = (siblings) => {
     siblings.sort((a, b) => {
-      const az = Number(computedStyleValue(a.element.style, "zIndex")), bz = Number(computedStyleValue(b.element.style, "zIndex"));
+      const az = Number(paintStyleValue(a.element.style, "zIndex")), bz = Number(paintStyleValue(b.element.style, "zIndex"));
       return (Number.isFinite(az) ? az : 0) - (Number.isFinite(bz) ? bz : 0);
     });
     for (const box of siblings) {
       result.push({ box, after: false });
       const descendants = children.get(box.element);
       if (descendants) visit(descendants);
-      if (/^0 0 0 \d+(?:\.\d+)?px .+$/.test(String(computedStyleValue(box.element.style, "boxShadow") ?? ""))) {
+      if (/^0 0 0 \d+(?:\.\d+)?px .+$/.test(String(paintStyleValue(box.element.style, "boxShadow") ?? ""))) {
         result.push({ box, after: true });
       }
     }
@@ -655,7 +1032,8 @@ function cachedPaintOrder(document, boxes) {
   if (!document) return paintOrder(boxes);
   const state = documentState(document);
   const cached = paintOrders.get(document);
-  if (cached?.generation === state.sceneGeneration && cached.elements.length === boxes.length
+  const orderGeneration = state.paintOrderGeneration ?? 0;
+  if (cached?.generation === orderGeneration && cached.elements.length === boxes.length
       && cached.elements.every((element, index) => element === boxes[index].element)) {
     for (const entry of cached.entries) entry.box = boxes[entry.index];
     return cached.entries;
@@ -663,7 +1041,7 @@ function cachedPaintOrder(document, boxes) {
   const entries = paintOrder(boxes);
   const indices = new Map(boxes.map((box, index) => [box.element, index]));
   paintOrders.set(document, {
-    generation: state.sceneGeneration,
+    generation: orderGeneration,
     elements: boxes.map(box => box.element),
     entries: entries.map(({ box, after }) => ({ index: indices.get(box.element), box, after })),
   });
@@ -745,12 +1123,16 @@ function roundedRectPolygon(rect, radius, corners = null) {
 // Display-list v3 stores screen-space triangles. JS performs the small per-box
 // CSS matrix/projection work; Rust only expands records and submits GPU geometry.
 export function buildTransformedDisplayList(boxes, width, height, overlays = []) {
+  resetReplayArena();
   const document = boxes[0]?.element.ownerDocument;
   const documentData = document ? documentState(document) : null;
   const generation = documentData?.staticPaintGeneration ?? documentData?.sceneGeneration ?? 0;
   const transitionGeneration = documentData?.transitionFrameGeneration ?? 0;
   const cacheable = !!document;
-  const fullSceneCacheable = cacheable && !boxes.some(box => box.element.localName === 'canvas' || box.element.localName === 'video');
+  // Video frames update the existing GPU texture in place. Keeping a <video>
+  // in the tree must not disable the transformed-scene cache — that rebuilt
+  // the whole carousel on every decoded frame.
+  const fullSceneCacheable = cacheable && !boxes.some(box => box.element.localName === 'canvas');
   if (process.env.NASTY_BENCH_PROFILE) {
     paintSegmentDiagnostics.frames++;
     if (cacheable) paintSegmentDiagnostics.cacheable++;
@@ -759,7 +1141,22 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   for (const element of activeTransitionElements ?? []) {
     if (!hasActiveStyleTransition(element.style)) activeTransitionElements.delete(element);
   }
-  const hasActiveTransitions = !!activeTransitionElements?.size;
+  // Pose/class updates mark live chrome. After a few quiet frames, bake them
+  // back into the scroll-scene base so idle presents can hit the cache.
+  const livePaintElements = documentData?.livePaintElements;
+  if (livePaintElements?.size && !documentData.livePaintDirty && !activeTransitionElements?.size) {
+    documentData.livePaintSettleFrames = (documentData.livePaintSettleFrames ?? 0) + 1;
+    if (documentData.livePaintSettleFrames >= 3) {
+      livePaintElements.clear();
+      documentData.livePaintSettleFrames = 0;
+      documentData.scrollSceneContentGeneration = (documentData.scrollSceneContentGeneration ?? 0) + 1;
+    }
+  } else if (documentData?.livePaintDirty) {
+    documentData.livePaintDirty = false;
+    documentData.livePaintSettleFrames = 0;
+  }
+  const hasLivePaint = !!livePaintElements?.size;
+  const hasActiveTransitions = !!activeTransitionElements?.size || hasLivePaint;
   const window = documentData?.defaultView ?? null;
   const scrollLayerState = window && document
     ? prepareScrollLayers(window, document, boxes)
@@ -894,7 +1291,18 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   const sceneParts = [];
   let commandCount = 0;
   const viewport = { x: 0, y: 0, width, height };
-  const projectPoint = createBoxProjector(boxes);
+  const projectPointReal = createBoxProjector(boxes);
+  // Capture mode records document-space vertices for elements that share
+  // `captureMatrix`, so a later pose can reproject without re-tessellating.
+  const paintMode = { capture: false, captureMatrix: null };
+  const projectPoint = (box, x, y) => {
+    if (paintMode.capture && projectPointReal.matrixFor(box) === paintMode.captureMatrix) {
+      return { x, y, reciprocalW: 1 };
+    }
+    return projectPointReal(box, x, y);
+  };
+  projectPoint.matrixFor = projectPointReal.matrixFor;
+  projectPoint.widthScaleAt = projectPointReal.widthScaleAt;
   const boxesByElement = new Map(boxes.map((box) => [box.element, box]));
   const transformedAncestors = new WeakMap();
   const hasTransform = element => {
@@ -904,8 +1312,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     // CSS animations (animate-float / sheen / spin) write transform through
     // computedStyleValue only — style.transform stays unset. Read computed so
     // animated ancestors still mark the subtree transformed for culling/clips.
-    const transform = computedStyleValue(style, "transform");
-    const perspective = computedStyleValue(style, "perspective");
+    const transform = samplesComputedStyle(style, "transform") ? computedStyleValue(style, "transform") : style.transform;
+    const perspective = samplesComputedStyle(style, "perspective") ? computedStyleValue(style, "perspective") : style.perspective;
     const own = (transform && transform !== "none")
       || (perspective && perspective !== "none");
     const parent = element.parentElement ?? element.parent;
@@ -927,6 +1335,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     if (cached !== undefined) return cached;
     const parent = element.parentElement ?? element.parent;
     const transitioning = !!activeTransitionElements?.has(element)
+      || !!livePaintElements?.has(element)
       || !!(parent && hasTransitionInPaintAncestry(parent));
     transitionAncestryCache.set(element, transitioning);
     return transitioning;
@@ -950,7 +1359,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     // those polygons froze the sheen window while the vinyl kept floating.
     const clipsTransforming = hasTransform(box.element)
       || clippingAncestors.some(({ ancestor }) => hasTransform(ancestor));
-    const previous = !clipsTransforming ? clipRegionCache.get(box.element) : null;
+    // Layout-mesh capture only bakes clips that share the element's transform.
+    // Outer clips are axis-aligned (or reprojected) when the mesh is replayed.
+    const activeAncestors = paintMode.capture
+      ? clippingAncestors.filter(({ ancestorBox }) => projectPointReal.matrixFor(ancestorBox) === paintMode.captureMatrix)
+      : clippingAncestors;
+    const previous = !clipsTransforming && !paintMode.capture ? clipRegionCache.get(box.element) : null;
     if (previous?.generation === generation && previous.ancestors.length === clippingAncestors.length
       && previous.ancestors.every((entry, index) => {
         const next = clippingAncestors[index];
@@ -958,8 +1372,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
           && entry.width === next.rect.width && entry.height === next.rect.height && entry.radiusText === next.radiusText;
       })) return previous.regions;
     const regions = [];
-    for (const { ancestor, ancestorBox, rect, radiusText } of clippingAncestors) {
-      if (ancestorClips.has(ancestor)) { regions.push(ancestorClips.get(ancestor)); continue; }
+    for (const { ancestor, ancestorBox, rect, radiusText } of activeAncestors) {
+      if (!paintMode.capture && ancestorClips.has(ancestor)) { regions.push(ancestorClips.get(ancestor)); continue; }
       const rawRadius = Number.parseFloat(radiusText) || 0;
       const radius = radiusText.trim().endsWith("%")
         ? Math.min(rect.width, rect.height) * rawRadius / 100
@@ -969,11 +1383,11 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         return { x: projected.x, y: projected.y };
       });
       if (polygon.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))) {
-        ancestorClips.set(ancestor, polygon);
+        if (!paintMode.capture) ancestorClips.set(ancestor, polygon);
         regions.push(polygon);
       }
     }
-    if (!clipsTransforming) {
+    if (!clipsTransforming && !paintMode.capture) {
       clipRegionCache.set(box.element, { generation, ancestors: clippingAncestors.map(({ ancestor, rect, radiusText }) => ({
         ancestor, x: rect.x, y: rect.y, width: rect.width, height: rect.height, radiusText,
       })), regions });
@@ -1090,11 +1504,11 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     if (polygon.some((point) => point === null)) return;
     let visible = polygon;
     if (clipRegions) for (const region of clipRegions) visible = clipConvexPolygon(visible, region);
-    else {
+    else if (!paintMode.capture) {
       const clip = box.clip ? intersection(box.clip, viewport) : viewport;
       visible = clipPolygon(visible, clip);
     }
-    visible = clipConvexPolygon(visible, windowClip);
+    if (!paintMode.capture) visible = clipConvexPolygon(visible, windowClip);
     if (visible.length < 3) return;
     for (let i = 1; i < visible.length - 1; i++) {
       const a = visible[0]; const b = visible[i]; const c = visible[i + 1];
@@ -1106,7 +1520,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     let polygon = points.map(([x, y]) => project(x - box.x, y - box.y));
     if (polygon.some(point => point === null)) return;
     for (const region of clipRegions) polygon = clipConvexPolygon(polygon, region);
-    polygon = clipConvexPolygon(polygon, windowClip);
+    if (!paintMode.capture) polygon = clipConvexPolygon(polygon, windowClip);
     for (let index = 1; index < polygon.length - 1; index++) {
       const a = polygon[0], b = polygon[index], c = polygon[index + 1];
       values.push(0, a.x, a.y, b.x, b.y, c.x, c.y, color[0], color[1], color[2], color[3]);
@@ -1260,10 +1674,85 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     commandCount += 1;
     addVisibleAncestors(hostElement);
   };
+  const clipsOverflowStyle = (style) => [style?.overflow, style?.overflowX, style?.overflowY]
+    .some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll");
+  // Same-matrix overflow is baked into the mesh. A later pose only needs to know
+  // those document-space rects did not move.
+  const sameMatrixClipList = (element, matrix) => {
+    const clips = [];
+    for (let ancestor = element.parentElement ?? element.parent; ancestor; ancestor = ancestor.parentElement ?? ancestor.parent) {
+      const ancestorBox = boxesByElement.get(ancestor);
+      if (!ancestorBox || projectPointReal.matrixFor(ancestorBox) !== matrix) continue;
+      const ancestorStyle = ancestor.style;
+      if (!clipsOverflowStyle(ancestorStyle)) continue;
+      const rect = ancestorBox.paddingBox ?? ancestorBox.borderBox;
+      clips.push({ x: rect.x, y: rect.y, w: rect.width, h: rect.height, radius: ancestorStyle.borderRadius ?? "" });
+    }
+    return clips;
+  };
+  const sameMatrixClipsMatch = (element, matrix, clips) => {
+    let index = 0;
+    for (let ancestor = element.parentElement ?? element.parent; ancestor; ancestor = ancestor.parentElement ?? ancestor.parent) {
+      const ancestorBox = boxesByElement.get(ancestor);
+      if (!ancestorBox || projectPointReal.matrixFor(ancestorBox) !== matrix) continue;
+      const ancestorStyle = ancestor.style;
+      if (!clipsOverflowStyle(ancestorStyle)) continue;
+      const rect = ancestorBox.paddingBox ?? ancestorBox.borderBox;
+      const clip = clips?.[index++];
+      if (!clip || !meshNear(clip.x, rect.x) || !meshNear(clip.y, rect.y)
+        || !meshNear(clip.w, rect.width) || !meshNear(clip.h, rect.height)
+        || clip.radius !== (ancestorStyle.borderRadius ?? "")) return false;
+    }
+    return index === (clips?.length ?? 0);
+  };
+  // Elements that share a world matrix share outer clips. IDENTITY_MATRIX is one
+  // object for every untransformed branch, so it is not a cache key.
+  const outerClipByMatrix = new Map();
+  const outerClipsFor = (box, matrix) => {
+    if (matrix !== IDENTITY_MATRIX) {
+      const cached = outerClipByMatrix.get(matrix);
+      if (cached) return cached;
+    }
+    let rect = { x: 0, y: 0, width, height };
+    const polygons = [];
+    // The rounded window is almost an AABB. Mesh replay clips to that box on the
+    // fast path and only tests the quarter-circle corners for triangles that
+    // reach them, instead of running the rounded polygon against every pose triangle.
+    for (let ancestor = box.element.parentElement ?? box.element.parent; ancestor; ancestor = ancestor.parentElement ?? ancestor.parent) {
+      const ancestorStyle = ancestor.style;
+      if (!ancestorStyle) continue;
+      const clipsOverflow = [ancestorStyle.overflow, ancestorStyle.overflowX, ancestorStyle.overflowY]
+        .some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll");
+      if (!clipsOverflow) continue;
+      const ancestorBox = boxesByElement.get(ancestor);
+      if (!ancestorBox) continue;
+      const ancestorMatrix = projectPointReal.matrixFor(ancestorBox);
+      if (ancestorMatrix === matrix) continue;
+      const pad = ancestorBox.paddingBox ?? ancestorBox.borderBox;
+      if (ancestorMatrix === IDENTITY_MATRIX) {
+        rect = intersection(rect, { x: pad.x, y: pad.y, width: pad.width, height: pad.height });
+        continue;
+      }
+      const radiusText = String(ancestorStyle.borderRadius ?? "");
+      const raw = Number.parseFloat(radiusText) || 0;
+      const radius = radiusText.trim().endsWith("%") ? Math.min(pad.width, pad.height) * raw / 100 : raw;
+      const polygon = roundedRectPolygon(pad, radius).map((point) => {
+        const projected = projectPointReal(ancestorBox, point.x, point.y);
+        return { x: projected.x, y: projected.y };
+      });
+      if (polygon.length >= 3 && polygon.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))) polygons.push(polygon);
+    }
+    const result = { rect, polygons };
+    if (matrix !== IDENTITY_MATRIX) outerClipByMatrix.set(matrix, result);
+    return result;
+  };
+  const paintProfile = process.env.NASTY_BENCH_PROFILE ? { n: 0, ms: 0, image: 0, gradient: 0, skip: 0, replay: 0, capture: 0, keyMs: 0, clipMs: 0, replayMs: 0, opacityMs: 0, transformMs: 0 } : null;
   for (const entry of cachedPaintOrder(document, paintBoxes)) {
+    const paintStarted = paintProfile ? performance.now() : 0;
     const { box } = entry;
     const element = box.element;
     const after = !!entry.after;
+    let captureState = null;
     // Reused scroll base already has static chrome + scroll quads; only emit live
     // transition/animation chrome (and skip re-emitting scroll layer hosts).
     if (reusedScrollBase) {
@@ -1272,18 +1761,29 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     }
     const beforeCommands = commandCount;
     const segmentStart = values.length;
+    const transformStarted = paintProfile ? performance.now() : 0;
     const transformed = hasTransform(element);
+    if (paintProfile) paintProfile.transformMs += performance.now() - transformStarted;
     try {
+    // Far carousel cards are opacity-0 but still in the tree. Skip them, including
+    // the box-shadow ring pass, so a pose frame does not tessellate off-stage covers.
+    const opacityStarted = paintProfile ? performance.now() : 0;
+    const opacity = opacityFor(element, documentData?.paintGeneration ?? 0);
+    if (paintProfile) paintProfile.opacityMs += performance.now() - opacityStarted;
+    if (opacity <= 0.001) {
+      if (paintProfile) paintProfile.skip++;
+      continue;
+    }
     if (!after && !transformed) {
       const clip = intersection(box.clip ?? viewport, viewport);
       if (box.x + box.width <= clip.x || box.y + box.height <= clip.y
           || box.x >= clip.x + clip.width || box.y >= clip.y + clip.height) continue;
     }
-    const status = clipStatus(box, transformed);
     const segmentCacheable = cacheable && !hasTransitionInPaintAncestry(element);
     const previousSegment = segmentCacheable && element.localName !== "canvas" && element.localName !== "video"
       ? paintSegments.get(element)?.[after ? "after" : "before"] : null;
     if (previousSegment?.generation === generation && previousSegment.width === width && previousSegment.height === height) {
+      const status = clipStatus(box, transformed);
       if (previousSegment.x === box.x && previousSegment.y === box.y
         && previousSegment.boxWidth === box.width && previousSegment.boxHeight === box.height
         && previousSegment.status === status
@@ -1313,10 +1813,59 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       }
     }
     if (process.env.NASTY_BENCH_PROFILE) paintSegmentDiagnostics.missed++;
+    // Video geometry is excluded from the screen-space segment cache because the
+    // texture updates in place. Pose/animation frames miss that cache because
+    // the transform changes. Both replay a layout-space mesh instead.
+    if (transformed && process.env.NASTY_LAYOUT_MESH !== "0"
+      && (element.localName === "video" || !segmentCacheable)) {
+      const matrix = projectPointReal.matrixFor(box);
+      const slot = after ? "after" : "before";
+      const keyStarted = paintProfile ? performance.now() : 0;
+      const image = elementState(element).image ?? elementState(element).video?.image;
+      const cached = layoutMeshCache.get(element)?.[slot];
+      // While a shadow or background is still interpolating, tessellation changes.
+      // Leave the mesh unset so the next settled frame captures the target paint.
+      const stable = meshTransitionsSettled(element.style);
+      const hit = stable && cached && cached.generation === generation
+        && cached.revision === styleMeshRevision(element.style)
+        && cached.opacity > 1e-3
+        && cached.textureId === (image?.textureId ?? 0)
+        && cached.imageW === (image?.width ?? 0)
+        && cached.imageH === (image?.height ?? 0)
+        && meshBoxMatch(cached, box)
+        && sameMatrixClipsMatch(element, matrix, cached.clips);
+      if (paintProfile) paintProfile.keyMs += performance.now() - keyStarted;
+      if (hit) {
+        const clipStarted = paintProfile ? performance.now() : 0;
+        const clips = outerClipsFor(box, matrix);
+        if (paintProfile) paintProfile.clipMs += performance.now() - clipStarted;
+        const replayStarted = paintProfile ? performance.now() : 0;
+        const replayed = replayLayoutMesh(cached, matrix, opacity / cached.opacity, clips.rect, clips.polygons, windowClip, windowRadius, width, height);
+        if (paintProfile) paintProfile.replayMs += performance.now() - replayStarted;
+        if (replayed) {
+          if (replayed.commands) {
+            pushScenePart(replayed.part, element, replayed.commands);
+            commandCount += replayed.commands;
+            addVisibleAncestors(element);
+          }
+          if (paintProfile) paintProfile.replay++;
+          continue;
+        }
+      }
+      if (stable && (after || layoutMeshElementOk(element, element.style))) {
+        captureState = { opacity, slot, matrix, partsBefore: sceneParts.length };
+        paintMode.capture = true;
+        paintMode.captureMatrix = matrix;
+      }
+    }
     if (entry.after) {
-      const ring = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(String(computedStyleValue(box.element.style, "boxShadow") ?? ""));
+      const ring = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(String(paintStyleValue(box.element.style, "boxShadow") ?? ""));
+      if (!ring) {
+        values = [];
+        continue;
+      }
       const spread = Number(ring[1]);
-      const color = withOpacity(parseColor(ring[2]), opacityFor(box.element, documentData?.paintGeneration ?? 0));
+      const color = withOpacity(parseColor(ring[2]), opacity);
       const project = (x, y) => {
         const point = projectPoint(box, box.x + x, box.y + y);
         return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
@@ -1368,11 +1917,13 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       const point = projectPoint(box, box.x + x, box.y + y);
       return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
     };
-    const corners = [
+    const corners = paintMode.capture ? null : [
       project(0, 0), project(box.width, 0),
       project(box.width, box.height), project(0, box.height),
     ];
-    if (corners.every(Boolean)) {
+    if (paintMode.capture) {
+      addVisibleAncestors(box.element);
+    } else if (corners.every(Boolean)) {
       let clippedBounds = corners.map((point) => ({ x: point.x, y: point.y }));
       for (const region of clipRegions) clippedBounds = clipConvexPolygon(clippedBounds, region);
       const visible = clippedBounds.length >= 3
@@ -1396,7 +1947,6 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       values = [];
       continue;
     }
-    const opacity = opacityFor(box.element, documentData?.paintGeneration ?? 0);
     const borderCorners = cornerRadiiFor(style, box.borderBox.width, box.borderBox.height);
     const radius = uniformCornerRadius(borderCorners) || Math.max(borderCorners.tl, borderCorners.tr, borderCorners.br, borderCorners.bl);
     const backgroundColor = withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity);
@@ -1534,9 +2084,11 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       const direction = gradient.direction;
       const horizontal = direction === "to right" || direction === "to left";
       const reverse = direction === "to top" || direction === "to left";
-      // A dense set of GPU solid-color strips keeps gradient composition on the
-      // normal WGPU path while exposing a standard CSS linear-gradient value.
-      const strips = 64;
+      // Static gradients stay dense; their meshes are segment-cached. Transformed
+      // chrome (carousel cards) is rebuilt every frame, and 64 rounded strips
+      // per gradient blew the refresh budget. 12 strips is enough for a fade
+      // and keeps pose/video frames on the display rate.
+      const strips = transformed ? 12 : 64;
       for (let strip = 0; strip < strips; strip++) {
         const start = strip / strips, end = (strip + 1) / strips;
         const a = reverse ? 1 - end : start;
@@ -1627,9 +2179,9 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         // Corners are already in screen space (including CSS transforms). Clip in
         // that same space: viewport first, then overflow/window regions. Using the
         // untransformed content box here used to chop floating/spinning images.
-        let clipped = clipTexturedPolygon(corners, viewport);
+        let clipped = paintMode.capture ? corners : clipTexturedPolygon(corners, viewport);
         for (const region of clipRegions) clipped = clipConvexPolygon(clipped, region);
-        clipped = clipConvexPolygon(clipped, windowClip);
+        if (!paintMode.capture) clipped = clipConvexPolygon(clipped, windowClip);
         if (clipped.length >= 3) {
           const triangles = [];
           for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
@@ -1687,6 +2239,54 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     if (values.length) pushScenePart(Float32Array.from(values), element, commandCount - beforeCommands);
     values = [];
     } finally {
+      if (captureState) {
+        paintMode.capture = false;
+        paintMode.captureMatrix = null;
+        let captured = null;
+        while (sceneParts.length > captureState.partsBefore) {
+          captured = sceneParts.pop();
+          scenePartOwners.pop();
+          commandCount -= scenePartCommands.pop() || 0;
+        }
+        values = [];
+        const part = captured ?? new Float32Array(0);
+        if (layoutStreamReplayable(part)) {
+          const image = elementState(element).image ?? elementState(element).video?.image;
+          const entries = layoutMeshCache.get(element) ?? {};
+          const stored = {
+            generation,
+            revision: styleMeshRevision(element.style),
+            opacity: captureState.opacity,
+            values: part,
+            x: box.x, y: box.y, w: box.width, h: box.height,
+            cw: box.contentBox.width, ch: box.contentBox.height,
+            bt: box.border.top, br: box.border.right, bb: box.border.bottom, bl: box.border.left,
+            textureId: image?.textureId ?? 0,
+            imageW: image?.width ?? 0,
+            imageH: image?.height ?? 0,
+            clips: sameMatrixClipList(element, captureState.matrix),
+          };
+          entries[captureState.slot] = stored;
+          layoutMeshCache.set(element, entries);
+          const clips = outerClipsFor(box, captureState.matrix);
+          const replayed = replayLayoutMesh(stored, captureState.matrix, 1, clips.rect, clips.polygons, windowClip, windowRadius, width, height);
+          if (replayed?.commands) {
+            pushScenePart(replayed.part, element, replayed.commands);
+            commandCount += replayed.commands;
+            addVisibleAncestors(element);
+          }
+          if (paintProfile) paintProfile.capture++;
+        }
+        captureState = null;
+      }
+      if (paintProfile && paintStarted) {
+        const dt = performance.now() - paintStarted;
+        paintProfile.n++;
+        paintProfile.ms += dt;
+        if (elementState(element).image || elementState(element).video?.image) paintProfile.image++;
+        const backgroundImage = element.style?.backgroundImage;
+        if (typeof backgroundImage === "string" && backgroundImage.includes("gradient")) paintProfile.gradient++;
+      }
       if (!reusedScrollBase && !after && scrollLayers.has(element)) {
         const clip = intersection(box.clip ?? viewport, viewport);
         if (box.x + box.width > clip.x && box.y + box.height > clip.y
@@ -1701,6 +2301,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       }
     }
   }
+  const assembleStarted = process.env.NASTY_BENCH_PROFILE ? performance.now() : 0;
   const sceneLength = 2 + sceneParts.reduce((total, part) => total + part.length, 0);
   const scene = new Float32Array(sceneLength);
   scene[0] = 5;
@@ -1710,9 +2311,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     scene.set(part, sceneOffset);
     sceneOffset += part.length;
   }
+  if (process.env.NASTY_BENCH_PROFILE && paintProfile) paintProfile.assemble = performance.now() - assembleStarted;
+  if (process.env.NASTY_BENCH_PROFILE && paintProfile) paintProfile.sceneFloats = sceneLength;
+  if (process.env.NASTY_BENCH_PROFILE && paintProfile) (globalThis.__nastyPaintLog ??= []).push(paintProfile.ms);
   const compose = overlays => {
   if (process.env.NASTY_BENCH_PROFILE && paintSegmentDiagnostics.frames % 30 === 0) {
-    console.error("NASTY_SEGMENTS", { ...paintSegmentDiagnostics, generation, elements: boxes.length, paintElements: paintBoxes.length });
+    console.error("NASTY_SEGMENTS", { ...paintSegmentDiagnostics, generation, elements: boxes.length, paintElements: paintBoxes.length, paintProfile });
     Object.assign(paintSegmentDiagnostics, { frames: 0, cacheable: 0, exact: 0, translated: 0, outside: 0, missed: 0 });
   }
   values = [5, 0];
@@ -1767,7 +2371,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         stripsAnimated = true;
         continue;
       }
-      baseParts.push(sceneParts[index]);
+      baseParts.push(retainedScenePart(sceneParts[index]));
       if (!isLayer) baseCommands += scenePartCommands[index] || 0;
     }
     // When reusing a prior stripped base, keep its command total for static chrome.

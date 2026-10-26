@@ -28,6 +28,18 @@ export function getStyleTransitionState(style) {
   return styleTransitionStates.get(style);
 }
 
+// Pose updates rewrite transform and opacity every frame. Layout meshes key off
+// this counter instead, and it stays put for those properties.
+export function styleMeshRevision(style) {
+  return styleTransitionStates.get(style)?.meshRevision ?? 0;
+}
+
+// Animations sample transform through computed style only. Callers can skip that
+// walk when this element has never had an animation attached.
+export function styleHasAnimations(style) {
+  return !!styleTransitionStates.get(style)?.animations?.size;
+}
+
 export function computedStyleValue(style, property) {
   const state = styleTransitionStates.get(style);
   if (!state) return style[property];

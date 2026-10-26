@@ -103,6 +103,7 @@ export class Window extends native.Window {
   #dragHitTestY = NaN;
   #dragHitTestControlGeneration = -1;
   #dragHitTestGeneration = -1;
+  #dragHitTestTransformGeneration = -1;
   #dragHitTestGeometryGeneration = -1;
   #presentationTimer = null;
   #documentPresented = false;
@@ -255,7 +256,8 @@ export class Window extends native.Window {
     const state = document ? documentState(document) : null;
     if (this.#dragHitTestDocument === document && this.#dragHitTestX === position.x && this.#dragHitTestY === position.y
       && this.#dragHitTestControlGeneration === state?.controlGeometryGeneration
-      && this.#dragHitTestGeneration === state?.hitTestGeneration) return;
+      && this.#dragHitTestGeneration === state?.hitTestGeneration
+      && this.#dragHitTestTransformGeneration === (state?.hitTestTransformGeneration ?? 0)) return;
     const target = document?.elementFromPoint(position.x, position.y) ?? null;
     const blocked = this.#dragAnywhere !== false && blocksWindowDrag(target);
     this.#dragHitTestDocument = document;
@@ -263,6 +265,7 @@ export class Window extends native.Window {
     this.#dragHitTestY = position.y;
     this.#dragHitTestControlGeneration = state?.controlGeometryGeneration ?? -1;
     this.#dragHitTestGeneration = state?.hitTestGeneration ?? -1;
+    this.#dragHitTestTransformGeneration = state?.hitTestTransformGeneration ?? 0;
     if (blocked === this.#dragBlocked) return;
     this.#dragBlocked = blocked;
     super.setDragBlocked(blocked);
@@ -460,6 +463,7 @@ export class Window extends native.Window {
       this.#dragHitTestY = fields.clientY;
       this.#dragHitTestControlGeneration = state.controlGeometryGeneration;
       this.#dragHitTestGeneration = state.hitTestGeneration;
+      this.#dragHitTestTransformGeneration = state.hitTestTransformGeneration ?? 0;
       if (blocked !== this.#dragBlocked) {
         this.#dragBlocked = blocked;
         super.setDragBlocked(blocked);
@@ -825,6 +829,27 @@ export class Window extends native.Window {
     catch (error) { if (super.closed) this.#stopMedia(); throw error; }
   }
   presentDocument() {
+    if (this.#document) {
+      const doc = documentState(this.#document);
+      doc.presentId = (doc.presentId ?? 0) + 1;
+      // Transition samples request the next frame. Apply that once, before
+      // paint, so a pose cannot invalidate the opacity cache mid-walk.
+      if (doc.needsTransitionFrame) {
+        doc.needsTransitionFrame = false;
+        doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
+        doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
+        doc.transitionFrameGeneration = (doc.transitionFrameGeneration ?? 0) + 1;
+        if (doc.needsTransformFrame) {
+          doc.needsTransformFrame = false;
+          doc.hitTestTransformGeneration = (doc.hitTestTransformGeneration ?? 0) + 1;
+        }
+        if (doc.needsHitStructureFrame) {
+          doc.needsHitStructureFrame = false;
+          doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
+          doc.paintOrderGeneration = (doc.paintOrderGeneration ?? 0) + 1;
+        }
+      }
+    }
     const benchmarkStages = process.env.NASTY_BENCH_PROFILE ? {} : null;
     let benchmarkStageStart = benchmarkStages ? performance.now() : 0;
     const benchmarkMark = name => {
@@ -1404,6 +1429,22 @@ const LAYOUT_STYLE_PROPERTIES = new Set([
   "textAlign", "textOverflow", "textTransform",
 ]);
 const HIT_TEST_TRANSITION_PROPERTIES = new Set(["transform", "perspective", "zIndex", "display", "visibility"]);
+// These do not change tessellated layout-space meshes. Carousel poses rewrite
+// them every frame; bumping the mesh revision here would recapture every card.
+const MESH_REVISION_IGNORED = new Set([
+  "opacity", "transform", "transformOrigin", "perspective", "perspectiveOrigin",
+  "zIndex", "cursor", "pointerEvents",
+  "transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction",
+  "animation", "animationName", "animationDuration", "animationTimingFunction",
+  "animationDelay", "animationIterationCount", "animationDirection", "animationFillMode", "animationPlayState",
+]);
+// Hit order and clip shape. Transform values are not in here: a pose frame only
+// needs a new projector, not a rebuilt stacking list.
+const HIT_STRUCTURE_PROPERTIES = new Set([
+  "display", "visibility", "pointerEvents", "position",
+  "overflow", "overflowX", "overflowY", "borderRadius",
+  "borderTopLeftRadius", "borderTopRightRadius", "borderBottomRightRadius", "borderBottomLeftRadius",
+]);
 
 const styleData = new WeakMap();
 function refreshStyleValues(state) {
@@ -1416,12 +1457,36 @@ function refreshStyleValues(state) {
   const keys = [...new Set([...Object.keys(state.values), ...Object.keys(next)])]
     .sort((a, b) => Number(transitionControls.has(b) || animationControls.has(b)) - Number(transitionControls.has(a) || animationControls.has(a)));
   const changed = new Set();
+  let hitStructure = false;
+  let transformMoved = false;
+  let orderMoved = false;
+  let paintOrderChanged = false;
   // Transition rules need to be visible before color or opacity targets change.
   if (next.transition !== undefined) state.values.transition = next.transition;
   for (const property of keys) {
     const before = state.values[property], after = next[property];
     if (Object.is(before, after)) continue;
     changed.add(property);
+    if (property === "transform" || property === "perspective" || property === "transformOrigin" || property === "perspectiveOrigin") {
+      const wasNone = before === undefined || before === "" || before === "none";
+      const nowNone = after === undefined || after === "" || after === "none";
+      if (wasNone !== nowNone) hitStructure = true;
+      transformMoved = true;
+    } else if (property === "opacity") {
+      const wasClear = before === undefined || Number(before) >= 1;
+      const nowClear = after === undefined || Number(after) >= 1;
+      if (wasClear !== nowClear) hitStructure = true;
+    } else if (property === "zIndex") {
+      const had = before !== undefined && before !== "" && before !== "auto";
+      const has = after !== undefined && after !== "" && after !== "auto";
+      if (had !== has) hitStructure = true;
+      else orderMoved = true;
+      paintOrderChanged = true;
+    } else if (HIT_STRUCTURE_PROPERTIES.has(property)) {
+      hitStructure = true;
+      if (property === "zIndex" || property === "display" || property === "position") paintOrderChanged = true;
+    }
+    if (property === "boxShadow" || property === "zIndex") paintOrderChanged = true;
     if (after !== undefined) {
       if (isAnimationControlProperty(property) || animationControls.has(property)) {
         state.values[property] = after;
@@ -1439,6 +1504,18 @@ function refreshStyleValues(state) {
     }
   }
   syncCssAnimations(state);
+  for (const property of changed) {
+    if (MESH_REVISION_IGNORED.has(property)) continue;
+    state.meshRevision = (state.meshRevision ?? 0) + 1;
+    break;
+  }
+  const doc = state.element?.document ? documentState(state.element.document) : null;
+  if (doc) {
+    if (transformMoved || hitStructure) doc.hitTestTransformGeneration = (doc.hitTestTransformGeneration ?? 0) + 1;
+    if (hitStructure) doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
+    if (orderMoved) doc.hitTestOrderGeneration = (doc.hitTestOrderGeneration ?? 0) + 1;
+    if (paintOrderChanged || hitStructure) doc.paintOrderGeneration = (doc.paintOrderGeneration ?? 0) + 1;
+  }
   return changed;
 }
 
@@ -1990,9 +2067,16 @@ export class Element extends EventTarget {
     video.frameRequest = (async () => {
       try {
         if (!this.document.defaultView) throw new Error("video requires an attached window");
-        const box = this.getBoundingClientRect();
-        const maxEdge = Math.max(1, Math.ceil(Math.max(box.width, box.height)));
-        const frame = await decodeVideoFrame(video.source, video.currentTime, maxEdge, seek);
+        // Layout size is stable across frames. Measuring every frame forced a
+        // full box walk on the decode cadence and kept playback off the refresh.
+        const docState = documentState(this.document);
+        const sizeGeneration = docState.staticPaintGeneration ?? 0;
+        if (video.maxEdgeGeneration !== sizeGeneration || !video.maxEdge) {
+          const box = this.getBoundingClientRect();
+          video.maxEdge = Math.max(1, Math.ceil(Math.max(box.width, box.height) || 1));
+          video.maxEdgeGeneration = sizeGeneration;
+        }
+        const frame = await decodeVideoFrame(video.source, video.currentTime, video.maxEdge, seek);
         if (token !== video.token || video.paused) return;
         const view = this.document.defaultView;
         if (!view || view.closed) return;
@@ -2253,9 +2337,16 @@ export class Element extends EventTarget {
 
   _styleChanged(property, inheritedFontChanged = false) {
     const doc = documentState(this.document);
-    // Scroll-texture descendants only dirty their host bake. Unrelated chrome
-    // (carousel, progress, etc.) must still invalidate the reusable scroll scene.
-    if (noteScrollLayerPaintChange(this) !== "content") {
+    // Scroll-texture descendants only dirty their host bake. Transform/opacity
+    // class updates (carousel poses) must not throw away the scroll-scene base;
+    // they stay live chrome and are reprojected until the pose settles.
+    const paintOnlyClass = property === "class";
+    if (paintOnlyClass) {
+      doc.livePaintElements ??= new Set();
+      doc.livePaintElements.add(this);
+      doc.livePaintDirty = true;
+      doc.transitionFrameGeneration = (doc.transitionFrameGeneration ?? 0) + 1;
+    } else if (noteScrollLayerPaintChange(this) !== "content") {
       doc.pendingScrollSceneInvalidation = true;
     }
     // Image decode completion clears only that img's paint segment. Bumping
@@ -2266,8 +2357,14 @@ export class Element extends EventTarget {
       doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
       if (property === undefined || inheritedFontChanged || LAYOUT_STYLE_PROPERTIES.has(property)) {
         doc.staticPaintGeneration = (doc.staticPaintGeneration ?? 0) + 1;
+        doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
+        doc.paintOrderGeneration = (doc.paintOrderGeneration ?? 0) + 1;
+      } else if (property !== "class") {
+        // Class updates record hit-test and paint-order generations from the
+        // properties that actually changed. A transform pose must not rebuild
+        // stacking for the whole document.
+        doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
       }
-      doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
     }
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
     doc.paintDirtyElements ??= new Set();
@@ -2297,16 +2394,20 @@ export class Element extends EventTarget {
     if (LAYOUT_STYLE_PROPERTIES.has(property)) {
       doc.pendingScrollSceneInvalidation = true;
     }
-    doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
-    doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
-    doc.transitionFrameGeneration = (doc.transitionFrameGeneration ?? 0) + 1;
+    doc.needsTransitionFrame = true;
+    if (property === "transform" || property === "perspective" || property === "transformOrigin" || property === "perspectiveOrigin") {
+      doc.needsTransformFrame = true;
+    } else if (LAYOUT_STYLE_PROPERTIES.has(property) || HIT_TEST_TRANSITION_PROPERTIES.has(property)) {
+      doc.needsHitStructureFrame = true;
+    }
     doc.activeTransitionElements ??= new Set();
     doc.activeTransitionElements.add(this);
     doc.paintDirtyElements ??= new Set();
     doc.paintDirtyElements.add(this);
-    if (LAYOUT_STYLE_PROPERTIES.has(property) || HIT_TEST_TRANSITION_PROPERTIES.has(property)) {
-      doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
-    }
+    const presentId = doc.presentId ?? 0;
+    const scheduled = presentId !== 0 && elementState(this).transitionScheduleId === presentId;
+    elementState(this).transitionScheduleId = presentId;
+    if (scheduled || !LAYOUT_STYLE_PROPERTIES.has(property)) return;
     if (LAYOUT_STYLE_PROPERTIES.has(property)) {
       doc.dirty = true;
       doc.transitionLayoutDirty = true;
@@ -2502,7 +2603,7 @@ export class Document extends EventTarget {
   get activeElement() { return documentState(this).activeElement ?? this.body; }
   get ownerDocument() { return null; }
   contains(node) { return node === this || this.body.contains(node); }
-  elementFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y)[0] ?? null; }
+  elementFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y, true)[0] ?? null; }
   elementsFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y); }
 
   dispatchEvent(event) {

@@ -726,7 +726,6 @@ function coverCard(index) {
       },
       cardImage(index),
       videoFor(index),
-      d.el("div", { class: "pointer-events-none absolute inset-0 bg-gradient-to-tr from-black/30 via-transparent to-white/25" }),
       d.el("button", {
         class: () => {
           const active = Number(index) === state.player.index && state.player.track;

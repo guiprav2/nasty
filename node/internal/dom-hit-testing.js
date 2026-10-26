@@ -82,10 +82,10 @@ function cornerRadii(box) {
   return radii;
 }
 
-function insideRoundedBox(box, point) {
+function insideRoundedBox(box, point, radii = null) {
   const x = point.x - box.x, y = point.y - box.y;
   if (x < 0 || y < 0 || x >= box.width || y >= box.height) return false;
-  const radii = cornerRadii(box);
+  radii ??= cornerRadii(box);
   const corners = [
     { index: 0, cx: radii[0].x, cy: radii[0].y, rx: radii[0].x, ry: radii[0].y, test: x < radii[0].x && y < radii[0].y },
     { index: 1, cx: box.width - radii[1].x, cy: radii[1].y, rx: radii[1].x, ry: radii[1].y, test: x >= box.width - radii[1].x && y < radii[1].y },
@@ -154,7 +154,7 @@ function isPaintedAndTargetable(element) {
   return true;
 }
 
-export function elementsFromPoint(document, x, y) {
+export function elementsFromPoint(document, x, y, stopAtFirst = false) {
   x = +x;
   y = +y;
   if (!Number.isFinite(x) || !Number.isFinite(y)) return [];
@@ -162,27 +162,51 @@ export function elementsFromPoint(document, x, y) {
   const viewport = state.defaultView?.size() ?? state.viewport;
   if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) return [];
   let cache = state.hitTestCache;
+  const transformGeneration = state.hitTestTransformGeneration ?? 0;
   // Paint-only animation frames do not move hit targets. Geometry mutations,
   // scrolling, and target-affecting style changes have dedicated generations.
+  // Transform poses keep the stacking list and only replace the projector.
   if (!cache || cache.geometryGeneration !== state.geometryGeneration || cache.hitTestGeneration !== state.hitTestGeneration) {
     const boxes = documentBoxes(document);
     cache = {
       geometryGeneration: state.geometryGeneration,
       controlGeometryGeneration: state.controlGeometryGeneration,
       hitTestGeneration: state.hitTestGeneration,
+      transformGeneration,
       boxes,
       byElement: new Map(boxes.map(box => [box.element, box])),
       project: createBoxProjector(boxes),
+      radii: new Map(),
       scrollOffsets: new Map(boxes.map(box => [box.element, [box.element.scrollLeft, box.element.scrollTop]])),
     };
     const order = new Map(boxes.map((box, index) => [box.element, index]));
     const root = document.body;
     cache.paintOrder = boxes.map((box, index) => ({ box, order: index, path: stackingPath(box.element, root, order) }))
       .sort(comparePaintOrder);
+    cache.orderGeneration = state.hitTestOrderGeneration ?? 0;
     state.hitTestCache = cache;
+  } else {
+    if ((cache.orderGeneration ?? 0) !== (state.hitTestOrderGeneration ?? 0)) {
+      for (const entry of cache.paintOrder) {
+        for (const step of entry.path) step.level = Number.parseInt(step.element.style.zIndex, 10) || 0;
+      }
+      cache.paintOrder.sort(comparePaintOrder);
+      cache.orderGeneration = state.hitTestOrderGeneration ?? 0;
+      cache.lastX = NaN;
+      cache.lastComplete = false;
+    }
+    if (cache.transformGeneration !== transformGeneration) {
+      cache.project = createBoxProjector(cache.boxes);
+      cache.transformGeneration = transformGeneration;
+      cache.lastX = NaN;
+      cache.lastComplete = false;
+    }
   }
   const { byElement, project, paintOrder } = cache;
-  if (cache.lastX === x && cache.lastY === y) return cache.lastHits.slice();
+  if (cache.lastX === x && cache.lastY === y && cache.lastHits) {
+    if (cache.lastComplete) return stopAtFirst ? cache.lastHits.slice(0, 1) : cache.lastHits.slice();
+    if (stopAtFirst && cache.lastHits.length) return cache.lastHits.slice(0, 1);
+  }
   const hits = [];
   for (let index = paintOrder.length - 1; index >= 0; index--) {
     const box = paintOrder[index].box;
@@ -190,7 +214,12 @@ export function elementsFromPoint(document, x, y) {
     if (!isPaintedAndTargetable(element) || box.width <= 0 || box.height <= 0 || !insideClip(box, x, y)) continue;
     try {
       const point = projectedLocalPoint(project, box, x, y);
-      if (!point || !insideRoundedBox(box, point)) continue;
+      let radii = cache.radii.get(element);
+      if (!radii) {
+        radii = cornerRadii(box);
+        cache.radii.set(element, radii);
+      }
+      if (!point || !insideRoundedBox(box, point, radii)) continue;
       let clipped = false;
       for (let parent = element.parent; parent; parent = parent.parent) {
         const clipX = clipsOverflow(parent, 'x'), clipY = clipsOverflow(parent, 'y');
@@ -206,7 +235,10 @@ export function elementsFromPoint(document, x, y) {
           break;
         }
       }
-      if (!clipped) hits.push(element);
+      if (!clipped) {
+        hits.push(element);
+        if (stopAtFirst) break;
+      }
     } catch {
       // An invalid transform declaration must not make hit-testing crash.
     }
@@ -214,6 +246,7 @@ export function elementsFromPoint(document, x, y) {
   cache.lastX = x;
   cache.lastY = y;
   cache.lastHits = hits;
+  cache.lastComplete = !stopAtFirst;
   return hits.slice();
 }
 
