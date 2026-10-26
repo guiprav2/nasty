@@ -7,7 +7,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static DEVICE_OPENING: AtomicBool = AtomicBool::new(false);
 
@@ -28,6 +28,7 @@ struct OpenedPcm {
     pcm: PCM,
     rate: u32,
     channels: u16,
+    period_frames: usize,
     kind: SampleKind,
 }
 
@@ -62,27 +63,66 @@ fn is_alsa_plugin_alias(name: &str) -> bool {
 
 fn open_pcm(name: &str) -> std::result::Result<OpenedPcm, String> {
     let open_format = |format| -> std::result::Result<OpenedPcm, String> {
-        let pcm = PCM::new(name, Direction::Playback, true).map_err(|error| error.to_string())?;
+        // Blocking mode: writei waits when the device buffer is full instead of
+        // needing a software sleep gate. Nonblocking + sleep was underrunning
+        // Pulse/PipeWire and producing constant clicks.
+        let pcm = PCM::new(name, Direction::Playback, false).map_err(|error| error.to_string())?;
         let params = HwParams::any(&pcm).map_err(|error| error.to_string())?;
         params.set_access(Access::RWInterleaved).map_err(|error| error.to_string())?;
         params.set_channels_near(2).map_err(|error| error.to_string())?;
         params.set_rate_near(48_000, ValueOr::Nearest).map_err(|error| error.to_string())?;
         params.set_format(format).map_err(|error| error.to_string())?;
-        params.set_period_size_near(512, ValueOr::Nearest).map_err(|error| error.to_string())?;
-        // A period alone does not bound latency: the default device can choose
-        // a multi-second buffer. Keep only four periods in the output device.
-        params.set_buffer_size_near(2048).map_err(|error| error.to_string())?;
+        params.set_period_size_near(1024, ValueOr::Nearest).map_err(|error| error.to_string())?;
+        // ~0.25s at 48k. Large enough to absorb decoder hitches without XRuns;
+        // still bounded so "default" cannot pick a multi-second buffer.
+        params.set_buffer_size_near(12288).map_err(|error| error.to_string())?;
         pcm.hw_params(&params).map_err(|error| error.to_string())?;
         let current = pcm.hw_params_current().map_err(|error| error.to_string())?;
         let rate = current.get_rate().map_err(|error| error.to_string())?;
         let channels = current.get_channels().map_err(|error| error.to_string())? as u16;
+        let period_frames = current.get_period_size().map_err(|error| error.to_string())? as usize;
         pcm.prepare().map_err(|error| error.to_string())?;
         drop(current);
         drop(params);
         let kind = if format == Format::float() { SampleKind::Float } else { SampleKind::I16 };
-        Ok(OpenedPcm { pcm, rate, channels, kind })
+        Ok(OpenedPcm {
+            pcm,
+            rate,
+            channels,
+            period_frames: period_frames.max(1),
+            kind,
+        })
     };
-    open_format(Format::float()).or_else(|_| open_format(Format::s16()))
+    // Prefer s16: Pulse/PipeWire float paths through ALSA are a common source of
+    // periodic clicks; s16 is the widely tested playback format.
+    open_format(Format::s16()).or_else(|_| open_format(Format::float()))
+}
+
+fn publish_playback_frames(
+    state: &QueueState,
+    written_frames: u64,
+    device_queued: u64,
+    pace_origin: Option<Instant>,
+    pace_origin_frames: u64,
+    output_rate: u32,
+) {
+    let from_device = written_frames.saturating_sub(device_queued);
+    // Pulse/PipeWire "default" often reports delay=0 while accepting writes as
+    // fast as the CPU can push them. Cap the published clock by wall time so
+    // A/V sync cannot race ahead of realtime.
+    let playback = if let Some(origin) = pace_origin {
+        let elapsed_frames = (origin.elapsed().as_secs_f64() * output_rate.max(1) as f64).round() as u64;
+        let from_wall = pace_origin_frames.saturating_add(elapsed_frames).min(written_frames);
+        let slack = u64::from(output_rate.max(1) / 10); // ~100ms
+        if from_device > from_wall.saturating_add(slack) {
+            from_wall
+        } else {
+            from_device
+        }
+    } else {
+        from_device
+    };
+    state.playback_frames.store(playback, Ordering::Release);
 }
 
 fn output_loop(
@@ -90,64 +130,82 @@ fn output_loop(
     state: Arc<Mutex<QueueState>>,
     commands: mpsc::Receiver<OutputCommand>,
 ) {
-    let mut f32_samples = vec![0.0f32; 512 * output.channels as usize];
-    let mut i16_samples = vec![0i16; 512 * output.channels as usize];
+    let mut write_frames = output.period_frames.max(1) * 2;
+    let mut f32_samples = vec![0.0f32; write_frames * output.channels as usize];
+    let mut i16_samples = vec![0i16; write_frames * output.channels as usize];
     let mut written_frames = 0u64;
+    let mut pace_origin: Option<Instant> = None;
+    let mut pace_origin_frames = 0u64;
+    let mut short_idle = 0u32;
     loop {
         match commands.try_recv() {
             Ok(OutputCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => break,
             Ok(OutputCommand::Switch(next, ready)) => {
                 output = next;
                 written_frames = 0;
+                pace_origin = None;
+                pace_origin_frames = 0;
+                short_idle = 0;
+                write_frames = output.period_frames.max(1) * 2;
                 state.lock().ok().map(|state| state.playback_frames.store(0, Ordering::Release));
-                f32_samples.resize(512 * output.channels as usize, 0.0);
-                i16_samples.resize(512 * output.channels as usize, 0);
+                f32_samples.resize(write_frames * output.channels as usize, 0.0);
+                i16_samples.resize(write_frames * output.channels as usize, 0);
                 let _ = ready.send(());
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        match output.pcm.wait(Some(20)) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(error) => {
-                if output.pcm.state() == PcmState::XRun {
-                    // The device consumed the queue before underrunning; delay()
-                    // is no longer valid, so publish the final consumed position.
-                    if let Ok(state) = state.lock() {
-                        state.playback_frames.store(written_frames, Ordering::Release);
-                    }
-                }
-                // An underrun also makes wait() fail. Recover here, otherwise
-                // the output thread never reaches writei() and its recovery path.
-                if output.pcm.recover(error.errno(), true).is_err() {
-                    thread::sleep(Duration::from_millis(10));
-                    let _ = output.pcm.prepare();
-                }
-                continue;
-            }
-        }
+
         let mut state = match state.lock() {
-                Ok(state) => state,
-                Err(_) => break,
-            };
+            Ok(state) => state,
+            Err(_) => break,
+        };
         let queued = output.pcm.delay().unwrap_or(0).max(0) as u64;
-        state.playback_frames.store(written_frames.saturating_sub(queued), Ordering::Release);
-        let sample_count = state.samples.len().min(f32_samples.len())
-            / output.channels as usize * output.channels as usize;
-        if state.paused || sample_count == 0 {
-            // Do not prime the device with silence before media arrives. Besides
-            // delaying audible startup, those samples are outside the media clock.
+        publish_playback_frames(&state, written_frames, queued, pace_origin, pace_origin_frames, output.rate);
+
+        let channels = output.channels as usize;
+        let period_samples = output.period_frames.max(1) * channels;
+        let available = state.samples.len() / channels * channels;
+        if state.paused {
             drop(state);
             thread::sleep(Duration::from_millis(5));
             continue;
         }
+        if available == 0 {
+            drop(state);
+            // No media yet / between chunks. Do not invent silence into the
+            // media clock; a short wait lets the decoder refill.
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+
+        // Avoid constant short writes: they underrun Pulse as a click per period.
+        // Wait for at least one full period unless the queue has been short for
+        // several iterations (end of stream drain).
+        let mut sample_count = available.min(f32_samples.len());
+        if sample_count < period_samples {
+            short_idle = short_idle.saturating_add(1);
+            if short_idle < 8 {
+                drop(state);
+                thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+        } else {
+            short_idle = 0;
+            // Write whole periods only while the queue is healthy.
+            sample_count = sample_count / period_samples * period_samples;
+        }
+        if sample_count == 0 {
+            drop(state);
+            continue;
+        }
+
         for (sample, source) in f32_samples[..sample_count].iter_mut().zip(&state.samples) {
             *sample = *source * state.volume;
         }
         let write_result = match output.kind {
             SampleKind::Float => output.pcm.io_f32().and_then(|io| io.writei(&f32_samples[..sample_count])),
             SampleKind::I16 => {
-                for (target, source) in i16_samples.iter_mut().zip(&f32_samples) {
+                for (target, source) in i16_samples[..sample_count].iter_mut().zip(&f32_samples[..sample_count]) {
                     *target = (source.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                 }
                 output.pcm.io_i16().and_then(|io| io.writei(&i16_samples[..sample_count]))
@@ -155,28 +213,36 @@ fn output_loop(
         };
         let write_error = match write_result {
             Ok(frames) => {
-                {
-                    let written_samples = frames.saturating_mul(output.channels as usize);
-                    let consumed = written_samples.min(state.samples.len());
-                    state.samples.drain(..consumed);
-                    written_frames = written_frames.saturating_add(frames as u64);
-                    let queued = output.pcm.delay().unwrap_or(0).max(0) as u64;
-                    state.playback_frames.store(written_frames.saturating_sub(queued), Ordering::Release);
+                let written_samples = frames.saturating_mul(channels);
+                let consumed = written_samples.min(state.samples.len());
+                state.samples.drain(..consumed);
+                if pace_origin.is_none() {
+                    pace_origin = Some(Instant::now());
+                    pace_origin_frames = written_frames;
                 }
+                written_frames = written_frames.saturating_add(frames as u64);
+                let queued = output.pcm.delay().unwrap_or(0).max(0) as u64;
+                publish_playback_frames(&state, written_frames, queued, pace_origin, pace_origin_frames, output.rate);
                 None
             }
             Err(error) => Some(error),
         };
         drop(state);
+
         if let Some(error) = write_error {
-            if error.errno() != 11 && output.pcm.recover(error.errno(), true).is_err() {
-                thread::sleep(Duration::from_millis(10));
+            if output.pcm.state() == PcmState::XRun {
+                let _ = output.pcm.recover(error.errno(), true);
+            } else if output.pcm.recover(error.errno(), true).is_err() {
+                thread::sleep(Duration::from_millis(5));
                 let _ = output.pcm.prepare();
             }
+            continue;
         }
         if output.pcm.state() != PcmState::Running {
             let _ = output.pcm.start();
         }
+        // No software lead-sleep. Blocking writei + wall-capped published clock
+        // keep audible output continuous while A/V sync stays at 1x.
     }
     let _ = output.pcm.drop();
 }

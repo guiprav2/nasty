@@ -43,9 +43,12 @@ test('volume changes preserve the audio stream and restore audible gain after ze
   recorder.stderr.on('data', chunk => { recordingError += chunk; });
   const amplitude = async volume => {
     if (volume !== undefined) video.volume = volume;
-    await delay(300);
+    // Gain is applied at the ALSA write edge. After the click-fix buffer
+    // increase (~0.25s device + ~0.5s JS prebuffer), wait out the old-gain
+    // audio before sampling the monitor.
+    await delay(900);
     samples = [];
-    await delay(200);
+    await delay(250);
     const data = Buffer.concat(samples);
     assert.ok(data.length > 1000, `monitor must provide samples: ${recordingError}`);
     let energy = 0;

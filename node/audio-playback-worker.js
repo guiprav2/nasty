@@ -51,7 +51,9 @@ function openPlayback(time = 0, selectedDevice = deviceId) {
 function pump() {
   if (!player || paused) return;
   try {
-    const targetFrames = player.sampleRate * 0.12;
+    // Keep ~0.5s in the JS ring so the blocking ALSA thread never starves and
+    // clicks from underruns. Ready threshold below matches a similar prebuffer.
+    const targetFrames = player.sampleRate * 0.5;
     while (decoder && player.queuedFrames < targetFrames) {
       if (pendingSilenceFrames > 0) {
         const requiredOutputFrames = targetFrames - player.queuedFrames;
@@ -94,7 +96,7 @@ function pump() {
       player.enqueue(samples, chunk.sampleRate, chunk.channels);
       audioCursor = Math.max(audioCursor, chunkPts) + availableFrames / chunk.sampleRate;
     }
-    if (!ready && (player.queuedFrames >= player.sampleRate * 0.1 || !decoder)) {
+    if (!ready && (player.queuedFrames >= player.sampleRate * 0.25 || !decoder)) {
       ready = true;
       parentPort.postMessage({ type: "audio-ready", audioId, generation });
     }

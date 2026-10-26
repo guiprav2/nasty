@@ -776,16 +776,26 @@ function coverStage() {
     wheelGestureTimer = null;
     carouselSuppressClickUntil = 0;
     cancelCarouselReset();
-    // Capture the standard pointer sequence so dragging keeps updating after
-    // the pointer crosses a card edge or leaves the carousel stage.
-    event.target?.setPointerCapture?.(event.pointerId);
-    gestureStart = { x: event.x, y: event.y, center: carouselCenter(), volume: currentVideo()?.volume ?? state.volume, axis: null, moved: false };
+    // Capture on the stage (currentTarget), not the nested card under the
+    // cursor. Cards share one layout box and only differ by transform; capturing
+    // a child makes release/click target the wrong track after a swipe.
+    (event.currentTarget ?? event.target)?.setPointerCapture?.(event.pointerId);
+    gestureStart = {
+      x: event.clientX ?? event.x,
+      y: event.clientY ?? event.y,
+      center: carouselCenter(),
+      volume: currentVideo()?.volume ?? state.volume,
+      axis: null,
+      moved: false,
+    };
     carouselPointer = gestureStart;
   };
   const onPointerMove = (event) => {
     if (!gestureStart) return;
-    const dx = event.x - gestureStart.x;
-    const dy = event.y - gestureStart.y;
+    const x = event.clientX ?? event.x;
+    const y = event.clientY ?? event.y;
+    const dx = x - gestureStart.x;
+    const dy = y - gestureStart.y;
     if (!gestureStart.axis && Math.max(Math.abs(dx), Math.abs(dy)) >= 6) {
       gestureStart.axis = Math.abs(dx) >= Math.abs(dy) ? "horizontal" : "vertical";
     }
@@ -793,29 +803,44 @@ function coverStage() {
     gestureStart.moved = true;
     if (gestureStart.axis === "vertical") {
       carouselPointer = null;
-      carouselSuppressClickUntil = Date.now() + 250;
+      carouselSuppressClickUntil = Date.now() + 500;
       showVolume(gestureStart.volume - dy / 240);
     } else {
-      carouselSuppressClickUntil = Date.now() + 250;
-      rotateCarousel(gestureStart.center - dx / spacing());
+      carouselSuppressClickUntil = Date.now() + 500;
+      // Store the live center on the gesture so release can snap to the card
+      // that was actually under the center at the last move, even if a later
+      // click/hit-test would resolve a different stacked card.
+      const next = gestureStart.center - dx / spacing();
+      gestureStart.preview = next;
+      rotateCarousel(next);
     }
   };
   const onPointerUp = () => {
     const moved = !!gestureStart?.moved;
     const axis = gestureStart?.axis;
+    const preview = gestureStart?.preview;
     gestureStart = null;
-    carouselPointer = null;
     if (!moved) {
+      carouselPointer = null;
       scheduleCarouselRender();
       if (carouselCenterPreview !== null) resetCarouselAfterPause();
       return;
     }
-    carouselSuppressClickUntil = Date.now() + 250;
+    carouselSuppressClickUntil = Date.now() + 500;
     if (axis === "horizontal") {
-      rotateCarousel(Math.round(carouselCenter()));
-      resetCarouselAfterPause();
-    } else if (axis === "vertical" && carouselCenterPreview !== null) {
-      resetCarouselAfterPause();
+      const center = preview ?? carouselCenter();
+      const snapped = Math.round(center);
+      // Keep duration-0 through the snap commit so release does not animate
+      // from a stale pose to the wrong card under the 700ms ease.
+      rotateCarousel(snapped);
+      requestAnimationFrame(() => {
+        carouselPointer = null;
+        scheduleCarouselRender();
+        resetCarouselAfterPause();
+      });
+    } else {
+      carouselPointer = null;
+      if (carouselCenterPreview !== null) resetCarouselAfterPause();
     }
   };
   const onWheel = (event) => {

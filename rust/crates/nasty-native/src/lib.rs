@@ -4377,14 +4377,18 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             OsWindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x, position.y);
+                // Layout, hit-testing, and DOM geometry use logical CSS pixels.
+                // Winit cursor positions are physical; convert before publishing.
+                let scale = self.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0).max(0.01);
+                let logical_x = position.x / scale;
+                let logical_y = position.y / scale;
+                self.cursor = (logical_x, logical_y);
                 if let Some(window) = self.window.as_ref() {
-                    let scale = window.scale_factor();
                     let logical_size = window.inner_size().to_logical::<f64>(scale);
                     let direction = resize_direction(
                         &self.resizable,
-                        position.x / scale,
-                        position.y / scale,
+                        logical_x,
+                        logical_y,
                         logical_size.width,
                         logical_size.height,
                     );
@@ -4404,8 +4408,8 @@ impl ApplicationHandler for WindowApp {
                 }
                 self.events.push(NativeEvent {
                     kind: "pointermove".into(),
-                    x: position.x,
-                    y: position.y,
+                    x: logical_x,
+                    y: logical_y,
                     key: None,
                     button: None,
                     text: None,
@@ -4439,8 +4443,8 @@ impl ApplicationHandler for WindowApp {
                     let size = window.inner_size().to_logical::<f64>(scale);
                     resize_direction(
                         &self.resizable,
-                        self.cursor.0 / scale,
-                        self.cursor.1 / scale,
+                        self.cursor.0,
+                        self.cursor.1,
                         size.width,
                         size.height,
                     )
@@ -4503,11 +4507,12 @@ impl ApplicationHandler for WindowApp {
             }
             OsWindowEvent::MouseWheel { delta, .. } => {
                 if (self.drag_key_is_down() && !self.drag_blocked) || self.drag_active { return; }
+                let scale = self.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0).max(0.01);
                 let (delta_x, delta_y) = match delta {
                     // Winit deltas describe which way content moves; DOM
                     // WheelEvent deltas describe the user's scroll direction.
                     MouseScrollDelta::LineDelta(x, y) => (-x as f64 * 40.0, -y as f64 * 40.0),
-                    MouseScrollDelta::PixelDelta(position) => (-position.x, -position.y),
+                    MouseScrollDelta::PixelDelta(position) => (-position.x / scale, -position.y / scale),
                 };
                 self.events.push(NativeEvent {
                     kind: "wheel".into(),
@@ -4628,7 +4633,7 @@ impl WindowApp {
         let Some(window) = self.window.as_ref() else { return; };
         let scale = window.scale_factor();
         let size = window.inner_size().to_logical::<f64>(scale);
-        let direction = resize_direction(&self.resizable, self.cursor.0 / scale, self.cursor.1 / scale, size.width, size.height);
+        let direction = resize_direction(&self.resizable, self.cursor.0, self.cursor.1, size.width, size.height);
         let cursor = if let Some(direction) = direction {
             CursorIcon::from(direction)
         } else if self.drag_active {

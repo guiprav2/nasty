@@ -2017,20 +2017,40 @@ export class Element extends EventTarget {
           }
         }
         const frameDuration = frame.frameDuration || 1 / 30;
-        if (!video.audioStartPending && video.playbackClockStartedAt !== null && video.playbackClockStartedAt !== undefined) {
+        const mediaClock = () => {
+          if (video.audioStartPending || video.playbackClockStartedAt == null) return null;
           const now = performance.now();
-          const expectedTime = video.playbackClockTime + (now - video.playbackClockStartedAt) / 1000;
-          if (frame.time + frameDuration * 0.5 < expectedTime) {
-            video.currentTime = expectedTime;
-            this._startVideo();
-            return;
-          }
+          return {
+            now,
+            expectedTime: video.playbackClockTime + (now - video.playbackClockStartedAt) / 1000,
+          };
+        };
+        // Late frames: drop to the wall/audio clock and decode once there.
+        // Do not present intermediates — that reads as a fast-forward catch-up.
+        const clockBeforePresent = mediaClock();
+        if (clockBeforePresent && frame.time + frameDuration * 0.5 < clockBeforePresent.expectedTime) {
+          const jump = clockBeforePresent.expectedTime - frame.time;
+          video.currentTime = clockBeforePresent.expectedTime;
+          if (jump > frameDuration * 2) video.seekPending = true;
+          this._startVideo();
+          return;
+        }
+        if (clockBeforePresent) {
           const due = video.playbackClockStartedAt + (frame.time - video.playbackClockTime) * 1000;
-          if (due > now) {
-            await new Promise(resolve => setTimeout(resolve, due - now));
+          if (due > clockBeforePresent.now) {
+            await new Promise(resolve => setTimeout(resolve, due - clockBeforePresent.now));
             if (token !== video.token || video.paused) return;
             const currentView = this.document.defaultView;
             if (!currentView || currentView.closed) return;
+            // Wait itself can leave us late again; drop instead of showing a stale frame.
+            const clockAfterWait = mediaClock();
+            if (clockAfterWait && frame.time + frameDuration * 0.5 < clockAfterWait.expectedTime) {
+              const jump = clockAfterWait.expectedTime - frame.time;
+              video.currentTime = clockAfterWait.expectedTime;
+              if (jump > frameDuration * 2) video.seekPending = true;
+              this._startVideo();
+              return;
+            }
           }
         }
         video.duration = frame.duration;
@@ -2063,14 +2083,27 @@ export class Element extends EventTarget {
           this.dispatchEvent(new Event("canplay"));
         }
         this.dispatchEvent(new Event("timeupdate"));
-        const nextDue = video.playbackClockStartedAt + (frame.time + frameDuration - video.playbackClockTime) * 1000;
+        const nextMediaTime = frame.time + frameDuration;
+        const nextDue = video.playbackClockStartedAt + (nextMediaTime - video.playbackClockTime) * 1000;
         video.timer = setTimeout(() => {
-          if (video.currentTime >= video.duration) {
+          if (video.currentTime >= video.duration || nextMediaTime >= video.duration) {
             if (this.loop) {
               video.currentTime = 0;
               this._startVideoAudio(0);
             } else { video.paused = true; video.ended = true; stopVideoAudio(video.audioId); this.dispatchEvent(new Event("ended")); return; }
-          } else video.currentTime += frameDuration;
+          } else {
+            // If the decoder/main thread stalled, jump to the clock — never step
+            // through the backlog with setTimeout(0) presents (visual fast-forward).
+            let nextTime = nextMediaTime;
+            if (video.playbackClockStartedAt != null) {
+              const expectedTime = video.playbackClockTime + (performance.now() - video.playbackClockStartedAt) / 1000;
+              if (nextTime + frameDuration * 0.5 < expectedTime) {
+                nextTime = expectedTime;
+                if (expectedTime - nextMediaTime > frameDuration * 2) video.seekPending = true;
+              }
+            }
+            video.currentTime = nextTime;
+          }
           this._startVideo();
         }, Math.max(0, nextDue - performance.now()));
       } catch (error) {
@@ -2893,6 +2926,7 @@ function dispatchDomEvent(target, type, fields = {}) {
   for (const current of path) {
     const event = makeHostEvent(type, fields);
     Object.defineProperty(event, "target", { configurable: true, value: target });
+    Object.defineProperty(event, "currentTarget", { configurable: true, value: current });
     event.stopPropagation = () => { stopped = true; };
     current.dispatchEvent(event);
     if (stopped) break;
