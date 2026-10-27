@@ -1,8 +1,6 @@
 import { snapshotText } from './library.js';
 import { searchWeb } from './search.js';
-import { fetchPage } from './page-cache.js';
-import { grepHtml } from './grep-page.js';
-import { httpUrl, looksTemporary, vanillaDownload, ytdlpDownload } from './download.js';
+import { httpUrl, looksTemporary, pickTitle, ytdlpDownload } from './download.js';
 
 function clip(text, max = 180) {
   return String(text || '').replace(/\s+/g, ' ').trim().slice(0, max);
@@ -23,6 +21,13 @@ async function pool(items, limit, fn) {
   return results;
 }
 
+function youtubeIdFrom(url) {
+  const href = httpUrl(url);
+  if (!href) return '';
+  const match = href.match(/(?:v=|youtu\.be\/|shorts\/)([\w-]{11})/);
+  return match ? match[1] : '';
+}
+
 async function searchOne(youtube, query) {
   let q = clip(query);
   if (!q) return { query: q, hit: null, error: 'empty search' };
@@ -34,15 +39,126 @@ async function searchOne(youtube, query) {
   }
 }
 
-function songList(value) {
-  let items = Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
-  let queries = [];
-  for (let item of items) {
-    let text = clip(item);
-    if (text && !queries.includes(text)) queries.push(text);
-    if (queries.length >= 12) break;
+function pageTrack(pageUrl, meta = {}) {
+  const videoId = /^[\w-]{11}$/.test(meta.videoId || '') ? meta.videoId : youtubeIdFrom(pageUrl);
+  return {
+    pageUrl,
+    videoId,
+    via: 'ytdlp',
+    pattern: '',
+    title: pickTitle(meta.infoTitle || '', pageUrl, meta.title),
+    channel: String(meta.channel || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+    thumbnail: String(meta.thumbnail || '').slice(0, 500),
+    duration: Number(meta.duration) || 0,
+    query: pageUrl,
+  };
+}
+
+// Playlist entries must survive a yt_dlp probe. CDN/stream URLs are temporary.
+async function resolvePageTrack(pageUrl, meta = {}) {
+  if (looksTemporary(pageUrl)) {
+    return { query: pageUrl, hit: null, error: 'That URL looks temporary. Use the watch/video page URL, not a CDN file link.' };
   }
-  return queries;
+  const info = await ytdlpDownload(pageUrl);
+  if (!info.ok) {
+    return {
+      query: pageUrl,
+      hit: null,
+      error: info.error || 'yt-dlp could not probe that URL. Only pages yt_dlp can open belong in a playlist.',
+    };
+  }
+  return {
+    query: pageUrl,
+    hit: pageTrack(info.pageUrl || pageUrl, {
+      title: meta.title,
+      infoTitle: info.title,
+      channel: meta.channel || info.channel,
+      thumbnail: meta.thumbnail || info.thumbnail,
+      duration: meta.duration || info.duration,
+      videoId: meta.videoId,
+    }),
+  };
+}
+
+async function resolveEntry(youtube, entry) {
+  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+    const pageUrl = httpUrl(entry.pageUrl);
+    const query = clip(entry.query || '');
+    if (pageUrl) return resolvePageTrack(pageUrl, entry);
+    if (query) return searchOne(youtube, query);
+    return { query: '', hit: null, error: 'track needs pageUrl or query' };
+  }
+  const text = clip(entry);
+  if (!text) return { query: '', hit: null, error: 'empty entry' };
+  const asUrl = httpUrl(text);
+  if (asUrl) return resolvePageTrack(asUrl, {});
+  return searchOne(youtube, text);
+}
+
+function songEntries(value) {
+  const items = Array.isArray(value) ? value : value == null ? [] : [value];
+  const out = [];
+  const seen = new Set();
+  for (const item of items) {
+    if (typeof item === 'string') {
+      const text = clip(item);
+      if (!text || seen.has(`s:${text}`)) continue;
+      seen.add(`s:${text}`);
+      out.push(text);
+    } else if (item && typeof item === 'object') {
+      const pageUrl = httpUrl(item.pageUrl);
+      const query = clip(item.query || '');
+      const key = pageUrl ? `u:${pageUrl}` : query ? `q:${query}` : '';
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+
+const songItemSchema = {
+  anyOf: [
+    {
+      type: 'string',
+      description: 'YouTube search query, or a watch/video page URL that yt_dlp can probe',
+    },
+    {
+      type: 'object',
+      properties: {
+        pageUrl: { type: 'string', description: 'Watch/video page URL. Must pass yt_dlp before it is saved. Never a signed CDN file URL.' },
+        query: { type: 'string', description: 'YouTube search when pageUrl is omitted' },
+        title: { type: 'string' },
+        channel: { type: 'string' },
+        thumbnail: { type: 'string' },
+        duration: { type: 'number' },
+        videoId: { type: 'string' },
+      },
+      description: 'Page URL from web_search. create_playlist runs yt_dlp and rejects URLs it cannot probe.',
+    },
+  ],
+};
+
+async function collectTracks(youtube, songs) {
+  const entries = songEntries(songs);
+  if (!entries.length) return { tracks: [], missed: [], error: 'Provide at least one song search or page URL' };
+  const found = await pool(entries, 3, (entry) => resolveEntry(youtube, entry));
+  const tracks = [];
+  const missed = [];
+  const seen = new Set();
+  for (const item of found) {
+    if (!item.hit) {
+      missed.push({ query: item.query, error: item.error });
+      continue;
+    }
+    const key = item.hit.videoId || item.hit.pageUrl;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    tracks.push(item.hit);
+  }
+  if (!tracks.length) return { tracks, missed, error: 'No playable tracks from those songs or pages' };
+  return { tracks, missed, error: '' };
 }
 
 function pubTrack(track) {
@@ -77,10 +193,8 @@ export function describeTool(name, result) {
     return `Player ${result.status}`;
   }
   if (name === 'search_youtube') return `Searched YouTube · ${result.results.length} hit${result.results.length === 1 ? '' : 's'}`;
-  if (name === 'search_web') return `Searched the web · ${result.results?.length || 0} hit${result.results?.length === 1 ? '' : 's'}`;
-  if (name === 'grep_page') return `Grepped ${result.url || 'page'} · ${result.matches || 0} match${result.matches === 1 ? '' : 'es'}`;
-  if (name === 'ytdlp_download') return result.ok ? `yt-dlp · ${result.title || result.pageUrl}` : 'yt-dlp failed';
-  if (name === 'vanilla_download') return result.media ? `Downloaded media · ${result.bytes} bytes` : 'Fetched a page';
+  if (name === 'web_search') return `Searched the web · ${result.results?.length || 0} hit${result.results?.length === 1 ? '' : 's'}`;
+  if (name === 'yt_dlp') return result.ok ? `yt-dlp · ${result.title || result.pageUrl}` : 'yt-dlp failed';
   if (name === 'remember') return `Remembered ${result.key}`;
   if (name === 'recall') return result.value ? `Recalled ${result.key}` : `Recalled ${result.entries?.length || 0} notes`;
   if (name === 'list_playlists') return `Listed ${result.playlists.length} playlist${result.playlists.length === 1 ? '' : 's'}`;
@@ -157,7 +271,7 @@ export function createTools(library, youtube, memory) {
     },
 
     create_playlist: {
-      description: 'Create a thematic playlist. Each entry in songs is a YouTube search for one track; the top result is saved. Set mood to a short comparable phrase such as "soothing ambient" or "tense electronic". Pass play true to start it. Playback starts at the first song unless start_at is set.',
+      description: 'Create a thematic playlist from YouTube searches and/or watch/video page URLs. Page URLs are probed with yt_dlp first; URLs yt_dlp cannot open are skipped. Set mood to a short comparable phrase such as "soothing ambient". Pass play true to start it.',
       parameters: {
         type: 'object',
         properties: {
@@ -166,8 +280,8 @@ export function createTools(library, youtube, memory) {
           theme: { type: 'string', description: 'One sentence about the theme' },
           songs: {
             type: 'array',
-            items: { type: 'string' },
-            description: 'YouTube search queries, one per song, up to 12. Example: "Satie Gymnopedie No.1"',
+            items: songItemSchema,
+            description: 'Up to 12 tracks. YouTube search, or a page URL / { pageUrl } that yt_dlp can probe.',
           },
           play: { type: 'boolean', description: 'Start playback after saving. Default false.' },
           start_at: {
@@ -178,27 +292,13 @@ export function createTools(library, youtube, memory) {
         required: ['name', 'mood', 'songs'],
       },
       handler: (args) => guard(async () => {
-        let queries = songList(args?.songs);
-        if (!queries.length) return { ok: false, error: 'Provide at least one song search' };
-        let found = await pool(queries, 3, (query) => searchOne(youtube, query));
-        let tracks = [];
-        let missed = [];
-        let seen = new Set();
-        for (let item of found) {
-          if (!item.hit) {
-            missed.push({ query: item.query, error: item.error });
-            continue;
-          }
-          if (seen.has(item.hit.videoId)) continue;
-          seen.add(item.hit.videoId);
-          tracks.push({ ...item.hit, query: item.query });
-        }
-        if (!tracks.length) return { ok: false, error: 'No YouTube results for those songs', missed };
+        const collected = await collectTracks(youtube, args?.songs);
+        if (collected.error) return { ok: false, error: collected.error, missed: collected.missed };
         let created = await library.createPlaylist({
           name: args?.name,
           theme: args?.theme || '',
           mood: args?.mood || '',
-          tracks,
+          tracks: collected.tracks,
         });
         if (!created.ok) return created;
         let started = null;
@@ -211,35 +311,31 @@ export function createTools(library, youtube, memory) {
             theme: created.playlist.theme,
             songs: created.playlist.tracks.map((track) => track.title),
           },
-          missed,
+          missed: collected.missed,
           started,
         };
       }),
     },
 
     add_to_playlist: {
-      description: 'Search YouTube and append songs to an existing playlist.',
+      description: 'Append songs to an existing playlist. Page URLs are probed with yt_dlp first; URLs yt_dlp cannot open are skipped.',
       parameters: {
         type: 'object',
         properties: {
           playlist: { type: 'string', description: 'Playlist name or id' },
-          songs: { type: 'array', items: { type: 'string' }, description: 'YouTube search queries to append' },
+          songs: {
+            type: 'array',
+            items: songItemSchema,
+            description: 'Tracks to append: YouTube search, or a page URL / { pageUrl } that yt_dlp can probe.',
+          },
         },
         required: ['playlist', 'songs'],
       },
       handler: (args) => guard(async () => {
-        let queries = songList(args?.songs);
-        if (!queries.length) return { ok: false, error: 'Provide at least one song search' };
-        let found = await pool(queries, 3, (query) => searchOne(youtube, query));
-        let tracks = [];
-        let missed = [];
-        for (let item of found) {
-          if (!item.hit) missed.push({ query: item.query, error: item.error });
-          else tracks.push({ ...item.hit, query: item.query });
-        }
-        if (!tracks.length) return { ok: false, error: 'No YouTube results for those songs', missed };
-        let added = await library.addTracks(args.playlist, tracks);
-        return added.ok ? { ...added, missed } : { ...added, missed };
+        const collected = await collectTracks(youtube, args?.songs);
+        if (collected.error) return { ok: false, error: collected.error, missed: collected.missed };
+        let added = await library.addTracks(args.playlist, collected.tracks);
+        return added.ok ? { ...added, missed: collected.missed } : { ...added, missed: collected.missed };
       }),
     },
 
@@ -315,8 +411,8 @@ export function createTools(library, youtube, memory) {
       handler: (args) => guard(() => library.transport(args?.action)),
     },
 
-    search_web: {
-      description: 'Search the public web with DuckDuckGo. Returns titles, stable page URLs, and snippets. Does not play or save anything.',
+    web_search: {
+      description: 'Search the public web with DuckDuckGo\'s HTML form. Returns titles, stable page URLs, and snippets. Does not play or save anything.',
       parameters: {
         type: 'object',
         properties: {
@@ -330,56 +426,14 @@ export function createTools(library, youtube, memory) {
       }),
     },
 
-    grep_page: {
-      description: 'Fetch one page and return matching lines, not the whole document. pattern is a regular expression, or a literal if it is not valid syntax. before is grep -B, after is grep -A, and context is grep -C. Uses the 10 second page cache.',
-      parameters: {
-        type: 'object',
-        properties: {
-          url: { type: 'string' },
-          pattern: { type: 'string' },
-          before: { type: 'integer' },
-          after: { type: 'integer' },
-          context: { type: 'integer' },
-        },
-        required: ['url', 'pattern'],
-      },
-      handler: (args) => guard(async () => {
-        const url = httpUrl(args?.url);
-        if (!url) return { ok: false, error: 'url must be http or https' };
-        const html = await fetchPage(url);
-        const found = grepHtml(html, args || {});
-        return { ok: true, url, matches: found.matches, lines: found.lines, text: found.text };
-      }),
-    },
-
-    ytdlp_download: {
-      description: 'Run yt-dlp on a page or a file URL. Works for YouTube and many other sites, including URLs that look like direct files. Returns the stable page URL to record. Does not return signed CDN links and does not play by itself.',
+    yt_dlp: {
+      description: 'Probe a watch/video page or file URL with yt-dlp. Returns the stable page URL and title. Only URLs that succeed here belong in a playlist. Does not return signed CDN links and does not play by itself.',
       parameters: {
         type: 'object',
         properties: { url: { type: 'string' } },
         required: ['url'],
       },
       handler: (args) => guard(() => ytdlpDownload(args?.url)),
-    },
-
-    vanilla_download: {
-      description: 'Fetch a URL with ordinary HTTP. HTML is cached for 10 seconds so grep_page can read it. A media file is saved locally for playback and is not a URL you should record. Use this when yt-dlp cannot handle the site.',
-      parameters: {
-        type: 'object',
-        properties: { url: { type: 'string' } },
-        required: ['url'],
-      },
-      handler: (args) => guard(async () => {
-        const downloaded = await vanillaDownload(args?.url);
-        if (!downloaded.ok) return downloaded;
-        return {
-          ok: true,
-          media: !!downloaded.media,
-          contentType: downloaded.contentType || '',
-          finalUrl: downloaded.finalUrl || '',
-          bytes: downloaded.bytes || 0,
-        };
-      }),
     },
 
     remember: {
@@ -415,34 +469,34 @@ export function createTools(library, youtube, memory) {
     },
 
     play_url: {
-      description: 'Play a video now. pageUrl must be the stable video page, never a signed or expiring file URL. via is "ytdlp" or "vanilla": playback repeats that choice. pattern is an optional regular expression with a capture group; when set, playback greps the page again and passes the new match to via. Do not invent signed URLs.',
+      description: 'Play a video now. pageUrl must be a watch/video page yt_dlp can open, never a signed, expiring, or CDN file URL. Prefer probing with yt_dlp first. Playback resolves streams through yt-dlp.',
       parameters: {
         type: 'object',
         properties: {
           pageUrl: { type: 'string' },
-          via: { type: 'string', enum: ['ytdlp', 'vanilla'] },
-          pattern: { type: 'string', description: 'Optional regex. Group 1 is the media URL to resolve again at playback.' },
           title: { type: 'string' },
           channel: { type: 'string' },
           thumbnail: { type: 'string' },
           duration: { type: 'number' },
         },
-        required: ['pageUrl', 'via'],
+        required: ['pageUrl'],
       },
       handler: (args) => guard(async () => {
         const pageUrl = httpUrl(args?.pageUrl);
         if (!pageUrl) return { ok: false, error: 'pageUrl must be http or https' };
         if (looksTemporary(pageUrl)) return { ok: false, error: 'That URL looks temporary. Record the stable video page, then let playback resolve a fresh file.' };
-        const via = args?.via === 'vanilla' ? 'vanilla' : args?.via === 'ytdlp' ? 'ytdlp' : '';
-        if (!via) return { ok: false, error: 'via must be ytdlp or vanilla' };
+        const probed = await ytdlpDownload(pageUrl);
+        if (!probed.ok) {
+          return { ok: false, error: probed.error || 'yt-dlp could not probe that URL' };
+        }
         return library.playOneOff({
-          pageUrl,
-          via,
-          pattern: String(args?.pattern || '').slice(0, 300),
-          title: args?.title,
-          channel: args?.channel,
-          thumbnail: args?.thumbnail,
-          duration: args?.duration,
+          pageUrl: probed.pageUrl || pageUrl,
+          via: 'ytdlp',
+          pattern: '',
+          title: args?.title || probed.title,
+          channel: args?.channel || probed.channel,
+          thumbnail: args?.thumbnail || probed.thumbnail,
+          duration: args?.duration || probed.duration,
           query: pageUrl,
         });
       }),

@@ -7,6 +7,7 @@ import { documentBoxes, documentState, elementRect, elementState, registerDocume
 import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
 import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startInterpolableTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
+import { computeTransform } from "./internal/css-transform.js";
 import { createElementAnimation, isAnimationControlProperty, syncCssAnimations } from "./internal/css-animations.js";
 import { buildTransformedDisplayList, clearPaintSegments, displayListElements, parseColor } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
@@ -17,6 +18,7 @@ import { resolveTailwind, resolveTailwindSelection } from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, hasVideoAudio, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
 import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
+import { ResizeObserver, notifyResizeObservers } from "./internal/resize-observer.js";
 import { renderedText } from "./internal/nerd-icon.js";
 import { canScroll, canScrollByUser, clipsOverflow, overflowAnchorPolicy, overflowMode } from "./internal/overflow.js";
 import { noteScrollLayerPaintChange } from "./internal/scroll-layers.js";
@@ -31,10 +33,48 @@ import {
 export const VideoDecoder = native.VideoDecoder;
 export const AudioDecoder = native.AudioDecoder;
 export const AudioPlayer = native.AudioPlayer;
+export const VideoStreamPlayer = native.VideoStreamPlayer;
 export const listAudioOutputs = native.listAudioOutputs;
+
+function clearBoundVideoStream(video) {
+  try { video.streamController?.dispose(); } catch { /* ignore */ }
+  try { video.streamPlayer?.close(); } catch { /* ignore */ }
+  video.streamController = null;
+  video.streamPlayer = null;
+  video.streamMediaUrl = "";
+  video.streamAudioUrl = "";
+  video.streamFrameGeneration = -1;
+  video.streamDecodeStarted = false;
+  video._heldStreamFrame = null;
+  video._audioClockAnchored = false;
+  video.streamMode = false;
+}
+
+/** Host helper: attach a demux+chunk VideoStreamPlayer to a <video> without inventing DOM APIs. */
+export function bindVideoStream(element, binding = {}) {
+  if (!element || element.localName !== "video") throw new Error("bindVideoStream requires a video element");
+  const video = elementState(element).video;
+  clearBoundVideoStream(video);
+  video.streamPlayer = binding.player || null;
+  video.streamController = binding.controller || null;
+  video.streamMediaUrl = binding.mediaUrl || "";
+  video.streamAudioUrl = binding.audioUrl || binding.mediaUrl || "";
+  video.streamMode = !!video.streamPlayer;
+  video.streamFrameGeneration = -1;
+  video.streamDecodeStarted = false;
+  video._heldStreamFrame = null;
+  if (Number.isFinite(binding.duration)) video.duration = binding.duration;
+  if (binding.width) video.width = binding.width;
+  if (binding.height) video.height = binding.height;
+  if (video.streamMediaUrl) video.source = video.streamMediaUrl;
+  stopVideoStream(video.source);
+  return element;
+}
+
 export { DOMRect };
 export { TransitionEvent };
 export { MutationObserver };
+export { ResizeObserver };
 
 const directoryPickerStarts = new Map();
 const WELL_KNOWN_DIRECTORY_STARTS = new Set([
@@ -1320,6 +1360,12 @@ function defaultElementStyle(name) {
   if (name === "button") {
     return { ...reset, display: "flex", justifyContent: "center", alignItems: "center", textAlign: "center", overflow: "hidden" };
   }
+  if (name === "select") {
+    return { ...reset, display: "flex", minHeight: "1em", alignItems: "center", overflow: "hidden", whiteSpace: "nowrap" };
+  }
+  if (name === "option" || name === "optgroup") {
+    return { ...reset, display: "none" };
+  }
   return reset;
 }
 
@@ -1605,7 +1651,7 @@ export class Element extends EventTarget {
       selectionStyle: {}, textAreaState: null, inputValue: "", selectionStart: 0, selectionEnd: 0, selectionDirection: "none",
       scrollLeft: 0, scrollTop: 0,
       renderScrollLeft: null, renderTextOriginX: null, renderCaretX: null,
-      video: { audioId: nextVideoAudioId++, audioGeneration: 0, audioStartPromise: null, seekPending: false, paused: true, ended: false, currentTime: 0, duration: NaN, width: 0, height: 0, timer: null, token: 0, source: "", frameRequest: null, resolveFrame: null, rejectFrame: null, textureId: null, volume: 1, metadataLoaded: false, dataLoaded: false } };
+      video: { audioId: nextVideoAudioId++, audioGeneration: 0, audioStartPromise: null, seekPending: false, paused: true, ended: false, currentTime: 0, duration: NaN, width: 0, height: 0, timer: null, token: 0, source: "", frameRequest: null, resolveFrame: null, rejectFrame: null, textureId: null, volume: 1, metadataLoaded: false, dataLoaded: false, prefetch: null, prefetchTime: null, maxEdge: 0, maxEdgeGeneration: -1, streamPlayer: null, streamController: null, streamMediaUrl: "", streamAudioUrl: "", streamFrameGeneration: -1, streamMode: false } };
     registerElementState(this, state);
     const docState = documentState(document);
     docState.elements.add(this);
@@ -1716,6 +1762,17 @@ export class Element extends EventTarget {
   get parentElement() {
     return this.parent;
   }
+
+  get isConnected() {
+    let node = this;
+    const doc = this.document;
+    while (node) {
+      if (node === doc) return true;
+      node = node.parentNode ?? node.parent ?? null;
+    }
+    return false;
+  }
+
 
   get selectionStart() { return this.localName === "input" || this.localName === "textarea" ? elementState(this).selectionStart : null; }
   set selectionStart(value) { if (this.localName === "input" || this.localName === "textarea") elementState(this).selectionStart = Math.max(0, Math.min(this.value.length, Number(value) || 0)); }
@@ -1842,14 +1899,38 @@ export class Element extends EventTarget {
   set hidden(value) { if (value) this.setAttribute("hidden", ""); else this.removeAttribute("hidden"); }
   get offsetWidth() { return Math.round(this.getBoundingClientRect().width); }
   get offsetHeight() { return Math.round(this.getBoundingClientRect().height); }
+  closest(selector) {
+    let node = this;
+    while (node && node.nodeType === 1) {
+      if (node.matches(selector)) return node;
+      node = node.parentElement ?? node.parentNode;
+      if (node && node.nodeType !== 1) break;
+    }
+    return null;
+  }
   matches(selector) {
-    return selector.split(",").some(part => {
+    return String(selector).split(",").some(part => {
       const pattern = part.trim();
-      if (!/^(?:[a-z][\w-]*|\*)?(?:[.#][\w-]+)*$/i.test(pattern)) throw new DOMException("Unsupported selector", "SyntaxError");
+      if (!pattern) return false;
+      // tag, #id, .class, and [attr] / [attr=value] / [attr="value"] / [attr='value']
+      if (!/^(?:[a-z][\w-]*|\*)?(?:[.#][\w-]+|\[[\w-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\]\s]+))?\])*$/i.test(pattern)) {
+        throw new DOMException(`Unsupported selector: ${pattern}`, "SyntaxError");
+      }
       const tag = pattern.match(/^[a-z][\w-]*/i)?.[0];
       if (tag && tag.toLowerCase() !== this.localName) return false;
-      return [...pattern.matchAll(/([.#])([\w-]+)/g)].every(([, type, name]) =>
-        type === "#" ? this.id === name : this.classList.contains(name));
+      for (const [, type, name] of pattern.matchAll(/([.#])([\w-]+)/g)) {
+        if (type === "#" ? this.id !== name : !this.classList.contains(name)) return false;
+      }
+      for (const match of pattern.matchAll(/\[([\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+)))?\]/g)) {
+        const attr = match[1];
+        const expected = match[2] ?? match[3] ?? match[4];
+        if (expected === undefined) {
+          if (!this.hasAttribute(attr)) return false;
+        } else if (String(this.getAttribute(attr) ?? "") !== expected) {
+          return false;
+        }
+      }
+      return true;
     });
   }
   querySelectorAll(selector) {
@@ -1981,8 +2062,18 @@ export class Element extends EventTarget {
     const video = elementState(this).video;
     video.currentTime = Math.max(0, Math.min(Number(value) || 0, Number.isFinite(video.duration) ? video.duration : Infinity));
     video.seekPending = true;
-    if (!video.paused && video.source) {
+    if (!video.paused && (video.source || video.streamMode)) {
       video.playbackClockStartedAt = null;
+      video._heldStreamFrame = null;
+      if (video.streamMode && video.streamPlayer) {
+        const start = video.currentTime;
+        // Seek must not call play(): play() stop_worker+clears the queue and
+        // restarts demux, which turns scrubbing / time updates into SPF stalls.
+        try { video.streamPlayer.seek(start); } catch { /* ignore */ }
+        video.streamController?.seek(start, false)?.catch?.(() => {});
+        video.streamFrameGeneration = -1;
+        video.streamDecodeStarted = true;
+      }
       this._startVideoAudio(video.currentTime);
       this._startVideo();
     }
@@ -2000,10 +2091,34 @@ export class Element extends EventTarget {
   async play() {
     if (this.localName !== "video") return;
     const video = elementState(this).video;
-    if (!this.src) throw new Error("video has no source");
+    if (!this.src && !video.streamMode) throw new Error("video has no source");
+    // Idempotent: Vitrola syncCarouselMedia / onattach call play() while already
+    // playing. Each restart stop_worker+clears packets+re-demuxes (~seconds),
+    // which looks like multi-second stalls per frame (SPF).
+    if (!video.paused) return video.frameRequest;
     video.paused = false;
     video.ended = false;
     video.playbackClockStartedAt = null;
+    video._heldStreamFrame = null;
+    video._audioClockAnchored = false;
+    if (video.streamMode && video.streamPlayer) {
+      const start = Math.max(0, video.currentTime || 0);
+      const docState = documentState(this.document);
+      const sizeGeneration = docState.staticPaintGeneration ?? 0;
+      if (video.maxEdgeGeneration !== sizeGeneration || !video.maxEdge) {
+        const box = this.getBoundingClientRect();
+        video.maxEdge = Math.max(1, Math.ceil(Math.max(box.width, box.height) || 1));
+        video.maxEdgeGeneration = sizeGeneration;
+      }
+      try { video.streamPlayer.setMaxEdge(video.maxEdge || 0); } catch { /* ignore */ }
+      video.streamDecodeStarted = false;
+      // Defer demux+decode until audio is primed. Starting decode on wall clock
+      // while m4a buffers races video 1–2s ahead; play() also clears the packet
+      // queue, so priming the feed beforehand was wasted.
+      if (this.muted || video.volume <= 0) {
+        this._startStreamDecode(video, start);
+      }
+    }
     this._startVideoAudio(video.currentTime);
     this._startVideo();
     this.dispatchEvent(new Event("play"));
@@ -2018,57 +2133,105 @@ export class Element extends EventTarget {
     video.token++;
     if (video.timer) clearTimeout(video.timer);
     video.timer = null;
-    stopVideoStream(video.source);
+    // Keep the decode worker session warm across pause. Closing it forced a
+    // full HTTP reopen on play and made non-YouTube progressive streams sloppy.
+    video.prefetch = null;
+    video.prefetchTime = null;
+    video._heldStreamFrame = null;
+    video.streamDecodeStarted = false;
+    video._audioClockAnchored = false;
+    try { video.streamController?.pause(); } catch { /* ignore */ }
+    try { video.streamPlayer?.pause(); } catch { /* ignore */ }
     pauseVideoAudio(video.audioId, true);
     this.dispatchEvent(new Event("pause"));
   }
 
   load() { if (this.localName === "video") this._setVideoSource(this.src); }
 
+  _startStreamDecode(video, time = 0) {
+    if (!video.streamMode || !video.streamPlayer || video.streamDecodeStarted) return;
+    const start = Math.max(0, time || 0);
+    const docState = documentState(this.document);
+    const sizeGeneration = docState.staticPaintGeneration ?? 0;
+    if (video.maxEdgeGeneration !== sizeGeneration || !video.maxEdge) {
+      const box = this.getBoundingClientRect();
+      video.maxEdge = Math.max(1, Math.ceil(Math.max(box.width, box.height) || 1));
+      video.maxEdgeGeneration = sizeGeneration;
+    }
+    try { video.streamPlayer.setMaxEdge(video.maxEdge || 0); } catch { /* ignore */ }
+    try { video.streamPlayer.play(start); } catch { /* ignore */ }
+    video.streamController?.start(start).catch(error => {
+      if (!video.paused) this.dispatchEvent(Object.assign(new Event("error"), { error }));
+    });
+    video.streamDecodeStarted = true;
+    video.streamFrameGeneration = -1;
+    video._heldStreamFrame = null;
+  }
+
   _startVideoAudio(time) {
     const video = elementState(this).video, view = this.document.defaultView;
-    if (view && video.source) {
-      const generation = startVideoAudio(video.audioId, video.source, time, this.muted ? 0 : video.volume, view.audioOutput);
+    const audioSource = video.streamAudioUrl || video.source;
+    if (view && audioSource) {
+      const generation = startVideoAudio(video.audioId, audioSource, time, this.muted ? 0 : video.volume, view.audioOutput);
       video.audioGeneration = generation;
       video.audioStartPending = true;
       video.playbackClockStartedAt = null;
+      video._audioClockAnchored = false;
       video.audioStartPromise = waitForVideoAudioReady(video.audioId).then(ready => {
         if (video.audioGeneration !== generation || video.paused) return;
         if (ready) pauseVideoAudio(video.audioId, false);
         video.audioStartPending = false;
         video.playbackClockTime = time;
         video.playbackClockStartedAt = performance.now();
+        video._audioClockAnchored = false;
+        // Start (or restart) decode on the audio timeline once priming finishes.
+        this._startStreamDecode(video, time);
+        if (!video.paused) this._startVideo();
       });
+    } else if (video.streamMode) {
+      this._startStreamDecode(video, time);
     }
   }
 
   _setVideoSource(source) {
     const state = elementState(this), video = state.video;
+    // Re-applying the progressive media URL for an active chunk stream must not
+    // tear down the VideoStreamPlayer (Vitrola syncs src after bind).
+    if (video.streamMode && source && source === video.streamMediaUrl) {
+      video.source = source;
+      return;
+    }
     video.token++;
     if (video.timer) clearTimeout(video.timer);
     video.timer = null;
     stopVideoStream(video.source);
     stopVideoAudio(video.audioId);
+    clearBoundVideoStream(video);
     if (video.textureId !== null && this.document.defaultView) this.document.defaultView.deleteImageTexture(video.textureId);
     video.textureId = null; video.width = video.height = 0; video.currentTime = 0; video.duration = NaN;
     video.ended = false; video.paused = true; video.source = source;
     video.metadataLoaded = false; video.dataLoaded = false;
     video.seekPending = false;
+    video.prefetch = null;
+    video.prefetchTime = null;
     video.image = null;
     if (source && (this.autoplay || this.hasAttribute("autoplay"))) this.play().catch(error => this.dispatchEvent(Object.assign(new Event("error"), { error })));
     this._styleChanged();
   }
 
-  _startVideo() {
-    const video = elementState(this).video, token = ++video.token;
-    const seek = video.seekPending;
-    video.seekPending = false;
-    if (video.timer) clearTimeout(video.timer);
-    video.frameRequest = (async () => {
+  _startStreamVideo(video, token, seek) {
+    return (async () => {
       try {
         if (!this.document.defaultView) throw new Error("video requires an attached window");
-        // Layout size is stable across frames. Measuring every frame forced a
-        // full box walk on the decode cadence and kept playback off the refresh.
+        const player = video.streamPlayer;
+        if (!player) return;
+        const view = this.document.defaultView;
+        if (!view || view.closed) return;
+
+        // Stream selection stays full-res. Export maxEdge is the element box so
+        // one CPU sws pass does YUV→RGBA at display size (~10ms) instead of full
+        // 720p/1080p convert (~60ms here, hard-capping visual FPS ~16). WGPU still
+        // scales the texture to the exact layout box.
         const docState = documentState(this.document);
         const sizeGeneration = docState.staticPaintGeneration ?? 0;
         if (video.maxEdgeGeneration !== sizeGeneration || !video.maxEdge) {
@@ -2076,7 +2239,218 @@ export class Element extends EventTarget {
           video.maxEdge = Math.max(1, Math.ceil(Math.max(box.width, box.height) || 1));
           video.maxEdgeGeneration = sizeGeneration;
         }
-        const frame = await decodeVideoFrame(video.source, video.currentTime, video.maxEdge, seek);
+        try { player.setMaxEdge(video.maxEdge || 0); } catch { /* ignore */ }
+
+        if (seek) {
+          const target = Math.max(0, video.currentTime || 0);
+          player.seek(target);
+          video.streamController?.seek(target, false)?.catch?.(() => {});
+        }
+
+        // Wait for audio priming. Decode+demux start together on audio-ready so
+        // video does not free-run 1–2s ahead while m4a buffers.
+        if (video.audioStartPending) {
+          video.timer = setTimeout(() => this._startVideo(), 16);
+          return;
+        }
+        if (!video.streamDecodeStarted) {
+          this._startStreamDecode(video, video.currentTime || 0);
+        }
+
+        // Master clock: wall time anchored when audio becomes ready (see
+        // _startVideoAudio). Re-anchor once to the first audio-clock sample so
+        // lipsync matches the audible timeline, then free-run at 1x wall — the
+        // continuous audio playback clock lags by the output buffer and caused
+        // multi-hundred-ms present holds when used as a hard master every frame.
+        const now = performance.now();
+        let audioExpected = null;
+        if (!this.muted && video.volume > 0) {
+          const audioClock = getVideoAudioClock(video.audioId);
+          if (audioClock) {
+            audioExpected = audioClock.time + (now - audioClock.receivedAt) / 1000;
+            if (!video._audioClockAnchored) {
+              video.playbackClockTime = audioClock.time;
+              video.playbackClockStartedAt = audioClock.receivedAt;
+              video._audioClockAnchored = true;
+            }
+          }
+        }
+        if (video.playbackClockStartedAt == null) {
+          video.playbackClockTime = Math.max(0, video.currentTime || 0);
+          video.playbackClockStartedAt = now;
+        }
+        // Present slightly behind the wall anchor so frames line up with the
+        // audible position (ALSA/Pulse keeps ~250ms queued after audio-ready).
+        const outputLatency = 0.18;
+        const expected = Math.max(0, video.playbackClockTime + (now - video.playbackClockStartedAt) / 1000 - outputLatency);
+        try { player.setMediaClock(expected); } catch { /* older native */ }
+
+        const failure = player.error;
+        if (failure) throw new Error(failure);
+
+        // Hold the taken frame so a slightly-early picture can wait without
+        // losing it (takeLatestFrame clears the slot).
+        if (!video._heldStreamFrame) {
+          let spins = 0;
+          while (!player.ended && spins < 30) {
+            if (token !== video.token || video.paused) return;
+            const gen = player.frameGeneration;
+            if (gen !== video.streamFrameGeneration) {
+              const next = player.takeLatestFrame();
+              if (next) {
+                video.streamFrameGeneration = gen;
+                video._heldStreamFrame = next;
+                break;
+              }
+            }
+            await new Promise(resolve => setTimeout(resolve, 4));
+            spins += 1;
+          }
+        }
+        if (token !== video.token || video.paused) return;
+        const frame = video._heldStreamFrame;
+        if (!frame) {
+          if (player.ended) {
+            video.paused = true;
+            video.ended = true;
+            stopVideoAudio(video.audioId);
+            this.dispatchEvent(new Event("ended"));
+            return;
+          }
+          video.timer = setTimeout(() => this._startVideo(), 8);
+          return;
+        }
+
+        const pts = frame.time ?? frame.pts ?? player.currentTime;
+        const frameDuration = (frame.frameDuration > 0 ? frame.frameDuration : 0) || 1 / 30;
+        if (pts > expected + 0.04) {
+          const wait = Math.min(40, Math.max(4, (pts - expected) * 1000));
+          video.timer = setTimeout(() => this._startVideo(), wait);
+          return;
+        }
+        if (pts < expected - 0.12) {
+          video._heldStreamFrame = null;
+          if (player.frameGeneration !== video.streamFrameGeneration) {
+            video.timer = setTimeout(() => this._startVideo(), 0);
+            return;
+          }
+        }
+
+        video._heldStreamFrame = null;
+        video.duration = player.duration;
+        const sourceWidth = frame.sourceWidth || frame.width || player.width;
+        const sourceHeight = frame.sourceHeight || frame.height || player.height;
+        const dimensionsChanged = video.width !== sourceWidth || video.height !== sourceHeight;
+        video.width = sourceWidth;
+        video.height = sourceHeight;
+        if (!video.metadataLoaded) {
+          video.metadataLoaded = true;
+          this.dispatchEvent(new Event("loadedmetadata"));
+          this.dispatchEvent(new Event("durationchange"));
+        }
+
+        const pixels = frame.pixels;
+        if (video.textureId !== null && (video.image?.width !== frame.width || video.image?.height !== frame.height)) {
+          view.deleteImageTexture(video.textureId);
+          video.textureId = null;
+        }
+        if (video.textureId === null) video.textureId = view.createImageTexture(frame.width, frame.height, pixels);
+        else view.updateImageTexture(video.textureId, pixels);
+        // Live GPU texture only — keep ~3.6MiB RGBA off the JS heap after upload.
+        video.image = { textureId: video.textureId, width: frame.width, height: frame.height };
+        video.currentTime = pts;
+        video.streamFrameGeneration = player.frameGeneration;
+        if (!video.dataLoaded) {
+          if (dimensionsChanged) this._styleChanged();
+          video.dataLoaded = true;
+          this.dispatchEvent(new Event("loadeddata"));
+          this.dispatchEvent(new Event("canplay"));
+        }
+        this.dispatchEvent(new Event("timeupdate"));
+
+        if (process.env.VITROLA_STREAM_TRACE) {
+          const gap = video._streamLastPresentAt != null ? now - video._streamLastPresentAt : 0;
+          video._streamLastPresentAt = performance.now();
+          video._streamPresentCount = (video._streamPresentCount || 0) + 1;
+          const skewMs = (pts - expected) * 1000;
+          const audioSkewMs = audioExpected != null ? (pts - audioExpected) * 1000 : null;
+          if (gap > 80 || Math.abs(skewMs) > 80 || video._streamPresentCount <= 5 || video._streamPresentCount % 30 === 0) {
+            console.error(`[stream-present #${video._streamPresentCount}] gapMs=${gap.toFixed(1)} skewMs=${skewMs.toFixed(1)} audioSkewMs=${audioSkewMs == null ? "n/a" : audioSkewMs.toFixed(1)} pts=${Number(pts).toFixed(3)} expected=${expected.toFixed(3)} maxEdge=${video.maxEdge} queue=${player.queueLen}`);
+          }
+        }
+
+        let delayMs = (pts + frameDuration - expected) * 1000;
+        if (!Number.isFinite(delayMs)) delayMs = frameDuration * 1000;
+        delayMs = Math.max(0, Math.min(delayMs, 48));
+        video.timer = setTimeout(() => {
+          if (player.ended || (Number.isFinite(video.duration) && video.currentTime >= video.duration)) {
+            if (this.loop) {
+              video.currentTime = 0;
+              video.seekPending = true;
+              video.streamDecodeStarted = false;
+              this._startVideoAudio(0);
+            } else {
+              video.paused = true;
+              video.ended = true;
+              stopVideoAudio(video.audioId);
+              this.dispatchEvent(new Event("ended"));
+              return;
+            }
+          }
+          this._startVideo();
+        }, delayMs);
+      } catch (error) {
+        if (token === video.token && !video.paused && this.document.defaultView && !this.document.defaultView.closed) {
+          video.paused = true;
+          this.dispatchEvent(Object.assign(new Event("error"), { error }));
+        }
+        throw error;
+      }
+    })();
+  }
+
+  _startVideo() {
+    const video = elementState(this).video, token = ++video.token;
+    const seek = video.seekPending;
+    video.seekPending = false;
+    if (video.timer) clearTimeout(video.timer);
+    if (video.streamMode && video.streamPlayer) {
+      video.frameRequest = this._startStreamVideo(video, token, seek);
+      video.frameRequest.catch(() => {});
+      return video.frameRequest;
+    }
+    video.frameRequest = (async () => {
+      try {
+        if (!this.document.defaultView) throw new Error("video requires an attached window");
+        // Layout size is stable across frames. Measuring every frame forced a
+        // full box walk on the decode cadence and kept playback off the refresh.
+        // Display-sized CPU convert (see stream path). Format URL stays full-res.
+        const docState = documentState(this.document);
+        const sizeGeneration = docState.staticPaintGeneration ?? 0;
+        if (video.maxEdgeGeneration !== sizeGeneration || !video.maxEdge) {
+          const box = this.getBoundingClientRect();
+          video.maxEdge = Math.max(1, Math.ceil(Math.max(box.width, box.height) || 1));
+          video.maxEdgeGeneration = sizeGeneration;
+        }
+        // Overlap decode of frame N+1 with present/upload/wait of frame N.
+        // Serial request→present→wait left the decoder idle for most of each
+        // frame period and kept full-res streams under target FPS.
+        const frameDurationHint = 1 / 30;
+        let frame;
+        const prefetch = video.prefetch;
+        const prefetchTime = video.prefetchTime;
+        video.prefetch = null;
+        video.prefetchTime = null;
+        if (
+          !seek
+          && prefetch
+          && Number.isFinite(prefetchTime)
+          && Math.abs(prefetchTime - video.currentTime) <= frameDurationHint * 0.75
+        ) {
+          frame = await prefetch;
+        } else {
+          frame = await decodeVideoFrame(video.source, video.currentTime, video.maxEdge, seek);
+        }
         if (token !== video.token || video.paused) return;
         const view = this.document.defaultView;
         if (!view || view.closed) return;
@@ -2111,14 +2485,33 @@ export class Element extends EventTarget {
         };
         // Late frames: drop to the wall/audio clock and decode once there.
         // Do not present intermediates — that reads as a fast-forward catch-up.
+        // Only force a container seek for multi-second gaps. Seeking HTTP
+        // progressive streams every ~2 frames thrash-decodes and yields <1 FPS;
+        // short lags use skipFrame (decode-without-sws) in the worker instead.
+        const seekCatchUpSeconds = 1;
+        const kickPrefetch = (nextTime, forceSeek = false) => {
+          if (token !== video.token || video.paused) return;
+          video.prefetchTime = nextTime;
+          video.prefetch = decodeVideoFrame(video.source, nextTime, video.maxEdge, forceSeek).catch(error => {
+            if (video.prefetchTime === nextTime) {
+              video.prefetch = null;
+              video.prefetchTime = null;
+            }
+            throw error;
+          });
+        };
         const clockBeforePresent = mediaClock();
         if (clockBeforePresent && frame.time + frameDuration * 0.5 < clockBeforePresent.expectedTime) {
           const jump = clockBeforePresent.expectedTime - frame.time;
           video.currentTime = clockBeforePresent.expectedTime;
-          if (jump > frameDuration * 2) video.seekPending = true;
+          if (jump > seekCatchUpSeconds) video.seekPending = true;
+          video.prefetch = null;
+          video.prefetchTime = null;
           this._startVideo();
           return;
         }
+        // Decode the next frame while we wait for the present deadline and upload.
+        kickPrefetch(frame.time + frameDuration, false);
         if (clockBeforePresent) {
           const due = video.playbackClockStartedAt + (frame.time - video.playbackClockTime) * 1000;
           if (due > clockBeforePresent.now) {
@@ -2131,7 +2524,9 @@ export class Element extends EventTarget {
             if (clockAfterWait && frame.time + frameDuration * 0.5 < clockAfterWait.expectedTime) {
               const jump = clockAfterWait.expectedTime - frame.time;
               video.currentTime = clockAfterWait.expectedTime;
-              if (jump > frameDuration * 2) video.seekPending = true;
+              if (jump > seekCatchUpSeconds) video.seekPending = true;
+              video.prefetch = null;
+              video.prefetchTime = null;
               this._startVideo();
               return;
             }
@@ -2147,14 +2542,14 @@ export class Element extends EventTarget {
           this.dispatchEvent(new Event("loadedmetadata"));
           this.dispatchEvent(new Event("durationchange"));
         }
-        const pixels = Buffer.from(frame.pixels.buffer, frame.pixels.byteOffset, frame.pixels.byteLength);
+        const pixels = frame.pixels;
         if (video.textureId !== null && (video.image.width !== frame.width || video.image.height !== frame.height)) {
           view.deleteImageTexture(video.textureId);
           video.textureId = null;
         }
         if (video.textureId === null) video.textureId = view.createImageTexture(frame.width, frame.height, pixels);
         else view.updateImageTexture(video.textureId, pixels);
-        video.image = { textureId: video.textureId, width: frame.width, height: frame.height, pixels: frame.pixels };
+        video.image = { textureId: video.textureId, width: frame.width, height: frame.height, pixels };
         video.currentTime = frame.time;
         if (video.playbackClockStartedAt == null) {
           video.playbackClockTime = frame.time;
@@ -2183,7 +2578,7 @@ export class Element extends EventTarget {
               const expectedTime = video.playbackClockTime + (performance.now() - video.playbackClockStartedAt) / 1000;
               if (nextTime + frameDuration * 0.5 < expectedTime) {
                 nextTime = expectedTime;
-                if (expectedTime - nextMediaTime > frameDuration * 2) video.seekPending = true;
+                if (expectedTime - nextMediaTime > 1) video.seekPending = true;
               }
             }
             video.currentTime = nextTime;
@@ -2469,6 +2864,19 @@ export class Element extends EventTarget {
     return styleForTaffy(style, fontSize, documentState(this.document).viewport);
   }
 
+  get clientWidth() {
+    const rect = this.getBoundingClientRect();
+    const left = Number.parseFloat(this.style.borderLeftWidth) || 0;
+    const right = Number.parseFloat(this.style.borderRightWidth) || 0;
+    return Math.max(0, Math.round(rect.width - left - right));
+  }
+  get clientHeight() {
+    const rect = this.getBoundingClientRect();
+    const top = Number.parseFloat(this.style.borderTopWidth) || 0;
+    const bottom = Number.parseFloat(this.style.borderBottomWidth) || 0;
+    return Math.max(0, Math.round(rect.height - top - bottom));
+  }
+
   get scrollLeft() { return elementState(this).scrollLeft; }
   set scrollLeft(value) {
     const next = Math.max(0, Number(value) || 0);
@@ -2565,9 +2973,56 @@ export class Element extends EventTarget {
   #syncChildren() {
     const doc = documentState(this.document);
     doc.layoutTree.setChildren(elementState(this).handle, this.children.map((child) => elementState(child).handle));
+    // Structural DOM changes outside baked scroll textures (modals, stage mounts)
+    // must rebuild the scroll-scene base. Changes inside a promoted scroller only
+    // dirty that texture — same classification as _styleChanged.
+    if (noteScrollLayerPaintChange(this) !== "content") {
+      doc.pendingScrollSceneInvalidation = true;
+    }
     doc.dirty = true;
     markGeometryDirty(doc);
   }
+}
+
+export function getComputedStyle(element, pseudoElt) {
+  if (pseudoElt != null && pseudoElt !== "") {
+    throw new DOMException("pseudo-element computed style is not supported", "NotSupportedError");
+  }
+  if (!element || element.nodeType !== 1) {
+    throw new TypeError("getComputedStyle expects an Element");
+  }
+  const style = element.style;
+  const box = element.getBoundingClientRect?.() ?? { width: 0, height: 0 };
+  const view = element.document?.defaultView;
+  const size = view?.size?.() ?? {};
+  const context = {
+    fontSize: Number(style.fontSize) || 16,
+    rootFontSize: Number(element.document?.documentElement?.style?.fontSize) || 16,
+    vw: Number(size.width) || box.width || 0,
+    vh: Number(size.height) || box.height || 0,
+  };
+  return new Proxy({}, {
+    get(_target, property) {
+      if (property === "getPropertyValue") {
+        return (name) => {
+          const camel = String(name).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+          return String(computedProperty(element, style, camel, box, context) ?? "");
+        };
+      }
+      if (typeof property !== "string" || property === "then") return undefined;
+      const value = computedProperty(element, style, property, box, context);
+      return value == null ? "" : String(value);
+    },
+  });
+}
+
+function computedProperty(element, style, property, box, context) {
+  const specified = computedStyleValue(style, property);
+  if (property === "transform") {
+    return computeTransform(specified ?? "none", box, context);
+  }
+  if (specified === undefined) return "";
+  return specified;
 }
 
 export class Document extends EventTarget {
@@ -2647,6 +3102,7 @@ export class Document extends EventTarget {
 
   _attachWindow(window) {
     documentState(this).defaultView = window;
+    window.getComputedStyle = (element, pseudo) => getComputedStyle(element, pseudo);
     window._syncDocumentSizeConstraints();
     window._syncBodyWindowAppearance();
     for (const element of documentState(this).elements) {
@@ -2731,6 +3187,7 @@ export class Document extends EventTarget {
     }
     if (timings) timings.layout = performance.now() - started;
     if (didReflow) requestImageLoadSchedule(this);
+    if (didReflow) notifyResizeObservers();
   }
 
   #boxes(timings, selectedElements = null) {

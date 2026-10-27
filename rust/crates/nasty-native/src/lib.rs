@@ -26,6 +26,8 @@ use wgpu::util::DeviceExt;
 mod ffmpeg_decode;
 #[cfg(target_os = "linux")]
 mod audio_output;
+#[cfg(target_os = "linux")]
+mod video_stream;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent as OsWindowEvent};
@@ -1162,10 +1164,9 @@ impl NativeVideoDecoder {
     #[napi(js_name = "skipFrame")]
     pub fn skip_frame(&mut self) -> Result<Option<f64>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| Error::new(Status::GenericFailure, "video decoder is closed"))?;
-        let Some(held) = decoder.pull().map_err(|error| Error::new(Status::GenericFailure, error))? else {
+        let Some(held) = decoder.skip().map_err(|error| Error::new(Status::GenericFailure, error))? else {
             return Ok(None);
         };
-        decoder.discard();
         Ok(Some(held.pts))
     }
 

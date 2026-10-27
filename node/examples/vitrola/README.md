@@ -2,6 +2,8 @@
 
 Vitrola retains the playlists, local library and conversation history, Grok tool workflow, YouTube search, site-page tools, and carousel video player. Interface bindings are provided by [`node/dominant.js`](../../dominant.js), which uses DOM operations and Nasty's `MutationObserver`; the example does not use renderer internals or inline style setters.
 
+The assistant finds video pages with `web_search` (DuckDuckGo HTML form), probes candidates with `yt_dlp`, and only then saves or plays them. Always store the watch/video page URL in the playlist, never a signed or temporary media `src`. `create_playlist` and `add_to_playlist` run yt-dlp on each page URL and skip ones it cannot open. At play time Vitrola resolves streams through yt-dlp.
+
 Run from `node/` with:
 
 ```sh

@@ -6,6 +6,8 @@ import { verifyKey } from "./grok.js";
 import { createLibrary } from "./library.js";
 import { createMemory } from "./memory.js";
 import { resolvePlayback } from "./download.js";
+import { resolveTrackPlayback } from "./stream-attach.js";
+import { bindVideoStream } from "../../index.js";
 import * as youtube from "./youtube.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -164,6 +166,7 @@ let pendingSeek = null;
 let nextProgressPaint = 0;
 let progressBar = null;
 let progressFrame = null;
+let timeLabel = null;
 const progressFillClasses = "h-full w-full origin-left rounded-full bg-rose-300";
 
 function progressRatio() {
@@ -213,8 +216,10 @@ function updatePlaybackTime(video) {
   if (now < nextProgressPaint) return;
   state.time = next;
   nextProgressPaint = now + 1000;
-  d.updateSync();
+  // Avoid a full-tree updateSync every second while playing — that competed
+  // with stream presents. Progress fill + time label are updated in place.
   paintProgress();
+  if (timeLabel) timeLabel.textContent = formatTime(state.time);
 }
 
 function seekPlayback(video, time) {
@@ -590,7 +595,9 @@ function syncCarouselMedia() {
       active._retriedMedia = false;
     }
     if (active && state.player.status === "playing" && state.entered) {
-      active.play().catch(() => {});
+      // Only start when paused. Repeated play() restarts demux/decode and
+      // produced multi-second stalls per frame on the stream path.
+      if (active.paused) active.play().catch(() => {});
     } else {
       active?.pause();
     }
@@ -617,8 +624,28 @@ function syncCarouselMedia() {
     return;
   }
   const generation = ++mediaGeneration;
-  resolvePlayback(track).then((src) => {
-    if (generation !== mediaGeneration) return;
+  const page = track?.pageUrl || (track?.videoId ? `https://www.youtube.com/watch?v=${track.videoId}` : "") || track?.url || "";
+  // Do not capture the video element across the yt-dlp await — carousel
+  // updates recreate cards, and binding the stale node forced CDN fallback.
+  const resolve = /^https?:\/\//i.test(page)
+    ? resolveTrackPlayback(page, { isCurrent: () => generation === mediaGeneration })
+    : resolvePlayback(track).then((mediaUrl) => ({ mode: "cdn", mediaUrl, audioUrl: mediaUrl }));
+  resolve.then((result) => {
+    if (generation !== mediaGeneration) {
+      try { result.binding?.controller?.dispose(); } catch { /* ignore */ }
+      try { result.binding?.player?.close(); } catch { /* ignore */ }
+      return;
+    }
+    const src = typeof result === "string" ? result : result.mediaUrl;
+    const live = currentVideo();
+    if (result.mode === "stream" && result.binding && live) {
+      bindVideoStream(live, result.binding);
+      console.info(`[vitrola] youtube stream ${result.height || "?"}p → ${new URL(src).host}`);
+    } else if (result.streamError) {
+      console.warn("[vitrola] stream path failed, using CDN fallback:", result.streamError);
+    } else {
+      console.info(`[vitrola] CDN playback → ${src ? new URL(src).host : "(none)"}`);
+    }
     resolvedMediaKey = key;
     resolvedMediaSrc = src;
     state.mediaError = "";
@@ -958,7 +985,10 @@ function transport() {
     d.el(
       "div",
       { class: "mt-3 flex w-full max-w-lg items-center gap-3 text-[11px] text-white/45" },
-      d.el("span", {}, d.text(() => formatTime(state.time))),
+      d.el("span", {
+        onattach: (node) => { timeLabel = node; node.textContent = formatTime(state.time); },
+        ondetach: (node) => { if (timeLabel === node) timeLabel = null; },
+      }, d.text(() => formatTime(state.time))),
       seekBar(),
       d.el("span", {}, d.text(() => formatTime(state.player.track?.duration || 0))),
     ),

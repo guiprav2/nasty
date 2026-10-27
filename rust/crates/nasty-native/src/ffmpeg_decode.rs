@@ -62,6 +62,12 @@ extern "C" {
         err_len: usize,
     ) -> c_int;
     fn sweet_ffmpeg_discard_video(media: *mut SweetMedia);
+    fn sweet_ffmpeg_skip_video(
+        media: *mut SweetMedia,
+        out: *mut SweetVideoFrame,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
     fn sweet_ffmpeg_next_audio(
         media: *mut SweetMedia,
         out: *mut SweetAudioChunk,
@@ -178,6 +184,26 @@ impl Video {
 
     pub fn discard(&mut self) {
         unsafe { sweet_ffmpeg_discard_video(self.raw) }
+    }
+
+    /// Decode the next picture with non-ref discard, then drop it (no sws).
+    pub fn skip(&mut self) -> Result<Option<HeldFrame>, String> {
+        let mut frame = SweetVideoFrame {
+            rgba: ptr::null(),
+            width: 0,
+            height: 0,
+            stride: 0,
+            pts: 0.0,
+        };
+        let mut err = [0u8; 512];
+        let ret = unsafe { sweet_ffmpeg_skip_video(self.raw, &mut frame, err.as_mut_ptr().cast(), err.len()) };
+        if ret == 0 {
+            return Ok(None);
+        }
+        if ret < 0 {
+            return Err(error_text(&err));
+        }
+        Ok(Some(HeldFrame { pts: frame.pts }))
     }
 
     /// Convert the picture from the last [`Self::pull`].
@@ -304,4 +330,211 @@ impl Drop for Audio {
     fn drop(&mut self) {
         unsafe { sweet_ffmpeg_close(self.raw) }
     }
+}
+
+enum SweetPacketVideo {}
+
+extern "C" {
+    fn sweet_ffmpeg_open_packet_video(
+        codec: *const c_char,
+        extradata: *const u8,
+        extradata_len: usize,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> *mut SweetPacketVideo;
+    fn sweet_ffmpeg_close_packet_video(dec: *mut SweetPacketVideo);
+    fn sweet_ffmpeg_packet_send(
+        dec: *mut SweetPacketVideo,
+        data: *const u8,
+        len: usize,
+        pts_seconds: f64,
+        keyframe: c_int,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn sweet_ffmpeg_packet_pull(
+        dec: *mut SweetPacketVideo,
+        out: *mut SweetVideoFrame,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn sweet_ffmpeg_packet_export(
+        dec: *mut SweetPacketVideo,
+        max_edge: c_int,
+        out: *mut SweetVideoFrame,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn sweet_ffmpeg_packet_receive_rgba(
+        dec: *mut SweetPacketVideo,
+        max_edge: c_int,
+        out: *mut SweetVideoFrame,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn sweet_ffmpeg_packet_discard(dec: *mut SweetPacketVideo);
+    fn sweet_ffmpeg_packet_flush(dec: *mut SweetPacketVideo, err: *mut c_char, err_len: usize) -> c_int;
+}
+
+/// Compressed-AU video decoder (H.264 / HEVC / AV1). No container — caller demuxes.
+pub struct PacketVideo {
+    raw: *mut SweetPacketVideo,
+}
+
+unsafe impl Send for PacketVideo {}
+
+impl PacketVideo {
+    pub fn open(codec: &str, extradata: &[u8]) -> Result<Self, String> {
+        let codec = CString::new(codec).map_err(|_| "codec name contains a NUL byte".to_string())?;
+        let mut err = [0u8; 512];
+        let raw = unsafe {
+            sweet_ffmpeg_open_packet_video(
+                codec.as_ptr(),
+                if extradata.is_empty() {
+                    ptr::null()
+                } else {
+                    extradata.as_ptr()
+                },
+                extradata.len(),
+                err.as_mut_ptr().cast(),
+                err.len(),
+            )
+        };
+        if raw.is_null() {
+            return Err(error_text(&err));
+        }
+        Ok(Self { raw })
+    }
+
+    pub fn send(&mut self, data: &[u8], pts_seconds: f64, keyframe: bool) -> Result<(), String> {
+        let mut err = [0u8; 512];
+        let ret = unsafe {
+            sweet_ffmpeg_packet_send(
+                self.raw,
+                data.as_ptr(),
+                data.len(),
+                pts_seconds,
+                if keyframe { 1 } else { 0 },
+                err.as_mut_ptr().cast(),
+                err.len(),
+            )
+        };
+        if ret < 0 {
+            return Err(error_text(&err));
+        }
+        Ok(())
+    }
+
+    /// Decode the next picture but do not color-convert it.
+    pub fn pull(&mut self) -> Result<Option<HeldFrame>, String> {
+        let mut frame = SweetVideoFrame {
+            rgba: ptr::null(),
+            width: 0,
+            height: 0,
+            stride: 0,
+            pts: 0.0,
+        };
+        let mut err = [0u8; 512];
+        let ret = unsafe { sweet_ffmpeg_packet_pull(self.raw, &mut frame, err.as_mut_ptr().cast(), err.len()) };
+        if ret == 0 {
+            return Ok(None);
+        }
+        if ret < 0 {
+            return Err(error_text(&err));
+        }
+        Ok(Some(HeldFrame { pts: frame.pts }))
+    }
+
+    pub fn discard(&mut self) {
+        unsafe { sweet_ffmpeg_packet_discard(self.raw) }
+    }
+
+    /// Convert the picture from the last [`Self::pull`].
+    pub fn export(&mut self, max_edge: u32) -> Result<RgbaFrame, String> {
+        let mut frame = SweetVideoFrame {
+            rgba: ptr::null(),
+            width: 0,
+            height: 0,
+            stride: 0,
+            pts: 0.0,
+        };
+        let mut err = [0u8; 512];
+        let ret = unsafe {
+            sweet_ffmpeg_packet_export(
+                self.raw,
+                max_edge.min(i32::MAX as u32) as c_int,
+                &mut frame,
+                err.as_mut_ptr().cast(),
+                err.len(),
+            )
+        };
+        if ret <= 0 {
+            return Err(if ret < 0 {
+                error_text(&err)
+            } else {
+                "FFmpeg returned an empty video frame".into()
+            });
+        }
+        copy_rgba_frame(&frame)
+    }
+
+    /// Receive and export one RGBA frame. `None` means the decoder needs more input.
+    pub fn receive_rgba(&mut self, max_edge: u32) -> Result<Option<RgbaFrame>, String> {
+        let mut frame = SweetVideoFrame {
+            rgba: ptr::null(),
+            width: 0,
+            height: 0,
+            stride: 0,
+            pts: 0.0,
+        };
+        let mut err = [0u8; 512];
+        let ret = unsafe {
+            sweet_ffmpeg_packet_receive_rgba(
+                self.raw,
+                max_edge.min(i32::MAX as u32) as c_int,
+                &mut frame,
+                err.as_mut_ptr().cast(),
+                err.len(),
+            )
+        };
+        if ret == 0 {
+            return Ok(None);
+        }
+        if ret < 0 {
+            return Err(error_text(&err));
+        }
+        Ok(Some(copy_rgba_frame(&frame)?))
+    }
+
+    pub fn flush(&mut self) -> Result<(), String> {
+        let mut err = [0u8; 512];
+        let ret = unsafe { sweet_ffmpeg_packet_flush(self.raw, err.as_mut_ptr().cast(), err.len()) };
+        if ret < 0 {
+            return Err(error_text(&err));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PacketVideo {
+    fn drop(&mut self) {
+        unsafe { sweet_ffmpeg_close_packet_video(self.raw) }
+    }
+}
+
+fn copy_rgba_frame(frame: &SweetVideoFrame) -> Result<RgbaFrame, String> {
+    if frame.rgba.is_null() || frame.width <= 0 || frame.height <= 0 || frame.stride <= 0 {
+        return Err("FFmpeg returned an empty video frame".into());
+    }
+    let byte_len = (frame.stride as usize)
+        .checked_mul(frame.height as usize)
+        .ok_or_else(|| "video frame size overflow".to_string())?;
+    let rgba = unsafe { std::slice::from_raw_parts(frame.rgba, byte_len) }.to_vec();
+    Ok(RgbaFrame {
+        width: frame.width as u32,
+        height: frame.height as u32,
+        stride: frame.stride as u32,
+        pts: frame.pts,
+        rgba,
+    })
 }

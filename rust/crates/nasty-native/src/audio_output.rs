@@ -4,6 +4,7 @@ use napi::bindgen_prelude::Buffer;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use std::collections::{HashSet, VecDeque};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -16,6 +17,8 @@ struct QueueState {
     paused: bool,
     volume: f32,
     channels: usize,
+    /// Bumped by `clear` so an in-flight write cannot put seeked-away samples back.
+    epoch: u64,
     playback_frames: Arc<AtomicU64>,
 }
 
@@ -61,7 +64,86 @@ fn is_alsa_plugin_alias(name: &str) -> bool {
         || name.starts_with("sysdefault:")
 }
 
+fn pulse_routed(name: &str) -> bool {
+    name == "default" || name == "pulse" || name == "pipewire"
+        || name.starts_with("pulse:")
+        || name.starts_with("pipewire:")
+}
+
+fn pactl_stdout(args: &[&str]) -> Option<String> {
+    let output = Command::new("pactl").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+fn spec_rate_hz(spec: &str) -> Option<u32> {
+    spec.split_whitespace()
+        .find(|token| token.ends_with("Hz"))
+        .and_then(|token| token.trim_end_matches("Hz").parse().ok())
+}
+
+struct PulseSink {
+    rate: u32,
+}
+
+/// Pulse/PipeWire sink behind this ALSA device. Hardware PCM devices return
+/// `None` and keep the 48 kHz / short-buffer path.
+fn pulse_sink_info(device: &str) -> Option<PulseSink> {
+    if !pulse_routed(device) {
+        return None;
+    }
+    let sink = if let Some(name) = device.strip_prefix("pulse:").filter(|name| !name.is_empty()) {
+        name.to_string()
+    } else if let Some(name) = device.strip_prefix("pipewire:").filter(|name| !name.is_empty()) {
+        name.to_string()
+    } else if let Ok(name) = std::env::var("PULSE_SINK") {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            pactl_stdout(&["get-default-sink"]).map(|text| text.trim().to_string()).filter(|name| !name.is_empty())?
+        } else {
+            name
+        }
+    } else {
+        pactl_stdout(&["get-default-sink"]).map(|text| text.trim().to_string()).filter(|name| !name.is_empty())?
+    };
+    let list = pactl_stdout(&["list", "sinks"])?;
+    let mut current = String::new();
+    let mut rate = None;
+    for line in list.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix("Name:") {
+            current = name.trim().to_string();
+            continue;
+        }
+        if current != sink {
+            continue;
+        }
+        if let Some(spec) = line.strip_prefix("Sample Specification:") {
+            rate = spec_rate_hz(spec);
+        }
+    }
+    Some(PulseSink { rate: rate? })
+}
+
 fn open_pcm(name: &str) -> std::result::Result<OpenedPcm, String> {
+    let sink = pulse_sink_info(name);
+    let requested_rate = sink.as_ref().map(|sink| sink.rate).unwrap_or(48_000);
+    // Keep tlength modest (~250ms). Matching the full sink configured latency
+    // (~826ms here) lets blocking writei accept nearly a second of PCM in one
+    // wall-clock burst before the buffer fills; SSR timestamps monitor chunks
+    // by arrival time and then drops/inserts to "catch up". Speakers still
+    // sound fine because Pulse plays that burst in realtime. A ~250ms buffer
+    // absorbs decoder hitches without handing SSR a huge startup lump.
+    let buffer_frames = match sink.as_ref() {
+        Some(_) => {
+            let target = i64::from(requested_rate) * 250 / 1000;
+            let max_frames = i64::from(requested_rate).saturating_mul(3).max(4 * 1024);
+            target.clamp(4 * 1024, max_frames)
+        }
+        None => 8192,
+    };
     let open_format = |format| -> std::result::Result<OpenedPcm, String> {
         // Blocking mode: writei waits when the device buffer is full instead of
         // needing a software sleep gate. Nonblocking + sleep was underrunning
@@ -70,20 +152,30 @@ fn open_pcm(name: &str) -> std::result::Result<OpenedPcm, String> {
         let params = HwParams::any(&pcm).map_err(|error| error.to_string())?;
         params.set_access(Access::RWInterleaved).map_err(|error| error.to_string())?;
         params.set_channels_near(2).map_err(|error| error.to_string())?;
-        params.set_rate_near(48_000, ValueOr::Nearest).map_err(|error| error.to_string())?;
+        params.set_rate_near(requested_rate, ValueOr::Nearest).map_err(|error| error.to_string())?;
         params.set_format(format).map_err(|error| error.to_string())?;
         params.set_period_size_near(1024, ValueOr::Nearest).map_err(|error| error.to_string())?;
-        // ~0.25s at 48k. Large enough to absorb decoder hitches without XRuns;
-        // still bounded so "default" cannot pick a multi-second buffer.
-        params.set_buffer_size_near(12288).map_err(|error| error.to_string())?;
+        params.set_buffer_size_near(buffer_frames).map_err(|error| error.to_string())?;
         pcm.hw_params(&params).map_err(|error| error.to_string())?;
         let current = pcm.hw_params_current().map_err(|error| error.to_string())?;
         let rate = current.get_rate().map_err(|error| error.to_string())?;
         let channels = current.get_channels().map_err(|error| error.to_string())? as u16;
         let period_frames = current.get_period_size().map_err(|error| error.to_string())? as usize;
-        pcm.prepare().map_err(|error| error.to_string())?;
+        let negotiated_buffer = current.get_buffer_size().map_err(|error| error.to_string())? as usize;
         drop(current);
         drop(params);
+        // Pulse's ALSA plugin maps start_threshold onto prebuf. One period of
+        // prebuf lets the stream underrun as soon as the sink renders a larger
+        // chunk; half the buffer gives Pulse a real cushion without waiting for
+        // a full tlength before audible start.
+        let period = period_frames.max(1) as alsa::pcm::Frames;
+        let start = (negotiated_buffer.max(1) / 2).max(period_frames.max(1)) as alsa::pcm::Frames;
+        let sw = pcm.sw_params_current().map_err(|error| error.to_string())?;
+        sw.set_avail_min(period).map_err(|error| error.to_string())?;
+        sw.set_start_threshold(start).map_err(|error| error.to_string())?;
+        pcm.sw_params(&sw).map_err(|error| error.to_string())?;
+        drop(sw);
+        pcm.prepare().map_err(|error| error.to_string())?;
         let kind = if format == Format::float() { SampleKind::Float } else { SampleKind::I16 };
         Ok(OpenedPcm {
             pcm,
@@ -93,8 +185,8 @@ fn open_pcm(name: &str) -> std::result::Result<OpenedPcm, String> {
             kind,
         })
     };
-    // Prefer s16: Pulse/PipeWire float paths through ALSA are a common source of
-    // periodic clicks; s16 is the widely tested playback format.
+    // Prefer s16: it matches this sink's format, so a same-rate stream is a
+    // straight copy. Float through the Pulse plugin was a common click source.
     open_format(Format::s16()).or_else(|_| open_format(Format::float()))
 }
 
@@ -125,14 +217,27 @@ fn publish_playback_frames(
     state.playback_frames.store(playback, Ordering::Release);
 }
 
+fn restore_unwritten(state: &Mutex<QueueState>, epoch: u64, samples: &[f32]) {
+    if samples.is_empty() {
+        return;
+    }
+    let Ok(mut state) = state.lock() else { return };
+    if state.epoch != epoch {
+        return;
+    }
+    for sample in samples.iter().rev() {
+        state.samples.push_front(*sample);
+    }
+}
+
 fn output_loop(
     mut output: OpenedPcm,
     state: Arc<Mutex<QueueState>>,
     commands: mpsc::Receiver<OutputCommand>,
 ) {
-    let mut write_frames = output.period_frames.max(1) * 2;
-    let mut f32_samples = vec![0.0f32; write_frames * output.channels as usize];
-    let mut i16_samples = vec![0i16; write_frames * output.channels as usize];
+    let mut taken = Vec::<f32>::new();
+    let mut scaled = Vec::<f32>::new();
+    let mut i16_samples = Vec::<i16>::new();
     let mut written_frames = 0u64;
     let mut pace_origin: Option<Instant> = None;
     let mut pace_origin_frames = 0u64;
@@ -146,88 +251,96 @@ fn output_loop(
                 pace_origin = None;
                 pace_origin_frames = 0;
                 short_idle = 0;
-                write_frames = output.period_frames.max(1) * 2;
                 state.lock().ok().map(|state| state.playback_frames.store(0, Ordering::Release));
-                f32_samples.resize(write_frames * output.channels as usize, 0.0);
-                i16_samples.resize(write_frames * output.channels as usize, 0);
                 let _ = ready.send(());
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        let mut state = match state.lock() {
+        let mut guard = match state.lock() {
             Ok(state) => state,
             Err(_) => break,
         };
-        let queued = output.pcm.delay().unwrap_or(0).max(0) as u64;
-        publish_playback_frames(&state, written_frames, queued, pace_origin, pace_origin_frames, output.rate);
+        // Do not call snd_pcm_delay here. On the Pulse plugin it waits until a
+        // latency update exists, and that wait sits in front of the next write
+        // so the stream never fills and the monitor hears a stall.
 
         let channels = output.channels as usize;
         let period_samples = output.period_frames.max(1) * channels;
-        let available = state.samples.len() / channels * channels;
-        if state.paused {
-            drop(state);
+        let available = guard.samples.len() / channels * channels;
+        if guard.paused {
+            drop(guard);
             thread::sleep(Duration::from_millis(5));
             continue;
         }
         if available == 0 {
-            drop(state);
+            drop(guard);
             // No media yet / between chunks. Do not invent silence into the
             // media clock; a short wait lets the decoder refill.
             thread::sleep(Duration::from_millis(2));
             continue;
         }
 
-        // Avoid constant short writes: they underrun Pulse as a click per period.
-        // Wait for at least one full period unless the queue has been short for
-        // several iterations (end of stream drain).
-        let mut sample_count = available.min(f32_samples.len());
-        if sample_count < period_samples {
+        // One full period per blocking write. A multi-period burst fills the
+        // Pulse stream in a lump, then the monitor latency jumps and a recorder
+        // hears chopped audio. Short writes underrun as a click, so wait for a
+        // full period unless the queue has been short (end of stream).
+        let sample_count = if available < period_samples {
             short_idle = short_idle.saturating_add(1);
             if short_idle < 8 {
-                drop(state);
+                drop(guard);
                 thread::sleep(Duration::from_millis(2));
                 continue;
             }
+            available
         } else {
             short_idle = 0;
-            // Write whole periods only while the queue is healthy.
-            sample_count = sample_count / period_samples * period_samples;
-        }
+            period_samples
+        };
         if sample_count == 0 {
-            drop(state);
+            drop(guard);
             continue;
         }
+        let epoch = guard.epoch;
+        let volume = guard.volume;
+        taken.clear();
+        taken.extend(guard.samples.drain(..sample_count));
+        drop(guard);
 
-        for (sample, source) in f32_samples[..sample_count].iter_mut().zip(&state.samples) {
-            *sample = *source * state.volume;
-        }
+        scaled.clear();
+        scaled.extend(taken.iter().map(|sample| sample * volume));
         let write_result = match output.kind {
-            SampleKind::Float => output.pcm.io_f32().and_then(|io| io.writei(&f32_samples[..sample_count])),
+            SampleKind::Float => output.pcm.io_f32().and_then(|io| io.writei(&scaled)),
             SampleKind::I16 => {
-                for (target, source) in i16_samples[..sample_count].iter_mut().zip(&f32_samples[..sample_count]) {
+                i16_samples.resize(scaled.len(), 0);
+                for (target, source) in i16_samples.iter_mut().zip(&scaled) {
                     *target = (source.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                 }
-                output.pcm.io_i16().and_then(|io| io.writei(&i16_samples[..sample_count]))
+                output.pcm.io_i16().and_then(|io| io.writei(&i16_samples[..scaled.len()]))
             }
         };
         let write_error = match write_result {
             Ok(frames) => {
-                let written_samples = frames.saturating_mul(channels);
-                let consumed = written_samples.min(state.samples.len());
-                state.samples.drain(..consumed);
-                if pace_origin.is_none() {
+                let written_samples = frames.saturating_mul(channels).min(taken.len());
+                restore_unwritten(&state, epoch, &taken[written_samples..]);
+                if pace_origin.is_none() && frames > 0 {
                     pace_origin = Some(Instant::now());
                     pace_origin_frames = written_frames;
                 }
                 written_frames = written_frames.saturating_add(frames as u64);
-                let queued = output.pcm.delay().unwrap_or(0).max(0) as u64;
-                publish_playback_frames(&state, written_frames, queued, pace_origin, pace_origin_frames, output.rate);
+                // No snd_pcm_delay / snd_pcm_avail here: both wait on the Pulse
+                // mainloop and stall the writer once the buffer is full. The
+                // wall cap below keeps the published clock at 1x.
+                if let Ok(guard) = state.lock() {
+                    publish_playback_frames(&guard, written_frames, 0, pace_origin, pace_origin_frames, output.rate);
+                }
                 None
             }
-            Err(error) => Some(error),
+            Err(error) => {
+                restore_unwritten(&state, epoch, &taken);
+                Some(error)
+            }
         };
-        drop(state);
 
         if let Some(error) = write_error {
             if output.pcm.state() == PcmState::XRun {
@@ -241,8 +354,10 @@ fn output_loop(
         if output.pcm.state() != PcmState::Running {
             let _ = output.pcm.start();
         }
-        // No software lead-sleep. Blocking writei + wall-capped published clock
-        // keep audible output continuous while A/V sync stays at 1x.
+        // No software lead-sleep. Blocking writei of one period paces the
+        // device once the modest (~250ms) buffer is full; wall-capped
+        // publish_playback_frames keeps A/V sync at 1x. Sleep-gating the write
+        // path previously starved Pulse and clicked on speakers.
     }
     let _ = output.pcm.drop();
 }
@@ -298,6 +413,7 @@ impl NativeAudioPlayer {
             paused: false,
             volume: 1.0,
             channels: output_channels,
+            epoch: 0,
             playback_frames: Arc::new(AtomicU64::new(0)),
         }));
         let (commands, receiver) = mpsc::channel();
@@ -343,11 +459,19 @@ impl NativeAudioPlayer {
         let output_frames = (numerator / sample_rate as u64) as usize;
         self.resample_remainder = numerator % sample_rate as u64;
         let mut converted = Vec::with_capacity(output_frames.saturating_mul(self.output_channels));
+        let denom = self.output_rate.max(1) as u64;
         for frame in 0..output_frames {
-            let source_frame = (frame * sample_rate / self.output_rate).min(frames - 1);
+            // Linear interpolation. Same-rate input stays bit-exact (frac == 0).
+            let numer = (frame as u64).saturating_mul(sample_rate as u64);
+            let index = (numer / denom) as usize;
+            let frac = (numer % denom) as f32 / denom as f32;
+            let i0 = index.min(frames - 1);
+            let i1 = (index + 1).min(frames - 1);
             for output_channel in 0..self.output_channels {
                 let source_channel = output_channel.min(channels - 1);
-                converted.push(input[source_frame * channels + source_channel]);
+                let a = input[i0 * channels + source_channel];
+                let b = input[i1 * channels + source_channel];
+                converted.push(a + (b - a) * frac);
             }
         }
         let mut state = self.state.lock().map_err(audio_error)?;
@@ -373,7 +497,9 @@ impl NativeAudioPlayer {
 
     #[napi]
     pub fn clear(&mut self) -> Result<()> {
-        self.state.lock().map_err(audio_error)?.samples.clear();
+        let mut state = self.state.lock().map_err(audio_error)?;
+        state.samples.clear();
+        state.epoch = state.epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -406,6 +532,7 @@ impl NativeAudioPlayer {
         self.resample_input_rate = 0;
         let mut state = self.state.lock().map_err(audio_error)?;
         state.samples.clear();
+        state.epoch = state.epoch.wrapping_add(1);
         state.channels = channels;
         Ok(())
     }

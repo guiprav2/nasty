@@ -128,7 +128,7 @@ function utilityStyle(utility) {
   const ringColor = /^ring-(.+)$/.exec(utility);
   if (ringColor && colorValue(ringColor[1])) return ["__ringColor", colorValue(ringColor[1])];
   const fixed = {
-    block: ["display", "block"], flex: ["display", "flex"], "inline-flex": ["display", "flex"], grid: ["display", "grid"], hidden: ["display", "none"],
+    block: ["display", "block"], flex: ["display", "flex"], "inline-flex": ["display", "flex"], grid: [["display", "flex"], ["flexWrap", "wrap"]], hidden: ["display", "none"], invisible: ["visibility", "hidden"], visible: ["visibility", "visible"],
     "flex-row": ["flexDirection", "row"], "flex-row-reverse": ["flexDirection", "row-reverse"], "flex-col": ["flexDirection", "column"], "flex-col-reverse": ["flexDirection", "column-reverse"],
     "flex-wrap": ["flexWrap", "wrap"], "flex-nowrap": ["flexWrap", "nowrap"], "flex-wrap-reverse": ["flexWrap", "wrap-reverse"],
     // These Tailwind shorthands expand to their standard CSS longhands so the
@@ -141,12 +141,16 @@ function utilityStyle(utility) {
     grow: ["flexGrow", 1], shrink: ["flexShrink", 1], static: ["position", "static"], relative: ["position", "relative"], absolute: ["position", "absolute"], fixed: ["position", "fixed"],
     "items-start": ["alignItems", "flex-start"], "items-end": ["alignItems", "flex-end"], "items-center": ["alignItems", "center"], "items-stretch": ["alignItems", "stretch"],
     "justify-start": ["justifyContent", "flex-start"], "justify-end": ["justifyContent", "flex-end"], "justify-center": ["justifyContent", "center"], "justify-between": ["justifyContent", "space-between"], "justify-around": ["justifyContent", "space-around"], "justify-evenly": ["justifyContent", "space-evenly"],
+    "font-display": ["fontFamily", "Fraunces, ui-serif, Georgia, serif"],
+    "font-sans": ["fontFamily", "Outfit, ui-sans-serif, system-ui, sans-serif"],
+    "font-serif": ["fontFamily", "ui-serif, Georgia, serif"],
     "origin-center": ["transformOrigin", "50% 50%"], "origin-top": ["transformOrigin", "50% 0%"], "origin-top-right": ["transformOrigin", "100% 0%"],
     "origin-right": ["transformOrigin", "100% 50%"], "origin-bottom-right": ["transformOrigin", "100% 100%"], "origin-bottom": ["transformOrigin", "50% 100%"],
     "origin-bottom-left": ["transformOrigin", "0% 100%"], "origin-left": ["transformOrigin", "0% 50%"], "origin-top-left": ["transformOrigin", "0% 0%"],
     "content-center": ["alignContent", "center"], "whitespace-nowrap": ["whiteSpace", "nowrap"],
     truncate: [["overflow", "hidden"], ["overflowX", "hidden"], ["overflowY", "hidden"], ["textOverflow", "ellipsis"], ["whiteSpace", "nowrap"]],
     "text-left": ["textAlign", "left"], "text-center": ["textAlign", "center"], "text-right": ["textAlign", "right"],
+    uppercase: ["textTransform", "uppercase"], lowercase: ["textTransform", "lowercase"], capitalize: ["textTransform", "capitalize"], "normal-case": ["textTransform", "none"],
     "overflow-hidden": [["overflow", "hidden"], ["overflowX", "hidden"], ["overflowY", "hidden"]],
     "overflow-auto": [["overflow", "auto"], ["overflowX", "auto"], ["overflowY", "auto"]],
     "overflow-scroll": [["overflow", "scroll"], ["overflowX", "scroll"], ["overflowY", "scroll"]],
@@ -241,6 +245,56 @@ function utilityStyle(utility) {
   if (duration) return ["transitionDuration", `${duration[1]}ms`];
   const caret = /^caret-(.+)$/.exec(utility);
   if (caret && colorValue(caret[1])) return ["caretColor", colorValue(caret[1])];
+  const roundedArb = /^rounded(?:-([trbl]{1,2}|[tl][lr]))?-\[(.+)\]$/.exec(utility);
+  if (roundedArb) {
+    let raw = roundedArb[2];
+    const amount = parseLength(raw.endsWith("px") || raw.endsWith("%") || raw.endsWith("rem") || raw.endsWith("em") || /^-?(?:\d+\.?\d*|\.\d+)$/.test(raw) ? raw : `[${raw}]`)
+      ?? (/^-?(?:\d+\.?\d*|\.\d+)px$/.test(raw) ? Number.parseFloat(raw) : undefined)
+      ?? (raw.endsWith("px") ? Number.parseFloat(raw) : undefined);
+    let value = amount;
+    if (value === undefined) {
+      if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(raw)) value = Number(raw);
+      else if (/^-?(?:\d+\.?\d*|\.\d+)px$/.test(raw)) value = Number.parseFloat(raw);
+      else if (/^-?(?:\d+\.?\d*|\.\d+)rem$/.test(raw)) value = Number.parseFloat(raw) * 16;
+      else if (/^-?(?:\d+\.?\d*|\.\d+)em$/.test(raw)) value = Number.parseFloat(raw) * 16;
+      else if (/^-?(?:\d+\.?\d*|\.\d+)%$/.test(raw)) value = raw;
+      else return null;
+    }
+    const corner = roundedArb[1];
+    const all = ["borderRadius", "borderTopLeftRadius", "borderTopRightRadius", "borderBottomRightRadius", "borderBottomLeftRadius"];
+    if (!corner) return all.map(p => [p, value]);
+    const map = {
+      t: ["borderTopLeftRadius", "borderTopRightRadius"],
+      b: ["borderBottomLeftRadius", "borderBottomRightRadius"],
+      l: ["borderTopLeftRadius", "borderBottomLeftRadius"],
+      r: ["borderTopRightRadius", "borderBottomRightRadius"],
+      tl: ["borderTopLeftRadius"], tr: ["borderTopRightRadius"],
+      bl: ["borderBottomLeftRadius"], br: ["borderBottomRightRadius"],
+    };
+    const props = map[corner];
+    if (!props) return null;
+    return props.map(p => [p, value]);
+  }
+  const tracking = /^tracking-(.+)$/.exec(utility);
+  if (tracking) {
+    const value = tracking[1];
+    const named = {
+      tighter: "-0.05em",
+      tight: "-0.025em",
+      normal: "0em",
+      wide: "0.025em",
+      wider: "0.05em",
+      widest: "0.1em",
+    };
+    if (Object.hasOwn(named, value)) return ["letterSpacing", named[value]];
+    if (value.startsWith("[") && value.endsWith("]")) {
+      const raw = value.slice(1, -1).replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_").trim();
+      if (!raw) return null;
+      if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(raw)) return ["letterSpacing", `${raw}px`];
+      return ["letterSpacing", raw];
+    }
+    return null;
+  }
   const inset = /^(inset(?:-[xy])?|top|right|bottom|left)-(.+)$/.exec(utility);
   if (inset) {
     const amount = parseLength(inset[2]);

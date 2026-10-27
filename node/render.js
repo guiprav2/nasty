@@ -3,6 +3,7 @@ import { computedStyleValue, getStyleTransitionState, hasActiveStyleTransition, 
 import { canvasCommands, canvasSurface } from "./canvas-2d.js";
 import { prepareScrollLayers } from "./internal/scroll-layers.js";
 import { objectFitLayout, objectPositionFractions } from "./internal/object-fit.js";
+import { transformMatrix as parseCssTransform } from "./internal/css-transform.js";
 
 const SIDES = ["Top", "Right", "Bottom", "Left"];
 const transformedListElements = new WeakMap();
@@ -610,6 +611,12 @@ export function buildOrderedDisplayList(boxes, width, height) {
   for (const box of boxes) {
     const { element, borderBox, border } = box;
     const style = element.style;
+    if (element.hidden || style.display === "none" || style.visibility === "hidden") continue;
+    let skip = false;
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      if (parent.hidden || parent.style.display === "none" || parent.style.visibility === "hidden") { skip = true; break; }
+    }
+    if (skip) continue;
     const clip = box.clip;
     pushQuad(borderBox, parseColor(computedStyleValue(style, "backgroundColor")), clip);
 
@@ -680,60 +687,8 @@ function angleValue(value) {
 }
 
 function parseTransform(source, width, height) {
-  if (!source || source === "none") return identity4();
-  const expression = /([a-zA-Z0-9]+)\(([^()]*)\)/g;
-  let matrix = identity4();
-  let end = 0;
-  let match;
-  while ((match = expression.exec(source))) {
-    if (source.slice(end, match.index).trim()) throw new TypeError(`invalid CSS transform: ${source}`);
-    end = expression.lastIndex;
-    const name = match[1];
-    const args = match[2].split(/\s*,\s*/).map((part) => part.trim()).filter(Boolean);
-    let fn = identity4();
-    if (["translate", "translate3d"].includes(name)) {
-      fn = translation(lengthValue(args[0] ?? "0", width), lengthValue(args[1] ?? "0", height), name === "translate3d" ? lengthValue(args[2] ?? "0") : 0);
-    } else if (["translateX", "translateY", "translateZ"].includes(name)) {
-      const index = name === "translateX" ? 0 : name === "translateY" ? 1 : 2;
-      const value = lengthValue(args[0] ?? "0", index === 0 ? width : index === 1 ? height : 0);
-      fn[index][3] = value;
-    } else if (["scale", "scale3d"].includes(name)) {
-      fn[0][0] = Number(args[0] ?? 1); fn[1][1] = Number(args[1] ?? args[0] ?? 1);
-      if (name === "scale3d") fn[2][2] = Number(args[2] ?? 1);
-    } else if (["scaleX", "scaleY", "scaleZ"].includes(name)) {
-      const index = name === "scaleX" ? 0 : name === "scaleY" ? 1 : 2;
-      fn[index][index] = Number(args[0]);
-    } else if (["rotate", "rotateZ", "rotateX", "rotateY"].includes(name)) {
-      const angle = angleValue(args[0]);
-      const c = Math.cos(angle); const s = Math.sin(angle);
-      if (name === "rotateX") { fn[1][1] = c; fn[1][2] = -s; fn[2][1] = s; fn[2][2] = c; }
-      else if (name === "rotateY") { fn[0][0] = c; fn[0][2] = s; fn[2][0] = -s; fn[2][2] = c; }
-      else { fn[0][0] = c; fn[0][1] = -s; fn[1][0] = s; fn[1][1] = c; }
-    } else if (name === "skew" || name === "skewX" || name === "skewY") {
-      const x = Math.tan(angleValue(name === "skewY" ? "0deg" : (args[0] ?? "0deg")));
-      const y = Math.tan(angleValue(name === "skewX" ? "0deg" : (name === "skew" ? (args[1] ?? "0deg") : (args[0] ?? "0deg"))));
-      fn[0][1] = x;
-      fn[1][0] = y;
-    } else if (name === "perspective") {
-      const distance = lengthValue(args[0]);
-      if (distance <= 0) throw new TypeError("perspective() distance must be positive");
-      fn[3][2] = -1 / distance;
-    } else if (name === "matrix") {
-      if (args.length !== 6) throw new TypeError("matrix() expects six values");
-      const [a, b, c, d, e, f] = args.map(Number);
-      fn = [[a, c, 0, e], [b, d, 0, f], [0, 0, 1, 0], [0, 0, 0, 1]];
-    } else if (name === "matrix3d") {
-      if (args.length !== 16) throw new TypeError("matrix3d() expects sixteen values");
-      const values = args.map(Number);
-      fn = Array.from({ length: 4 }, (_, row) => Array.from({ length: 4 }, (_, col) => values[col * 4 + row]));
-    } else throw new TypeError(`unsupported CSS transform function: ${name}`);
-    if (fn.flat().some((value) => !Number.isFinite(value))) throw new TypeError(`non-finite CSS transform: ${source}`);
-    matrix = multiply4(matrix, fn);
-  }
-  if (source.slice(end).trim() || end === 0) throw new TypeError(`invalid CSS transform: ${source}`);
-  return matrix;
+  return parseCssTransform(source, width, height);
 }
-
 function transformOrigin(source, width, height) {
   const parts = String(source ?? "50% 50% 0px").trim().split(/\s+/);
   const keyword = (value, axis) => value === "center" ? "50%" : value === "left" || value === "top" ? "0%" : value === "right" || value === "bottom" ? "100%" : value;
@@ -1180,7 +1135,25 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       && scrollSceneCache.hostKeys.every((element) => scrollLayers.has(element)));
   // Quiet frames need a complete base (stripsAnimated false). Animated frames
   // need a base that already omitted live chrome (stripsAnimated true).
-  if (scrollSceneReusable && !hasActiveTransitions && !scrollSceneCache.stripsAnimated) {
+  // Refuse quiet reuse when the box set includes elements the cached base never
+  // painted — otherwise newly mounted overlays (dialogs) stay invisible until
+  // some unrelated contentGeneration bump.
+  const scrollSceneQuietReusable = scrollSceneReusable && !hasActiveTransitions && !scrollSceneCache.stripsAnimated
+    && (() => {
+      const known = new Set(scrollSceneCache.visibleElements);
+      for (const box of boxes) {
+        if (scrollCovered.has(box.element)) continue;
+        if (known.has(box.element)) continue;
+        const style = box.element.style;
+        const paints = (style.backgroundColor && style.backgroundColor !== "transparent")
+          || (style.backgroundImage && style.backgroundImage !== "none")
+          || box.element.localName === "img" || box.element.localName === "video"
+          || box.element.localName === "canvas";
+        if (paints) return false;
+      }
+      return true;
+    })();
+  if (scrollSceneQuietReusable) {
     const boxesByElement = new Map(boxes.map((box) => [box.element, box]));
     const projectPoint = createBoxProjector(boxes);
     const viewport = { x: 0, y: 0, width, height };
@@ -1276,11 +1249,43 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     let sceneOffset = 2;
     for (const part of sceneParts) { scene.set(part, sceneOffset); sceneOffset += part.length; }
     const compose = (overlayList) => {
+      // Quiet reuse keeps the cached base; input caret/selection overlays still
+      // need a light rebuild on top so they are not frozen with the scene.
       let overlayValues = [5, 0];
       let overlayCommands = 0;
-      // Overlays still rebuilt lightly via the cached compose from a full build when present.
-      const combined = new Float32Array(scene.length);
+      if (overlayList?.length) {
+        const overlayBoxes = new Map(boxes.map((box) => [box.element, box]));
+        for (const overlay of overlayList) {
+          const box = overlayBoxes.get(overlay.element);
+          if (!box) continue;
+          const color = overlay.color;
+          if (!color) continue;
+          const rect = overlay.rect;
+          if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+          const project = (x, y) => {
+            const point = projectPoint(box, box.x + x, box.y + y);
+            return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
+          };
+          const corners = [
+            project(rect.x - box.x, rect.y - box.y),
+            project(rect.x - box.x + rect.width, rect.y - box.y),
+            project(rect.x - box.x + rect.width, rect.y - box.y + rect.height),
+            project(rect.x - box.x, rect.y - box.y + rect.height),
+          ];
+          if (corners.some((point) => !point)) continue;
+          for (let i = 1; i < corners.length - 1; i++) {
+            const a = corners[0], b = corners[i], c = corners[i + 1];
+            overlayValues.push(0, a.x, a.y, b.x, b.y, c.x, c.y, color[0], color[1], color[2], color[3]);
+            overlayCommands++;
+          }
+        }
+      }
+      const combined = new Float32Array(scene.length + Math.max(0, overlayValues.length - 2));
       combined.set(scene);
+      if (overlayCommands) {
+        combined.set(Float32Array.from(overlayValues.slice(2)), scene.length);
+        combined[1] += overlayCommands;
+      }
       const displayList = Buffer.from(combined.buffer);
       transformedListElements.set(displayList, visibleElements);
       return displayList;
@@ -1419,8 +1424,10 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       visibleElements.add(current);
     }
   };
-  // Seed from the scroll-scene base, then repaint only live chrome below.
+  // Seed from the scroll-scene base, then repaint live chrome (and any elements
+  // missing from that base, e.g. newly mounted dialogs) below.
   let reusedScrollBase = false;
+  let scrollSceneCachedVisible = null;
   const scenePartOwners = [];
   const scenePartCommands = [];
   const pushScenePart = (part, owner, commands = 1) => {
@@ -1435,7 +1442,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       scenePartCommands.push(0);
     }
     commandCount = scrollSceneCache.baseCommands;
-    for (const element of scrollSceneCache.visibleElements) visibleElements.add(element);
+    scrollSceneCachedVisible = new Set(scrollSceneCache.visibleElements);
+    for (const element of scrollSceneCachedVisible) visibleElements.add(element);
     reusedScrollBase = true;
     // Refresh scroll-layer quads in their cached slots (same as the quiet hit path).
     for (const [hostElement, layer] of scrollLayers) {
@@ -1752,12 +1760,20 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     const { box } = entry;
     const element = box.element;
     const after = !!entry.after;
+    if (element.hidden || element.style.display === "none" || element.style.visibility === "hidden") continue;
+    let hiddenAncestor = false;
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      if (parent.hidden || parent.style.display === "none" || parent.style.visibility === "hidden") { hiddenAncestor = true; break; }
+    }
+    if (hiddenAncestor) continue;
     let captureState = null;
-    // Reused scroll base already has static chrome + scroll quads; only emit live
-    // transition/animation chrome (and skip re-emitting scroll layer hosts).
+    // Reused scroll base already has static chrome + scroll quads. Emit live
+    // transition/animation chrome, and also any element that never made it into
+    // the cached visible set (modals mounted without a contentGeneration bump).
     if (reusedScrollBase) {
       if (scrollLayers.has(element)) continue;
-      if (!hasTransitionInPaintAncestry(element)) continue;
+      const inCachedBase = scrollSceneCachedVisible?.has(element);
+      if (!hasTransitionInPaintAncestry(element) && inCachedBase) continue;
     }
     const beforeCommands = commandCount;
     const segmentStart = values.length;
@@ -2374,9 +2390,23 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       baseParts.push(retainedScenePart(sceneParts[index]));
       if (!isLayer) baseCommands += scenePartCommands[index] || 0;
     }
-    // When reusing a prior stripped base, keep its command total for static chrome.
+    // When reusing a prior stripped base, keep its static command total and add
+    // any newly appended non-live parts (modals that painted because they were
+    // missing from the cached visible set). Overwriting with the old total alone
+    // would truncate those commands on the next reuse.
     if (reusedScrollBase && scrollSceneCache) {
-      baseCommands = scrollSceneCache.baseCommands;
+      let appendedCommands = 0;
+      const priorCount = scrollSceneCache.baseParts.length;
+      for (let index = priorCount; index < sceneParts.length; index++) {
+        let isLayer = false;
+        for (const [, slot] of activeLayerSlots) {
+          if (slot === index) { isLayer = true; break; }
+        }
+        const owner = scenePartOwners[index];
+        if (isLayer || (owner && hasTransitionInPaintAncestry(owner))) continue;
+        appendedCommands += scenePartCommands[index] || 0;
+      }
+      baseCommands = scrollSceneCache.baseCommands + appendedCommands;
       stripsAnimated = true;
     }
     documentData.scrollSceneCache = {

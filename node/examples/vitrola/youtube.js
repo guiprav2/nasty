@@ -48,12 +48,13 @@ export function ytdlBin() {
 
 export async function videoInfo(url) {
   let bin = await ytdlBin();
+  // Default client (not android): android often only exposes muxed 360p (fmt 18),
+  // which blocks full-res DASH progressive MP4s the stream demuxer needs.
   let raw = await runChecked(bin, [
     '--no-playlist',
     '--no-warnings',
     '--skip-download',
     '--dump-single-json',
-    '--extractor-args', 'youtube:player_client=android',
     '--socket-timeout', '20',
     String(url),
   ], { timeout: 60000 });
@@ -62,9 +63,12 @@ export async function videoInfo(url) {
 
 export async function playbackUrl(url) {
   const bin = await ytdlBin();
+  // Always prefer the highest progressive muxed stream. Fullscreen will need
+  // high-res later; switching formats mid-playback interrupts, so start high.
+  // Prefer progressive https MP4 (SpankBang often omits codec tags) before HLS.
   const raw = await runChecked(bin, [
     '--no-playlist', '--no-warnings', '--get-url',
-    '-f', 'best[ext=mp4][vcodec^=avc1][acodec!=none]/best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]',
+    '-f', 'best[ext=mp4][protocol=https]/best[ext=mp4][protocol=http]/best[ext=mp4][vcodec^=avc1][acodec!=none]/best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best',
     '--extractor-args', 'youtube:player_client=android',
     '--socket-timeout', '20', String(url),
   ], { timeout: 60000 });
@@ -132,6 +136,8 @@ export function normalizeEntry(entry, query = '') {
   let duration = Number(entry?.duration);
   return {
     videoId,
+    pageUrl: `https://www.youtube.com/watch?v=${videoId}`,
+    via: 'ytdlp',
     title: String(entry?.title || 'Untitled').replace(/\s+/g, ' ').trim().slice(0, 300) || 'Untitled',
     channel: String(entry?.channel || entry?.uploader || '').replace(/\s+/g, ' ').trim().slice(0, 200),
     duration: Number.isFinite(duration) && duration > 0 ? Math.round(duration) : 0,

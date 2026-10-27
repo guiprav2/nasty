@@ -23,6 +23,9 @@ function setBoundValue(element, key, value, previous) {
   if (key === "class") {
     const next = classes(value).join(" ");
     if (next !== previous) element.className = next;
+  } else if (key === "hidden") {
+    const next = Boolean(value);
+    if (next !== Boolean(previous) || element.hidden !== next) element.hidden = next;
   } else if (key === "value" || key === "checked") {
     if (value !== previous) element[key] = value ?? "";
   } else if (key.includes("-")) {
@@ -247,6 +250,9 @@ export function dominant(document) {
     updateSync() {
       updateBound(document);
       for (const node of state.bound) scan(document, [node], true);
+      // Bindings can change class/hidden after the first pass; flush once more
+      // so display:none reaches layout before paint.
+      updateBound(document);
     },
     update() {
       if (state.scheduled) return Promise.resolve();

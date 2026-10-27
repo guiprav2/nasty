@@ -68,5 +68,27 @@ export function canScroll(element, axis) {
 }
 
 export function canScrollByUser(element, axis) {
-  return scrollableModes.has(overflowMode(element, axis));
+  if (!scrollableModes.has(overflowMode(element, axis))) return false;
+  // overflow:auto/scroll only participate in user scrolling (and thus window-drag
+  // blocking) when content actually overflows the padding box on that axis.
+  return contentOverflows(element, axis);
+}
+
+/** True when laid-out scroll size exceeds the client (padding) box on `axis`. */
+export function contentOverflows(element, axis) {
+  if (!element) return false;
+  // Prefer live layout metrics when present; fall back to scroll vs client.
+  const scroll = Number(axis === 'x' ? element.scrollWidth : element.scrollHeight);
+  let client = Number(axis === 'x' ? element.clientWidth : element.clientHeight);
+  if (!Number.isFinite(client) || client <= 0) {
+    // clientWidth/Height may be unset until a full CSSOM path exists; use
+    // getBoundingClientRect padding-box approximation via offset/border box.
+    try {
+      const rect = element.getBoundingClientRect?.();
+      if (rect) client = axis === 'x' ? Number(rect.width) : Number(rect.height);
+    } catch { /* ignore */ }
+  }
+  if (!Number.isFinite(scroll) || !Number.isFinite(client)) return false;
+  // Subpixel slack: treat near-equality as non-overflowing.
+  return scroll > client + 0.5;
 }

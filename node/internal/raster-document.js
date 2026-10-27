@@ -38,7 +38,7 @@ function stackingOrder(boxes) {
   const members = new Set(byElement.keys());
   const order = [];
   function visit(box) {
-    if (!box || box.element.hidden || box.element.style.display === 'none') return;
+    if (!box || box.element.hidden || box.element.style.display === 'none' || box.element.style.visibility === 'hidden') return;
     order.push(box);
     const children = box.element.children.map(element => byElement.get(element)).filter(Boolean);
     children.sort((a, b) => (Number(a.element.style.zIndex) || 0) - (Number(b.element.style.zIndex) || 0));
@@ -246,13 +246,13 @@ function rasterizeCachedLayer(document, width, height, surface, state, key, opti
   const previousPaintBounds = state[`${key}PaintBounds`] ?? new Map();
   const visibleElements = new Set(includedBoxes.filter(box => !skipped?.has(box.element)
     && box.width > 0 && box.height > 0 && !box.element.hidden
-    && box.element.style.display !== 'none' && effectiveOpacity(box.element) > 0).map(box => box.element));
+    && box.element.style.display !== 'none' && box.element.style.visibility !== 'hidden' && effectiveOpacity(box.element) > 0).map(box => box.element));
   const previouslyVisible = state[`${key}VisibleElements`] ?? new Set();
   const lostVisibleContent = [...previouslyVisible].some(element => !visibleElements.has(element));
   const removedContent = [...previousBoxMap].some(([element, previous]) => {
     const current = currentBoxMap.get(element);
     return previous.width > 0 && previous.height > 0
-      && (!current || current.width <= 0 || current.height <= 0 || element.hidden || element.style.display === 'none');
+      && (!current || current.width <= 0 || current.height <= 0 || element.hidden || element.style.display === 'none' || element.style.visibility === 'hidden');
   });
   const policyChanged = !sameElementSet(state[`${key}IncludedElements`], includedElements)
     || !sameElementSet(state[`${key}SkippedElements`], skippedElements);

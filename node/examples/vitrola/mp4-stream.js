@@ -516,8 +516,9 @@ function sampleBytes(data, nalLengthSize, codec) {
 }
 
 function chooseFormat(info) {
-  const maxHeight = process.platform === "android" ? 480 : 720;
-  const formats = (info.formats || []).filter((f) => f.url && f.ext === "mp4" && /^avc1|^hvc1|^hev1|^av01/.test(f.vcodec || "") && f.protocol !== "m3u8" && f.protocol !== "m3u8_native" && (!f.height || f.height <= maxHeight));
+  // Full-res only: never cap height. Fullscreen will need high-res later;
+  // switching formats mid-playback interrupts.
+  const formats = (info.formats || []).filter((f) => f.url && f.ext === "mp4" && /^avc1|^hvc1|^hev1|^av01/.test(f.vcodec || "") && f.protocol !== "m3u8" && f.protocol !== "m3u8_native");
   const codecRank = (format) => /^avc1/.test(format.vcodec || "") ? 3 : /^hvc1|^hev1/.test(format.vcodec || "") ? 2 : 1;
   formats.sort((a, b) => codecRank(b) - codecRank(a) || (b.height || 0) - (a.height || 0) || Number(!!b.acodec && b.acodec !== "none") - Number(!!a.acodec && a.acodec !== "none") || (b.tbr || 0) - (a.tbr || 0));
   if (!formats.length) throw new Error("yt-dlp returned no supported MP4 video format");
@@ -671,5 +672,16 @@ export async function createYoutubeVideoStream(source, native, isCurrent = () =>
     },
   };
 
-  return { duration, width: stream.width || format.width || 0, height: stream.height || format.height || 0, controller };
+  // mediaUrl is the progressive CDN URL (real media bytes) for audio / fallback.
+  // The page URL is only used above for yt-dlp metadata — never put it in video.src.
+  return {
+    duration,
+    width: stream.width || format.width || 0,
+    height: stream.height || format.height || 0,
+    controller,
+    mediaUrl: format.url,
+    audioUrl: separateAudio?.url || (format.acodec && format.acodec !== "none" ? format.url : ""),
+    formatId: format.format_id,
+    heightSelected: format.height || stream.height || 0,
+  };
 }

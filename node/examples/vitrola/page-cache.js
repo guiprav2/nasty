@@ -1,4 +1,4 @@
-// Page HTML cache shared by grep and any tool that reads a page.
+// Page HTML cache shared by playback pattern fallback (and any tool that reads a page).
 // Entries are URL -> { html, at }. A hit older than 10 seconds is a miss.
 
 const TTL_MS = 10_000;
@@ -15,10 +15,14 @@ export function cachedPage(url) {
   return fresh(entry, Date.now()) ? entry.html : null;
 }
 
-export function storePage(url, html) {
+export function storePage(url, html, at = Date.now()) {
   const key = String(url || "");
   if (!key) return;
-  pages[key] = { html: String(html ?? ""), at: Date.now() };
+  pages[key] = { html: String(html ?? ""), at: Number(at) || Date.now() };
+}
+
+export function clearPageCache() {
+  for (const key of Object.keys(pages)) delete pages[key];
 }
 
 export async function fetchPage(url, fetchImpl = globalThis.fetch) {

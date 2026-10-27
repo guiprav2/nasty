@@ -10,6 +10,7 @@
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -587,6 +588,10 @@ static int ensure_swr(SweetMedia *media, char *err, size_t err_len) {
     return 0;
 }
 
+static int host_has(const char *path, const char *needle) {
+    return path && needle && strstr(path, needle) != NULL;
+}
+
 static int open_input(const char *path, AVFormatContext **fmt, char *err, size_t err_len) {
     AVDictionary *options = NULL;
     int remote = strncmp(path, "https://", 8) == 0 || strncmp(path, "http://", 7) == 0;
@@ -596,7 +601,17 @@ static int open_input(const char *path, AVFormatContext **fmt, char *err, size_t
         // obtain the signed URL. FFmpeg's Lavf default can receive an HTML
         // denial page, which is then reported as invalid media data.
         av_dict_set(&options, "user_agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36", 0);
-        av_dict_set(&options, "referer", "https://www.youtube.com/", 0);
+        // A YouTube referer on third-party CDNs (SpankBang sb-cd, etc.) causes
+        // denials or throttled progressive reads that starve the decoder.
+        if (host_has(path, "googlevideo.com") || host_has(path, "youtube.com") || host_has(path, "ytimg.com")) {
+            av_dict_set(&options, "referer", "https://www.youtube.com/", 0);
+        } else if (host_has(path, "sb-cd.com") || host_has(path, "spankbang.com") || host_has(path, "spankbang.")) {
+            av_dict_set(&options, "referer", "https://spankbang.com/", 0);
+        }
+        av_dict_set(&options, "reconnect", "1", 0);
+        av_dict_set(&options, "reconnect_streamed", "1", 0);
+        av_dict_set(&options, "reconnect_on_network_error", "1", 0);
+        av_dict_set(&options, "reconnect_delay_max", "5", 0);
     }
     ret = avformat_open_input(fmt, path, NULL, &options);
     av_dict_free(&options);
@@ -902,6 +917,25 @@ void sweet_ffmpeg_discard_video(SweetMedia *media) {
     media->held = 0;
 }
 
+int sweet_ffmpeg_skip_video(SweetMedia *media, SweetVideoFrame *out, char *err, size_t err_len) {
+    enum AVDiscard saved;
+    int ret;
+    if (!media || !media->video || !out) {
+        set_err(err, err_len, "no video stream");
+        return -1;
+    }
+    /* Drop non-reference pictures in the decoder so catch-up on full-res
+     * streams does not pay full reconstruct cost for every skipped frame. */
+    saved = media->video->skip_frame;
+    media->video->skip_frame = AVDISCARD_NONREF;
+    ret = sweet_ffmpeg_pull_video(media, out, err, err_len);
+    media->video->skip_frame = saved;
+    if (ret == 1) {
+        sweet_ffmpeg_discard_video(media);
+    }
+    return ret;
+}
+
 int sweet_ffmpeg_next_video(SweetMedia *media, int max_edge, SweetVideoFrame *out, char *err, size_t err_len) {
     int ret = sweet_ffmpeg_pull_video(media, out, err, err_len);
     if (ret != 1) {
@@ -1041,4 +1075,455 @@ int sweet_ffmpeg_next_audio(SweetMedia *media, SweetAudioChunk *out, char *err, 
         set_averr(err, err_len, "decoding audio", ret);
         return -1;
     }
+}
+
+struct SweetPacketVideo {
+    AVCodecContext *video;
+    AVPacket *packet;
+    AVFrame *frame;
+    AVFrame *downloaded;
+    int held;
+    int flush_sent;
+    struct SwsContext *sws;
+    int sws_w, sws_h, sws_fmt, sws_dw, sws_dh, sws_cs, sws_range;
+    unsigned char *rgba;
+    int rgba_cap;
+    unsigned char *scratch;
+    int scratch_cap;
+};
+
+static enum AVCodecID packet_codec_id(const char *codec) {
+    if (!codec) {
+        return AV_CODEC_ID_NONE;
+    }
+    if (!strcmp(codec, "h264") || !strcmp(codec, "avc1") || !strcmp(codec, "AVC1")) {
+        return AV_CODEC_ID_H264;
+    }
+    if (!strcmp(codec, "hevc") || !strcmp(codec, "h265") || !strcmp(codec, "hvc1") || !strcmp(codec, "hev1")) {
+        return AV_CODEC_ID_HEVC;
+    }
+    if (!strcmp(codec, "av1") || !strcmp(codec, "av01") || !strcmp(codec, "AV1")) {
+        return AV_CODEC_ID_AV1;
+    }
+    return AV_CODEC_ID_NONE;
+}
+
+static int ensure_sws_packet(SweetPacketVideo *dec, const AVFrame *frame, int dst_w, int dst_h, int cs, int range,
+                             char *err, size_t err_len) {
+    const int *coeffs;
+    if (dec->sws && dec->sws_w == frame->width && dec->sws_h == frame->height &&
+        dec->sws_fmt == frame->format && dec->sws_dw == dst_w && dec->sws_dh == dst_h &&
+        dec->sws_cs == cs && dec->sws_range == range) {
+        return 0;
+    }
+    sws_freeContext(dec->sws);
+    dec->sws = sws_getContext(frame->width, frame->height, (enum AVPixelFormat)frame->format, dst_w, dst_h,
+                              AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
+    if (!dec->sws) {
+        set_err(err, err_len, "swscale cannot convert this frame");
+        return -1;
+    }
+    coeffs = sws_getCoefficients(cs);
+    sws_setColorspaceDetails(dec->sws, coeffs, range, coeffs, 1, 0, 1 << 16, 1 << 16);
+    dec->sws_w = frame->width;
+    dec->sws_h = frame->height;
+    dec->sws_fmt = frame->format;
+    dec->sws_dw = dst_w;
+    dec->sws_dh = dst_h;
+    dec->sws_cs = cs;
+    dec->sws_range = range;
+    return 0;
+}
+
+static AVFrame *software_frame_packet(SweetPacketVideo *dec, AVFrame *frame, char *err, size_t err_len) {
+    int ret;
+    if (frame->format != AV_PIX_FMT_VAAPI) {
+        return frame;
+    }
+    if (!dec->downloaded) {
+        dec->downloaded = av_frame_alloc();
+        if (!dec->downloaded) {
+            set_err(err, err_len, "out of memory");
+            return NULL;
+        }
+    }
+    av_frame_unref(dec->downloaded);
+    ret = av_hwframe_transfer_data(dec->downloaded, frame, 0);
+    if (ret < 0) {
+        set_averr(err, err_len, "reading a hardware frame", ret);
+        return NULL;
+    }
+    if (dec->downloaded->color_range == AVCOL_RANGE_UNSPECIFIED) {
+        dec->downloaded->color_range = frame->color_range;
+    }
+    if (dec->downloaded->colorspace == AVCOL_SPC_UNSPECIFIED) {
+        dec->downloaded->colorspace = frame->colorspace;
+    }
+    dec->downloaded->pts = frame->pts;
+    dec->downloaded->best_effort_timestamp = frame->best_effort_timestamp;
+    if (dec->downloaded->sample_aspect_ratio.num <= 0) {
+        dec->downloaded->sample_aspect_ratio = frame->sample_aspect_ratio;
+    }
+    return dec->downloaded;
+}
+
+static double packet_frame_pts(const AVFrame *frame, AVRational time_base) {
+    int64_t pts = frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) {
+        pts = frame->pts;
+    }
+    if (pts == AV_NOPTS_VALUE) {
+        return 0.0;
+    }
+    return pts * av_q2d(time_base);
+}
+
+static int emit_packet_video(SweetPacketVideo *dec, int max_edge, SweetVideoFrame *out, char *err, size_t err_len) {
+    AVFrame *hw = dec->frame;
+    AVFrame *frame;
+    AVRational sar = {1, 1};
+    int rotation = 0, out_w, out_h, pre_w, pre_h, cs, range, pre_stride, out_stride;
+    unsigned char *scaled;
+    const uint8_t *src_slices[4];
+    int src_strides[4];
+    uint8_t *dst_slices[4];
+    int dst_strides[4];
+    if (!hw || hw->width <= 0 || hw->height <= 0) {
+        return 0;
+    }
+    if (hw->sample_aspect_ratio.num > 0 && hw->sample_aspect_ratio.den > 0) {
+        sar = hw->sample_aspect_ratio;
+    }
+    frame = software_frame_packet(dec, hw, err, err_len);
+    if (!frame) {
+        return -1;
+    }
+    upright_size(frame->width, frame->height, sar, rotation, max_edge, &out_w, &out_h, &pre_w, &pre_h);
+    if (out_w <= 0 || out_h <= 0 || pre_w <= 0 || pre_h <= 0) {
+        return 0;
+    }
+    cs = colorspace_of(frame);
+    range = full_range(frame);
+    if (ensure_sws_packet(dec, frame, pre_w, pre_h, cs, range, err, err_len) < 0) {
+        return -1;
+    }
+    pre_stride = pre_w * 4;
+    out_stride = out_w * 4;
+    if (pre_stride / 4 != pre_w || out_stride / 4 != out_w) {
+        set_err(err, err_len, "frame size overflow");
+        return -1;
+    }
+    if (ensure_bytes(&dec->rgba, &dec->rgba_cap, out_stride * out_h, err, err_len) < 0) {
+        return -1;
+    }
+    if (rotation == 0) {
+        scaled = dec->rgba;
+    } else {
+        if (ensure_bytes(&dec->scratch, &dec->scratch_cap, pre_stride * pre_h, err, err_len) < 0) {
+            return -1;
+        }
+        scaled = dec->scratch;
+    }
+    src_slices[0] = frame->data[0];
+    src_slices[1] = frame->data[1];
+    src_slices[2] = frame->data[2];
+    src_slices[3] = frame->data[3];
+    src_strides[0] = frame->linesize[0];
+    src_strides[1] = frame->linesize[1];
+    src_strides[2] = frame->linesize[2];
+    src_strides[3] = frame->linesize[3];
+    dst_slices[0] = scaled;
+    dst_slices[1] = NULL;
+    dst_slices[2] = NULL;
+    dst_slices[3] = NULL;
+    dst_strides[0] = pre_stride;
+    dst_strides[1] = 0;
+    dst_strides[2] = 0;
+    dst_strides[3] = 0;
+    if (sws_scale(dec->sws, src_slices, src_strides, 0, frame->height, dst_slices, dst_strides) <= 0) {
+        set_err(err, err_len, "swscale produced no rows");
+        return -1;
+    }
+    if (rotation != 0) {
+        rotate_rgba(scaled, pre_stride, pre_w, pre_h, rotation, dec->rgba, out_stride);
+    }
+    out->rgba = dec->rgba;
+    out->width = out_w;
+    out->height = out_h;
+    out->stride = out_stride;
+    out->pts = packet_frame_pts(frame, dec->video->pkt_timebase);
+    return 1;
+}
+
+static int open_packet_decoder(enum AVCodecID id, const unsigned char *extradata, size_t extradata_len,
+                               AVCodecContext **out, char *err, size_t err_len) {
+    AVCodec *codec;
+    int attempt;
+    codec = avcodec_find_decoder(id);
+    if (!codec) {
+        set_err(err, err_len, "unsupported video codec");
+        return -1;
+    }
+    for (attempt = 0; attempt < 2; attempt++) {
+        AVCodecContext *ctx = avcodec_alloc_context3(codec);
+        int use_hw = attempt == 0;
+        int ret;
+        int cpus;
+        if (!ctx) {
+            set_err(err, err_len, "out of memory");
+            return -1;
+        }
+        if (extradata && extradata_len > 0) {
+            if (extradata_len > (size_t)INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE) {
+                avcodec_free_context(&ctx);
+                set_err(err, err_len, "extradata too large");
+                return -1;
+            }
+            ctx->extradata = av_mallocz(extradata_len + AV_INPUT_BUFFER_PADDING_SIZE);
+            if (!ctx->extradata) {
+                avcodec_free_context(&ctx);
+                set_err(err, err_len, "out of memory");
+                return -1;
+            }
+            memcpy(ctx->extradata, extradata, extradata_len);
+            ctx->extradata_size = (int)extradata_len;
+        }
+        ctx->pkt_timebase = (AVRational){1, AV_TIME_BASE};
+        cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (cpus < 1) {
+            cpus = 1;
+        }
+        ctx->thread_count = cpus > 4 ? 2 : cpus;
+        ctx->thread_type = FF_THREAD_FRAME;
+        if (use_hw) {
+            AVBufferRef *device = open_vaapi_device();
+            if (!device) {
+                avcodec_free_context(&ctx);
+                continue;
+            }
+            ctx->hw_device_ctx = device;
+            ctx->get_format = choose_video_format;
+            ctx->extra_hw_frames = 16;
+            ctx->thread_count = 1;
+        }
+        ret = avcodec_open2(ctx, codec, NULL);
+        if (ret == 0) {
+            *out = ctx;
+            return 0;
+        }
+        avcodec_free_context(&ctx);
+        if (!use_hw) {
+            set_averr(err, err_len, "opening decoder", ret);
+            return -1;
+        }
+    }
+    set_err(err, err_len, "opening decoder");
+    return -1;
+}
+
+SweetPacketVideo *sweet_ffmpeg_open_packet_video(const char *codec, const unsigned char *extradata,
+                                                 size_t extradata_len, char *err, size_t err_len) {
+    SweetPacketVideo *dec;
+    enum AVCodecID id;
+    av_log_set_level(AV_LOG_ERROR);
+    id = packet_codec_id(codec);
+    if (id == AV_CODEC_ID_NONE) {
+        set_err(err, err_len, "unsupported streaming video codec");
+        return NULL;
+    }
+    dec = calloc(1, sizeof *dec);
+    if (!dec) {
+        set_err(err, err_len, "out of memory");
+        return NULL;
+    }
+    if (open_packet_decoder(id, extradata, extradata_len, &dec->video, err, err_len) < 0) {
+        free(dec);
+        return NULL;
+    }
+    dec->packet = av_packet_alloc();
+    dec->frame = av_frame_alloc();
+    if (!dec->packet || !dec->frame) {
+        set_err(err, err_len, "out of memory");
+        sweet_ffmpeg_close_packet_video(dec);
+        return NULL;
+    }
+    return dec;
+}
+
+void sweet_ffmpeg_close_packet_video(SweetPacketVideo *dec) {
+    if (!dec) {
+        return;
+    }
+    sws_freeContext(dec->sws);
+    av_frame_free(&dec->downloaded);
+    av_frame_free(&dec->frame);
+    av_packet_free(&dec->packet);
+    avcodec_free_context(&dec->video);
+    free(dec->rgba);
+    free(dec->scratch);
+    free(dec);
+}
+
+static int packet_try_receive_held(SweetPacketVideo *dec, char *err, size_t err_len) {
+    int ret;
+    if (dec->held) {
+        return 0;
+    }
+    ret = avcodec_receive_frame(dec->video, dec->frame);
+    if (ret == 0) {
+        if (dec->frame->width <= 0 || dec->frame->height <= 0) {
+            av_frame_unref(dec->frame);
+            return 0;
+        }
+        dec->held = 1;
+        return 0;
+    }
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        return 0;
+    }
+    set_averr(err, err_len, "decoding video", ret);
+    return -1;
+}
+
+int sweet_ffmpeg_packet_send(SweetPacketVideo *dec, const unsigned char *data, size_t len, double pts_seconds,
+                             int keyframe, char *err, size_t err_len) {
+    int ret;
+    int spins = 0;
+    if (!dec || !dec->video) {
+        set_err(err, err_len, "packet decoder is closed");
+        return -1;
+    }
+    if (!data || len == 0) {
+        set_err(err, err_len, "empty packet");
+        return -1;
+    }
+    if (len > (size_t)INT_MAX) {
+        set_err(err, err_len, "packet too large");
+        return -1;
+    }
+    dec->flush_sent = 0;
+    av_packet_unref(dec->packet);
+    ret = av_new_packet(dec->packet, (int)len);
+    if (ret < 0) {
+        set_averr(err, err_len, "allocating packet", ret);
+        return -1;
+    }
+    memcpy(dec->packet->data, data, len);
+    dec->packet->pts = (int64_t)(pts_seconds * (double)AV_TIME_BASE);
+    dec->packet->dts = dec->packet->pts;
+    if (keyframe) {
+        dec->packet->flags |= AV_PKT_FLAG_KEY;
+    }
+    for (;;) {
+        ret = avcodec_send_packet(dec->video, dec->packet);
+        if (ret == 0) {
+            av_packet_unref(dec->packet);
+            return 0;
+        }
+        if (ret == AVERROR(EAGAIN)) {
+            if (dec->held) {
+                set_err(err, err_len, "video decoder full; receive before sending");
+                return -1;
+            }
+            if (packet_try_receive_held(dec, err, err_len) < 0) {
+                return -1;
+            }
+            if (!dec->held) {
+                if (++spins > 8) {
+                    set_err(err, err_len, "video decoder stalled");
+                    return -1;
+                }
+            }
+            continue;
+        }
+        set_averr(err, err_len, "sending video packet", ret);
+        return -1;
+    }
+}
+
+static void describe_packet_held(const SweetPacketVideo *dec, SweetVideoFrame *out) {
+    out->rgba = NULL;
+    out->width = dec->frame->width;
+    out->height = dec->frame->height;
+    out->stride = 0;
+    out->pts = packet_frame_pts(dec->frame, dec->video->pkt_timebase);
+}
+
+int sweet_ffmpeg_packet_pull(SweetPacketVideo *dec, SweetVideoFrame *out, char *err, size_t err_len) {
+    int ret;
+    if (!dec || !dec->video || !out) {
+        set_err(err, err_len, "no video stream");
+        return -1;
+    }
+    if (dec->held) {
+        describe_packet_held(dec, out);
+        return 1;
+    }
+    ret = avcodec_receive_frame(dec->video, dec->frame);
+    if (ret == 0) {
+        if (dec->frame->width <= 0 || dec->frame->height <= 0) {
+            av_frame_unref(dec->frame);
+            return 0;
+        }
+        dec->held = 1;
+        describe_packet_held(dec, out);
+        return 1;
+    }
+    if (ret == AVERROR(EAGAIN)) {
+        return 0;
+    }
+    if (ret == AVERROR_EOF) {
+        return 0;
+    }
+    set_averr(err, err_len, "decoding video", ret);
+    return -1;
+}
+
+int sweet_ffmpeg_packet_export(SweetPacketVideo *dec, int max_edge, SweetVideoFrame *out, char *err, size_t err_len) {
+    int produced;
+    if (!dec || !dec->held || !out) {
+        set_err(err, err_len, "no video frame");
+        return -1;
+    }
+    produced = emit_packet_video(dec, max_edge, out, err, err_len);
+    av_frame_unref(dec->frame);
+    dec->held = 0;
+    if (produced < 0) {
+        return -1;
+    }
+    return produced == 0 ? 0 : 1;
+}
+
+int sweet_ffmpeg_packet_receive_rgba(SweetPacketVideo *dec, int max_edge, SweetVideoFrame *out, char *err,
+                                     size_t err_len) {
+    int ret = sweet_ffmpeg_packet_pull(dec, out, err, err_len);
+    if (ret != 1) {
+        return ret;
+    }
+    return sweet_ffmpeg_packet_export(dec, max_edge, out, err, err_len);
+}
+
+void sweet_ffmpeg_packet_discard(SweetPacketVideo *dec) {
+    if (!dec || !dec->held) {
+        return;
+    }
+    av_frame_unref(dec->frame);
+    dec->held = 0;
+}
+
+int sweet_ffmpeg_packet_flush(SweetPacketVideo *dec, char *err, size_t err_len) {
+    int ret;
+    if (!dec || !dec->video) {
+        set_err(err, err_len, "packet decoder is closed");
+        return -1;
+    }
+    if (!dec->flush_sent) {
+        ret = avcodec_send_packet(dec->video, NULL);
+        dec->flush_sent = 1;
+        if (ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
+            set_averr(err, err_len, "flushing video", ret);
+            return -1;
+        }
+    }
+    return 0;
 }
