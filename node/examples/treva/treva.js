@@ -1,13 +1,14 @@
 /**
- * Treva title screen (idle welcome + header chrome) ported to Nasty.
- * Source: kittygpt/erodig/treva public app idle path.
+ * Treva header + title screen ported to Nasty.
+ * Header includes Index / Wallpaper / Grok dropdowns (UI + local state).
+ * Gallery body is not ported yet.
  * Run from node/: node examples/treva/treva.js
  */
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 
 const here = dirname(fileURLToPath(import.meta.url));
-// Prefer shared fonts; Fraunces/Outfit fall back to serif/sans if not installed.
 process.env.NASTY_FONT_DIR ??= here;
 
 const { Document, Window } = await import("../../index.js");
@@ -15,6 +16,9 @@ const { dominant } = await import("../../dominant.js");
 
 const doc = new Document();
 const d = dominant(doc);
+
+const dataDir = process.env.TREVA_DATA_DIR || join(here, "data");
+const grokKeyFile = join(dataDir, "grok-key.json");
 
 // Treva theme colors (index.html @theme) as arbitrary utilities.
 const C = {
@@ -27,7 +31,11 @@ const C = {
   copper700: "#9a6230",
   gold300: "#f6d56e",
   body: "#f4efe8",
+  teal400: "#2dd4bf",
 };
+
+const FIELD = `mt-1.5 w-full rounded-xl border border-white/10 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`;
+const FIELD_H = `h-10 ${FIELD}`;
 
 const SHORTCUTS = [
   ["← →", "Previous and next image"],
@@ -60,11 +68,36 @@ const ICONS = {
   restore: "nf-md-window_restore",
 };
 
+const INTERVALS = [
+  { key: "2s", label: "2 seconds" },
+  { key: "10s", label: "10 seconds" },
+  { key: "1m", label: "1 minute" },
+  { key: "5m", label: "5 minutes" },
+  { key: "15m", label: "15 minutes" },
+  { key: "30m", label: "30 minutes" },
+  { key: "1h", label: "1 hour" },
+  { key: "6h", label: "6 hours" },
+  { key: "12h", label: "12 hours" },
+  { key: "24h", label: "24 hours" },
+];
+
+const SORT_LABEL = {
+  name: "Name",
+  path: "Path",
+  ext: "Type",
+  size: "Size",
+  modified: "Modified",
+};
+
 const state = {
   status: "idle",
   folderName: "",
   resumeName: "",
   images: [],
+  filter: "",
+  sortKey: "name",
+  sortDir: "asc",
+  recursive: true,
   screen: "gallery",
   slideshow: false,
   help: false,
@@ -74,6 +107,51 @@ const state = {
   windowMax: false,
   toasts: [],
   scan: { errors: 0 },
+  viewportW: 1100,
+  viewportH: 720,
+};
+
+/** Index dropdown (catalog.js UI) — local mock; no catalog backend yet. */
+const ix = {
+  open: false,
+  anchor: { left: 8, top: 56, width: 320 },
+  scope: "all",
+  order: "sort",
+  running: false,
+  stop: false,
+  done: 0,
+  failed: 0,
+  skipped: 0,
+  status: "",
+  current: "",
+};
+
+/** Wallpaper dropdown (wallpaper.js UI) — local state only. */
+const wp = {
+  open: false,
+  anchor: { left: 8, top: 56, width: 320 },
+  prompt: "",
+  interval: "2s",
+  enabled: false,
+  scheduler: "",
+  jobId: "",
+  lastPrompted: "",
+  lastError: "",
+  busy: false,
+};
+
+/** Grok settings dropdown (reimagine.js UI) — key stored under examples/treva/data. */
+const rx = {
+  settings: false,
+  settingsAnchor: { left: 8, top: 56, width: 288 },
+  cli: false,
+  envKey: !!(process.env.XAI_API_KEY || process.env.GROK_API_KEY),
+  hasStoredKey: false,
+  memoryKey: "",
+  keyDraft: "",
+  keyReplace: false,
+  keyNotice: "",
+  runs: [],
 };
 
 const nodes = {};
@@ -81,6 +159,7 @@ let toastSeq = 0;
 const toastTimers = new Map();
 const TOAST_MS = 5000;
 let win;
+let indexTimer = 0;
 
 function desktopShell() {
   return true;
@@ -88,6 +167,10 @@ function desktopShell() {
 
 function pickerAvailable() {
   return typeof win?.showDirectoryPicker === "function";
+}
+
+function folderOpen() {
+  return state.status !== "idle";
 }
 
 function dismissToast(id) {
@@ -145,7 +228,6 @@ function tool(opts, ...kids) {
 }
 
 function kbd(label) {
-  // index.html kbd styles → Tailwind
   return d.el(
     "span",
     {
@@ -154,6 +236,786 @@ function kbd(label) {
     label,
   );
 }
+
+function closeAllMenus({ except } = {}) {
+  if (except !== "index") ix.open = false;
+  if (except !== "wallpaper") wp.open = false;
+  if (except !== "grok") {
+    rx.settings = false;
+    rx.keyReplace = false;
+  }
+  if (except !== "help") state.help = false;
+}
+
+function placeAnchor(ev, preferredWidth, preferredHeight = 320) {
+  const rect = ev.currentTarget.getBoundingClientRect();
+  const width = Math.min(preferredWidth, state.viewportW - 16);
+  let left = Math.max(8, Math.min(rect.right - width, state.viewportW - width - 8));
+  let top = rect.bottom + 8;
+  const maxTop = Math.max(8, state.viewportH - preferredHeight);
+  if (top > maxTop) top = maxTop;
+  return { left: Math.round(left), top: Math.round(top), width: Math.round(width) };
+}
+
+function panelClass(anchor, extra = "") {
+  const a = anchor || { left: 8, top: 56, width: 288 };
+  return [
+    `fixed z-[70] max-h-[90vh] overflow-auto rounded-2xl border border-white/10 bg-[${C.ink900}] p-4`,
+    `left-[${a.left}px] top-[${a.top}px] w-[${a.width}px]`,
+    extra,
+  ].filter(Boolean).join(" ");
+}
+
+function backdrop(onClose, label) {
+  return d.el("button", {
+    type: "button",
+    class: "fixed inset-0 z-[60] cursor-default bg-transparent",
+    "aria-label": label,
+    onclick: onClose,
+  });
+}
+
+// --- Grok settings ---
+
+async function loadGrokPrefs() {
+  try {
+    const raw = await readFile(grokKeyFile, "utf8");
+    const json = JSON.parse(raw);
+    rx.hasStoredKey = !!(json.apiKey && String(json.apiKey).trim());
+    rx.memoryKey = rx.hasStoredKey ? String(json.apiKey).trim() : "";
+    rx.cli = !!json.cli;
+  } catch {
+    rx.hasStoredKey = false;
+    rx.memoryKey = "";
+  }
+}
+
+async function saveGrokPrefs() {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(
+    grokKeyFile,
+    JSON.stringify({ apiKey: rx.memoryKey || "", cli: !!rx.cli }, null, 2),
+    { mode: 0o600 },
+  );
+  rx.hasStoredKey = !!rx.memoryKey;
+}
+
+function grokStatusLine() {
+  if (rx.keyNotice) return rx.keyNotice;
+  if (rx.envKey) return "This process is using XAI_API_KEY / GROK_API_KEY from the environment.";
+  if (rx.hasStoredKey || rx.memoryKey) return "API key saved on this machine.";
+  return "No API key saved.";
+}
+
+function closeGrokSettings() {
+  rx.settings = false;
+  rx.keyReplace = false;
+  d.update();
+}
+
+function openGrokSettings(ev) {
+  if (rx.settings) {
+    closeGrokSettings();
+    return;
+  }
+  closeAllMenus({ except: "grok" });
+  rx.settingsAnchor = placeAnchor(ev, 288, 360);
+  rx.settings = true;
+  if (!(rx.envKey || rx.memoryKey || rx.hasStoredKey)) rx.keyReplace = true;
+  d.update();
+}
+
+async function commitKeyDraft() {
+  const value = String(rx.keyDraft || "").trim();
+  if (!value) {
+    rx.keyNotice = "Paste an API key first.";
+    d.update();
+    return;
+  }
+  rx.memoryKey = value;
+  rx.keyDraft = "";
+  rx.keyReplace = false;
+  rx.keyNotice = "API key saved.";
+  try {
+    await saveGrokPrefs();
+  } catch (err) {
+    rx.keyNotice = err.message || "Could not save the key.";
+  }
+  d.update();
+}
+
+async function resetApiKey() {
+  rx.memoryKey = "";
+  rx.hasStoredKey = false;
+  rx.keyDraft = "";
+  rx.keyReplace = true;
+  rx.keyNotice = "Key cleared. Paste a new one to save.";
+  try {
+    await saveGrokPrefs();
+  } catch (err) {
+    rx.keyNotice = err.message || "Could not clear the key.";
+  }
+  d.update();
+}
+
+async function setCli(value) {
+  rx.cli = !!value;
+  try {
+    await saveGrokPrefs();
+  } catch (err) {
+    showToast(err.message || "Could not save CLI preference");
+  }
+  d.update();
+}
+
+function cliChoice(testId) {
+  return d.el(
+    "label",
+    {
+      class: "mt-4 flex cursor-pointer items-start gap-3 text-sm text-stone-200",
+      "data-testid": testId,
+    },
+    d.el("input", {
+      type: "checkbox",
+      class: "mt-1 h-4 w-4 shrink-0",
+      checked: d.binding({
+        get: () => rx.cli,
+        set: value => { void setCli(value); },
+      }),
+    }),
+    d.el(
+      "span",
+      {},
+      "Use Grok CLI instead",
+      d.el(
+        "span",
+        { class: "mt-0.5 block text-xs font-normal text-stone-500" },
+        "Prompt writing and image edits use the Grok CLI signed in on this machine.",
+      ),
+    ),
+  );
+}
+
+function grokSettingsMenu() {
+  return d.if(
+    () => rx.settings,
+    d.el(
+      "div",
+      { "data-testid": "grok-settings-menu" },
+      backdrop(() => closeGrokSettings(), "Close Grok API settings"),
+      d.el(
+        "div",
+        {
+          role: "dialog",
+          "aria-label": "Grok API settings",
+          class: () => panelClass(rx.settingsAnchor),
+          onclick: ev => ev.stopPropagation?.(),
+        },
+        d.el("div", { class: "font-display text-lg text-stone-50" }, "Grok API"),
+        d.el(
+          "p",
+          {
+            class: () =>
+              "mt-1 text-xs leading-relaxed " +
+              (rx.keyNotice ? `text-[${C.copper300}]` : "text-stone-400"),
+          },
+          d.text(grokStatusLine),
+        ),
+        d.if(
+          () => rx.keyReplace,
+          d.el(
+            "label",
+            { class: "mt-3 block text-[11px] uppercase tracking-wide text-stone-500" },
+            "API key",
+            d.el("input", {
+              type: "password",
+              name: "treva-grok-api-key",
+              autocomplete: "new-password",
+              spellcheck: "false",
+              placeholder: "xai-…",
+              "data-testid": "grok-key-input",
+              class: `mt-1.5 h-10 w-full rounded-xl border border-white/10 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`,
+              value: d.binding({
+                get: () => rx.keyDraft,
+                set: v => { rx.keyDraft = v; },
+              }),
+              onkeydown: ev => {
+                if (ev.key !== "Enter") return;
+                ev.preventDefault?.();
+                void commitKeyDraft();
+              },
+            }),
+          ),
+        ),
+        d.el(
+          "div",
+          { class: "mt-3 flex flex-wrap gap-2" },
+          d.if(
+            () => rx.keyReplace,
+            d.el(
+              "button",
+              {
+                type: "button",
+                "data-testid": "grok-save-key",
+                class: `rounded-full bg-[${C.copper500}] px-3 py-1.5 text-sm text-[${C.ink950}] hover:bg-[${C.copper300}] cursor-pointer`,
+                onclick: () => void commitKeyDraft(),
+              },
+              "Save",
+            ),
+          ),
+          d.el(
+            "button",
+            {
+              type: "button",
+              "data-testid": "grok-reset-key",
+              class: "rounded-full px-3 py-1.5 text-sm text-stone-200 hover:bg-white/10 cursor-pointer",
+              onclick: () => void resetApiKey(),
+            },
+            "Forget key",
+          ),
+          d.if(
+            () => !rx.keyReplace && (rx.hasStoredKey || rx.memoryKey || rx.envKey),
+            d.el(
+              "button",
+              {
+                type: "button",
+                class: "rounded-full px-3 py-1.5 text-sm text-stone-200 hover:bg-white/10 cursor-pointer",
+                onclick: () => {
+                  rx.keyReplace = true;
+                  d.update();
+                },
+              },
+              "Replace key",
+            ),
+          ),
+        ),
+        cliChoice("grok-cli-toggle"),
+      ),
+    ),
+  );
+}
+
+function grokSettings() {
+  return d.el(
+    "div",
+    { class: "relative shrink-0" },
+    d.el(
+      "button",
+      {
+        type: "button",
+        "data-action": "grok-settings",
+        "data-testid": "grok-settings",
+        "data-cli": () => (rx.cli ? "1" : "0"),
+        title: () => (rx.cli ? "Grok API settings, CLI on" : "Grok API settings"),
+        "aria-label": "Grok API settings",
+        "aria-expanded": () => (rx.settings ? "true" : "false"),
+        class: [
+          "relative z-[80] inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md px-2 text-sm cursor-pointer",
+          () =>
+            rx.settings
+              ? `bg-[${C.copper500}] text-[${C.ink950}]`
+              : "text-stone-200 hover:bg-white/10",
+        ],
+        onclick: ev => {
+          ev.stopPropagation?.();
+          openGrokSettings(ev);
+        },
+      },
+      "Grok",
+    ),
+  );
+}
+
+// --- Wallpaper ---
+
+function wallpaperStatusLine() {
+  if (wp.busy) return "Working…";
+  if (wp.lastError && !wp.enabled) return wp.lastError;
+  if (!wp.enabled) {
+    return "Off. The selected photo becomes the wallpaper, then each run advances your sequence.";
+  }
+  const interval = INTERVALS.find(item => item.key === wp.interval);
+  const every = interval ? interval.label : wp.interval;
+  const last = wp.lastPrompted
+    ? ` Last change: ${wp.lastPrompted}.`
+    : " The first change has not run yet.";
+  const err = wp.lastError ? ` Last error: ${wp.lastError}` : "";
+  return `On, every ${every}.${last}${err}`;
+}
+
+function closeWallpaper() {
+  wp.open = false;
+  d.update();
+}
+
+function openWallpaper(ev) {
+  if (wp.open) {
+    closeWallpaper();
+    return;
+  }
+  closeAllMenus({ except: "wallpaper" });
+  wp.anchor = placeAnchor(ev, 320, 380);
+  wp.open = true;
+  d.update();
+}
+
+function wallpaperEnable() {
+  const prompt = wp.prompt.trim();
+  if (!prompt) {
+    showToast("Describe how the wallpaper should change");
+    return;
+  }
+  if (!folderOpen()) {
+    showToast("Open a folder first");
+    return;
+  }
+  if (!(rx.cli || rx.memoryKey || rx.envKey || rx.hasStoredKey)) {
+    showToast("Save a Grok API key in settings or enable Grok CLI");
+    return;
+  }
+  wp.busy = true;
+  wp.lastError = "";
+  d.update();
+  // Desktop wallpaper backend is not ported yet — keep the panel interactive.
+  setTimeout(() => {
+    wp.busy = false;
+    wp.enabled = true;
+    wp.lastPrompted = prompt.split("\n").map(s => s.trim()).filter(Boolean)[0] || prompt;
+    showToast("Wallpaper schedule UI is local-only until the backend is ported.");
+    d.update();
+  }, 200);
+}
+
+function wallpaperDisable() {
+  wp.busy = true;
+  d.update();
+  setTimeout(() => {
+    wp.busy = false;
+    wp.enabled = false;
+    showToast("Generative wallpaper is off.");
+    d.update();
+  }, 100);
+}
+
+function wallpaperMenu() {
+  return d.if(
+    () => wp.open,
+    d.el(
+      "div",
+      { "data-testid": "wallpaper-menu" },
+      backdrop(() => closeWallpaper(), "Close generative wallpaper"),
+      d.el(
+        "div",
+        {
+          role: "dialog",
+          "aria-label": "Generative wallpaper",
+          class: () => panelClass(wp.anchor),
+          onclick: ev => ev.stopPropagation?.(),
+        },
+        d.el("div", { class: "font-display text-lg text-stone-50" }, "Generative wallpaper"),
+        d.el(
+          "p",
+          { class: "mt-1 text-xs leading-relaxed text-stone-400" },
+          "Each run asks Grok to make the next change in your sequence, then sets that image as your wallpaper.",
+        ),
+        d.el(
+          "label",
+          { class: "mt-3 block text-[11px] uppercase tracking-wide text-stone-500" },
+          "Sequence",
+          d.el("textarea", {
+            "data-testid": "wallpaper-prompt",
+            rows: 5,
+            placeholder: "Shift the light to dusk\n\nTurn on the room lights\nThen change the scene to night",
+            class: `${FIELD} py-2`,
+            value: d.binding({
+              get: () => wp.prompt,
+              set: value => { wp.prompt = value; },
+            }),
+          }),
+        ),
+        d.el(
+          "label",
+          { class: "mt-3 block text-[11px] uppercase tracking-wide text-stone-500" },
+          "Every",
+          d.el(
+            "select",
+            {
+              "data-testid": "wallpaper-interval",
+              class: FIELD_H,
+              value: d.binding({
+                get: () => wp.interval,
+                set: value => { wp.interval = value; },
+              }),
+            },
+            ...INTERVALS.map(item => d.el("option", { value: item.key }, item.label)),
+          ),
+        ),
+        d.el(
+          "div",
+          { class: "mt-3 flex flex-wrap gap-2" },
+          d.el(
+            "button",
+            {
+              type: "button",
+              "data-testid": "wallpaper-enable",
+              class: `rounded-full bg-[${C.copper500}] px-3 py-1.5 text-sm text-[${C.ink950}] hover:bg-[${C.copper300}] cursor-pointer`,
+              disabled: () => wp.busy,
+              onclick: () => wallpaperEnable(),
+            },
+            d.text(() => (wp.enabled ? "Update" : "Start")),
+          ),
+          d.if(
+            () => wp.enabled,
+            d.el(
+              "button",
+              {
+                type: "button",
+                "data-testid": "wallpaper-disable",
+                class: "rounded-full px-3 py-1.5 text-sm text-stone-200 hover:bg-white/10 cursor-pointer",
+                disabled: () => wp.busy,
+                onclick: () => wallpaperDisable(),
+              },
+              "Disable",
+            ),
+          ),
+        ),
+        d.el(
+          "p",
+          {
+            "data-testid": "wallpaper-status",
+            class: () =>
+              "mt-3 text-xs leading-relaxed " +
+              (wp.lastError ? `text-[${C.copper300}]` : "text-stone-400"),
+          },
+          d.text(wallpaperStatusLine),
+        ),
+      ),
+    ),
+  );
+}
+
+function wallpaperControl() {
+  return d.el(
+    "div",
+    { class: "relative shrink-0" },
+    d.el(
+      "button",
+      {
+        type: "button",
+        "data-action": "wallpaper",
+        "data-testid": "wallpaper-button",
+        "data-on": () => (wp.enabled ? "1" : "0"),
+        title: "Generative wallpaper",
+        "aria-label": "Generative wallpaper",
+        "aria-expanded": () => (wp.open ? "true" : "false"),
+        class: [
+          "relative z-[80] inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md px-2 text-sm cursor-pointer",
+          () =>
+            wp.open || wp.enabled
+              ? `bg-[${C.copper500}] text-[${C.ink950}]`
+              : "text-stone-200 hover:bg-white/10",
+        ],
+        onclick: ev => {
+          ev.stopPropagation?.();
+          openWallpaper(ev);
+        },
+      },
+      "Wallpaper",
+    ),
+  );
+}
+
+// --- Index ---
+
+const CLI_INDEX_TITLE =
+  "Indexing is off while Grok CLI is on. Turn it off in the Grok menu to index photos.";
+
+function sortWatchText() {
+  if (ix.order === "random") {
+    return ix.running
+      ? "Random order is fixed for this run."
+      : "Random order is shuffled once when indexing starts.";
+  }
+  const label = SORT_LABEL[state.sortKey] || "Name";
+  const dir = state.sortDir === "desc" ? "descending" : "ascending";
+  return `Current sorting order: ${label}, ${dir}. A change applies to the next image.`;
+}
+
+function upcomingLabel() {
+  if (ix.order === "random" && !ix.running) return "Next: chosen when indexing starts";
+  if (!state.images.length) return "Next: no images in the open folder";
+  if (ix.scope === "filtered" && state.filter) {
+    return `Next: first match for “${state.filter}”`;
+  }
+  return `Next: ${state.images[0]?.name || state.images[0]?.path || "—"}`;
+}
+
+function strategyButton(testId, active, label, hint, onPick) {
+  return d.el(
+    "button",
+    {
+      type: "button",
+      "data-testid": testId,
+      class: [
+        "w-full rounded-xl border px-3 py-2 text-left cursor-pointer",
+        () =>
+          active()
+            ? `border-[${C.copper500}] bg-[${C.copper500}]/15`
+            : "border-white/10 hover:bg-white/5",
+      ],
+      onclick: () => {
+        onPick();
+        d.update();
+      },
+    },
+    d.el("div", { class: "text-sm text-stone-100" }, label),
+    d.el("div", { class: "mt-0.5 text-xs leading-relaxed text-stone-500" }, hint),
+  );
+}
+
+function stopIndex() {
+  ix.stop = true;
+  ix.running = false;
+  ix.status = "Stopped.";
+  if (indexTimer) clearInterval(indexTimer);
+  indexTimer = 0;
+  d.update();
+}
+
+function startIndex() {
+  if (ix.running) return;
+  if (!folderOpen()) {
+    showToast("Open a folder first");
+    return;
+  }
+  if (rx.cli) {
+    showToast(CLI_INDEX_TITLE);
+    return;
+  }
+  ix.running = true;
+  ix.stop = false;
+  ix.done = 0;
+  ix.failed = 0;
+  ix.skipped = 0;
+  ix.status = "Indexing (UI mock — catalog backend not ported)…";
+  d.update();
+  const total = Math.max(1, state.images.length || 8);
+  if (indexTimer) clearInterval(indexTimer);
+  indexTimer = setInterval(() => {
+    if (ix.stop) return stopIndex();
+    ix.done += 1;
+    ix.status = `Indexed ${ix.done} / ${total}`;
+    if (ix.done >= total) {
+      ix.running = false;
+      ix.status = `Done · ${ix.done} indexed`;
+      clearInterval(indexTimer);
+      indexTimer = 0;
+    }
+    d.update();
+  }, 180);
+}
+
+function toggleIndex(ev) {
+  if (rx.cli) return;
+  if (ix.open) {
+    ix.open = false;
+    d.update();
+    return;
+  }
+  closeAllMenus({ except: "index" });
+  ix.anchor = placeAnchor(ev, 320, 420);
+  ix.open = true;
+  d.update();
+}
+
+function indexMenu() {
+  return d.if(
+    () => folderOpen() && ix.open,
+    d.el(
+      "div",
+      { class: "fixed inset-0 z-[70]" },
+      backdrop(() => {
+        ix.open = false;
+        d.update();
+      }, "Close index menu"),
+      d.el(
+        "div",
+        {
+          "data-testid": "index-menu",
+          role: "dialog",
+          "aria-label": "Index photos",
+          class: () =>
+            panelClass(ix.anchor, "max-h-[min(32rem,90vh)] rounded-xl p-3"),
+          onclick: ev => ev.stopPropagation?.(),
+        },
+        d.el(
+          "div",
+          { class: "mb-2 text-[11px] uppercase tracking-[0.16em] text-stone-500" },
+          "Which files",
+        ),
+        d.el(
+          "div",
+          { class: "flex w-full flex-col gap-1.5" },
+          strategyButton(
+            "index-scope-all",
+            () => ix.scope === "all",
+            "All files",
+            "Every image in the open folder, including subfolders.",
+            () => { ix.scope = "all"; },
+          ),
+          strategyButton(
+            "index-scope-filtered",
+            () => ix.scope === "filtered",
+            "Filtered results only",
+            "Only the images that match the current filter and folder view.",
+            () => { ix.scope = "filtered"; },
+          ),
+        ),
+        d.el(
+          "div",
+          { class: "mb-2 mt-3 text-[11px] uppercase tracking-[0.16em] text-stone-500" },
+          "Order",
+        ),
+        d.el(
+          "div",
+          { class: "flex w-full flex-col gap-1.5" },
+          strategyButton(
+            "index-order-sort",
+            () => ix.order === "sort",
+            "Current sorting order",
+            "Follows the sidebar sort. Changing it moves the next image.",
+            () => { ix.order = "sort"; },
+          ),
+          strategyButton(
+            "index-order-random",
+            () => ix.order === "random",
+            "Random order",
+            "Shuffle the chosen files once, then walk that list.",
+            () => { ix.order = "random"; },
+          ),
+        ),
+        d.el(
+          "p",
+          {
+            "data-testid": "index-order-live",
+            class: "mt-3 text-xs leading-relaxed text-teal-300",
+          },
+          d.text(sortWatchText),
+        ),
+        d.el(
+          "p",
+          {
+            "data-testid": "index-next",
+            class: "mt-1 truncate text-xs text-stone-300",
+          },
+          d.text(upcomingLabel),
+        ),
+        d.el(
+          "p",
+          {
+            "data-testid": "index-status",
+            class: "mt-1 min-h-4 text-xs leading-relaxed text-stone-400",
+          },
+          d.text(() => ix.status),
+        ),
+        d.el(
+          "div",
+          { class: "mt-3 flex gap-2" },
+          d.el(
+            "button",
+            {
+              type: "button",
+              "data-testid": "index-start",
+              disabled: () => ix.running,
+              class: `inline-flex h-8 items-center rounded-full bg-[${C.copper500}] px-3 text-sm text-[${C.ink950}] cursor-pointer`,
+              onclick: () => startIndex(),
+            },
+            "Start",
+          ),
+          d.el(
+            "button",
+            {
+              type: "button",
+              "data-testid": "index-stop",
+              disabled: () => !ix.running,
+              class: "inline-flex h-8 items-center rounded-full px-3 text-sm text-stone-200 ring-1 ring-white/15 cursor-pointer",
+              onclick: stopIndex,
+            },
+            "Stop",
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+function indexControl() {
+  return d.if(
+    () => folderOpen(),
+    d.el(
+      "span",
+      {
+        class: "inline-flex",
+        title: () => (rx.cli ? CLI_INDEX_TITLE : "Index photos into the catalog"),
+      },
+      d.el(
+        "button",
+        {
+          type: "button",
+          "data-testid": "index-open",
+          "data-running": () => (ix.running ? "1" : "0"),
+          "data-cli-blocked": () => (rx.cli ? "1" : "0"),
+          "aria-expanded": () => (ix.open ? "true" : "false"),
+          "aria-label": () =>
+            rx.cli ? CLI_INDEX_TITLE : "Index photos into the catalog",
+          disabled: () => rx.cli,
+          class: [
+            "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md px-2 text-sm text-stone-200 hover:bg-white/10 cursor-pointer",
+            () => (rx.cli ? "opacity-40 pointer-events-none" : ""),
+          ],
+          onclick: ev => toggleIndex(ev),
+        },
+        d.el("span", {
+          class: () =>
+            ix.running
+              ? `inline-block h-2 w-2 rounded-full bg-[${C.teal400}]`
+              : "hidden",
+          "aria-hidden": "true",
+        }),
+        "Index",
+      ),
+    ),
+  );
+}
+
+// --- Reimagine tabs (header chips when runs exist) ---
+
+function reimagineTabs() {
+  return d.if(
+    () => rx.runs.length > 0,
+    d.el(
+      "div",
+      {
+        class: "flex min-w-0 max-w-[min(28rem,40vw)] shrink items-center gap-1.5 overflow-x-auto",
+        "data-testid": "reimagine-tabs",
+      },
+      d.map(
+        () => rx.runs,
+        run =>
+          d.el(
+            "div",
+            {
+              class: `flex h-8 max-w-[12rem] shrink-0 items-center gap-1 rounded-full bg-white/5 px-2.5 text-xs text-stone-200 ring-1 ring-white/10`,
+              "data-testid": "reimagine-tab",
+            },
+            d.el("span", { class: "min-w-0 truncate" }, run.name || "Reimagine"),
+          ),
+      ),
+    ),
+  );
+}
+
+// --- Folder open ---
 
 async function chooseFolder() {
   if (!pickerAvailable()) {
@@ -164,8 +1026,14 @@ async function chooseFolder() {
     const handle = await win.showDirectoryPicker({ mode: "read" });
     state.folderName = handle.name || "Folder";
     state.resumeName = state.folderName;
-    // Title-screen-only port: do not enter the gallery yet.
-    showToast(`Selected “${state.folderName}”. Gallery is not ported yet.`);
+    state.status = "ready";
+    // Placeholder listing so Index enables; full scan is not ported yet.
+    state.images = [
+      { id: "demo-1", name: "sample-a.jpg", path: "sample-a.jpg" },
+      { id: "demo-2", name: "sample-b.jpg", path: "nested/sample-b.jpg" },
+      { id: "demo-3", name: "sample-c.png", path: "sample-c.png" },
+    ];
+    showToast(`Opened “${state.folderName}”. Gallery body not ported yet.`);
     d.update();
   } catch (err) {
     if (err && (err.name === "AbortError" || /abort/i.test(String(err.message || err)))) return;
@@ -176,6 +1044,17 @@ async function chooseFolder() {
 function reopen() {
   if (!state.resumeName) return;
   showToast(`Reopen “${state.resumeName}” needs the gallery port.`);
+}
+
+function closeFolder() {
+  stopIndex();
+  closeAllMenus();
+  state.status = "idle";
+  state.folderName = "";
+  state.images = [];
+  state.screen = "gallery";
+  state.slideshow = false;
+  d.update();
 }
 
 function welcome() {
@@ -208,11 +1087,7 @@ function welcome() {
       d.el(
         "p",
         { class: "mt-4 max-w-md text-lg leading-relaxed text-stone-300" },
-        d.text(() =>
-          desktopShell()
-            ? "Open a folder and Treva lists every image in it, including nested ones. Files stay on this computer."
-            : "Open a folder and Treva lists every image in it, including nested ones. Files are read in this browser and are not uploaded.",
-        ),
+        "Open a folder and Treva lists every image in it, including nested ones. Files stay on this computer.",
       ),
       d.el(
         "div",
@@ -244,15 +1119,31 @@ function welcome() {
       d.el(
         "p",
         { class: "mt-4 max-w-md text-sm text-stone-500" },
-        d.text(() =>
-          desktopShell()
-            ? "This window opens folders with the system file dialog. You can also drop a folder on the page."
-            : pickerAvailable()
-              ? "The directory picker is available in this browser. You can also drop a folder on the page."
-              : "This browser has no directory picker. Choose a folder with the button, or drop one on the page.",
-        ),
+        "This window opens folders with the system file dialog. You can also drop a folder on the page.",
       ),
       d.el("div", { class: "mt-8 max-w-md" }, keys),
+    ),
+  );
+}
+
+function mainPlaceholder() {
+  return d.el(
+    "div",
+    {
+      class: "flex min-h-0 w-full flex-1 items-center justify-center p-8 text-center",
+      "data-testid": "gallery-placeholder",
+    },
+    d.el(
+      "div",
+      { class: "max-w-md" },
+      d.el("div", { class: "font-display text-2xl text-stone-50" }, d.text(() => state.folderName || "Folder")),
+      d.el(
+        "p",
+        { class: "mt-2 text-sm leading-relaxed text-stone-400" },
+        d.text(() =>
+          `${state.images.length} placeholder image${state.images.length === 1 ? "" : "s"}. Sidebar and grid come next.`,
+        ),
+      ),
     ),
   );
 }
@@ -274,7 +1165,7 @@ function helpModal() {
     d.el(
       "div",
       {
-        class: "absolute inset-0 z-50 grid place-items-center bg-black/70 p-4",
+        class: "fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4",
         onclick: () => {
           state.help = false;
           d.update();
@@ -426,7 +1317,7 @@ function header() {
       },
       d.text(() => state.folderName || (state.narrow ? "Treva" : "No folder open")),
     ),
-    // reimagineTabs / indexControl / wallpaperControl / grokSettings omitted (not on minimal title port dependencies)
+    reimagineTabs(),
     d.el("div", { class: "hidden text-sm text-stone-400 sm:block" }, d.text(countLabel)),
     tool(
       {
@@ -437,6 +1328,7 @@ function header() {
         disabled: () => !state.images.length,
         onClick: () => {
           state.screen = "gallery";
+          if (state.slideshow) state.slideshow = false;
           d.update();
         },
       },
@@ -449,7 +1341,10 @@ function header() {
         label: "View selected image",
         active: () => state.screen === "viewer",
         disabled: () => !state.images.length,
-        onClick: () => {},
+        onClick: () => {
+          state.screen = "viewer";
+          d.update();
+        },
       },
       icon("image"),
     ),
@@ -467,6 +1362,7 @@ function header() {
       },
       d.if(() => state.slideshow, icon("pause"), icon("play")),
     ),
+    indexControl(),
     d.el(
       "button",
       {
@@ -478,12 +1374,15 @@ function header() {
       icon("folder", "h-4 w-4 text-sm"),
       d.text(() => (pickerAvailable() ? "Open" : "Choose")),
     ),
+    wallpaperControl(),
+    grokSettings(),
     tool(
       {
         action: "help",
         title: "Shortcuts (?)",
         label: "Keyboard shortcuts",
         onClick: () => {
+          closeAllMenus({ except: "help" });
           state.help = !state.help;
           d.update();
         },
@@ -497,12 +1396,7 @@ function header() {
           action: "close",
           title: "Close folder",
           label: "Close folder",
-          onClick: () => {
-            state.status = "idle";
-            state.folderName = "";
-            state.images = [];
-            d.update();
-          },
+          onClick: () => closeFolder(),
         },
         icon("close"),
       ),
@@ -524,11 +1418,15 @@ function shell() {
     d.el(
       "div",
       { class: "relative flex min-h-0 flex-1 flex-col" },
-      d.if(() => state.status === "idle", welcome()),
+      d.if(() => state.status === "idle", welcome(), mainPlaceholder()),
     ),
     helpModal(),
     dragOverlay(),
     toast(),
+    // Header dropdown layers (portaled as fixed overlays).
+    indexMenu(),
+    wallpaperMenu(),
+    grokSettingsMenu(),
   );
   nodes.root = node;
   return node;
@@ -541,6 +1439,7 @@ function updateBodyFrame(maximized = state.windowMax) {
   doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[${C.ink950}] text-[${C.body}] font-sans`;
 }
 
+await loadGrokPrefs();
 updateBodyFrame(false);
 doc.body.appendChild(shell());
 d.updateSync();
@@ -560,6 +1459,8 @@ win.document = doc;
 const closed = new Promise(resolve => win.addEventListener("close", resolve, { once: true }));
 
 win.addEventListener("resize", event => {
+  state.viewportW = event.x;
+  state.viewportH = event.y;
   state.narrow = event.x < 768;
   d.updateSync();
 });
@@ -568,13 +1469,33 @@ win.addEventListener("maximize", event => {
   d.updateSync();
 });
 win.addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    if (rx.settings) {
+      closeGrokSettings();
+      return;
+    }
+    if (wp.open) {
+      closeWallpaper();
+      return;
+    }
+    if (ix.open) {
+      ix.open = false;
+      d.update();
+      return;
+    }
+    if (state.help) {
+      state.help = false;
+      d.update();
+    }
+    return;
+  }
   if (event.key === "?" || (event.shiftKey && event.key === "/")) {
     state.help = !state.help;
     d.update();
-  } else if (event.key === "Escape" && state.help) {
-    state.help = false;
-    d.update();
   }
+});
+win.addEventListener("close", () => {
+  if (indexTimer) clearInterval(indexTimer);
 });
 
 await closed;

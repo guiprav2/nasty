@@ -1321,11 +1321,16 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
       : (result[edge] ?? borderWidth);
     result[edge] = width > 0 ? width : 0;
   }
-  if (style.position === "fixed") {
+  // fixed: insets are viewport-relative. absolute: insets are containing-block
+  // relative; when top+bottom or left+right are both set, CSS stretches the box.
+  // Taffy needs an explicit pixel width/height for that stretch (same bridge as fixed).
+  if (style.position === "fixed" || style.position === "absolute") {
     const left = fixedInset(style.left, viewport.width, fontSize, viewport);
     const right = fixedInset(style.right, viewport.width, fontSize, viewport);
     const top = fixedInset(style.top, viewport.height, fontSize, viewport);
     const bottom = fixedInset(style.bottom, viewport.height, fontSize, viewport);
+    // For absolute, percent insets still resolve against the viewport here only as a
+    // fallback when the containing block equals the viewport (full-bleed overlays).
     if (result.widthPercent !== undefined) {
       result.width = viewport.width * result.widthPercent;
       delete result.widthPercent;
