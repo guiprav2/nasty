@@ -6,12 +6,12 @@
 // network can still run in parallel once higher-priority work is in flight.
 //
 // The pool gates *starting* work. Loaded textures are kept while the image
-// intersects a keep region of twice the viewport (centered on the viewport).
+// intersects a keep region extending one viewport beyond each viewport edge.
 // After one continuous minute fully outside that region, the texture is
 // unloaded and the img returns to pending (sticky / detached Image() exempt).
-import { documentState, elementState } from "./dom-state.js";
+import { documentLiveLookup, documentState, elementState } from "./dom-state.js";
 
-const DEFAULT_POOL = 16;
+const DEFAULT_POOL = 48;
 const DEFAULT_KEEP_FOLD = 2;
 const DEFAULT_EVICT_MS = 60_000;
 const pendingDocs = new Set();
@@ -37,9 +37,24 @@ export function imageEvictMs() {
   return DEFAULT_EVICT_MS;
 }
 
+/**
+ * `new Image()` instances that have never been in the document tree have no
+ * viewport position; like browsers, they always load their source. Images
+ * removed from the tree are not admitted again.
+ */
 export function isDetachedImage(element) {
   const state = elementState(element);
-  return !!(state?.imageConstructor && !element.parent);
+  // Only `new Image()` is exempt from viewport admission. An <img> made with
+  // createElement waits for the tree and the keep region like any other.
+  if (!state || state.imageConnected || !state.imageConstructor) return false;
+  const body = element.document?.body;
+  for (let node = element; node; node = node.parent) {
+    if (node === body) {
+      state.imageConnected = true;
+      return false;
+    }
+  }
+  return true;
 }
 
 /** file:/data:/blob: and plain filesystem paths — everything else is network. */
@@ -63,28 +78,32 @@ function intersectsRect(rect, region) {
   return right > left && bottom > top;
 }
 
-/** Viewport scaled by `fold` and centered on the viewport (fold=2 → 2× keep). */
+/** Viewport extended by `fold - 1` viewports on every side (fold=2 → one extra viewport up, down, left, and right). */
 function keepRegion(viewport, fold = imageKeepFold()) {
-  const scale = Math.max(1, fold);
-  const width = viewport.width * scale;
-  const height = viewport.height * scale;
+  const extend = Math.max(1, fold) - 1;
+  const marginX = viewport.width * extend;
+  const marginY = viewport.height * extend;
   return {
-    x: viewport.width / 2 - width / 2,
-    y: viewport.height / 2 - height / 2,
-    width,
-    height,
+    x: -marginX,
+    y: -marginY,
+    width: viewport.width + marginX * 2,
+    height: viewport.height + marginY * 2,
   };
 }
 
-function clippedBounds(box) {
+/**
+ * Box bounds clipped by its overflow ancestors. `margin` grows the clip on every
+ * side so content just past a scroll container's edge counts as nearby.
+ */
+function clippedBounds(box, marginX = 0, marginY = 0) {
   if (!box || box.width <= 0 || box.height <= 0) return null;
   if (box.element.hidden || box.element.style.display === "none") return null;
   const bounds = box.borderBox ?? box;
   if (!box.clip) return bounds;
-  const left = Math.max(bounds.x, box.clip.x);
-  const top = Math.max(bounds.y, box.clip.y);
-  const right = Math.min(bounds.x + bounds.width, box.clip.x + box.clip.width);
-  const bottom = Math.min(bounds.y + bounds.height, box.clip.y + box.clip.height);
+  const left = Math.max(bounds.x, box.clip.x - marginX);
+  const top = Math.max(bounds.y, box.clip.y - marginY);
+  const right = Math.min(bounds.x + bounds.width, box.clip.x + box.clip.width + marginX);
+  const bottom = Math.min(bounds.y + bounds.height, box.clip.y + box.clip.height + marginY);
   if (!(right > left && bottom > top)) return null;
   return { x: left, y: top, width: right - left, height: bottom - top };
 }
@@ -95,32 +114,42 @@ function visibleThroughClip(box, viewport) {
 }
 
 function withinKeepFold(box, viewport) {
-  const bounds = clippedBounds(box);
-  return !!(bounds && intersectsRect(bounds, keepRegion(viewport)));
+  const region = keepRegion(viewport);
+  const bounds = clippedBounds(box, -region.x, -region.y);
+  return !!(bounds && intersectsRect(bounds, region));
 }
 
+// Source classification only needs the attribute text; resolving it to a URL
+// (done once, when the load starts) is far too slow to repeat per scheduling pass.
 function resolvedSrc(element) {
-  try { return element.src || element.getAttribute?.("src") || ""; }
-  catch { return element.getAttribute?.("src") || ""; }
+  return element.getAttribute?.("src") || "";
+}
+
+function inTree(element, body) {
+  for (let node = element; node; node = node.parent) if (node === body) return true;
+  return false;
 }
 
 function documentImages(document) {
   const images = [];
-  const seen = new Set();
-  const visit = (element) => {
-    if (element.localName === "img") {
+  const state = documentState(document);
+  const body = document.body;
+  const registry = state.imageElements;
+  if (!registry) return images;
+  for (const element of registry) {
+    const elementData = elementState(element);
+    if (inTree(element, body)) {
+      elementData.imageConnected = true;
       const src = element.getAttribute?.("src");
-      if (src != null && src !== "") {
-        images.push(element);
-        seen.add(element);
-      }
+      if (src != null && src !== "") images.push(element);
+      continue;
     }
-    for (const child of element.children) visit(child);
-  };
-  if (document.body) visit(document.body);
-  for (const element of documentState(document).elements) {
-    if (seen.has(element) || element.localName !== "img") continue;
-    if (!isDetachedImage(element) && !elementState(element).imageLoadSticky) continue;
+    // Removed from the tree for good: forget it unless it still has to load.
+    if (elementData.imageConnected && !elementData.imageLoadSticky) {
+      registry.delete(element);
+      continue;
+    }
+    if (!isDetachedImage(element) && !elementData.imageLoadSticky) continue;
     const src = element.getAttribute?.("src");
     if (src != null && src !== "") images.push(element);
   }
@@ -137,13 +166,22 @@ function ensurePendingPromise(element) {
   state.imageLoad.catch(() => {});
 }
 
-function admitImage(element, window) {
+function admitImage(element, window, layoutBox = null) {
   const state = elementState(element);
   if (state.imageLoadState === "loaded" || state.imageLoadState === "loading") return;
   if (state.imageLoadState === "error") return;
   ensurePendingPromise(element);
   if (state.imageLoadState !== "pending") state.imageLoadState = "pending";
   state.imageAwaySince = null;
+  // Prefer layout-snapshot box for decode maxEdge (no forced layout/getBoundingClientRect).
+  if (layoutBox && layoutBox.width > 0 && layoutBox.height > 0) {
+    const dpr = window.devicePixelRatio?.() ?? 1;
+    // 2× CSS pixels is enough for sharp thumbs; hard-cap so gallery opens stay light.
+    state.imageMaxEdge = Math.min(
+      1024,
+      Math.max(64, Math.ceil(Math.max(layoutBox.width, layoutBox.height) * dpr * 2)),
+    );
+  }
   element._beginImageLoad(element.src, window, state.imageRequest);
 }
 
@@ -247,16 +285,15 @@ export function scheduleDocumentImageLoads(document, boxes = null) {
   if (!hasViewport || !docState.layoutSnapshot) {
     for (const element of images) {
       if (isDetachedImage(element) || elementState(element).imageLoadSticky) {
-        admitImage(element, window);
+        admitImage(element, window, null);
       }
     }
     return;
   }
 
-  const resolvedBoxes = boxes ?? docState.boxesSnapshot;
-  const byElement = resolvedBoxes?.length
-    ? new Map(resolvedBoxes.map(box => [box.element, box]))
-    : new Map();
+  const byElement = boxes
+    ? new Map(boxes.map(box => [box.element, box]))
+    : { get: documentLiveLookup(document) };
 
   const now = performance.now();
   const soonestEvict = evictAwayImages(document, window, images, byElement, viewport, now);
@@ -284,36 +321,100 @@ export function scheduleDocumentImageLoads(document, boxes = null) {
   }
 
   const pool = imageLoadPoolSize();
-  // Always admit must-load targets (visible / detached / sticky), even above pool.
-  for (const element of must) admitImage(element, window);
+  // Sticky + detached Image() always admit (decode() / constructor path).
+  // In-tree visible images are paced by the pool so a dense gallery cannot
+  // open unbounded work in one flush; leftovers stay pending for later turns.
+  const inFlight = inFlightCount(images);
+  let started = 0;
+  let startBudget = Math.max(0, pool - inFlight);
+  for (const element of must) {
+    if (elementState(element).imageLoadState === "loading" || elementState(element).imageLoadState === "loaded") continue;
+    const box = byElement.get(element) ?? null;
+    if (isDetachedImage(element) || elementState(element).imageLoadSticky) {
+      admitImage(element, window, box);
+      started++;
+      continue;
+    }
+    if (startBudget <= 0) break;
+    admitImage(element, window, box);
+    started++;
+    startBudget--;
+  }
 
   // Prefetch into remaining in-flight capacity: local first, then network.
-  let slots = Math.max(0, pool - inFlightCount(images));
+  let slots = Math.max(0, pool - inFlight - started);
   for (const element of localFill) {
     if (slots <= 0) break;
     if (elementState(element).imageLoadState !== "pending") continue;
-    admitImage(element, window);
+    admitImage(element, window, byElement.get(element) ?? null);
+    started++;
     slots--;
   }
   for (const element of networkFill) {
     if (slots <= 0) break;
     if (elementState(element).imageLoadState !== "pending") continue;
-    admitImage(element, window);
+    admitImage(element, window, byElement.get(element) ?? null);
+    started++;
     slots--;
   }
+
+  // Keep draining the queue across turns while work remains, without spinning
+  // the current event-loop callback.
+  // Far-off images stay pending with src set until they enter the 2× keep band.
+  // Re-arm only when capacity frees or geometry may have changed (caller also
+  // schedules on scroll/reflow).
+  // Always continue while nearby work remains OR in-flight jobs will free slots.
+  const inflight = inFlight + started;
+  const stillNearbyPending = images.some((element) => {
+    const st = elementState(element);
+    if (st.imageLoadState !== "pending") return false;
+    if (st.imageLoadSticky || isDetachedImage(element)) return true;
+    const box = byElement.get(element);
+    return !!(box && (visibleThroughClip(box, viewport) || withinKeepFold(box, viewport)));
+  });
+  if (stillNearbyPending || inflight > 0) {
+    // Pace follow-up flushes so we drain the native pool without spinning.
+    const kick = typeof setTimeout === "function" ? setTimeout : null;
+    if (kick) {
+      const t = kick(() => requestImageLoadSchedule(document), inflight > 0 ? 8 : 0);
+      t?.unref?.();
+    } else {
+      requestImageLoadSchedule(document);
+    }
+  }
 }
+
+// Scrolling asks for admission every frame; admission only matters at the
+// scale of a viewport, so passes run at most this often per document.
+const MIN_SCHEDULE_INTERVAL_MS = 60;
+const lastScheduleAt = new WeakMap();
+// A pass costs time proportional to the number of images, so passes also leave
+// at least eight times their own duration before the next one.
+const lastScheduleCost = new WeakMap();
 
 function flushImageLoadSchedules() {
   flushScheduled = false;
   const docs = [...pendingDocs];
   pendingDocs.clear();
   flushing = true;
+  let retryIn = null;
   try {
     for (const doc of docs) {
       try {
         const state = documentState(doc);
         if (!state?.defaultView || state.closed) continue;
+        const now = performance.now();
+        const interval = Math.max(MIN_SCHEDULE_INTERVAL_MS, 8 * (lastScheduleCost.get(doc) ?? 0));
+        const wait = interval - (now - (lastScheduleAt.get(doc) ?? -Infinity));
+        if (wait > 0) {
+          pendingDocs.add(doc);
+          retryIn = retryIn == null ? wait : Math.min(retryIn, wait);
+          continue;
+        }
         scheduleDocumentImageLoads(doc);
+        const finished = performance.now();
+        lastScheduleAt.set(doc, finished);
+        lastScheduleCost.set(doc, finished - now);
       } catch (error) {
         console.error("Nasty image load schedule failed:", error);
       }
@@ -323,17 +424,31 @@ function flushImageLoadSchedules() {
   }
   if (pendingDocs.size && !flushScheduled) {
     flushScheduled = true;
-    queueMicrotask(flushImageLoadSchedules);
+    if (retryIn != null) {
+      const timer = setTimeout(flushImageLoadSchedules, Math.ceil(retryIn));
+      timer.unref?.();
+      return;
+    }
+    const kick = typeof setImmediate === "function" ? setImmediate : (fn) => setTimeout(fn, 0);
+    const handle = kick(flushImageLoadSchedules);
+    handle?.unref?.();
   }
 }
 
-/** Coalesce schedule requests after reflow/scroll/src changes. */
+/** Coalesce schedule requests after reflow/scroll/src changes.
+ *  Use setImmediate (not queueMicrotask) so admission never runs in the same
+ *  turn as layout/scroll handlers — keeps the UI event loop free even when
+ *  the decode pipeline is saturated.
+ */
 export function requestImageLoadSchedule(document) {
   if (!document) return;
   pendingDocs.add(document);
   if (flushScheduled || flushing) return;
   flushScheduled = true;
-  queueMicrotask(flushImageLoadSchedules);
+  // A one-shot kick stays ref'd: a pending admission (e.g. a detached Image()
+  // awaiting decode()) must start before Node decides nothing is left to do.
+  const kick = typeof setImmediate === "function" ? setImmediate : (fn) => setTimeout(fn, 0);
+  kick(flushImageLoadSchedules);
 }
 
 export function markImageLoadSticky(element) {

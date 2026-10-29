@@ -28,6 +28,11 @@ mod ffmpeg_decode;
 mod audio_output;
 #[cfg(target_os = "linux")]
 mod video_stream;
+mod image_decode_pool;
+mod webrtc_bridge;
+#[cfg(target_os = "android")]
+mod android_camera;
+use image_decode_pool::{ImageDecodePool, ImageJobOutcome};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent as OsWindowEvent};
@@ -90,6 +95,17 @@ pub struct LayoutStyle {
     pub flex_basis_percent: Option<f64>,
     pub align_items: Option<String>,
     pub justify_content: Option<String>,
+    /// CSS `grid-template-columns` track list, e.g. `repeat(3, minmax(0px, 1fr))`.
+    pub grid_template_columns: Option<String>,
+    /// CSS `grid-template-rows` track list.
+    pub grid_template_rows: Option<String>,
+    pub grid_auto_flow: Option<String>,
+    pub grid_auto_columns: Option<String>,
+    pub grid_auto_rows: Option<String>,
+    pub grid_column: Option<String>,
+    pub grid_row: Option<String>,
+    pub row_gap: Option<f64>,
+    pub column_gap: Option<f64>,
 }
 
 #[napi(object)]
@@ -130,6 +146,244 @@ fn finite_signed(value: f64, name: &str) -> Result<f32> {
         ));
     }
     Ok(value as f32)
+}
+
+
+fn parse_css_length_px(s: &str) -> Result<f32> {
+    let s = s.trim();
+    if let Some(px) = s.strip_suffix("px") {
+        let n: f64 = px.trim().parse().map_err(|_| {
+            Error::new(Status::InvalidArg, format!("invalid length: {s}"))
+        })?;
+        return finite_nonnegative(n, "length");
+    }
+    if let Some(pct) = s.strip_suffix('%') {
+        let n: f64 = pct.trim().parse().map_err(|_| {
+            Error::new(Status::InvalidArg, format!("invalid percent length: {s}"))
+        })?;
+        // Percent tracks are resolved by Taffy against the grid container; store as length 0
+        // is wrong. Prefer explicit px for bridge simplicity — reject bare %.
+        let _ = n;
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("percent track sizes are not supported yet: {s}"),
+        ));
+    }
+    let n: f64 = s.parse().map_err(|_| {
+        Error::new(Status::InvalidArg, format!("invalid length: {s}"))
+    })?;
+    finite_nonnegative(n, "length")
+}
+
+fn split_top_level_comma(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ' ' | '\t' | '\n' | '\r' if depth == 0 => {
+                if i > start {
+                    let piece = s[start..i].trim();
+                    if !piece.is_empty() {
+                        out.push(piece.to_string());
+                    }
+                }
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start < s.len() {
+        let tail = s[start..].trim();
+        if !tail.is_empty() {
+            out.push(tail.to_string());
+        }
+    }
+    out
+}
+
+fn parse_min_track_sizing(s: &str) -> Result<MinTrackSizingFunction> {
+    let s = s.trim();
+    if s == "auto" {
+        return Ok(MinTrackSizingFunction::auto());
+    }
+    if s == "min-content" {
+        return Ok(MinTrackSizingFunction::min_content());
+    }
+    if s == "max-content" {
+        return Ok(MinTrackSizingFunction::max_content());
+    }
+    if s.ends_with("fr") {
+        return Ok(MinTrackSizingFunction::auto());
+    }
+    let len = parse_css_length_px(s)?;
+    Ok(MinTrackSizingFunction::from(LengthPercentage::length(len)))
+}
+
+fn parse_max_track_sizing(s: &str) -> Result<MaxTrackSizingFunction> {
+    let s = s.trim();
+    if s == "auto" {
+        return Ok(MaxTrackSizingFunction::auto());
+    }
+    if s == "min-content" {
+        return Ok(MaxTrackSizingFunction::min_content());
+    }
+    if s == "max-content" {
+        return Ok(MaxTrackSizingFunction::max_content());
+    }
+    if let Some(fr) = s.strip_suffix("fr") {
+        let n: f32 = fr.trim().parse().map_err(|_| {
+            Error::new(Status::InvalidArg, format!("invalid fr max track: {s}"))
+        })?;
+        if !n.is_finite() || n < 0.0 {
+            return Err(Error::new(Status::InvalidArg, format!("invalid fr max track: {s}")));
+        }
+        return Ok(MaxTrackSizingFunction::fr(n));
+    }
+    let len = parse_css_length_px(s)?;
+    Ok(MaxTrackSizingFunction::from(LengthPercentage::length(len)))
+}
+
+fn parse_track_sizing_function(raw: &str) -> Result<TrackSizingFunction> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(Error::new(Status::InvalidArg, "empty grid track"));
+    }
+    if let Some(inner) = s.strip_prefix("minmax(").and_then(|rest| rest.strip_suffix(')')) {
+        let (min_raw, max_raw) = split_top_level_comma(inner).ok_or_else(|| {
+            Error::new(Status::InvalidArg, format!("invalid minmax track: {s}"))
+        })?;
+        let min = parse_min_track_sizing(min_raw.trim())?;
+        let max = parse_max_track_sizing(max_raw.trim())?;
+        return Ok(minmax(min, max));
+    }
+    if s == "auto" {
+        return Ok(TrackSizingFunction::AUTO);
+    }
+    if s == "min-content" {
+        return Ok(TrackSizingFunction::MIN_CONTENT);
+    }
+    if s == "max-content" {
+        return Ok(TrackSizingFunction::MAX_CONTENT);
+    }
+    if let Some(fr) = s.strip_suffix("fr") {
+        let n: f32 = fr.trim().parse().map_err(|_| {
+            Error::new(Status::InvalidArg, format!("invalid fr track: {s}"))
+        })?;
+        if !n.is_finite() || n < 0.0 {
+            return Err(Error::new(Status::InvalidArg, format!("invalid fr track: {s}")));
+        }
+        return Ok(flex(n));
+    }
+    let len = parse_css_length_px(s)?;
+    Ok(TrackSizingFunction::from(LengthPercentage::length(len)))
+}
+
+fn parse_grid_template_tracks(raw: &str) -> Result<Vec<GridTemplateComponent<String>>> {
+    let tokens = split_top_level_tokens(raw.trim());
+    let mut tracks = Vec::new();
+    for token in tokens {
+        let t = token.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(inner) = t.strip_prefix("repeat(").and_then(|rest| rest.strip_suffix(')')) {
+            let (count_raw, list_raw) = split_top_level_comma(inner).ok_or_else(|| {
+                Error::new(Status::InvalidArg, format!("invalid repeat(): {t}"))
+            })?;
+            let count_raw = count_raw.trim();
+            let mut repeated = Vec::new();
+            for part in split_top_level_tokens(list_raw.trim()) {
+                if part.trim().is_empty() {
+                    continue;
+                }
+                repeated.push(parse_track_sizing_function(&part)?);
+            }
+            if count_raw == "auto-fill" {
+                tracks.push(repeat(RepetitionCount::AutoFill, repeated));
+            } else if count_raw == "auto-fit" {
+                tracks.push(repeat(RepetitionCount::AutoFit, repeated));
+            } else {
+                let count: u16 = count_raw.parse().map_err(|_| {
+                    Error::new(Status::InvalidArg, format!("invalid repeat count: {count_raw}"))
+                })?;
+                tracks.push(repeat(count, repeated));
+            }
+        } else {
+            let sizing = parse_track_sizing_function(t)?;
+            tracks.push(GridTemplateComponent::Single(sizing));
+        }
+    }
+    Ok(tracks)
+}
+
+fn parse_grid_auto_tracks(raw: &str) -> Result<Vec<TrackSizingFunction>> {
+    let mut tracks = Vec::new();
+    for token in split_top_level_tokens(raw.trim()) {
+        if token.trim().is_empty() {
+            continue;
+        }
+        tracks.push(parse_track_sizing_function(&token)?);
+    }
+    Ok(tracks)
+}
+
+fn parse_grid_placement_line(raw: &str) -> Result<Line<GridPlacement>> {
+    let s = raw.trim();
+    if s == "auto" {
+        return Ok(Line {
+            start: GridPlacement::Auto,
+            end: GridPlacement::Auto,
+        });
+    }
+    let parts: Vec<&str> = s.split('/').map(|p| p.trim()).collect();
+    let parse_one = |part: &str| -> Result<GridPlacement> {
+        let part = part.trim();
+        if part == "auto" || part.is_empty() {
+            return Ok(GridPlacement::Auto);
+        }
+        if let Some(n) = part.strip_prefix("span ") {
+            let n: u16 = n.trim().parse().map_err(|_| {
+                Error::new(Status::InvalidArg, format!("invalid grid span: {part}"))
+            })?;
+            return Ok(span(n));
+        }
+        let n: i16 = part.parse().map_err(|_| {
+            Error::new(Status::InvalidArg, format!("invalid grid line: {part}"))
+        })?;
+        Ok(line(n))
+    };
+    if parts.len() == 1 {
+        Ok(Line {
+            start: parse_one(parts[0])?,
+            end: GridPlacement::Auto,
+        })
+    } else if parts.len() == 2 {
+        Ok(Line {
+            start: parse_one(parts[0])?,
+            end: parse_one(parts[1])?,
+        })
+    } else {
+        Err(Error::new(
+            Status::InvalidArg,
+            format!("invalid grid placement: {raw}"),
+        ))
+    }
 }
 
 fn convert_style(input: LayoutStyle) -> Result<Style> {
@@ -173,6 +427,7 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
         style.display = match display {
             "block" => Display::Block,
             "flex" => Display::Flex,
+            "grid" => Display::Grid,
             "none" => Display::None,
             _ => {
                 return Err(Error::new(
@@ -310,6 +565,44 @@ fn convert_style(input: LayoutStyle) -> Result<Style> {
             width: value,
             height: value,
         };
+    }
+    if let Some(value) = input.row_gap {
+        style.gap.height = LengthPercentage::length(finite_nonnegative(value, "rowGap")?);
+    }
+    if let Some(value) = input.column_gap {
+        style.gap.width = LengthPercentage::length(finite_nonnegative(value, "columnGap")?);
+    }
+    if let Some(ref raw) = input.grid_template_columns {
+        style.grid_template_columns = parse_grid_template_tracks(raw)?;
+    }
+    if let Some(ref raw) = input.grid_template_rows {
+        style.grid_template_rows = parse_grid_template_tracks(raw)?;
+    }
+    if let Some(ref raw) = input.grid_auto_columns {
+        style.grid_auto_columns = parse_grid_auto_tracks(raw)?;
+    }
+    if let Some(ref raw) = input.grid_auto_rows {
+        style.grid_auto_rows = parse_grid_auto_tracks(raw)?;
+    }
+    if let Some(value) = input.grid_auto_flow.as_deref() {
+        style.grid_auto_flow = match value {
+            "row" => GridAutoFlow::Row,
+            "column" => GridAutoFlow::Column,
+            "row dense" | "dense" => GridAutoFlow::RowDense,
+            "column dense" => GridAutoFlow::ColumnDense,
+            _ => {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("unknown gridAutoFlow: {value}"),
+                ))
+            }
+        };
+    }
+    if let Some(ref raw) = input.grid_column {
+        style.grid_column = parse_grid_placement_line(raw)?;
+    }
+    if let Some(ref raw) = input.grid_row {
+        style.grid_row = parse_grid_placement_line(raw)?;
     }
     if let Some(value) = input.flex_grow {
         style.flex_grow = finite_nonnegative(value, "flexGrow")?;
@@ -495,6 +788,24 @@ impl LayoutTree {
             .map(|handle| self.layout(handle))
             .collect()
     }
+
+    /// Same fields as `layouts`, packed as 16 little-endian f32 per handle
+    /// (x, y, width, height, margin trbl, border trbl, padding trbl). Building
+    /// one object per node dominated layout time for large trees.
+    #[napi]
+    pub fn layouts_packed(&self, handles: Vec<u32>) -> Result<Buffer> {
+        let mut values = Vec::<f32>::with_capacity(handles.len() * 16);
+        for handle in handles {
+            let layout = self.tree.layout(self.node(handle)?).map_err(taffy_error)?;
+            values.extend_from_slice(&[
+                layout.location.x, layout.location.y, layout.size.width, layout.size.height,
+                layout.margin.top, layout.margin.right, layout.margin.bottom, layout.margin.left,
+                layout.border.top, layout.border.right, layout.border.bottom, layout.border.left,
+                layout.padding.top, layout.padding.right, layout.padding.bottom, layout.padding.left,
+            ]);
+        }
+        Ok(Buffer::from(bytemuck::cast_slice::<f32, u8>(&values).to_vec()))
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -589,11 +900,17 @@ pub fn android_main(android_app: winit::platform::android::activity::AndroidApp)
         }
     }
 
-    let script_path = project_dir.join("node/examples/tour.js");
+    // The APK names its JavaScript entry in nasty/entry; the tour is the default.
+    let entry = std::fs::read_to_string(project_dir.join("entry"))
+        .ok()
+        .map(|entry| entry.trim().to_owned())
+        .filter(|entry| !entry.is_empty() && !entry.starts_with('/') && !entry.contains(".."))
+        .unwrap_or_else(|| "node/examples/tour.js".to_owned());
+    let script_path = project_dir.join(entry);
     let script_path = match CString::new(script_path.to_string_lossy().as_bytes()) {
         Ok(path) => path,
         Err(_) => {
-            eprintln!("Nasty: invalid tour script path");
+            eprintln!("Nasty: invalid entry script path");
             return;
         }
     };
@@ -641,6 +958,19 @@ struct GpuImage {
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
+    /// Scroll-layer render targets hold premultiplied color (ALPHA_BLENDING
+    /// into a transparent target) and composite with a premultiplied blend.
+    premultiplied: bool,
+}
+
+/// Region of a layer texture that `render` draws into instead of the window.
+#[derive(Clone, Copy)]
+struct LayerTarget {
+    texture_id: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 enum DrawOrder {
@@ -670,7 +1000,26 @@ enum DrawOrder {
     },
     Image(usize),
     BackdropBlur { x: f32, y: f32, width: f32, height: f32, radius: f32 },
+    /// GPU boxes: SDF rounded rects with fill/gradient, border, and up to two
+    /// rounded clips, BOX_FLOATS floats per instance in `display_boxes`.
+    Boxes(std::ops::Range<u32>),
+    /// Textured GPU boxes for one texture: IMAGE_BOX_FLOATS floats per
+    /// instance in `display_image_boxes`.
+    ImageBoxes { texture_id: u32, range: std::ops::Range<u32> },
+    /// Draw prepared text runs of this layer here (display-list tag 9).
+    TextLayer(u32),
 }
+
+/// Image box layout (6 × vec4): destination rect, UV rect (u0 v0 u1 v1),
+/// own corner radii (tl tr br bl), clip0 rect, clip1 rect, (clip0 radius,
+/// clip1 radius, opacity, unused).
+const IMAGE_BOX_FLOATS: usize = 24;
+
+/// Box instance layout (13 × vec4): rect, radii (tl tr br bl), four gradient
+/// stop colors, stop offsets, gradient line (x0 y0 x1 y1), border widths
+/// (t r b l), border color, clip0 rect, clip1 rect, (clip0 radius, clip1
+/// radius, stop count, unused). Colors are straight RGBA in [0, 1].
+const BOX_FLOATS: usize = 52;
 
 enum CanvasCommand {
     Triangles(std::ops::Range<u32>),
@@ -852,6 +1201,12 @@ pub struct DecodedImageTexture {
 }
 
 #[napi(object)]
+pub struct ImageDecodeJob {
+    pub id: f64,
+}
+
+
+#[napi(object)]
 pub struct DecodedImageRgba {
     pub width: u32,
     pub height: u32,
@@ -860,13 +1215,17 @@ pub struct DecodedImageRgba {
 
 /// Longest edge for `<img>` GPU textures. Larger sources are scaled down,
 /// preserving aspect ratio, before upload.
-pub const IMAGE_TEXTURE_MAX_EDGE: u32 = 4096;
+pub const IMAGE_TEXTURE_MAX_EDGE: u32 = 8192;
 
 fn decode_image_rgba(
     encoded: &[u8],
     max_edge: u32,
 ) -> std::result::Result<(u32, u32, Vec<u8>), String> {
     let max_edge = max_edge.max(1);
+    // Never call imageops::resize (rayon) from pool workers — nested deadlock.
+    if let Ok(img) = try_decode_jpeg_scaled(encoded, max_edge) {
+        return Ok(img);
+    }
     let image = image::load_from_memory(encoded)
         .map_err(|error| format!("decode image: {error}"))?
         .into_rgba8();
@@ -881,13 +1240,164 @@ fn decode_image_rgba(
     let scale = f64::from(max_edge) / f64::from(longest);
     let next_width = ((f64::from(width) * scale).round() as u32).max(1);
     let next_height = ((f64::from(height) * scale).round() as u32).max(1);
-    let resized = image::imageops::resize(
-        &image,
-        next_width,
-        next_height,
-        image::imageops::FilterType::Triangle,
-    );
-    Ok((next_width, next_height, resized.into_raw()))
+    let resized = resize_rgba_nearest(&image, next_width, next_height);
+    Ok((next_width, next_height, resized))
+}
+
+fn try_decode_jpeg_scaled(
+    encoded: &[u8],
+    max_edge: u32,
+) -> std::result::Result<(u32, u32, Vec<u8>), String> {
+    if encoded.len() < 3 || encoded[0] != 0xFF || encoded[1] != 0xD8 {
+        return Err("not jpeg".into());
+    }
+    // Single decoder: read_info → scale(requested) → decode. jpeg-decoder picks
+    // IDCT 1/1,1/2,1/4,1/8 from the requested size.
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(encoded));
+    decoder.read_info().map_err(|e| format!("jpeg info: {e}"))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| "jpeg missing info".to_string())?;
+    let full_w = u32::from(info.width);
+    let full_h = u32::from(info.height);
+    if full_w == 0 || full_h == 0 {
+        return Err("jpeg has no dimensions".into());
+    }
+    let longest = full_w.max(full_h);
+    let (req_w, req_h) = if longest <= max_edge {
+        (
+            full_w.min(u32::from(u16::MAX)) as u16,
+            full_h.min(u32::from(u16::MAX)) as u16,
+        )
+    } else {
+        let s = f64::from(max_edge) / f64::from(longest);
+        (
+            ((f64::from(full_w) * s).round() as u32)
+                .max(1)
+                .min(u32::from(u16::MAX)) as u16,
+            ((f64::from(full_h) * s).round() as u32)
+                .max(1)
+                .min(u32::from(u16::MAX)) as u16,
+        )
+    };
+    decoder
+        .scale(req_w, req_h)
+        .map_err(|e| format!("jpeg scale: {e}"))?;
+    let pixels = decoder.decode().map_err(|e| format!("jpeg decode: {e}"))?;
+    let info = decoder
+        .info()
+        .ok_or_else(|| "jpeg missing info after decode".to_string())?;
+    let width = u32::from(info.width);
+    let height = u32::from(info.height);
+    let rgba = jpeg_pixels_to_rgba(&pixels, info.pixel_format, width, height)?;
+    let longest = width.max(height);
+    if longest <= max_edge {
+        return Ok((width, height, rgba));
+    }
+    let img = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| "rgba buffer size mismatch".to_string())?;
+    let s = f64::from(max_edge) / f64::from(longest);
+    let nw = ((f64::from(width) * s).round() as u32).max(1);
+    let nh = ((f64::from(height) * s).round() as u32).max(1);
+    Ok((nw, nh, resize_rgba_nearest(&img, nw, nh)))
+}
+
+fn jpeg_pixels_to_rgba(
+    pixels: &[u8],
+    format: jpeg_decoder::PixelFormat,
+    width: u32,
+    height: u32,
+) -> std::result::Result<Vec<u8>, String> {
+    let n = (width as usize).saturating_mul(height as usize);
+    match format {
+        jpeg_decoder::PixelFormat::L16 => {
+            if pixels.len() < n * 2 {
+                return Err("jpeg L16 underrun".into());
+            }
+            let mut out = vec![0u8; n * 4];
+            for i in 0..n {
+                // Take high byte.
+                let g = pixels[i * 2];
+                let o = i * 4;
+                out[o] = g;
+                out[o + 1] = g;
+                out[o + 2] = g;
+                out[o + 3] = 255;
+            }
+            Ok(out)
+        }
+        jpeg_decoder::PixelFormat::L8 => {
+            if pixels.len() < n {
+                return Err("jpeg L8 underrun".into());
+            }
+            let mut out = vec![0u8; n * 4];
+            for i in 0..n {
+                let g = pixels[i];
+                let o = i * 4;
+                out[o] = g;
+                out[o + 1] = g;
+                out[o + 2] = g;
+                out[o + 3] = 255;
+            }
+            Ok(out)
+        }
+        jpeg_decoder::PixelFormat::RGB24 => {
+            if pixels.len() < n * 3 {
+                return Err("jpeg RGB underrun".into());
+            }
+            let mut out = vec![0u8; n * 4];
+            for i in 0..n {
+                let s = i * 3;
+                let o = i * 4;
+                out[o] = pixels[s];
+                out[o + 1] = pixels[s + 1];
+                out[o + 2] = pixels[s + 2];
+                out[o + 3] = 255;
+            }
+            Ok(out)
+        }
+        jpeg_decoder::PixelFormat::CMYK32 => {
+            if pixels.len() < n * 4 {
+                return Err("jpeg CMYK underrun".into());
+            }
+            let mut out = vec![0u8; n * 4];
+            for i in 0..n {
+                let s = i * 4;
+                let c = u16::from(pixels[s]);
+                let m = u16::from(pixels[s + 1]);
+                let y = u16::from(pixels[s + 2]);
+                let k = u16::from(pixels[s + 3]);
+                let o = i * 4;
+                out[o] = (((255 - c) * (255 - k)) / 255) as u8;
+                out[o + 1] = (((255 - m) * (255 - k)) / 255) as u8;
+                out[o + 2] = (((255 - y) * (255 - k)) / 255) as u8;
+                out[o + 3] = 255;
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn resize_rgba_nearest(
+    src: &image::RgbaImage,
+    next_width: u32,
+    next_height: u32,
+) -> Vec<u8> {
+    let (sw, sh) = src.dimensions();
+    let mut out = vec![0u8; (next_width as usize) * (next_height as usize) * 4];
+    if sw == 0 || sh == 0 || next_width == 0 || next_height == 0 {
+        return out;
+    }
+    for y in 0..next_height {
+        let sy = (u64::from(y) * u64::from(sh)) / u64::from(next_height);
+        for x in 0..next_width {
+            let sx = (u64::from(x) * u64::from(sw)) / u64::from(next_width);
+            let p = src.get_pixel(sx as u32, sy as u32).0;
+            let i = ((y as usize) * (next_width as usize) + (x as usize)) * 4;
+            out[i..i + 4].copy_from_slice(&p);
+        }
+    }
+    out
 }
 
 /// CPU-only decode for worker threads. Does not touch the GPU.
@@ -1125,7 +1635,9 @@ impl NativeAudioDecoder {
     }
 
     #[napi]
-    pub fn close(&mut self) { self.decoder.take(); }
+    pub fn close(&mut self) {
+        self.decoder.take();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1241,6 +1753,12 @@ pub struct TextRunOptions {
     pub wrap: Option<bool>,
     #[napi(js_name = "breakWords")]
     pub break_words: Option<bool>,
+    /// Paint layer: text in layer N is drawn at the display list's
+    /// TextLayer(N) marker, so later boxes (toasts, menus) can cover it.
+    pub layer: Option<u32>,
+    /// Non-zero: the run belongs to a scroll layer and is drawn only by
+    /// `renderLayer`, never by the window's text pass.
+    pub target: Option<u32>,
 }
 
 fn text_bounds(run: &TextRunOptions, width: u32, height: u32) -> TextBounds {
@@ -1272,6 +1790,22 @@ fn text_bounds(run: &TextRunOptions, width: u32, height: u32) -> TextBounds {
     }
 }
 
+/// Clip bounds of a scroll-layer run inside the region being painted, whose
+/// top-left sits at (origin_x, origin_y) in layer content space.
+fn layer_text_bounds(run: &TextRunOptions, origin_x: f64, origin_y: f64, width: u32, height: u32) -> TextBounds {
+    let (width, height) = (width as f64, height as f64);
+    let left = run.clip_x.map_or(0.0, |x| x - origin_x).floor().clamp(0.0, width);
+    let top = run.clip_y.map_or(0.0, |y| y - origin_y).floor().clamp(0.0, height);
+    let right = run.clip_x.zip(run.clip_width).map_or(width, |(x, w)| x + w - origin_x).ceil().clamp(0.0, width);
+    let bottom = run.clip_y.zip(run.clip_height).map_or(height, |(y, h)| y + h - origin_y).ceil().clamp(0.0, height);
+    TextBounds {
+        left: left as i32,
+        top: top as i32,
+        right: right.max(left) as i32,
+        bottom: bottom.max(top) as i32,
+    }
+}
+
 fn text_run_align(value: Option<&str>) -> Option<Align> {
     match value {
         Some("right") => Some(Align::Right),
@@ -1291,17 +1825,49 @@ fn custom_font_key(family: &str, data: &[u8]) -> (String, u64) {
     (family.to_owned(), hash.finish())
 }
 
-fn text_family(family: Option<&str>) -> Family<'_> {
-    let Some(family) = family else {
+fn generic_text_family(name: &str) -> Option<Family<'static>> {
+    match name.to_ascii_lowercase().as_str() {
+        "serif" | "ui-serif" | "fangsong" => Some(Family::Serif),
+        "sans-serif" | "system-ui" | "ui-sans-serif" | "ui-rounded" => Some(Family::SansSerif),
+        "monospace" | "ui-monospace" => Some(Family::Monospace),
+        "cursive" => Some(Family::Cursive),
+        "fantasy" => Some(Family::Fantasy),
+        _ => None,
+    }
+}
+
+/// Resolves a CSS font-family stack ("Fraunces, ui-serif, Georgia, serif") to
+/// the first entry the font database can satisfy, like a browser's font
+/// matching. Results are cached per stack until the database gains faces.
+fn text_family<'a>(family: Option<&'a str>, db: &glyphon::fontdb::Database) -> Family<'a> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static RESOLVED: Mutex<Option<(usize, HashMap<String, Option<usize>>)>> = Mutex::new(None);
+    let Some(stack) = family else {
         return Family::SansSerif;
     };
-    match family.trim().to_ascii_lowercase().as_str() {
-        "serif" | "ui-serif" | "fangsong" => Family::Serif,
-        "sans-serif" | "system-ui" | "ui-sans-serif" | "ui-rounded" => Family::SansSerif,
-        "monospace" | "ui-monospace" => Family::Monospace,
-        "cursive" => Family::Cursive,
-        "fantasy" => Family::Fantasy,
-        _ => Family::Name(family),
+    let entries: Vec<&'a str> = stack
+        .split(',')
+        .map(|entry| entry.trim().trim_matches(|c| c == '\'' || c == '"').trim())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let face_count = db.len();
+    let index = {
+        let mut cache = RESOLVED.lock().expect("font family cache lock");
+        if cache.as_ref().map_or(true, |(count, _)| *count != face_count) {
+            *cache = Some((face_count, HashMap::new()));
+        }
+        let map = &mut cache.as_mut().unwrap().1;
+        *map.entry(stack.to_owned()).or_insert_with(|| {
+            entries.iter().position(|entry| {
+                generic_text_family(entry).is_some()
+                    || db.faces().any(|face| face.families.iter().any(|(name, _)| name.eq_ignore_ascii_case(entry)))
+            })
+        })
+    };
+    match index.map(|index| entries[index]) {
+        Some(entry) => generic_text_family(entry).unwrap_or(Family::Name(entry)),
+        None => Family::SansSerif,
     }
 }
 
@@ -1358,6 +1924,12 @@ struct Renderer {
     canvas_circle_pipeline: wgpu::RenderPipeline,
     canvas_bezier_pipeline: wgpu::RenderPipeline,
     image_pipeline: wgpu::RenderPipeline,
+    image_premultiplied_pipeline: wgpu::RenderPipeline,
+    clear_pipeline: wgpu::RenderPipeline,
+    layer_viewport_buffer: wgpu::Buffer,
+    layer_viewport_bind_group: wgpu::BindGroup,
+    /// Set while `render` draws into a scroll-layer texture region.
+    layer_target: Option<LayerTarget>,
     image_bind_group_layout: wgpu::BindGroupLayout,
     images: std::collections::HashMap<u32, GpuImage>,
     retired_images: std::collections::HashMap<u32, GpuImage>,
@@ -1372,6 +1944,12 @@ struct Renderer {
     canvas_circle_vertex_capacity: usize,
     canvas_bezier_vertex_buffer: wgpu::Buffer,
     canvas_bezier_vertex_capacity: usize,
+    box_pipeline: wgpu::RenderPipeline,
+    box_instance_buffer: wgpu::Buffer,
+    box_instance_capacity: usize,
+    image_box_pipeline: wgpu::RenderPipeline,
+    image_box_instance_buffer: wgpu::Buffer,
+    image_box_instance_capacity: usize,
     text_runtime: Option<TextRuntime>,
     worker_runtime: Option<TextRuntime>,
     text_worker: Sender<TextWorkerMessage>,
@@ -1401,7 +1979,11 @@ struct TextRuntime {
     swash_cache: SwashCache,
     text_viewport: Viewport,
     text_atlas: TextAtlas,
-    text_renderer: Option<TextRenderer>,
+    /// One renderer per text paint layer (see TextRunOptions::layer).
+    text_renderers: Vec<TextRenderer>,
+    /// Renderers and resolution for the scroll-layer region being painted.
+    layer_text_viewport: Viewport,
+    layer_text_renderers: Vec<TextRenderer>,
     text_buffers: Vec<PositionedText>,
     text_run_options: Vec<TextRunOptions>,
 }
@@ -2227,6 +2809,7 @@ fn create_text_runtime(
     let cache = TextCache::new(device);
     let mut viewport = Viewport::new(device, &cache);
     viewport.update(queue, Resolution { width, height });
+    let layer_viewport = Viewport::new(device, &cache);
     let atlas = TextAtlas::new(device, queue, &cache, format);
     TextRuntime {
         font_system: None,
@@ -2235,7 +2818,9 @@ fn create_text_runtime(
         swash_cache: SwashCache::new(),
         text_viewport: viewport,
         text_atlas: atlas,
-        text_renderer: None,
+        text_renderers: Vec::new(),
+        layer_text_viewport: layer_viewport,
+        layer_text_renderers: Vec::new(),
         text_buffers: Vec::new(),
         text_run_options: Vec::new(),
     }
@@ -2394,6 +2979,34 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+        // Replaces (no blend) so a scroll-layer region can be reset to
+        // transparent before it is repainted.
+        let clear_targets = [Some(wgpu::ColorTargetState {
+            format,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        let clear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Nasty layer clear pipeline"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[vertex_layout.clone()],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &clear_targets,
+            }),
+            multiview: None,
+            cache: None,
+        });
         let canvas_viewport_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Nasty canvas viewport binding"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -2416,6 +3029,16 @@ impl Renderer {
             label: Some("Nasty canvas viewport bind group"),
             layout: &canvas_viewport_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: canvas_viewport_buffer.as_entire_binding() }],
+        });
+        let layer_viewport_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Nasty layer viewport"),
+            contents: bytemuck::cast_slice(&[1.0_f32, 1.0]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let layer_viewport_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Nasty layer viewport bind group"),
+            layout: &canvas_viewport_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: layer_viewport_buffer.as_entire_binding() }],
         });
         let canvas_color_output = if format.is_srgb() {
             "srgb_to_linear(input.color.rgb)"
@@ -2577,6 +3200,137 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+        let box_color_output = if format.is_srgb() { "srgb_to_linear(rgb)" } else { "rgb" };
+        let box_shader_source = r#"
+                struct Viewport { size: vec2<f32> };
+                @group(0) @binding(0) var<uniform> viewport: Viewport;
+                struct BoxInput {
+                    @location(0) rect: vec4<f32>, @location(1) radii: vec4<f32>,
+                    @location(2) c0: vec4<f32>, @location(3) c1: vec4<f32>,
+                    @location(4) c2: vec4<f32>, @location(5) c3: vec4<f32>,
+                    @location(6) stops: vec4<f32>, @location(7) line: vec4<f32>,
+                    @location(8) border: vec4<f32>, @location(9) border_color: vec4<f32>,
+                    @location(10) clip0: vec4<f32>, @location(11) clip1: vec4<f32>,
+                    @location(12) extra: vec4<f32>,
+                };
+                struct BoxOutput {
+                    @builtin(position) position: vec4<f32>,
+                    @location(0) point: vec2<f32>,
+                    @location(1) @interpolate(flat) rect: vec4<f32>, @location(2) @interpolate(flat) radii: vec4<f32>,
+                    @location(3) @interpolate(flat) c0: vec4<f32>, @location(4) @interpolate(flat) c1: vec4<f32>,
+                    @location(5) @interpolate(flat) c2: vec4<f32>, @location(6) @interpolate(flat) c3: vec4<f32>,
+                    @location(7) @interpolate(flat) stops: vec4<f32>, @location(8) @interpolate(flat) line: vec4<f32>,
+                    @location(9) @interpolate(flat) border: vec4<f32>, @location(10) @interpolate(flat) border_color: vec4<f32>,
+                    @location(11) @interpolate(flat) clip0: vec4<f32>, @location(12) @interpolate(flat) clip1: vec4<f32>,
+                    @location(13) @interpolate(flat) extra: vec4<f32>,
+                };
+                fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
+                    let low = value / vec3<f32>(12.92);
+                    let high = pow((value + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
+                    return select(high, low, value <= vec3<f32>(0.04045));
+                }
+                // Signed distance to a rounded rect with per-corner radii (y down).
+                fn sd_round_rect(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
+                    let half = rect.zw * 0.5;
+                    let q = p - (rect.xy + half);
+                    var r = select(radii.x, radii.y, q.x > 0.0);
+                    if (q.y > 0.0) { r = select(radii.w, radii.z, q.x > 0.0); }
+                    r = min(r, min(half.x, half.y));
+                    let d = abs(q) - half + vec2<f32>(r);
+                    return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - r;
+                }
+                fn coverage(d: f32) -> f32 { return clamp(0.5 - d, 0.0, 1.0); }
+                fn clip_coverage(p: vec2<f32>, clip: vec4<f32>, radius: f32) -> f32 {
+                    if (clip.z <= 0.0 || clip.w <= 0.0) { return select(1.0, 0.0, clip.z < 0.0); }
+                    return coverage(sd_round_rect(p, clip, vec4<f32>(radius)));
+                }
+                @vertex fn vs_main(input: BoxInput, @builtin(vertex_index) vertex_index: u32) -> BoxOutput {
+                    let corners = array<vec2<f32>, 6>(
+                        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+                        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));
+                    // One pixel of slack on every side for antialiased edges.
+                    let point = input.rect.xy - vec2<f32>(1.0) + corners[vertex_index] * (input.rect.zw + vec2<f32>(2.0));
+                    var output: BoxOutput;
+                    output.position = vec4<f32>(point.x / viewport.size.x * 2.0 - 1.0, 1.0 - point.y / viewport.size.y * 2.0, 0.0, 1.0);
+                    output.point = point;
+                    output.rect = input.rect; output.radii = input.radii;
+                    output.c0 = input.c0; output.c1 = input.c1; output.c2 = input.c2; output.c3 = input.c3;
+                    output.stops = input.stops; output.line = input.line;
+                    output.border = input.border; output.border_color = input.border_color;
+                    output.clip0 = input.clip0; output.clip1 = input.clip1; output.extra = input.extra;
+                    return output;
+                }
+                fn premultiplied(color: vec4<f32>) -> vec4<f32> { return vec4<f32>(color.rgb * color.a, color.a); }
+                fn segment(a: vec4<f32>, b: vec4<f32>, lo: f32, hi: f32, t: f32) -> vec4<f32> {
+                    return mix(premultiplied(a), premultiplied(b), clamp((t - lo) / max(hi - lo, 1e-6), 0.0, 1.0));
+                }
+                fn fill_color(input: BoxOutput) -> vec4<f32> {
+                    let count = input.extra.z;
+                    if (count < 1.5) { return premultiplied(input.c0); }
+                    let direction = input.line.zw - input.line.xy;
+                    let t = clamp(dot(input.point - input.line.xy, direction) / max(dot(direction, direction), 1e-6), 0.0, 1.0);
+                    let s = input.stops;
+                    if (t <= s.x) { return premultiplied(input.c0); }
+                    if (t <= s.y || count < 2.5) { return segment(input.c0, input.c1, s.x, s.y, t); }
+                    if (t <= s.z || count < 3.5) { return segment(input.c1, input.c2, s.y, s.z, t); }
+                    return segment(input.c2, input.c3, s.z, s.w, t);
+                }
+                @fragment fn fs_main(input: BoxOutput) -> @location(0) vec4<f32> {
+                    let outer = coverage(sd_round_rect(input.point, input.rect, input.radii));
+                    var inner = outer;
+                    let border = input.border;
+                    if (any(border > vec4<f32>(0.0))) {
+                        let inner_rect = vec4<f32>(input.rect.x + border.w, input.rect.y + border.x,
+                            input.rect.z - border.y - border.w, input.rect.w - border.x - border.z);
+                        let inner_radii = max(input.radii - vec4<f32>(max(border.x, border.w), max(border.x, border.y),
+                            max(border.z, border.y), max(border.z, border.w)), vec4<f32>(0.0));
+                        inner = select(0.0, min(outer, coverage(sd_round_rect(input.point, inner_rect, inner_radii))),
+                            inner_rect.z > 0.0 && inner_rect.w > 0.0);
+                    }
+                    var color = fill_color(input) * inner + premultiplied(input.border_color) * (outer - inner);
+                    color = color * clip_coverage(input.point, input.clip0, input.extra.x)
+                        * clip_coverage(input.point, input.clip1, input.extra.y);
+                    if (color.a <= 0.0) { discard; }
+                    let rgb = color.rgb / color.a;
+                    return vec4<f32>(__OUTPUT_RGB__, color.a);
+                }
+            "#
+            .replace("__OUTPUT_RGB__", box_color_output);
+        let box_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty box shader"),
+            source: wgpu::ShaderSource::Wgsl(box_shader_source.into()),
+        });
+        const BOX_ATTRIBUTES: [wgpu::VertexAttribute; 13] = wgpu::vertex_attr_array![
+            0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4,
+            5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 8 => Float32x4, 9 => Float32x4,
+            10 => Float32x4, 11 => Float32x4, 12 => Float32x4
+        ];
+        let box_layout = wgpu::VertexBufferLayout {
+            array_stride: (BOX_FLOATS * std::mem::size_of::<f32>()) as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &BOX_ATTRIBUTES,
+        };
+        let box_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Nasty box pipeline"),
+            layout: Some(&canvas_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &box_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[box_layout],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &box_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview: None,
+            cache: None,
+        });
         let bezier_color_output = if format.is_srgb() {
             "srgb_to_linear(input.color.rgb)"
         } else {
@@ -2720,7 +3474,7 @@ impl Renderer {
                 module: &image_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[image_vertex_layout],
+                buffers: &[image_vertex_layout.clone()],
             },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -2733,6 +3487,130 @@ impl Renderer {
             }),
             multiview: None,
             cache: None,
+        });
+        let premultiplied_targets = [Some(wgpu::ColorTargetState {
+            format,
+            blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        let image_premultiplied_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Nasty premultiplied image pipeline"),
+            layout: Some(&image_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &image_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[image_vertex_layout.clone()],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &premultiplied_targets,
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let image_box_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty image box shader"),
+            source: wgpu::ShaderSource::Wgsl(r#"
+                struct Viewport { size: vec2<f32> };
+                @group(1) @binding(0) var<uniform> viewport: Viewport;
+                @group(0) @binding(0) var image_texture: texture_2d<f32>;
+                @group(0) @binding(1) var image_sampler: sampler;
+                struct ImageBoxInput {
+                    @location(0) rect: vec4<f32>, @location(1) uv: vec4<f32>, @location(2) radii: vec4<f32>,
+                    @location(3) clip0: vec4<f32>, @location(4) clip1: vec4<f32>, @location(5) extra: vec4<f32>,
+                };
+                struct ImageBoxOutput {
+                    @builtin(position) position: vec4<f32>,
+                    @location(0) point: vec2<f32>,
+                    @location(1) uv: vec2<f32>,
+                    @location(2) @interpolate(flat) rect: vec4<f32>, @location(3) @interpolate(flat) radii: vec4<f32>,
+                    @location(4) @interpolate(flat) clip0: vec4<f32>, @location(5) @interpolate(flat) clip1: vec4<f32>,
+                    @location(6) @interpolate(flat) extra: vec4<f32>,
+                };
+                fn sd_round_rect(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
+                    let half = rect.zw * 0.5;
+                    let q = p - (rect.xy + half);
+                    var r = select(radii.x, radii.y, q.x > 0.0);
+                    if (q.y > 0.0) { r = select(radii.w, radii.z, q.x > 0.0); }
+                    r = min(r, min(half.x, half.y));
+                    let d = abs(q) - half + vec2<f32>(r);
+                    return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - r;
+                }
+                fn coverage(d: f32) -> f32 { return clamp(0.5 - d, 0.0, 1.0); }
+                fn clip_coverage(p: vec2<f32>, clip: vec4<f32>, radius: f32) -> f32 {
+                    if (clip.z <= 0.0 || clip.w <= 0.0) { return select(1.0, 0.0, clip.z < 0.0); }
+                    return coverage(sd_round_rect(p, clip, vec4<f32>(radius)));
+                }
+                @vertex fn vs_main(input: ImageBoxInput, @builtin(vertex_index) vertex_index: u32) -> ImageBoxOutput {
+                    let corners = array<vec2<f32>, 6>(
+                        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+                        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));
+                    let corner = corners[vertex_index];
+                    let point = input.rect.xy + corner * input.rect.zw;
+                    var output: ImageBoxOutput;
+                    output.position = vec4<f32>(point.x / viewport.size.x * 2.0 - 1.0, 1.0 - point.y / viewport.size.y * 2.0, 0.0, 1.0);
+                    output.point = point;
+                    output.uv = mix(input.uv.xy, input.uv.zw, corner);
+                    output.rect = input.rect; output.radii = input.radii;
+                    output.clip0 = input.clip0; output.clip1 = input.clip1; output.extra = input.extra;
+                    return output;
+                }
+                @fragment fn fs_main(input: ImageBoxOutput) -> @location(0) vec4<f32> {
+                    let color = textureSample(image_texture, image_sampler, input.uv);
+                    var cover = input.extra.z;
+                    if (any(input.radii > vec4<f32>(0.0))) { cover = cover * coverage(sd_round_rect(input.point, input.rect, input.radii)); }
+                    cover = cover * clip_coverage(input.point, input.clip0, input.extra.x)
+                        * clip_coverage(input.point, input.clip1, input.extra.y);
+                    if (cover <= 0.0) { discard; }
+                    return vec4<f32>(color.rgb, color.a * cover);
+                }
+            "#.into()),
+        });
+        let image_box_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Nasty image box pipeline layout"),
+            bind_group_layouts: &[&image_bind_group_layout, &canvas_viewport_layout],
+            push_constant_ranges: &[],
+        });
+        const IMAGE_BOX_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+            0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4
+        ];
+        let image_box_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Nasty image box pipeline"),
+            layout: Some(&image_box_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &image_box_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: (IMAGE_BOX_FLOATS * std::mem::size_of::<f32>()) as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &IMAGE_BOX_ATTRIBUTES,
+                }],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &image_box_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let image_box_instance_capacity = 64 * 1024;
+        let image_box_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nasty image box instances"),
+            size: image_box_instance_capacity as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         // Avoid a visible first-frame allocation for ordinary display lists.
         // Larger lists still grow geometrically in `render`.
@@ -2754,6 +3632,13 @@ impl Renderer {
         let canvas_circle_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Nasty canvas radial circle instances"),
             size: canvas_circle_vertex_capacity as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let box_instance_capacity = 64 * 1024;
+        let box_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nasty box instances"),
+            size: box_instance_capacity as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2822,6 +3707,11 @@ impl Renderer {
             canvas_circle_pipeline,
             canvas_bezier_pipeline,
             image_pipeline,
+            image_premultiplied_pipeline,
+            clear_pipeline,
+            layer_viewport_buffer,
+            layer_viewport_bind_group,
+            layer_target: None,
             image_bind_group_layout,
             images: std::collections::HashMap::new(),
             retired_images: std::collections::HashMap::new(),
@@ -2834,6 +3724,12 @@ impl Renderer {
             canvas_vertex_capacity,
             canvas_circle_vertex_buffer,
             canvas_circle_vertex_capacity,
+            box_pipeline,
+            box_instance_buffer,
+            box_instance_capacity,
+            image_box_pipeline,
+            image_box_instance_buffer,
+            image_box_instance_capacity,
             canvas_bezier_vertex_buffer,
             canvas_bezier_vertex_capacity,
             text_runtime: Some(text_runtime),
@@ -2953,9 +3849,93 @@ impl Renderer {
                 bind_group,
                 width,
                 height,
+                premultiplied: false,
             },
         );
         Ok(id)
+    }
+
+    fn new_layer_texture(&self, width: u32, height: u32) -> wgpu::Texture {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Nasty scroll layer"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Nasty layer clear") });
+        {
+            let attachments = [Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })];
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty layer clear"),
+                color_attachments: &attachments, depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+        }
+        self.queue.submit(Some(encoder.finish()));
+        texture
+    }
+
+    fn layer_image(&self, texture: wgpu::Texture, width: u32, height: u32) -> GpuImage {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Nasty scroll layer sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Nasty scroll layer bind group"),
+            layout: &self.image_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        GpuImage { _texture: texture, bind_group, width, height, premultiplied: true }
+    }
+
+    fn check_layer_size(&self, width: u32, height: u32) -> std::result::Result<(), String> {
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
+            return Err(format!("layer texture dimensions must be between 1 and {max} pixels"));
+        }
+        Ok(())
+    }
+
+    fn create_layer_texture(&mut self, width: u32, height: u32) -> std::result::Result<u32, String> {
+        self.check_layer_size(width, height)?;
+        let texture = self.new_layer_texture(width, height);
+        let image = self.layer_image(texture, width, height);
+        let id = self.next_image_id;
+        self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        self.images.insert(id, image);
+        Ok(id)
+    }
+
+    /// Grow (or shrink) a layer texture, keeping its painted content at the
+    /// same texel positions.
+    fn resize_layer_texture(&mut self, id: u32, width: u32, height: u32) -> std::result::Result<(), String> {
+        self.check_layer_size(width, height)?;
+        let previous = self.images.get(&id).filter(|image| image.premultiplied)
+            .ok_or_else(|| format!("unknown layer texture {id}"))?;
+        if previous.width == width && previous.height == height { return Ok(()); }
+        let texture = self.new_layer_texture(width, height);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Nasty layer grow") });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: &previous._texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: previous.width.min(width), height: previous.height.min(height), depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let image = self.layer_image(texture, width, height);
+        self.images.insert(id, image);
+        Ok(())
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -2994,14 +3974,25 @@ impl Renderer {
         triangles: &[f32],
         circles: &[f32],
         beziers: &[f32],
+        boxes: &[f32],
+        image_boxes: &[f32],
+        canvas_triangles: &[f32],
         image_draws: &[ImageDraw],
         draw_order: &[DrawOrder],
     ) -> std::result::Result<RenderTimings, String> {
         let started = Instant::now();
         let prepare_started = Instant::now();
         let mut vertices = Vec::with_capacity((list.len() / 8) * 6);
-        let width = self.config.width as f32;
-        let height = self.config.height as f32;
+        // A layer target renders a texture region as if it were the whole
+        // viewport: NDC, scissors and text resolve against the region size and
+        // the pass viewport places it at (ox, oy) inside the texture.
+        let layer_target = self.layer_target;
+        let (ox, oy, target_width, target_height) = match layer_target {
+            Some(target) => (target.x, target.y, target.width, target.height),
+            None => (0, 0, self.config.width, self.config.height),
+        };
+        let width = target_width as f32;
+        let height = target_height as f32;
         let canvas_direct = draw_order.iter().any(|command| matches!(command, DrawOrder::CanvasProgram { .. }));
         for quad in list.chunks_exact(8) {
             let [x, y, w, h, r, g, b, a] = [
@@ -3040,8 +4031,12 @@ impl Renderer {
             ]);
         }
         let triangle_vertex_offset = vertices.len() as u32;
-        if canvas_direct {
-            let bytes = std::mem::size_of_val(triangles);
+        // present_ordered passes canvas vertices as `triangles`; presentTransformed
+        // passes them separately so its own triangles still draw as quads.
+        let legacy_canvas = canvas_direct && canvas_triangles.is_empty();
+        let canvas_source: &[f32] = if legacy_canvas { triangles } else { canvas_triangles };
+        if !canvas_source.is_empty() {
+            let bytes = std::mem::size_of_val(canvas_source);
             if bytes > self.canvas_vertex_capacity {
                 self.canvas_vertex_capacity = bytes.next_power_of_two();
                 self.canvas_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3051,10 +4046,9 @@ impl Renderer {
                     mapped_at_creation: false,
                 });
             }
-            if !triangles.is_empty() {
-                self.queue.write_buffer(&self.canvas_vertex_buffer, 0, bytemuck::cast_slice(triangles));
-            }
-        } else {
+            self.queue.write_buffer(&self.canvas_vertex_buffer, 0, bytemuck::cast_slice(canvas_source));
+        }
+        if !legacy_canvas {
             for vertex in triangles.chunks_exact(6) {
                 let x = vertex[0] / width * 2.0 - 1.0;
                 let y = 1.0 - vertex[1] / height * 2.0;
@@ -3063,6 +4057,32 @@ impl Renderer {
                     color: [vertex[2], vertex[3], vertex[4], vertex[5]],
                 });
             }
+        }
+        if !boxes.is_empty() {
+            let box_bytes = std::mem::size_of_val(boxes);
+            if box_bytes > self.box_instance_capacity {
+                self.box_instance_capacity = box_bytes.next_power_of_two();
+                self.box_instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Nasty box instances"),
+                    size: self.box_instance_capacity as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            self.queue.write_buffer(&self.box_instance_buffer, 0, bytemuck::cast_slice(boxes));
+        }
+        if !image_boxes.is_empty() {
+            let bytes = std::mem::size_of_val(image_boxes);
+            if bytes > self.image_box_instance_capacity {
+                self.image_box_instance_capacity = bytes.next_power_of_two();
+                self.image_box_instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Nasty image box instances"),
+                    size: self.image_box_instance_capacity as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            self.queue.write_buffer(&self.image_box_instance_buffer, 0, bytemuck::cast_slice(image_boxes));
         }
         // CSS radial-gradient (DrawOrder::RadialCircles) and canvas circle/bezier
         // strokes share these instance buffers. Upload whenever present — not only
@@ -3090,6 +4110,14 @@ impl Renderer {
                 });
             }
             self.queue.write_buffer(&self.canvas_bezier_vertex_buffer, 0, bytemuck::cast_slice(beziers));
+        }
+        let clear_vertex_offset = vertices.len() as u32;
+        if layer_target.is_some() {
+            let clear = [0.0_f32; 4];
+            for position in [[-1.0, 1.0], [1.0, 1.0], [-1.0, -1.0], [-1.0, -1.0], [1.0, 1.0], [1.0, -1.0]] {
+                vertices.push(Vertex { position, color: clear });
+            }
+            self.queue.write_buffer(&self.layer_viewport_buffer, 0, bytemuck::cast_slice(&[width, height]));
         }
         let bytes = bytemuck::cast_slice(&vertices);
         if bytes.len() > self.vertex_capacity {
@@ -3126,12 +4154,12 @@ impl Renderer {
                     .clip_x
                     .zip(image.clip_width)
                     .map(|(x, w)| (x + w).ceil().clamp(0.0, width as f64) as u32)
-                    .unwrap_or(self.config.width);
+                    .unwrap_or(target_width);
                 let cb = image
                     .clip_y
                     .zip(image.clip_height)
                     .map(|(y, h)| (y + h).ceil().clamp(0.0, height as f64) as u32)
-                    .unwrap_or(self.config.height);
+                    .unwrap_or(target_height);
                 if cr <= cx || cb <= cy {
                     image_batches.push(None);
                     continue;
@@ -3229,12 +4257,12 @@ impl Renderer {
                 .clip_x
                 .zip(image.clip_width)
                 .map(|(x, w)| (x + w).ceil().clamp(0.0, width as f64) as u32)
-                .unwrap_or(self.config.width);
+                .unwrap_or(target_width);
             let cb = image
                 .clip_y
                 .zip(image.clip_height)
                 .map(|(y, h)| (y + h).ceil().clamp(0.0, height as f64) as u32)
-                .unwrap_or(self.config.height);
+                .unwrap_or(target_height);
             if cr <= cx || cb <= cy {
                 image_vertices.truncate(start as usize);
                 image_batches.push(None);
@@ -3266,26 +4294,37 @@ impl Renderer {
         }
 
         let acquire_started = Instant::now();
-        let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.resize(window.inner_size().width, window.inner_size().height);
-                self.surface
-                    .get_current_texture()
-                    .map_err(|error| format!("acquire GPU frame after resize: {error}"))?
-            }
-            Err(error) => return Err(format!("acquire GPU frame: {error}")),
+        let frame = if layer_target.is_some() {
+            None
+        } else {
+            Some(match self.surface.get_current_texture() {
+                Ok(frame) => frame,
+                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    self.resize(window.inner_size().width, window.inner_size().height);
+                    self.surface
+                        .get_current_texture()
+                        .map_err(|error| format!("acquire GPU frame after resize: {error}"))?
+                }
+                Err(error) => return Err(format!("acquire GPU frame: {error}")),
+            })
         };
         let acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = match (&frame, layer_target) {
+            (Some(frame), _) => frame.texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            (None, Some(target)) => self
+                .images
+                .get(&target.texture_id)
+                .ok_or_else(|| format!("unknown layer texture {}", target.texture_id))?
+                ._texture
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+            (None, None) => unreachable!(),
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Nasty frame encoder"),
             });
-        if draw_order.iter().any(|command| matches!(command, DrawOrder::BackdropBlur { .. })) {
+        if layer_target.is_none() && draw_order.iter().any(|command| matches!(command, DrawOrder::BackdropBlur { .. })) {
             {
                 let attachments = [Some(wgpu::RenderPassColorAttachment {
                     view: &view, resolve_target: None,
@@ -3304,7 +4343,7 @@ impl Renderer {
                     if !self.surface_copy_src {
                         return Err("GPU surface does not support copy-out required for backdrop-filter".into());
                     }
-                    self.encode_backdrop_blur(&mut encoder, &frame.texture, *x, *y, *width, *height, *radius)?;
+                    self.encode_backdrop_blur(&mut encoder, &frame.as_ref().expect("window frame").texture, *x, *y, *width, *height, *radius)?;
                     segment_start += 1;
                     continue;
                 }
@@ -3390,42 +4429,73 @@ impl Renderer {
                         }
                     }
                     DrawOrder::Image(index) => if let Some((texture_id, range, x, y, w, h)) = image_batches.get(*index).and_then(Option::as_ref) {
-                        pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
+                        let image = self.image(texture_id).expect("prepared image texture");
+                        pass.set_pipeline(if image.premultiplied { &self.image_premultiplied_pipeline } else { &self.image_pipeline }); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
                         pass.set_scissor_rect(*x, *y, *w, *h);
-                        pass.set_bind_group(0, &self.image(texture_id).expect("prepared image texture").bind_group, &[]); pass.draw(range.clone(), 0..1);
+                        pass.set_bind_group(0, &image.bind_group, &[]); pass.draw(range.clone(), 0..1);
                         pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                    },
+                    DrawOrder::Boxes(range) => if !range.is_empty() {
+                        pass.set_pipeline(&self.box_pipeline);
+                        pass.set_bind_group(0, &self.canvas_viewport_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.box_instance_buffer.slice(..));
+                        pass.draw(0..6, range.clone());
+                    },
+                    DrawOrder::ImageBoxes { texture_id, range } => if let Some(image) = self.image(texture_id) {
+                        pass.set_pipeline(&self.image_box_pipeline);
+                        pass.set_bind_group(0, &image.bind_group, &[]);
+                        pass.set_bind_group(1, &self.canvas_viewport_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.image_box_instance_buffer.slice(..));
+                        pass.draw(0..6, range.clone());
+                    },
+                    DrawOrder::TextLayer(layer) => if let Some(runtime) = self.text_runtime.as_ref() {
+                        if let Some(renderer) = runtime.text_renderers.get(*layer as usize) {
+                            renderer.render(&runtime.text_atlas, &runtime.text_viewport, &mut pass)
+                                .map_err(|error| format!("render text: {error}"))?;
+                        }
                     },
                     DrawOrder::BackdropBlur { .. } => unreachable!(),
                 }
                 }
                 segment_start = segment_end;
             }
-            if let Some(runtime) = self.text_runtime.as_ref().filter(|runtime| !runtime.text_buffers.is_empty()) {
-                if let Some(text_renderer) = runtime.text_renderer.as_ref() {
-                    let attachments = [Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })];
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty text pass"),
-                        color_attachments: &attachments, depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
-                    text_renderer.render(&runtime.text_atlas, &runtime.text_viewport, &mut pass)
+            let layered_text = draw_order.iter().any(|command| matches!(command, DrawOrder::TextLayer(_)));
+            if let Some(runtime) = self.text_runtime.as_ref().filter(|runtime| !runtime.text_buffers.is_empty() && !layered_text) {
+                let attachments = [Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty text pass"),
+                    color_attachments: &attachments, depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+                for renderer in &runtime.text_renderers {
+                    renderer.render(&runtime.text_atlas, &runtime.text_viewport, &mut pass)
                         .map_err(|error| format!("render text: {error}"))?;
                 }
             }
         } else {
+            let viewport_bind_group = if layer_target.is_some() { &self.layer_viewport_bind_group } else { &self.canvas_viewport_bind_group };
+            let load = if layer_target.is_some() { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(if self.transparent {
+                wgpu::Color::TRANSPARENT
+            } else { wgpu::Color { r: 0.035, g: 0.047, b: 0.078, a: 1.0 } }) };
             let attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: &view, resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(if self.transparent {
-                    wgpu::Color::TRANSPARENT
-                } else { wgpu::Color { r: 0.035, g: 0.047, b: 0.078, a: 1.0 } }), store: wgpu::StoreOp::Store },
+                ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
             })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty display list pass"),
                 color_attachments: &attachments, depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+            if layer_target.is_some() {
+                pass.set_viewport(ox as f32, oy as f32, width, height, 0.0, 1.0);
+                pass.set_scissor_rect(ox, oy, target_width, target_height);
+                pass.set_pipeline(&self.clear_pipeline);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.draw(clear_vertex_offset..clear_vertex_offset + 6, 0..1);
+            }
             if draw_order.is_empty() {
                 if !vertices.is_empty() { pass.set_pipeline(&self.pipeline); pass.set_vertex_buffer(0, self.vertex_buffer.slice(..)); pass.draw(0..vertices.len() as u32, 0..1); }
                 for batch in image_batches.iter().flatten() {
                     let (texture_id, range, x, y, w, h) = batch;
-                    pass.set_pipeline(&self.image_pipeline); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
-                    pass.set_scissor_rect(*x, *y, *w, *h); pass.set_bind_group(0, &self.image(texture_id).expect("prepared image texture").bind_group, &[]); pass.draw(range.clone(), 0..1);
-                    pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                    let image = self.image(texture_id).expect("prepared image texture");
+                    pass.set_pipeline(if image.premultiplied { &self.image_premultiplied_pipeline } else { &self.image_pipeline }); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
+                    pass.set_scissor_rect(ox + *x, oy + *y, *w, *h); pass.set_bind_group(0, &image.bind_group, &[]); pass.draw(range.clone(), 0..1);
+                    pass.set_scissor_rect(ox, oy, target_width, target_height);
                 }
             } else {
                 for command in draw_order {
@@ -3436,60 +4506,88 @@ impl Renderer {
                             let left=clip_x.floor().clamp(0.0,width as f64) as u32; let top=clip_y.floor().clamp(0.0,height as f64) as u32;
                             let right=(*clip_x+*clip_width).ceil().clamp(0.0,width as f64) as u32; let bottom=(*clip_y+*clip_height).ceil().clamp(0.0,height as f64) as u32;
                             if right>left && bottom>top {
-                                pass.set_scissor_rect(left,top,right-left,bottom-top);
+                                pass.set_scissor_rect(ox+left,oy+top,right-left,bottom-top);
                                 for primitive in commands {
                                     match primitive {
-                                        CanvasCommand::Triangles(range) if !range.is_empty() => { pass.set_pipeline(&self.canvas_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_vertex_buffer.slice(..)); pass.draw(range.clone(),0..1); }
-                                        CanvasCommand::Circles(range) if !range.is_empty() => { pass.set_pipeline(&self.canvas_circle_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_circle_vertex_buffer.slice(..)); pass.draw(0..6,range.clone()); }
-                                        CanvasCommand::Beziers(range) if !range.is_empty() => { pass.set_pipeline(&self.canvas_bezier_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_bezier_vertex_buffer.slice(..)); pass.draw(0..96,range.clone()); }
+                                        CanvasCommand::Triangles(range) if !range.is_empty() => { pass.set_pipeline(&self.canvas_pipeline); pass.set_bind_group(0,viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_vertex_buffer.slice(..)); pass.draw(range.clone(),0..1); }
+                                        CanvasCommand::Circles(range) if !range.is_empty() => { pass.set_pipeline(&self.canvas_circle_pipeline); pass.set_bind_group(0,viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_circle_vertex_buffer.slice(..)); pass.draw(0..6,range.clone()); }
+                                        CanvasCommand::Beziers(range) if !range.is_empty() => { pass.set_pipeline(&self.canvas_bezier_pipeline); pass.set_bind_group(0,viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_bezier_vertex_buffer.slice(..)); pass.draw(0..96,range.clone()); }
                                         _ => {}
                                     }
                                 }
-                                pass.set_scissor_rect(0,0,self.config.width,self.config.height);
+                                pass.set_scissor_rect(ox,oy,target_width,target_height);
                             }
                         }
                         DrawOrder::CanvasTriangles { range, clip_x, clip_y, clip_width, clip_height } => {
                             let left=clip_x.floor().clamp(0.0,width as f64) as u32; let top=clip_y.floor().clamp(0.0,height as f64) as u32;
                             let right=(*clip_x+*clip_width).ceil().clamp(0.0,width as f64) as u32; let bottom=(*clip_y+*clip_height).ceil().clamp(0.0,height as f64) as u32;
-                            if right>left && bottom>top { pass.set_pipeline(&self.canvas_pipeline); pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_vertex_buffer.slice(..)); pass.set_scissor_rect(left,top,right-left,bottom-top); pass.draw(range.clone(),0..1); pass.set_scissor_rect(0,0,self.config.width,self.config.height); }
+                            if right>left && bottom>top { pass.set_pipeline(&self.canvas_pipeline); pass.set_bind_group(0,viewport_bind_group,&[]); pass.set_vertex_buffer(0,self.canvas_vertex_buffer.slice(..)); pass.set_scissor_rect(ox+left,oy+top,right-left,bottom-top); pass.draw(range.clone(),0..1); pass.set_scissor_rect(ox,oy,target_width,target_height); }
                         }
                         DrawOrder::RadialCircles { range, clip_x, clip_y, clip_width, clip_height } => {
                             let left=clip_x.floor().clamp(0.0,width as f64) as u32; let top=clip_y.floor().clamp(0.0,height as f64) as u32;
                             let right=(*clip_x+*clip_width).ceil().clamp(0.0,width as f64) as u32; let bottom=(*clip_y+*clip_height).ceil().clamp(0.0,height as f64) as u32;
                             if right>left && bottom>top && !range.is_empty() {
                                 pass.set_pipeline(&self.canvas_circle_pipeline);
-                                pass.set_bind_group(0,&self.canvas_viewport_bind_group,&[]);
+                                pass.set_bind_group(0,viewport_bind_group,&[]);
                                 pass.set_vertex_buffer(0,self.canvas_circle_vertex_buffer.slice(..));
-                                pass.set_scissor_rect(left,top,right-left,bottom-top);
+                                pass.set_scissor_rect(ox+left,oy+top,right-left,bottom-top);
                                 pass.draw(0..6, range.clone());
-                                pass.set_scissor_rect(0,0,self.config.width,self.config.height);
+                                pass.set_scissor_rect(ox,oy,target_width,target_height);
                             }
                         }
                         DrawOrder::Image(index) => if let Some((texture_id,range,x,y,w,h))=image_batches.get(*index).and_then(Option::as_ref) {
-                            pass.set_pipeline(&self.image_pipeline);
+                            let image = self.image(texture_id).expect("prepared image texture");
+                            pass.set_pipeline(if image.premultiplied { &self.image_premultiplied_pipeline } else { &self.image_pipeline });
                             pass.set_vertex_buffer(0,self.image_vertex_buffer.slice(..));
-                            pass.set_scissor_rect(*x,*y,*w,*h);
-                            pass.set_bind_group(0,&self.image(texture_id).expect("prepared image texture").bind_group,&[]);
+                            pass.set_scissor_rect(ox + *x,oy + *y,*w,*h);
+                            pass.set_bind_group(0,&image.bind_group,&[]);
                             pass.draw(range.clone(),0..1);
                             // Match the BackdropBlur path: restore full-frame scissor so
                             // later Solids/Triangles (title form fills under a spinning logo)
                             // are not clipped to the image rect.
-                            pass.set_scissor_rect(0,0,self.config.width,self.config.height);
+                            pass.set_scissor_rect(ox,oy,target_width,target_height);
+                        },
+                        DrawOrder::Boxes(range) => if !range.is_empty() {
+                            pass.set_pipeline(&self.box_pipeline);
+                            pass.set_bind_group(0, viewport_bind_group, &[]);
+                            pass.set_vertex_buffer(0, self.box_instance_buffer.slice(..));
+                            pass.draw(0..6, range.clone());
+                        },
+                        DrawOrder::ImageBoxes { texture_id, range } => if let Some(image) = self.image(texture_id) {
+                            pass.set_pipeline(&self.image_box_pipeline);
+                            pass.set_bind_group(0, &image.bind_group, &[]);
+                            pass.set_bind_group(1, viewport_bind_group, &[]);
+                            pass.set_vertex_buffer(0, self.image_box_instance_buffer.slice(..));
+                            pass.draw(0..6, range.clone());
+                        },
+                        DrawOrder::TextLayer(layer) => if let Some(runtime) = self.text_runtime.as_ref() {
+                            let (renderers, text_viewport) = if layer_target.is_some() {
+                                (&runtime.layer_text_renderers, &runtime.layer_text_viewport)
+                            } else { (&runtime.text_renderers, &runtime.text_viewport) };
+                            if let Some(renderer) = renderers.get(*layer as usize) {
+                                renderer.render(&runtime.text_atlas, text_viewport, &mut pass)
+                                    .map_err(|error| format!("render text: {error}"))?;
+                            }
                         },
                         DrawOrder::BackdropBlur { .. } => unreachable!(),
                     }
                 }
             }
-            pass.set_scissor_rect(0,0,self.config.width,self.config.height);
+            pass.set_scissor_rect(ox,oy,target_width,target_height);
             if let Some(runtime) = self.text_runtime.as_ref().filter(|runtime| !runtime.text_buffers.is_empty()) {
-                if let Some(text_renderer) = runtime.text_renderer.as_ref() { text_renderer.render(&runtime.text_atlas,&runtime.text_viewport,&mut pass).map_err(|error|format!("render text: {error}"))?; }
+                if !draw_order.iter().any(|command| matches!(command, DrawOrder::TextLayer(_))) {
+                    let (renderers, text_viewport) = if layer_target.is_some() {
+                        (&runtime.layer_text_renderers, &runtime.layer_text_viewport)
+                    } else { (&runtime.text_renderers, &runtime.text_viewport) };
+                    for renderer in renderers { renderer.render(&runtime.text_atlas,text_viewport,&mut pass).map_err(|error|format!("render text: {error}"))?; }
+                }
             }
         }
         let submit_started = Instant::now();
         self.queue.submit(Some(encoder.finish()));
         let submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         let present_started = Instant::now();
-        frame.present();
+        if let Some(frame) = frame { frame.present(); }
         let present_ms = present_started.elapsed().as_secs_f64() * 1000.0;
         Ok(RenderTimings {
             total_ms: started.elapsed().as_secs_f64() * 1000.0,
@@ -3669,6 +4767,45 @@ impl Renderer {
         Ok(stats)
     }
 
+    /// Reshape one existing run in place without handing over the whole list.
+    fn set_text_run_at(
+        &mut self,
+        index: usize,
+        mut run: TextRunOptions,
+        custom_fonts: Vec<TextFontData>,
+        system_font: Option<(String, Vec<u8>)>,
+    ) -> std::result::Result<TextPreparationStats, String> {
+        let mut custom_fonts = custom_fonts
+            .into_iter()
+            .map(|font| (font.family, font.data.to_vec()))
+            .collect::<Vec<_>>();
+        if let Some((family_name, data)) = system_font {
+            if run.font_family.is_none() {
+                run.font_family = Some(family_name.clone());
+            }
+            if !custom_fonts.iter().any(|(family, _)| family == &family_name) {
+                custom_fonts.push((family_name, data));
+            }
+        }
+        let request_id = self.next_text_request;
+        self.next_text_request = self.next_text_request.wrapping_add(1).max(1);
+        let runtime = self
+            .text_runtime
+            .as_mut()
+            .ok_or_else(|| "active text resources are unavailable".to_string())?;
+        let stats = runtime.set_text_run(
+            index,
+            run,
+            &custom_fonts,
+            &self.device,
+            &self.queue,
+            self.config.width,
+            self.config.height,
+        )?;
+        self.active_text_request = request_id;
+        Ok(stats)
+    }
+
     fn textarea_geometry_for_api(
         &self,
         text: &str,
@@ -3726,6 +4863,68 @@ impl Renderer {
 }
 
 impl TextRuntime {
+    /// Prepare the layer text renderers for one scroll-layer region. `runs`
+    /// holds (run index, paint layer) pairs; positions and clips are shifted by
+    /// the region origin so the region renders as its own viewport.
+    fn prepare_layer_text(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        runs: &[u32],
+        origin_x: f64,
+        origin_y: f64,
+        width: u32,
+        height: u32,
+    ) -> std::result::Result<(), String> {
+        let layer_count = runs.chunks_exact(2).map(|pair| pair[1] as usize + 1).max().unwrap_or(0);
+        if layer_count > 0 && self.font_system.is_none() {
+            return Err("layer text runs were requested before any text was shaped".into());
+        }
+        while self.layer_text_renderers.len() < layer_count {
+            self.layer_text_renderers.push(TextRenderer::new(
+                &mut self.text_atlas,
+                device,
+                wgpu::MultisampleState::default(),
+                None,
+            ));
+        }
+        self.layer_text_viewport.update(queue, Resolution { width, height });
+        let Some(font_system) = self.font_system.as_mut() else { return Ok(()); };
+        for (layer, renderer) in self.layer_text_renderers.iter_mut().enumerate() {
+            let areas = runs
+                .chunks_exact(2)
+                .filter(|pair| pair[1] as usize == layer)
+                .filter_map(|pair| {
+                    let index = pair[0] as usize;
+                    let text = self.text_buffers.get(index)?;
+                    let options = self.text_run_options.get(index)?;
+                    let bounds = layer_text_bounds(options, origin_x, origin_y, width, height);
+                    (bounds.right > bounds.left && bounds.bottom > bounds.top).then_some(TextArea {
+                        buffer: &text.buffer,
+                        left: (text.x as f64 - origin_x) as f32,
+                        top: (text.y as f64 - origin_y) as f32,
+                        scale: 1.0,
+                        bounds,
+                        default_color: text.color,
+                        custom_glyphs: &[],
+                    })
+                })
+                .collect::<Vec<_>>();
+            renderer
+                .prepare(
+                    device,
+                    queue,
+                    font_system,
+                    &mut self.text_atlas,
+                    &self.layer_text_viewport,
+                    areas,
+                    &mut self.swash_cache,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn prepare_text_areas(
         &mut self,
         device: &wgpu::Device,
@@ -3736,8 +4935,14 @@ impl TextRuntime {
         if self.text_buffers.is_empty() {
             return Ok(());
         }
-        if self.text_renderer.is_none() {
-            self.text_renderer = Some(TextRenderer::new(
+        let layer_count = self
+            .text_run_options
+            .iter()
+            .map(|options| options.layer.unwrap_or(0) as usize + 1)
+            .max()
+            .unwrap_or(1);
+        while self.text_renderers.len() < layer_count {
+            self.text_renderers.push(TextRenderer::new(
                 &mut self.text_atlas,
                 device,
                 wgpu::MultisampleState::default(),
@@ -3746,40 +4951,43 @@ impl TextRuntime {
         }
         self.text_viewport
             .update(queue, Resolution { width, height });
-        let areas = self
-            .text_buffers
-            .iter()
-            .zip(&self.text_run_options)
-            .filter_map(|(text, options)| {
-                let bounds = text_bounds(options, width, height);
-                (bounds.right > bounds.left && bounds.bottom > bounds.top).then_some(TextArea {
-                    buffer: &text.buffer,
-                    left: text.x,
-                    top: text.y,
-                    scale: 1.0,
-                    bounds,
-                    default_color: text.color,
-                    custom_glyphs: &[],
-                })
-            })
-            .collect::<Vec<_>>();
         let font_system = self
             .font_system
             .as_mut()
             .ok_or_else(|| "font system is unavailable".to_string())?;
-        self.text_renderer
-            .as_mut()
-            .expect("text renderer initialized")
-            .prepare(
-                device,
-                queue,
-                font_system,
-                &mut self.text_atlas,
-                &self.text_viewport,
-                areas,
-                &mut self.swash_cache,
-            )
-            .map_err(|error| error.to_string())
+        for (layer, renderer) in self.text_renderers.iter_mut().enumerate() {
+            let areas = self
+                .text_buffers
+                .iter()
+                .zip(&self.text_run_options)
+                .filter(|(_, options)| options.layer.unwrap_or(0) as usize == layer
+                    && options.target.unwrap_or(0) == 0)
+                .filter_map(|(text, options)| {
+                    let bounds = text_bounds(options, width, height);
+                    (bounds.right > bounds.left && bounds.bottom > bounds.top).then_some(TextArea {
+                        buffer: &text.buffer,
+                        left: text.x,
+                        top: text.y,
+                        scale: 1.0,
+                        bounds,
+                        default_color: text.color,
+                        custom_glyphs: &[],
+                    })
+                })
+                .collect::<Vec<_>>();
+            renderer
+                .prepare(
+                    device,
+                    queue,
+                    font_system,
+                    &mut self.text_atlas,
+                    &self.text_viewport,
+                    areas,
+                    &mut self.swash_cache,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     fn set_text_run(
@@ -3897,16 +5105,14 @@ impl TextRuntime {
                     Wrap::Word
                 },
             );
-            buffer.set_size(
-                font_system,
-                Some((run_width as f32).max(1.0)),
-                Some((height as f32 - y as f32).max(1.0)),
-            );
+            // Unbounded height, as in `set_text_runs`: a run may sit below the
+            // window (scroll-layer content), and lines are clipped at draw time.
+            buffer.set_size(font_system, Some((run_width as f32).max(1.0)), None);
             buffer.set_text(
                 font_system,
                 &run.text,
                 Attrs::new()
-                    .family(text_family(run.font_family.as_deref()))
+                    .family(text_family(run.font_family.as_deref(), font_system.db()))
                     .weight(Weight(run.font_weight.unwrap_or(400))),
                 Shaping::Advanced,
             );
@@ -4017,7 +5223,7 @@ impl TextRuntime {
                 font_system,
                 &run.text,
                 Attrs::new()
-                    .family(text_family(run.font_family.as_deref()))
+                    .family(text_family(run.font_family.as_deref(), font_system.db()))
                     .weight(Weight(run.font_weight.unwrap_or(400))),
                 Shaping::Advanced,
             );
@@ -4250,6 +5456,13 @@ struct WindowApp {
     display_triangles: Vec<f32>,
     display_circles: Vec<f32>,
     display_beziers: Vec<f32>,
+    display_boxes: Vec<f32>,
+    display_image_boxes: Vec<f32>,
+    /// GPU canvas program vertices for presentTransformed (canvas pixel space).
+    display_canvas_triangles: Vec<f32>,
+    /// Last known inner size from Resized events. Querying the window
+    /// (an X11 round trip) on every layout cost ~1 ms under load.
+    cached_inner_size: Option<winit::dpi::PhysicalSize<u32>>,
     image_draws: Vec<ImageDraw>,
     draw_order: Vec<DrawOrder>,
     render_pending: bool,
@@ -4260,6 +5473,119 @@ struct WindowApp {
     last_submit_ms: f64,
     last_present_ms: f64,
     last_render_count: u64,
+    image_decode_pool: Option<std::sync::Arc<ImageDecodePool>>,
+    /// Reuse GPU texture ids for identical (source, max_edge) submissions.
+    gpu_image_cache: std::collections::HashMap<(String, u32), (u32, u32, u32)>,
+}
+
+
+impl WindowApp {
+    fn ensure_image_pool(&mut self) -> std::sync::Arc<ImageDecodePool> {
+        if self.image_decode_pool.is_none() {
+            let pool = std::sync::Arc::new(ImageDecodePool::default());
+            pool.ensure_started();
+            self.image_decode_pool = Some(std::sync::Arc::clone(&pool));
+            return pool;
+        }
+        self.image_decode_pool.as_ref().unwrap().clone()
+    }
+
+    fn submit_image_decode(&mut self, source: String, max_edge: Option<u32>) -> u64 {
+        let max_edge = max_edge
+            .unwrap_or(image_decode_pool::POOL_MAX_EDGE)
+            .clamp(1, image_decode_pool::POOL_MAX_EDGE);
+        // Instant GPU-cache hit: emit image-ready on next drain without re-decode/upload.
+        if let Some(&(texture_id, width, height)) =
+            self.gpu_image_cache.get(&(source.clone(), max_edge))
+        {
+            let pool = self.ensure_image_pool();
+            let id = pool.alloc_id();
+            self.events.push(NativeEvent {
+                kind: "image-ready".into(),
+                x: f64::from(texture_id),
+                y: f64::from(width),
+                key: None,
+                button: None,
+                text: None,
+                modifiers: None,
+                drag_requested: None,
+                delta_x: Some(id as f64),
+                delta_y: Some(f64::from(height)),
+            });
+            return id;
+        }
+        let pool = self.ensure_image_pool();
+        pool.submit(source, Some(max_edge))
+    }
+
+    /// Drain worker results and upload on the GPU/window thread. Emits
+    /// `image-ready` (texture id in `x`, width `y`, height as `deltaY`, job id as `deltaX`)
+    /// or `image-error` (message in `key`, job id as `deltaX`). No pixel buffers enter JS.
+    fn drain_image_decode_uploads(&mut self, limit: usize) {
+        let Some(pool) = self.image_decode_pool.clone() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            // Keep results queued until the surface exists.
+            return;
+        };
+        for outcome in pool.drain_results(limit) {
+            match outcome {
+                ImageJobOutcome::Ready {
+                    id,
+                    source,
+                    max_edge,
+                    width,
+                    height,
+                    pixels,
+                } => match renderer.upload_image(width, height, &pixels) {
+                    Ok(texture_id) => {
+                        if self.gpu_image_cache.len() > 512 {
+                            self.gpu_image_cache.clear();
+                        }
+                        self.gpu_image_cache
+                            .insert((source, max_edge), (texture_id, width, height));
+                        self.events.push(NativeEvent {
+                            kind: "image-ready".into(),
+                            x: f64::from(texture_id),
+                            y: f64::from(width),
+                            key: None,
+                            button: None,
+                            text: None,
+                            modifiers: None,
+                            drag_requested: None,
+                            delta_x: Some(id as f64),
+                            delta_y: Some(f64::from(height)),
+                        });
+                    }
+                    Err(error) => self.events.push(NativeEvent {
+                        kind: "image-error".into(),
+                        x: 0.0,
+                        y: 0.0,
+                        key: Some(error),
+                        button: None,
+                        text: None,
+                        modifiers: None,
+                        drag_requested: None,
+                        delta_x: Some(id as f64),
+                        delta_y: None,
+                    }),
+                },
+                ImageJobOutcome::Failed { id, error } => self.events.push(NativeEvent {
+                    kind: "image-error".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    key: Some(error),
+                    button: None,
+                    text: None,
+                    modifiers: None,
+                    drag_requested: None,
+                    delta_x: Some(id as f64),
+                    delta_y: None,
+                }),
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for WindowApp {
@@ -4335,6 +5661,7 @@ impl ApplicationHandler for WindowApp {
                 });
             }
             OsWindowEvent::Resized(size) => {
+                self.cached_inner_size = Some(size);
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
                 }
@@ -4594,6 +5921,9 @@ impl ApplicationHandler for WindowApp {
                     &self.display_triangles,
                     &self.display_circles,
                     &self.display_beziers,
+                    &self.display_boxes,
+                    &self.display_image_boxes,
+                    &self.display_canvas_triangles,
                     &self.image_draws,
                     &self.draw_order,
                 ) {
@@ -4828,6 +6158,8 @@ impl Window {
         let mut window = Self { event_loop, app };
         window.apply_orientation()?;
         window.pump(Duration::ZERO)?;
+        // Warm the decode pool so the first folder open does not pay thread spawn.
+        let _ = window.app.ensure_image_pool();
         #[cfg(target_os = "android")]
         {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -5099,12 +6431,11 @@ impl Window {
 
     #[napi]
     pub fn size(&self) -> WindowSize {
-        let size = self
-            .app
-            .window
-            .as_ref()
-            .map(|window| window.inner_size())
-            .unwrap_or_default();
+        let size = match (self.app.cached_inner_size, self.app.window.as_ref()) {
+            (Some(size), Some(_)) => size,
+            (_, Some(window)) => window.inner_size(),
+            _ => Default::default(),
+        };
         WindowSize {
             width: size.width,
             height: size.height,
@@ -5222,6 +6553,31 @@ impl Window {
                 system_font,
                 update_run_index.map(|index| index as usize),
             )
+            .map_err(|error| Error::new(Status::GenericFailure, error))
+    }
+
+    /// Reshape the run at `index` of the active run list.
+    #[napi(js_name = "setTextRunAt")]
+    pub fn set_text_run_at(
+        &mut self,
+        index: u32,
+        run: TextRunOptions,
+        custom_fonts: Option<Vec<TextFontData>>,
+    ) -> Result<TextPreparationStats> {
+        if self.app.closed {
+            return Err(Error::new(Status::GenericFailure, "window is closed"));
+        }
+        let system_font = self.app.text_editor.as_ref().and_then(|editor| {
+            Some((
+                editor.system_font_family.clone()?,
+                editor.system_font_bytes.clone()?,
+            ))
+        });
+        self.app
+            .renderer
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?
+            .set_text_run_at(index as usize, run, custom_fonts.unwrap_or_default(), system_font)
             .map_err(|error| Error::new(Status::GenericFailure, error))
     }
 
@@ -5359,6 +6715,9 @@ impl Window {
 
     #[napi]
     pub fn close(&mut self) {
+        if let Some(pool) = self.app.image_decode_pool.take() {
+            pool.shutdown();
+        }
         self.app.closed = true;
         self.app.window = None;
         self.app.renderer = None;
@@ -5370,6 +6729,9 @@ impl Window {
         // expensive or infrequent presentation also throttles keyboard input.
         if !self.app.closed {
             self.pump(Duration::ZERO)?;
+            // Upload a bounded batch of decoded images each poll so GPU work
+            // stays off the JS heap and cannot monopolize a single turn.
+            self.app.drain_image_decode_uploads(32);
             self.check_error()?;
         }
         Ok(std::mem::take(&mut self.app.events))
@@ -5419,6 +6781,53 @@ impl Window {
         self.present_display_list(display_list, Vec::new())
     }
 
+
+    /// Queue an image decode on the native 64-worker pool.
+    /// `source` may be `file://…`, a filesystem path, a `data:` URI, or an `http(s)://` URL.
+    /// Completion arrives as a native window event (`image-ready` / `image-error`);
+    /// only a GPU texture id is returned to JS — never pixel buffers.
+    #[napi(js_name = "submitImageDecode")]
+    pub fn submit_image_decode(
+        &mut self,
+        source: String,
+        max_edge: Option<u32>,
+    ) -> Result<ImageDecodeJob> {
+        if self.app.closed {
+            return Err(Error::new(Status::GenericFailure, "window is closed"));
+        }
+        let id = self.app.submit_image_decode(source, max_edge);
+        Ok(ImageDecodeJob { id: id as f64 })
+    }
+
+    /// How many decode jobs are waiting on worker threads.
+    #[napi(js_name = "imageDecodePending")]
+    pub fn image_decode_pending(&self) -> u32 {
+        self.app
+            .image_decode_pool
+            .as_ref()
+            .map(|p| p.pending_count() as u32)
+            .unwrap_or(0)
+    }
+
+    /// How many decoded (CPU) results are waiting for GPU upload.
+    #[napi(js_name = "imageDecodeReady")]
+    pub fn image_decode_ready(&self) -> u32 {
+        self.app
+            .image_decode_pool
+            .as_ref()
+            .map(|p| p.result_count() as u32)
+            .unwrap_or(0)
+    }
+
+    #[napi(js_name = "imageDecodeInFlight")]
+    pub fn image_decode_in_flight(&self) -> u32 {
+        self.app
+            .image_decode_pool
+            .as_ref()
+            .map(|p| p.in_flight_count() as u32)
+            .unwrap_or(0)
+    }
+
     #[napi(js_name = "createImageTexture")]
     pub fn create_image_texture(&mut self, width: u32, height: u32, pixels: Buffer) -> Result<u32> {
         let renderer = self
@@ -5429,6 +6838,110 @@ impl Window {
         renderer
             .upload_image(width, height, pixels.as_ref())
             .map_err(|error| Error::new(Status::InvalidArg, error))
+    }
+
+    /// Largest width or height a layer texture may have on this GPU.
+    #[napi(js_name = "maxTextureDimension")]
+    pub fn max_texture_dimension(&self) -> u32 {
+        self.app.renderer.as_ref().map_or(8192, |renderer| renderer.device.limits().max_texture_dimension_2d)
+    }
+
+    // Internal compositor transport: scroll-layer render targets.
+    #[napi(js_name = "createLayerTexture")]
+    pub fn create_layer_texture(&mut self, width: u32, height: u32) -> Result<u32> {
+        self.app.renderer.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?
+            .create_layer_texture(width, height)
+            .map_err(|error| Error::new(Status::InvalidArg, error))
+    }
+
+    #[napi(js_name = "resizeLayerTexture")]
+    pub fn resize_layer_texture(&mut self, texture_id: u32, width: u32, height: u32) -> Result<()> {
+        self.app.renderer.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?
+            .resize_layer_texture(texture_id, width, height)
+            .map_err(|error| Error::new(Status::InvalidArg, error))
+    }
+
+    /// Clear the region (x, y, width, height) of a layer texture and draw a
+    /// transformed display list into it, with the region as the viewport.
+    /// `textRuns` lists (run index, paint layer) pairs of prepared text runs
+    /// whose content-space positions are offset by (textOriginX, textOriginY).
+    #[napi(js_name = "renderLayer")]
+    pub fn render_layer(
+        &mut self,
+        texture_id: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        display_list: Buffer,
+        canvas_triangles: Option<Buffer>,
+        canvas_circles: Option<Buffer>,
+        canvas_beziers: Option<Buffer>,
+        canvas_operations: Option<Buffer>,
+        text_runs: Option<Vec<u32>>,
+        text_origin_x: Option<f64>,
+        text_origin_y: Option<f64>,
+    ) -> Result<()> {
+        if self.app.closed {
+            return Err(Error::new(Status::GenericFailure, "window is closed"));
+        }
+        let canvas_vertices = canvas_triangles.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        let canvas_circles = canvas_circles.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        let canvas_beziers = canvas_beziers.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        let canvas_operations = canvas_operations.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        if canvas_vertices.len() % 6 != 0 || canvas_circles.len() % 16 != 0 || canvas_beziers.len() % 13 != 0
+            || canvas_operations.len() % 3 != 0
+            || canvas_vertices.iter().chain(&canvas_circles).chain(&canvas_beziers).chain(&canvas_operations).any(|value| !value.is_finite())
+        {
+            return Err(Error::new(Status::InvalidArg, "canvas program buffers are malformed"));
+        }
+        let text_runs = text_runs.unwrap_or_default();
+        if text_runs.len() % 2 != 0 {
+            return Err(Error::new(Status::InvalidArg, "layer text runs must be (index, layer) pairs"));
+        }
+        let canvas = TransformedCanvas {
+            vertex_count: (canvas_vertices.len() / 6) as u32,
+            circle_count: (canvas_circles.len() / 16) as u32,
+            bezier_count: (canvas_beziers.len() / 13) as u32,
+            operations: &canvas_operations,
+        };
+        let (triangles, mut circles, images, mut order, boxes, image_boxes) =
+            parse_transformed_display_list(display_list.as_ref(), Some(&canvas))?;
+        let circle_base = (circles.len() / 16) as u32;
+        for command in &mut order {
+            if let DrawOrder::CanvasProgram { commands, .. } = command {
+                for primitive in commands {
+                    if let CanvasCommand::Circles(range) = primitive {
+                        *range = (range.start + circle_base)..(range.end + circle_base);
+                    }
+                }
+            }
+        }
+        circles.extend_from_slice(&canvas_circles);
+        let app = &mut self.app;
+        let window = app.window.as_ref().ok_or_else(|| Error::new(Status::GenericFailure, "window is unavailable"))?;
+        let renderer = app.renderer.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        let layer = renderer.images.get(&texture_id).filter(|image| image.premultiplied)
+            .ok_or_else(|| Error::new(Status::InvalidArg, "unknown layer texture"))?;
+        if width == 0 || height == 0 || x.checked_add(width).is_none_or(|right| right > layer.width)
+            || y.checked_add(height).is_none_or(|bottom| bottom > layer.height)
+        {
+            return Err(Error::new(Status::InvalidArg, "layer region is outside the texture"));
+        }
+        if let Some(runtime) = renderer.text_runtime.as_mut() {
+            runtime
+                .prepare_layer_text(&renderer.device, &renderer.queue, &text_runs,
+                    text_origin_x.unwrap_or(0.0), text_origin_y.unwrap_or(0.0), width, height)
+                .map_err(|error| Error::new(Status::GenericFailure, error))?;
+        }
+        renderer.layer_target = Some(LayerTarget { texture_id, x, y, width, height });
+        let result = renderer.render(window, &[], &triangles, &circles, &canvas_beziers, &boxes, &image_boxes,
+            &canvas_vertices, &images, &order);
+        renderer.layer_target = None;
+        result.map(|_| ()).map_err(|error| Error::new(Status::GenericFailure, error))
     }
 
     /// Decode encoded image bytes (JPEG/PNG/GIF/WebP/BMP) into a full-resolution
@@ -5598,16 +7111,59 @@ impl Window {
             return Err(Error::new(Status::InvalidArg, "canvas triangle vertices must be finite"));
         }
         let (quads, images, order) = parse_ordered_display_list(display_list.as_ref(), (triangles.len() / 6) as u32, (circles.len() / 16) as u32, (beziers.len() / 13) as u32, &operations)?;
+        self.app.display_canvas_triangles.clear();
         self.present_parsed(quads, triangles, circles, beziers, images, order)
     }
 
     #[napi(js_name = "presentTransformed")]
-    pub fn present_transformed(&mut self, display_list: Buffer) -> Result<PresentStats> {
+    pub fn present_transformed(
+        &mut self,
+        display_list: Buffer,
+        canvas_triangles: Option<Buffer>,
+        canvas_circles: Option<Buffer>,
+        canvas_beziers: Option<Buffer>,
+        canvas_operations: Option<Buffer>,
+    ) -> Result<PresentStats> {
         if self.app.closed {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
-        let (triangles, circles, images, order) = parse_transformed_display_list(display_list.as_ref())?;
-        self.present_parsed(Vec::new(), triangles, circles, Vec::new(), images, order)
+        // Optional GPU canvas program (display-list tag 10): the canvas's own
+        // triangles/circles/beziers in canvas pixel space, drawn in order.
+        let canvas_vertices = canvas_triangles.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        let canvas_circles = canvas_circles.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        let canvas_beziers = canvas_beziers.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        let canvas_operations = canvas_operations.as_ref().map(|buffer| copy_f32_buffer(buffer.as_ref())).unwrap_or_default();
+        if canvas_vertices.len() % 6 != 0 || canvas_circles.len() % 16 != 0 || canvas_beziers.len() % 13 != 0
+            || canvas_operations.len() % 3 != 0
+            || canvas_vertices.iter().chain(&canvas_circles).chain(&canvas_beziers).chain(&canvas_operations).any(|value| !value.is_finite())
+        {
+            return Err(Error::new(Status::InvalidArg, "canvas program buffers are malformed"));
+        }
+        let canvas = TransformedCanvas {
+            vertex_count: (canvas_vertices.len() / 6) as u32,
+            circle_count: (canvas_circles.len() / 16) as u32,
+            bezier_count: (canvas_beziers.len() / 13) as u32,
+            operations: &canvas_operations,
+        };
+        let (triangles, mut circles, images, mut order, boxes, image_boxes) =
+            parse_transformed_display_list(display_list.as_ref(), Some(&canvas))?;
+        // Canvas circles follow the list's own radial-gradient circles.
+        let circle_base = (circles.len() / 16) as u32;
+        for command in &mut order {
+            if let DrawOrder::CanvasProgram { commands, .. } = command {
+                for primitive in commands {
+                    if let CanvasCommand::Circles(range) = primitive {
+                        *range = (range.start + circle_base)..(range.end + circle_base);
+                    }
+                }
+            }
+        }
+        circles.extend_from_slice(&canvas_circles);
+        // Boxes must be in place before present_parsed renders synchronously.
+        self.app.display_boxes = boxes;
+        self.app.display_image_boxes = image_boxes;
+        self.app.display_canvas_triangles = canvas_vertices;
+        self.present_parsed(Vec::new(), triangles, circles, canvas_beziers, images, order)
     }
 }
 
@@ -5631,6 +7187,7 @@ impl Window {
             return Err(Error::new(Status::GenericFailure, "window is closed"));
         }
         let list = parse_display_list(display_list.as_ref())?;
+        self.app.display_canvas_triangles.clear();
         self.present_parsed(list, Vec::new(), Vec::new(), Vec::new(), images, Vec::new())
     }
 
@@ -5690,7 +7247,11 @@ impl Window {
             .event_loop
             .pump_app_events(Some(timeout), &mut self.app)
         {
-            PumpStatus::Continue => Ok(()),
+            PumpStatus::Continue => {
+                // Upload finished decodes even when the app only presents (no drainEvents).
+                self.app.drain_image_decode_uploads(32);
+                Ok(())
+            }
             PumpStatus::Exit(_) => {
                 self.app.closed = true;
                 Ok(())
@@ -5892,9 +7453,17 @@ fn parse_canvas_operations(values: &[f32], triangle_vertex_count: u32, circle_co
     Ok(commands)
 }
 
+struct TransformedCanvas<'a> {
+    vertex_count: u32,
+    circle_count: u32,
+    bezier_count: u32,
+    operations: &'a [f32],
+}
+
 fn parse_transformed_display_list(
     bytes: &[u8],
-) -> Result<(Vec<f32>, Vec<f32>, Vec<ImageDraw>, Vec<DrawOrder>)> {
+    canvas: Option<&TransformedCanvas>,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<ImageDraw>, Vec<DrawOrder>, Vec<f32>, Vec<f32>)> {
     if bytes.len() < 8 || bytes.len() % 4 != 0 {
         return Err(Error::new(
             Status::InvalidArg,
@@ -5952,7 +7521,7 @@ fn parse_transformed_display_list(
         } else {
             vec![DrawOrder::Triangles(0..(triangle_count * 3) as u32)]
         };
-        return Ok((vertices, Vec::new(), Vec::new(), order));
+        return Ok((vertices, Vec::new(), Vec::new(), order, Vec::new(), Vec::new()));
     }
     let triangle_count = values[1] as usize;
     if triangle_count > 1_000_000 {
@@ -5963,6 +7532,8 @@ fn parse_transformed_display_list(
     }
     let mut vertices = Vec::with_capacity(values.len().saturating_mul(2));
     let mut circles = Vec::<f32>::new();
+    let mut boxes = Vec::<f32>::new();
+    let mut image_boxes = Vec::<f32>::new();
     let mut images = Vec::new();
     // Most adjacent triangle records collapse into a single GPU range.
     let mut order = Vec::with_capacity(triangle_count.min(64));
@@ -6188,6 +7759,67 @@ fn parse_transformed_display_list(
                 });
             }
             cursor = end;
+        } else if tag == 7.0 {
+            let end = cursor + BOX_FLOATS;
+            let record = values
+                .get(cursor..end)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "truncated transformed box"))?;
+            if record.iter().any(|value| !value.is_finite()) {
+                return Err(Error::new(Status::InvalidArg, "transformed box contains invalid values"));
+            }
+            let index = (boxes.len() / BOX_FLOATS) as u32;
+            boxes.extend_from_slice(record);
+            match order.last_mut() {
+                Some(DrawOrder::Boxes(range)) if range.end == index => range.end = index + 1,
+                _ => order.push(DrawOrder::Boxes(index..index + 1)),
+            }
+            cursor = end;
+        } else if tag == 10.0 {
+            // [clip x, y, width, height]: the canvas program, already in window space.
+            let end = cursor + 4;
+            let record = values
+                .get(cursor..end)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "truncated canvas program"))?;
+            let canvas = canvas.ok_or_else(|| Error::new(Status::InvalidArg, "canvas program without canvas buffers"))?;
+            if record.iter().any(|value| !value.is_finite()) || record[2] < 0.0 || record[3] < 0.0 {
+                return Err(Error::new(Status::InvalidArg, "canvas program has an invalid clip"));
+            }
+            let fallback = 0..canvas.vertex_count;
+            let commands = parse_canvas_operations(canvas.operations, canvas.vertex_count, canvas.circle_count, canvas.bezier_count, fallback)?;
+            order.push(DrawOrder::CanvasProgram {
+                commands,
+                clip_x: record[0] as f64,
+                clip_y: record[1] as f64,
+                clip_width: record[2] as f64,
+                clip_height: record[3] as f64,
+            });
+            cursor = end;
+        } else if tag == 9.0 {
+            let layer = *values
+                .get(cursor)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "truncated text layer marker"))?;
+            if !layer.is_finite() || layer < 0.0 || layer.fract() != 0.0 || layer > 4096.0 {
+                return Err(Error::new(Status::InvalidArg, "invalid text layer marker"));
+            }
+            order.push(DrawOrder::TextLayer(layer as u32));
+            cursor += 1;
+        } else if tag == 8.0 {
+            // [texture id, IMAGE_BOX_FLOATS instance floats]
+            let end = cursor + 1 + IMAGE_BOX_FLOATS;
+            let record = values
+                .get(cursor..end)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "truncated transformed image box"))?;
+            if record.iter().any(|value| !value.is_finite()) || record[0] < 0.0 || record[0].fract() != 0.0 {
+                return Err(Error::new(Status::InvalidArg, "transformed image box contains invalid values"));
+            }
+            let texture_id = record[0] as u32;
+            let index = (image_boxes.len() / IMAGE_BOX_FLOATS) as u32;
+            image_boxes.extend_from_slice(&record[1..]);
+            match order.last_mut() {
+                Some(DrawOrder::ImageBoxes { texture_id: previous, range }) if *previous == texture_id && range.end == index => range.end = index + 1,
+                _ => order.push(DrawOrder::ImageBoxes { texture_id, range: index..index + 1 }),
+            }
+            cursor = end;
         } else {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -6201,7 +7833,7 @@ fn parse_transformed_display_list(
             "transformed display list contains trailing data",
         ));
     }
-    Ok((vertices, circles, images, order))
+    Ok((vertices, circles, images, order, boxes, image_boxes))
 }
 
 impl LayoutTree {

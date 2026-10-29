@@ -7,13 +7,19 @@
     "build:debug": "cargo build --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js",
     "build:release": "cargo build --release --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js --release",
     "build:android-arm64": "bash scripts/build-android-arm64.sh",
-    "build:tour-apk": "bash scripts/build-tour-apk.sh"
+    "build:tour-apk": "bash scripts/build-tour-apk.sh",
+    "build:dyndyn-apk": "bash scripts/build-dyndyn-apk.sh"
   },
   "dependencies": {
     "@napi-rs/canvas": "1.0.11",
     "acorn": "^8.7.0",
     "commander": "^15.0.0",
+    "fast-glob": "^3.3.3",
     "jpeg-js": "^0.4.4",
-    "pngjs": "^7.0.0"
+    "jsqr": "^1.4.0",
+    "pngjs": "^7.0.0",
+    "qrcode-generator": "^2.0.4",
+    "trystero": "^0.26.0",
+    "ws": "^8.22.0"
   }
 }

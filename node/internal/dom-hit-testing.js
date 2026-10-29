@@ -1,4 +1,5 @@
-import { documentBoxes, documentState } from './dom-state.js';
+import { documentPaintBoxes, documentState } from './dom-state.js';
+import { liveHostLookup } from './gpu-scroll-layers.js';
 import { createBoxProjector } from '../render.js';
 import { canScrollByUser, clipsOverflow } from './overflow.js';
 
@@ -98,8 +99,7 @@ function insideRoundedBox(box, point, radii = null) {
   return dx * dx + dy * dy <= 1;
 }
 
-function insideClip(box, x, y) {
-  const clip = box.clip;
+function insideClip(clip, x, y) {
   return !clip || (x >= clip.x && y >= clip.y && x < clip.x + clip.width && y < clip.y + clip.height);
 }
 
@@ -119,16 +119,17 @@ function createsStackingContext(element, parent) {
     || String(style.isolation ?? '').toLowerCase() === 'isolate';
 }
 
-function stackingPath(element, root, order) {
-  const ancestors = [];
-  for (let current = element; current && current !== root; current = current.parent) ancestors.push(current);
-  ancestors.reverse();
-  return ancestors.filter((current, index) => createsStackingContext(current, ancestors[index - 1] ?? root))
-    .map(current => ({
-      level: Number.parseInt(current.style.zIndex, 10) || 0,
-      order: order.get(current) ?? 0,
-      element: current,
-    }));
+// A path extends its parent's path, so build each element's once and share it.
+function stackingPath(element, root, order, memo) {
+  if (!element || element === root) return [];
+  let path = memo.get(element);
+  if (path) return path;
+  const inherited = stackingPath(element.parent, root, order, memo);
+  path = createsStackingContext(element, element.parent ?? root)
+    ? [...inherited, { level: Number.parseInt(element.style.zIndex, 10) || 0, order: order.get(element) ?? 0, element }]
+    : inherited;
+  memo.set(element, path);
+  return path;
 }
 
 function comparePaintOrder(left, right) {
@@ -167,7 +168,9 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
   // scrolling, and target-affecting style changes have dedicated generations.
   // Transform poses keep the stacking list and only replace the projector.
   if (!cache || cache.geometryGeneration !== state.geometryGeneration || cache.hitTestGeneration !== state.hitTestGeneration) {
-    const boxes = documentBoxes(document);
+    // Assembled boxes: scroll-layer content keeps the geometry it was assembled
+    // with, and a scroll only moves the query point per scroll container.
+    const boxes = documentPaintBoxes(document);
     cache = {
       geometryGeneration: state.geometryGeneration,
       controlGeometryGeneration: state.controlGeometryGeneration,
@@ -177,11 +180,13 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
       byElement: new Map(boxes.map(box => [box.element, box])),
       project: createBoxProjector(boxes),
       radii: new Map(),
-      scrollOffsets: new Map(boxes.map(box => [box.element, [box.element.scrollLeft, box.element.scrollTop]])),
+      hostOf: liveHostLookup(boxes),
+      scrollGeneration: state.scrollGeneration ?? 0,
     };
     const order = new Map(boxes.map((box, index) => [box.element, index]));
     const root = document.body;
-    cache.paintOrder = boxes.map((box, index) => ({ box, order: index, path: stackingPath(box.element, root, order) }))
+    const pathMemo = new Map();
+    cache.paintOrder = boxes.map((box, index) => ({ box, order: index, path: stackingPath(box.element, root, order, pathMemo) }))
       .sort(comparePaintOrder);
     cache.orderGeneration = state.hitTestOrderGeneration ?? 0;
     state.hitTestCache = cache;
@@ -195,6 +200,12 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
       cache.lastX = NaN;
       cache.lastComplete = false;
     }
+    if (cache.scrollGeneration !== (state.scrollGeneration ?? 0)) {
+      cache.hostOf = liveHostLookup(cache.boxes);
+      cache.scrollGeneration = state.scrollGeneration ?? 0;
+      cache.lastX = NaN;
+      cache.lastComplete = false;
+    }
     if (cache.transformGeneration !== transformGeneration) {
       cache.project = createBoxProjector(cache.boxes);
       cache.transformGeneration = transformGeneration;
@@ -202,7 +213,11 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
       cache.lastComplete = false;
     }
   }
-  const { byElement, project, paintOrder } = cache;
+  const { byElement, project, paintOrder, hostOf } = cache;
+  const insideView = (view, px, py) => px >= view.x && py >= view.y && px < view.x + view.width && py < view.y + view.height;
+  // A scroll container's layer content is assembled at its scroll offsets of
+  // that moment; the query point moves instead of every box.
+  const shift = (box) => (box.layerHost ? hostOf(box.layerHost) : null);
   if (cache.lastX === x && cache.lastY === y && cache.lastHits) {
     if (cache.lastComplete) return stopAtFirst ? cache.lastHits.slice(0, 1) : cache.lastHits.slice();
     if (stopAtFirst && cache.lastHits.length) return cache.lastHits.slice(0, 1);
@@ -211,9 +226,23 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
   for (let index = paintOrder.length - 1; index >= 0; index--) {
     const box = paintOrder[index].box;
     const element = box.element;
-    if (!isPaintedAndTargetable(element) || box.width <= 0 || box.height <= 0 || !insideClip(box, x, y)) continue;
+    const host = shift(box);
+    let px = x, py = y;
+    if (host) {
+      if (!insideView(host.view, x, y)) continue;
+      px = x - host.dx;
+      py = y - host.dy;
+    }
+    if (box.width <= 0 || box.height <= 0 || !insideClip(host ? box.innerClip : box.clip, px, py)) continue;
     try {
-      const point = projectedLocalPoint(project, box, x, y);
+      // Untransformed boxes (almost all of them) reject by bounds before any
+      // matrix or style work, which keeps a large document's scan cheap.
+      const matrix = project.matrixFor(box);
+      if (matrix[0][0] === 1 && matrix[1][1] === 1 && matrix[0][1] === 0 && matrix[1][0] === 0
+        && matrix[0][3] === 0 && matrix[1][3] === 0 && matrix[3][0] === 0 && matrix[3][1] === 0 && matrix[3][3] === 1
+        && (px < box.x || py < box.y || px >= box.x + box.width || py >= box.y + box.height)) continue;
+      if (!isPaintedAndTargetable(element)) continue;
+      const point = projectedLocalPoint(project, box, px, py);
       let radii = cache.radii.get(element);
       if (!radii) {
         radii = cornerRadii(box);
@@ -225,7 +254,8 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
         const clipX = clipsOverflow(parent, 'x'), clipY = clipsOverflow(parent, 'y');
         if (!clipX && !clipY) continue;
         const parentBox = byElement.get(parent);
-        const parentPoint = parentBox && projectedLocalPoint(project, parentBox, x, y);
+        const parentHost = parentBox && shift(parentBox);
+        const parentPoint = parentBox && projectedLocalPoint(project, parentBox, x - (parentHost?.dx ?? 0), y - (parentHost?.dy ?? 0));
         const outsideX = clipX && (!parentBox || !parentPoint
           || parentPoint.x < parentBox.paddingBox.x || parentPoint.x >= parentBox.paddingBox.x + parentBox.paddingBox.width);
         const outsideY = clipY && (!parentBox || !parentPoint

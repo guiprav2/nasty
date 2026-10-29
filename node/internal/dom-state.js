@@ -43,12 +43,30 @@ export function documentBoxes(document, timings) {
   return internals.boxes(timings);
 }
 
+/** Boxes for painting: scroll-layer content keeps its layer-space geometry
+ *  across scrolls, so this never re-derives screen positions. */
+export function documentPaintBoxes(document, timings) {
+  const internals = documents.get(document);
+  if (!internals) throw new TypeError("document is not managed by Nasty");
+  return internals.paintBoxes(timings);
+}
+
 // Internal rendering path for callers that already know which scene is visible.
 // It avoids assembling geometry for every offscreen DOM subtree each frame.
 export function documentBoxesFor(document, elements, timings) {
   const internals = documents.get(document);
   if (!internals) throw new TypeError("document is not managed by Nasty");
   return internals.renderBoxes(elements, timings);
+}
+
+/** The last assembled boxes at current scroll offsets, without forcing layout. */
+export function documentLiveSnapshot(document) {
+  return documents.get(document)?.liveSnapshot() ?? null;
+}
+
+/** Per-element scroll-adjusted boxes, derived on demand (no whole-document copy). */
+export function documentLiveLookup(document) {
+  return documents.get(document)?.liveLookup() ?? (() => undefined);
 }
 
 export function elementRect(element) {

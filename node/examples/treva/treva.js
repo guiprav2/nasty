@@ -4,14 +4,21 @@
  * Gallery body is not ported yet.
  * Run from node/: node examples/treva/treva.js
  */
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, relative, sep, basename } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import fg from "fast-glob";
+import {
+  IMAGE_EXT,
+  extOf,
+  visibleImages,
+  plural,
+} from "./model.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 process.env.NASTY_FONT_DIR ??= here;
 
-const { Document, Window } = await import("../../index.js");
+const { Document, ResizeObserver, Window } = await import("../../index.js");
 const { dominant } = await import("../../dominant.js");
 
 const doc = new Document();
@@ -34,7 +41,7 @@ const C = {
   teal400: "#2dd4bf",
 };
 
-const FIELD = `mt-1.5 w-full rounded-xl border border-white/10 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`;
+const FIELD = `mt-1.5 w-full rounded-xl border border-stone-400/10 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`;
 const FIELD_H = `h-10 ${FIELD}`;
 
 const SHORTCUTS = [
@@ -93,11 +100,14 @@ const state = {
   status: "idle",
   folderName: "",
   resumeName: "",
+  folderPath: "",
   images: [],
   filter: "",
   sortKey: "name",
   sortDir: "asc",
   recursive: true,
+  thumb: 180,
+  currentId: null,
   screen: "gallery",
   slideshow: false,
   help: false,
@@ -109,6 +119,9 @@ const state = {
   scan: { errors: 0 },
   viewportW: 1100,
   viewportH: 720,
+  scroll: { grid: 0, list: 0 },
+  viewport: { grid: 0, gridH: 0, list: 0, listH: 0 },
+  generation: 0,
 };
 
 /** Index dropdown (catalog.js UI) — local mock; no catalog backend yet. */
@@ -191,8 +204,10 @@ function showToast(message) {
 }
 
 function countLabel() {
-  const n = state.images.length;
-  return n ? `${n} image${n === 1 ? "" : "s"}` : "";
+  const n = state.status === "idle" ? 0 : visible().length;
+  const total = state.images.length;
+  if (!n) return total ? "0 shown" : "";
+  return n === total ? `${n} image${n === 1 ? "" : "s"}` : `${n} / ${total}`;
 }
 
 function icon(name, className = "h-4 w-4 text-base") {
@@ -231,7 +246,7 @@ function kbd(label) {
   return d.el(
     "span",
     {
-      class: `inline-flex items-center rounded-[5px] border border-white/16 border-b-2 bg-[${C.ink800}] px-1.5 py-px text-[11px] text-[${C.body}] font-sans`,
+      class: `inline-flex items-center rounded-[5px] border border-stone-400/14 border-b-2 bg-[${C.ink800}] px-1.5 py-px text-[11px] text-[${C.body}] font-sans`,
     },
     label,
   );
@@ -260,7 +275,7 @@ function placeAnchor(ev, preferredWidth, preferredHeight = 320) {
 function panelClass(anchor, extra = "") {
   const a = anchor || { left: 8, top: 56, width: 288 };
   return [
-    `fixed z-[70] max-h-[90vh] overflow-auto rounded-2xl border border-white/10 bg-[${C.ink900}] p-4`,
+    `fixed z-[70] max-h-[90vh] overflow-auto rounded-2xl border border-stone-400/10 bg-[${C.ink900}] p-4`,
     `left-[${a.left}px] top-[${a.top}px] w-[${a.width}px]`,
     extra,
   ].filter(Boolean).join(" ");
@@ -434,7 +449,7 @@ function grokSettingsMenu() {
               spellcheck: "false",
               placeholder: "xai-…",
               "data-testid": "grok-key-input",
-              class: `mt-1.5 h-10 w-full rounded-xl border border-white/10 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`,
+              class: `mt-1.5 h-10 w-full rounded-xl border border-stone-400/10 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`,
               value: d.binding({
                 get: () => rx.keyDraft,
                 set: v => { rx.keyDraft = v; },
@@ -761,7 +776,7 @@ function strategyButton(testId, active, label, hint, onPick) {
         () =>
           active()
             ? `border-[${C.copper500}] bg-[${C.copper500}]/15`
-            : "border-white/10 hover:bg-white/5",
+            : "border-stone-400/10 hover:bg-white/5",
       ],
       onclick: () => {
         onPick();
@@ -1005,7 +1020,7 @@ function reimagineTabs() {
           d.el(
             "div",
             {
-              class: `flex h-8 max-w-[12rem] shrink-0 items-center gap-1 rounded-full bg-white/5 px-2.5 text-xs text-stone-200 ring-1 ring-white/10`,
+              class: `flex h-8 max-w-[12rem] shrink-0 items-center gap-1 rounded-full bg-white/5 px-2.5 text-xs text-stone-200 ring-1 ring-stone-400/10`,
               "data-testid": "reimagine-tab",
             },
             d.el("span", { class: "min-w-0 truncate" }, run.name || "Reimagine"),
@@ -1017,6 +1032,419 @@ function reimagineTabs() {
 
 // --- Folder open ---
 
+
+// --- Gallery / folder scan ---
+
+// Per-update cache, as in Treva's app.js: bindings share one sorted list.
+let frame = {};
+
+function invalidate() {
+  frame.visible = null;
+}
+
+d.on("beforeUpdate", invalidate);
+
+// Sidebar file list window, as in Treva's app.js (ROW_H rows, overscan).
+const ROW_H = 58;
+
+function visible() {
+  if (frame.visible) return frame.visible;
+  frame.visible = visibleImages(state.images, {
+    filter: state.filter,
+    recursive: state.recursive,
+    sortKey: state.sortKey,
+    sortDir: state.sortDir,
+  });
+  return frame.visible;
+}
+
+let _byIdSource = null;
+let _byId = null;
+function imageById(id) {
+  if (_byIdSource !== state.images) {
+    _byIdSource = state.images;
+    _byId = new Map(state.images.map(im => [im.id, im]));
+  }
+  return _byId.get(id);
+}
+
+function currentImage() {
+  if (!state.currentId) return visible()[0] || null;
+  return state.images.find(im => im.id === state.currentId) || visible()[0] || null;
+}
+
+function activateImage(im) {
+  if (!im) return;
+  state.currentId = im.id;
+  d.update();
+}
+
+function fileUrlFor(im) {
+  if (!im?.absPath) return "";
+  return pathToFileURL(im.absPath).href;
+}
+
+// Thumb <img src> stays set for the life of the node. Visibility admission and
+// decode isolation are engine responsibilities — the app must not remove src.
+
+async function listImages(rootPath) {
+  const exts = [...IMAGE_EXT];
+  // One glob with brace expansion is faster than 16 separate walks.
+  const patterns = [`**/*.{${exts.join(",")}}`];
+  const absPaths = await fg(patterns, {
+    cwd: rootPath,
+    absolute: true,
+    onlyFiles: true,
+    caseSensitiveMatch: false,
+    // Skip junk trees; still cheap compared to per-file stat in JS walk.
+    ignore: [
+      "**/node_modules/**",
+      "**/.git/**",
+      "**/.svn/**",
+      "**/.hg/**",
+      "**/$RECYCLE.BIN/**",
+      "**/System Volume Information/**",
+      "**/.Trash/**",
+      "**/.Trashes/**",
+      "**/.Spotlight-V100/**",
+    ],
+    // Keep directory order stable-ish; we sort via visibleImages anyway.
+    followSymbolicLinks: false,
+  });
+  const root = rootPath.endsWith(sep) ? rootPath : rootPath + sep;
+  return absPaths.map((absPath, index) => {
+    const rel = absPath.startsWith(root)
+      ? absPath.slice(root.length)
+      : relative(rootPath, absPath);
+    const path = rel.split(sep).join("/");
+    const name = basename(absPath);
+    return {
+      id: `im-${index + 1}`,
+      name,
+      path,
+      absPath,
+      ext: extOf(name),
+      size: null,
+      lastModified: 0,
+      loaded: false,
+      error: false,
+      width: 0,
+      height: 0,
+    };
+  });
+}
+
+function thumbButton(im) {
+  const selected = () => im.id === state.currentId;
+  return d.el(
+    "button",
+    {
+      type: "button",
+      "data-testid": "thumb",
+      "data-path": im.path,
+      title: im.path,
+      class: [
+        `relative min-w-0 w-full overflow-hidden rounded-md bg-[${C.ink800}] text-left cursor-pointer content-auto`,
+        // Explicit square size from virtualizer — more reliable than aspect-square alone
+        // for giving <img> a non-zero content box to paint into.
+        "aspect-square w-full",
+        () =>
+          selected()
+            ? `ring-2 ring-[${C.gold300}]`
+            : "ring-1 ring-stone-400/10",
+      ],
+      onclick: () => activateImage(im),
+    },
+    d.el("img", {
+      alt: "",
+      draggable: false,
+      decoding: "async",
+      class: [
+        "relative z-10 h-full w-full object-cover bg-transparent",
+        () => (im.error ? "opacity-0" : "opacity-100"),
+      ],
+      src: fileUrlFor(im),
+      onload: ev => {
+        im.loaded = true;
+        im.width = ev.target?.naturalWidth || 0;
+        im.height = ev.target?.naturalHeight || 0;
+        // Avoid full-tree d.update per decode; toggle local classes if needed.
+        try {
+          ev.target?.classList?.remove?.("opacity-0");
+          ev.target?.classList?.add?.("opacity-100");
+          const pulse = ev.target?.parentElement?.querySelector?.(".animate-pulse");
+          pulse?.remove?.();
+        } catch { /* ignore */ }
+      },
+      onerror: ev => {
+        im.error = true;
+        try {
+          ev.target?.classList?.add?.("opacity-0");
+        } catch { /* ignore */ }
+      },
+    }),
+    d.if(
+      () => !im.loaded && !im.error,
+      d.el("div", { class: "pointer-events-none absolute inset-0 animate-pulse bg-white/5" }),
+    ),
+    d.if(
+      () => im.error,
+      d.el(
+        "div",
+        {
+          class: `absolute inset-0 z-20 flex items-center justify-center bg-[${C.ink900}]/85 text-[10px] uppercase tracking-wide text-stone-400`,
+        },
+        d.text(() => im.ext || "?"),
+      ),
+    ),
+  );
+}
+
+function gallery() {
+  return d.el(
+    "div",
+    {
+      class: [
+        "relative flex min-h-0 w-full flex-1 flex-col",
+        () => (state.screen === "gallery" ? "z-10" : "invisible pointer-events-none z-0"),
+      ],
+      "data-testid": "gallery",
+    },
+    d.el(
+      "div",
+      {
+        class: "min-h-0 h-full flex-1 overflow-auto",
+        "data-testid": "grid",
+        "data-scrollroot": "grid",
+      },
+      // Every image is attached; only image loading is gated by the engine.
+      d.el(
+        "div",
+        {
+          class: "grid w-full grid-cols-2 gap-2.5 p-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7",
+          "data-testid": "grid-inner",
+        },
+        d.map(() => visible().map(im => im.id), (id) => {
+          const im = imageById(id);
+          return im ? thumbButton(im) : null;
+        }),
+      ),
+      d.if(
+        () => visible().length === 0,
+        d.el(
+          "div",
+          {
+            class:
+              "pointer-events-none absolute inset-0 flex items-center justify-center p-8 text-center",
+          },
+          d.el(
+            "div",
+            {},
+            d.el("div", { class: "font-display text-3xl text-stone-200" }, "Nothing here"),
+            d.el(
+              "p",
+              { class: "mt-2 max-w-sm text-sm text-stone-400", "data-testid": "empty-copy" },
+              d.text(() => {
+                if (state.filter.trim()) return `Nothing matches “${state.filter.trim()}”.`;
+                if (!state.recursive) return "No images at the top of this folder.";
+                return "No images in this folder.";
+              }),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+function sidebar() {
+  return d.el(
+    "aside",
+    {
+      class: [
+        `z-30 w-72 shrink-0 flex-col border-r border-stone-400/10 bg-[${C.ink900}]`,
+        () => {
+          if (!state.sidebarOpen) return "hidden";
+          if (state.narrow) return "absolute inset-y-0 left-0 flex";
+          return "static flex";
+        },
+      ],
+      "data-testid": "sidebar",
+    },
+    d.el(
+      "div",
+      { class: "shrink-0 space-y-3 border-b border-stone-400/10 p-3" },
+      d.el(
+        "div",
+        { class: "flex items-center justify-between gap-2" },
+        d.el("div", { class: "text-xs uppercase tracking-[0.16em] text-stone-500" }, "Images"),
+        d.el(
+          "div",
+          { class: "text-xs text-stone-400", "data-testid": "count" },
+          d.text(countLabel),
+        ),
+      ),
+      d.el("input", {
+        "data-testid": "filter",
+        class: `h-8 w-full rounded-md border border-stone-400/10 bg-[${C.ink950}] px-2 text-sm text-stone-100`,
+        placeholder: "Filter name or path",
+        value: d.binding({
+          get: () => state.filter,
+          set: v => {
+            state.filter = v;
+            state.scroll.grid = 0;
+            state.scroll.list = 0;
+          },
+        }),
+      }),
+      d.el(
+        "div",
+        { class: "flex gap-2" },
+        d.el(
+          "select",
+          {
+            "data-testid": "sort",
+            class: `h-8 min-w-0 flex-1 rounded-md border border-stone-400/10 bg-[${C.ink950}] px-2 text-sm text-stone-100`,
+            value: d.binding({
+              get: () => state.sortKey,
+              set: v => {
+                state.sortKey = v;
+                state.scroll.grid = 0;
+                state.scroll.list = 0;
+              },
+            }),
+          },
+          d.el("option", { value: "name" }, "Name"),
+          d.el("option", { value: "path" }, "Path"),
+          d.el("option", { value: "size" }, "Size"),
+          d.el("option", { value: "modified" }, "Modified"),
+          d.el("option", { value: "ext" }, "Type"),
+        ),
+        d.el(
+          "button",
+          {
+            type: "button",
+            class:
+              "h-8 shrink-0 rounded-md px-2 text-xs text-stone-200 ring-1 ring-stone-400/10 hover:bg-white/10 cursor-pointer",
+            title: "Reverse sort",
+            onclick: () => {
+              state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+              state.scroll.grid = 0;
+              state.scroll.list = 0;
+              d.update();
+            },
+          },
+          d.text(() => (state.sortDir === "asc" ? "Asc" : "Desc")),
+        ),
+      ),
+      d.el(
+        "label",
+        { class: "flex items-center gap-2 text-sm text-stone-300" },
+        d.el("input", {
+          type: "checkbox",
+          "data-testid": "subfolders",
+          class: "h-4 w-4",
+          checked: d.binding({
+            get: () => state.recursive,
+            set: v => {
+              state.recursive = !!v;
+              state.scroll.grid = 0;
+              state.scroll.list = 0;
+            },
+          }),
+        }),
+        "Show images in subfolders",
+      ),
+      d.el(
+        "label",
+        { class: "block text-xs text-stone-500" },
+        "Thumbnail size",
+        d.el("input", {
+          type: "range",
+          min: "120",
+          max: "320",
+          step: "10",
+          "data-testid": "thumb-size",
+          class: "mt-1 w-full",
+          value: d.binding({
+            get: () => state.thumb,
+            set: v => {
+              state.thumb = Number(v) || 180;
+            },
+          }),
+        }),
+      ),
+    ),
+    d.el(
+      "div",
+      {
+        class: "min-h-0 flex-1 overflow-auto",
+        "data-testid": "file-list",
+      },
+      d.map(
+        () => visible(),
+        im =>
+          d.el(
+            "button",
+            {
+              type: "button",
+              "data-testid": "file-row",
+              class: [
+                `flex h-[${ROW_H}px] w-full items-center gap-3 border-b border-stone-400/6 px-3 text-left hover:bg-white/5 cursor-pointer content-auto`,
+                () => (im.id === state.currentId ? `bg-[${C.gold300}]/15` : ""),
+              ],
+              onclick: () => activateImage(im),
+            },
+            d.el(
+              "div",
+              {
+                class: [
+                  `h-10 w-10 shrink-0 overflow-hidden rounded bg-[${C.ink800}]`,
+                  () =>
+                    im.id === state.currentId
+                      ? `ring-2 ring-[${C.gold300}]`
+                      : "ring-1 ring-stone-400/10",
+                ],
+              },
+              d.el("img", {
+                alt: "",
+                class: "h-full w-full object-cover",
+                src: fileUrlFor(im),
+              }),
+            ),
+            d.el(
+              "div",
+              { class: "min-w-0 flex-1" },
+              d.el("div", { class: "truncate text-sm text-stone-100" }, im.name),
+              d.el(
+                "div",
+                { class: "truncate text-xs text-stone-500" },
+                d.text(() =>
+                  im.path.includes("/")
+                    ? im.path.slice(0, im.path.lastIndexOf("/"))
+                    : "Top",
+                ),
+              ),
+            ),
+          ),
+      ),
+    ),
+  );
+}
+
+function workspace() {
+  return d.el(
+    "div",
+    { class: "relative flex min-h-0 w-full flex-1" },
+    sidebar(),
+    d.el(
+      "div",
+      { class: "relative flex min-h-0 min-w-0 flex-1 flex-col" },
+      gallery(),
+    ),
+  );
+}
+
 async function chooseFolder() {
   if (!pickerAvailable()) {
     showToast("Directory picker is not available.");
@@ -1024,17 +1452,35 @@ async function chooseFolder() {
   }
   try {
     const handle = await win.showDirectoryPicker({ mode: "read" });
+    const rootPath = handle.path;
     state.folderName = handle.name || "Folder";
     state.resumeName = state.folderName;
+    state.folderPath = rootPath;
+    state.scroll.grid = 0;
+    state.scroll.list = 0;
+    state.currentId = null;
+    state.scan = { errors: 0 };
+
+    // Glob off the critical path already; yield once so the picker dialog can
+    // dismiss and a frame can paint before we build the gallery DOM.
+    const images = await listImages(rootPath);
+    await new Promise((r) => setImmediate(r));
+    state.images = images;
+    invalidate();
     state.status = "ready";
-    // Placeholder listing so Index enables; full scan is not ported yet.
-    state.images = [
-      { id: "demo-1", name: "sample-a.jpg", path: "sample-a.jpg" },
-      { id: "demo-2", name: "sample-b.jpg", path: "nested/sample-b.jpg" },
-      { id: "demo-3", name: "sample-c.png", path: "sample-c.png" },
-    ];
-    showToast(`Opened “${state.folderName}”. Gallery body not ported yet.`);
+    if (images[0]) state.currentId = images[0].id;
+    state.scroll.grid = 0;
+    state.scroll.list = 0;
+    showToast(
+      images.length
+        ? `Opened “${state.folderName}” · ${plural(images.length, "image")}`
+        : `Opened “${state.folderName}” · no images found`,
+    );
     d.update();
+    // After gallery mounts, nudge admission once layout boxes exist.
+    queueMicrotask(() => {
+      try { d.update(); } catch { /* ignore */ }
+    });
   } catch (err) {
     if (err && (err.name === "AbortError" || /abort/i.test(String(err.message || err)))) return;
     showToast(err && err.message ? err.message : String(err));
@@ -1051,7 +1497,10 @@ function closeFolder() {
   closeAllMenus();
   state.status = "idle";
   state.folderName = "";
+  state.folderPath = "";
   state.images = [];
+  invalidate();
+  state.currentId = null;
   state.screen = "gallery";
   state.slideshow = false;
   d.update();
@@ -1063,7 +1512,7 @@ function welcome() {
     keys.push(
       d.el(
         "div",
-        { class: "flex items-center justify-between gap-6 border-b border-white/5 py-1.5 text-sm" },
+        { class: "flex items-center justify-between gap-6 border-b border-stone-400/6 py-1.5 text-sm" },
         d.el("span", { class: "text-stone-400" }, pair[1]),
         kbd(pair[0]),
       ),
@@ -1126,27 +1575,6 @@ function welcome() {
   );
 }
 
-function mainPlaceholder() {
-  return d.el(
-    "div",
-    {
-      class: "flex min-h-0 w-full flex-1 items-center justify-center p-8 text-center",
-      "data-testid": "gallery-placeholder",
-    },
-    d.el(
-      "div",
-      { class: "max-w-md" },
-      d.el("div", { class: "font-display text-2xl text-stone-50" }, d.text(() => state.folderName || "Folder")),
-      d.el(
-        "p",
-        { class: "mt-2 text-sm leading-relaxed text-stone-400" },
-        d.text(() =>
-          `${state.images.length} placeholder image${state.images.length === 1 ? "" : "s"}. Sidebar and grid come next.`,
-        ),
-      ),
-    ),
-  );
-}
 
 function helpModal() {
   const rows = [];
@@ -1154,7 +1582,7 @@ function helpModal() {
     rows.push(
       d.el(
         "div",
-        { class: "flex items-center justify-between gap-4 border-b border-white/5 py-2 text-sm" },
+        { class: "flex items-center justify-between gap-4 border-b border-stone-400/6 py-2 text-sm" },
         d.el("span", { class: "text-stone-300" }, pair[1]),
         kbd(pair[0]),
       ),
@@ -1178,7 +1606,7 @@ function helpModal() {
           "aria-modal": "true",
           "aria-label": "Keyboard shortcuts",
           "data-testid": "help",
-          class: `max-h-full w-full max-w-lg overflow-auto rounded-xl border border-white/10 bg-[${C.ink900}] p-6`,
+          class: `max-h-full w-full max-w-lg overflow-auto rounded-xl border border-stone-400/10 bg-[${C.ink900}] p-6`,
           onclick: ev => ev.stopPropagation?.(),
         },
         d.el(
@@ -1235,7 +1663,7 @@ function toast() {
           {
             role: "alert",
             "data-testid": "toast",
-            class: `pointer-events-auto flex items-start gap-3 rounded-lg border border-white/10 bg-[${C.ink800}] px-4 py-3 text-sm`,
+            class: `pointer-events-auto flex items-start gap-3 rounded-lg border border-stone-400/10 bg-[${C.ink800}] px-4 py-3 text-sm`,
           },
           d.el("div", { class: "min-w-0 flex-1" }, item.text),
           d.el(
@@ -1291,7 +1719,7 @@ function windowControls() {
 
 function header() {
   const bar = {
-    class: `relative z-[60] flex h-14 shrink-0 items-center gap-2 overflow-x-auto border-b border-white/10 bg-[${C.ink950}] px-3`,
+    class: `relative z-[60] flex h-14 shrink-0 items-center gap-2 overflow-x-auto border-b border-stone-400/10 bg-[${C.ink950}] px-3`,
   };
   return d.el(
     "header",
@@ -1418,7 +1846,7 @@ function shell() {
     d.el(
       "div",
       { class: "relative flex min-h-0 flex-1 flex-col" },
-      d.if(() => state.status === "idle", welcome(), mainPlaceholder()),
+      d.if(() => state.status === "idle", welcome(), workspace()),
     ),
     helpModal(),
     dragOverlay(),
@@ -1435,7 +1863,7 @@ function shell() {
 function updateBodyFrame(maximized = state.windowMax) {
   state.windowMax = maximized;
   const open = process.env.SWEET_ANDROID_APK || maximized;
-  const frame = open ? "" : "rounded-2xl border border-white/10 ";
+  const frame = open ? "" : "rounded-2xl border border-stone-400/10 ";
   doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[${C.ink950}] text-[${C.body}] font-sans`;
 }
 

@@ -2,26 +2,68 @@ import native from "./internal/native.js";
 import { resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { LayoutWorker } from "./internal/layout-worker.js";
+import "./internal/locale-compare.js";
+import "./internal/web-globals.js";
+import { availableParallelism, cpus } from "node:os";
+import { MediaStream, mediaDevices, readVideoTrackFrame } from "./webrtc.js";
 import { loadImage, unloadImage } from "./image-decoder.js";
-import { documentBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
+
+// Image decode completions are applied off the hot path: worker results only
+// enqueue here, and GPU upload + DOM load events drain with a per-turn budget
+// so scroll/input keep running even when hundreds of decodes finish at once.
+const imageCompletionQueue = [];
+let imageCompletionDrainScheduled = false;
+const IMAGE_COMPLETION_BUDGET_MS = 12;
+const IMAGE_COMPLETION_MAX_PER_TURN = 16;
+
+function scheduleImageCompletionDrain() {
+  if (imageCompletionDrainScheduled) return;
+  imageCompletionDrainScheduled = true;
+  const kick = typeof setImmediate === "function"
+    ? (fn) => { const h = setImmediate(fn); h.unref?.(); }
+    : (fn) => setTimeout(fn, 0);
+  kick(drainImageCompletions);
+}
+
+function drainImageCompletions() {
+  imageCompletionDrainScheduled = false;
+  const started = performance.now();
+  let n = 0;
+  while (imageCompletionQueue.length && n < IMAGE_COMPLETION_MAX_PER_TURN) {
+    if (performance.now() - started > IMAGE_COMPLETION_BUDGET_MS) break;
+    const job = imageCompletionQueue.shift();
+    n++;
+    try { job(); }
+    catch (error) { console.error("Nasty image completion failed:", error); }
+  }
+  if (imageCompletionQueue.length) scheduleImageCompletionDrain();
+}
+
+function enqueueImageCompletion(job) {
+  imageCompletionQueue.push(job);
+  scheduleImageCompletionDrain();
+}
+
+
+import { documentBoxes, documentLiveLookup, documentPaintBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
 import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
 import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startInterpolableTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
 import { computeTransform } from "./internal/css-transform.js";
 import { createElementAnimation, isAnimationControlProperty, syncCssAnimations } from "./internal/css-animations.js";
-import { buildTransformedDisplayList, clearPaintSegments, displayListElements, parseColor } from "./render.js";
+import { buildTransformedDisplayList, clearPaintSegments, displayListCanvas, displayListTextLayers, parseColor } from "./render.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics } from "./internal/text-metrics.js";
-import { documentImage } from "./internal/raster-document.js";
 import { blocksWindowDrag, elementsFromPoint as hitTestElementsFromPoint, trackClickListener } from "./internal/dom-hit-testing.js";
 import { resolveTailwind, resolveTailwindSelection } from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, hasVideoAudio, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
 import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
 import { ResizeObserver, notifyResizeObservers } from "./internal/resize-observer.js";
-import { renderedText } from "./internal/nerd-icon.js";
-import { canScroll, canScrollByUser, clipsOverflow, overflowAnchorPolicy, overflowMode } from "./internal/overflow.js";
-import { noteScrollLayerPaintChange } from "./internal/scroll-layers.js";
+import { nerdIcon, renderedText } from "./internal/nerd-icon.js";
+import { canScroll, canScrollByUser, clipsOverflow, overflowAnchorPolicy, overflowMode, userScrollableStyle } from "./internal/overflow.js";
+import { applyIntrinsicSize, insideSkippedContent, isContentSkipped, noteContentVisibility, reconcileContentVisibility } from './internal/content-visibility.js';
+import { liveBoxLookup, liveScreenBoxes, noteLayerScrolled, noteScrollLayerPaintChange, paintScrollLayers } from "./internal/gpu-scroll-layers.js";
 import {
   clearImageLoadSticky,
   isDetachedImage,
@@ -75,6 +117,24 @@ export { DOMRect };
 export { TransitionEvent };
 export { MutationObserver };
 export { ResizeObserver };
+export {
+  MediaDeviceInfo, MediaDevices, MediaStream, MediaStreamTrack, MediaStreamTrackEvent,
+  RTCDataChannel, RTCDataChannelEvent, RTCError, RTCErrorEvent, RTCIceCandidate, RTCPeerConnection,
+  RTCPeerConnectionIceEvent, RTCRtpReceiver, RTCRtpSender, RTCRtpTransceiver, RTCSctpTransport,
+  RTCSessionDescription, RTCStatsReport, RTCTrackEvent,
+} from "./webrtc.js";
+
+/** The `window.navigator` object: media capture plus the basic platform fields. */
+export class Navigator {
+  get mediaDevices() { return mediaDevices; }
+  get userAgent() { return `Mozilla/5.0 (${process.platform}) Nasty/0.1`; }
+  get platform() { return process.platform; }
+  get language() { return this.languages[0]; }
+  get languages() { return Object.freeze([Intl.DateTimeFormat().resolvedOptions().locale || "en-US"]); }
+  get hardwareConcurrency() { return availableParallelism?.() ?? cpus().length; }
+  get onLine() { return true; }
+}
+const sharedNavigator = new Navigator();
 
 const directoryPickerStarts = new Map();
 const WELL_KNOWN_DIRECTORY_STARTS = new Set([
@@ -315,7 +375,15 @@ export class Window extends native.Window {
     const events = super.drainEvents();
     const routedEvents = [];
     for (const event of events) {
-      if (event.type !== "pointerdown" || event.button !== 0 || !event.dragRequested) {
+      const eventType = event.type || event.kind;
+      // Image completions must never be returned "raw" to a caller that forgets
+      // to dispatch them — that permanently loses texture handles. Always route
+      // through the window EventTarget first.
+      if (eventType === "image-ready" || eventType === "image-error") {
+        this.#routeNativeEvent(event);
+        continue;
+      }
+      if (eventType !== "pointerdown" || event.button !== 0 || !event.dragRequested) {
         routedEvents.push(event);
         continue;
       }
@@ -436,7 +504,12 @@ export class Window extends native.Window {
   }
 
   #flushNativeEvents() {
-    for (const event of this.drainEvents()) this.#routeNativeEvent(event);
+    // Use the public drainEvents path so dragAnywhere + image-ready routing stay unified.
+    for (const event of this.drainEvents()) {
+      const eventType = event.type || event.kind;
+      if (eventType === "image-ready" || eventType === "image-error") continue; // already routed inside drainEvents
+      this.#routeNativeEvent(event);
+    }
   }
 
   #commitPendingWheelScroll() {
@@ -448,7 +521,8 @@ export class Window extends native.Window {
 
   #startEventPolling() {
     if (this.#eventTimer !== null || super.closed) return;
-    if (this.#document && !this.#documentPresented) return;
+    // Do not wait for the first presentDocument: image-ready/error must flow
+    // while decodes complete, or gallery opens look frozen then blank.
     const poll = () => {
       this.#eventTimer = null;
       if (super.closed) {
@@ -463,16 +537,37 @@ export class Window extends native.Window {
       if (!super.closed) {
         // Keep OS key delivery ahead of presentation so a slow frame cannot
         // starve the winit/egui input queue.
-        this.#eventTimer = setTimeout(poll, 4);
-        this.#eventTimer.unref?.();
+        // When image decodes are in flight, poll faster so GPU upload/events keep up.
+        const busy = (typeof this.imageDecodePending === "function" && this.imageDecodePending() > 0)
+          || (typeof this.imageDecodeInFlight === "function" && this.imageDecodeInFlight() > 0)
+          || (typeof this.imageDecodeReady === "function" && this.imageDecodeReady() > 0);
+        this.#eventTimer = setTimeout(poll, busy ? 1 : 4);
+        // An open window showing a document keeps the process alive, like a
+        // browser window. Outstanding image decodes do too, like a pending
+        // fetch: `await img.decode()` before any present must settle.
+        if (!busy && !this.#document) this.#eventTimer.unref?.();
       } else this.#notifyClosed();
     };
     this.#eventTimer = setTimeout(poll, 0);
-    this.#eventTimer.unref?.();
+    if (!this.#document) this.#eventTimer.unref?.();
   }
 
   #routeNativeEvent(nativeEvent) {
-    if (nativeEvent.type !== "wheel") this.#commitPendingWheelScroll();
+    const eventType = nativeEvent.type || nativeEvent.kind;
+    if (eventType !== "wheel") this.#commitPendingWheelScroll();
+    // Image decode completions are window-level only (texture handles).
+    if (eventType === "image-ready" || eventType === "image-error") {
+      const fields = {
+        x: nativeEvent.x ?? 0,
+        y: nativeEvent.y ?? 0,
+        deltaX: nativeEvent.deltaX ?? 0,
+        deltaY: nativeEvent.deltaY ?? 0,
+        key: nativeEvent.key ?? "",
+        text: nativeEvent.text ?? "",
+      };
+      this.#dispatchWindowEvent(makeHostEvent(eventType, fields));
+      return;
+    }
     const cursor = Number.isFinite(nativeEvent.x) && Number.isFinite(nativeEvent.y)
       ? { x: nativeEvent.x, y: nativeEvent.y }
       : super.cursorPosition();
@@ -743,10 +838,9 @@ export class Window extends native.Window {
     };
     // Prefer the retained text-control registry when present so long documents
     // (Vitrola chat) do not scan every element on every animation frame.
-    const registered = documentStateValue.textControls;
-    const candidates = registered?.size
-      ? registered
-      : documentStateValue.elements;
+    // Inputs and textareas register on creation, so an empty registry means
+    // there are none: never fall back to scanning every element.
+    const candidates = documentStateValue.textControls ?? documentStateValue.elements;
     const controls = [];
     for (const element of candidates) {
       if (!(element.localName === "input" || element.localName === "textarea")) continue;
@@ -777,7 +871,8 @@ export class Window extends native.Window {
         || documentStateValue.textControlGeometryGeneration !== geometryGeneration;
     });
     if (!needsSync) return;
-    const boxes = new Map(documentBoxes(document).map(box => [box.element, box]));
+    documentPaintBoxes(document);
+    const boxes = { get: documentLiveLookup(document) };
     const options = [];
     for (const element of controls) {
       const box = boxes.get(element);
@@ -860,7 +955,7 @@ export class Window extends native.Window {
   }
   presentTransformed(list) {
     this._syncDragHitTest();
-    syncDocumentTextForPresent(this, this.#document, displayListElements(list));
+    syncDocumentTextForPresent(this, this.#document, displayListTextLayers(list));
     try {
       const result = super.presentTransformed(list);
       this._syncDragHitTest();
@@ -919,41 +1014,39 @@ export class Window extends native.Window {
     benchmarkMark("wheelCommit");
     this.#syncDocumentTextControls();
     benchmarkMark("textControls");
-    const hasTransformedContent = this.#document
-      ? documentHasTransformedContent(this.#document)
-      : false;
     benchmarkMark("visibleTree");
+    // Nasty renders documents only through the GPU display list: boxes,
+    // gradients, borders, and image/video textures become WGPU draws, and text
+    // is shaped and drawn natively. Nothing is rasterized on the CPU.
     let result;
-    if (hasTransformedContent) {
+    if (this.#document) {
+      // Scrolling can bring skipped contents near, or push released ones away.
+      const content = documentState(this.#document);
+      if (content.cvElements?.size && content.cvScrollGeneration !== (content.scrollGeneration ?? 0)) {
+        reconcileContentVisibility(this.#document, markGeometryDirty);
+      }
       const size = this.size();
-      const boxes = documentBoxes(this.#document);
+      const boxes = documentPaintBoxes(this.#document);
       benchmarkMark("documentBoxes");
       const overlays = inputDecorationOverlays(this.#document);
       benchmarkMark("overlays");
       const list = buildTransformedDisplayList(boxes, size.width, size.height, overlays);
       benchmarkMark("displayList");
-      result = this.presentTransformed(list);
-      benchmarkMark("nativePresent");
-    } else {
-      const frame = documentImage(this, this.#document);
-      const size = this.size();
-      const decorations = inputDecorationQuads(this.#document, size.width, size.height);
-      if (decorations.length) {
-        if (frame.ordered) {
-          result = super.presentOrdered(appendOrderedQuads(frame.list, decorations), frame.triangles, frame.circles, frame.beziers, frame.canvasOperations);
-        } else {
-          const records = [2, frame.images.length];
-          for (const image of frame.images) {
-            records.push(1, image.textureId, image.x, image.y, image.width, image.height,
-              image.clipX ?? 0, image.clipY ?? 0, image.clipWidth ?? image.width, image.clipHeight ?? image.height);
-          }
-          result = super.presentOrdered(appendOrderedQuads(Buffer.from(new Float32Array(records).buffer), decorations));
-        }
-      } else {
-        result = frame.ordered
-          ? super.presentOrdered(frame.list, frame.triangles, frame.circles, frame.beziers, frame.canvasOperations)
-          : super.presentWithImages(frame.list, frame.images);
+      syncDocumentTextForPresent(this, this.#document, displayListTextLayers(list));
+      benchmarkMark("text");
+      // Scroll-layer content is drawn into its textures only where it changed;
+      // its text was just placed in layer space above.
+      paintScrollLayers(this, this.#document);
+      documentState(this.#document).paintDirtyElements?.clear();
+      benchmarkMark("scrollLayers");
+      try {
+        const canvas = displayListCanvas(list);
+        result = super.presentTransformed(list, canvas?.triangles, canvas?.circles, canvas?.beziers, canvas?.operations);
+      } catch (error) {
+        if (super.closed) this.#stopMedia();
+        throw error;
       }
+      benchmarkMark("nativePresent");
     }
     this._syncDragHitTest();
     benchmarkMark("finalDragHitTest");
@@ -995,6 +1088,10 @@ export class Window extends native.Window {
     return this.#document;
   }
 
+  get navigator() {
+    return sharedNavigator;
+  }
+
   /**
    * Browser-like `new Image()` for detached `<img>` elements. Loads immediately
    * at visible priority (always admitted), even before the first in-tree reflow.
@@ -1026,14 +1123,14 @@ export class Window extends native.Window {
     if (document) {
       document._attachWindow(this);
       this.#documentPresented = false;
+      // Image completions must not wait on first present — start the pump now.
+      this.#startEventPolling();
       // Warm layout as soon as the document attaches so the first present does
       // not pay the full create/style/children apply cost on the event path.
       queueMicrotask(() => {
         try { if (this.#document === document && !this.closed) documentBoxes(document); }
         catch (error) { if (!this.closed) console.error("Nasty initial layout failed:", error); }
       });
-      // Present before event polling. Hit-testing during the initial create/style
-      // burst otherwise blocks the main thread on a synchronous layoutSync.
       this.#scheduleAutomaticPresentation();
     } else {
       clearTimeout(this.#presentationTimer);
@@ -1114,8 +1211,8 @@ const RESIZABLE_MODES = new Set(["horizontal", "vertical", "both", "none"]);
 const ORIENTATION_MODES = new Set(["auto", "portrait", "landscape"]);
 
 function inputDecorationQuads(document, width, height) {
-  const boxes = documentBoxes(document);
-  const byElement = new Map(boxes.map(box => [box.element, box]));
+  documentPaintBoxes(document);
+  const byElement = { get: documentLiveLookup(document) };
   const values = [];
   const push = (rect, color, clip) => {
     let x = Math.max(0, rect.x, clip?.x ?? 0), y = Math.max(0, rect.y, clip?.y ?? 0);
@@ -1124,9 +1221,10 @@ function inputDecorationQuads(document, width, height) {
     if (right <= x || bottom <= y || !color) return;
     values.push(0, x, y, right - x, bottom - y, color[0], color[1], color[2], color[3], 0);
   };
-  for (const element of documentState(document).elements) {
-    if (element.localName !== "input" && element.localName !== "textarea") continue;
-    const state = elementState(element), editor = state.textAreaState, box = byElement.get(element);
+  for (const element of documentState(document).textControls ?? []) {
+    const state = elementState(element), editor = state.textAreaState;
+    if (!editor?.focused) continue;
+    const box = byElement.get(element);
     if (!editor?.focused || !box) continue;
     const clip = box.clip
       ? { x: Math.max(box.clip.x, box.contentBox.x), y: Math.max(box.clip.y, box.contentBox.y),
@@ -1145,8 +1243,7 @@ function inputDecorationQuads(document, width, height) {
 
 function inputDecorationOverlays(document) {
   const overlays = [];
-  for (const element of documentState(document).elements) {
-    if (element.localName !== "input" && element.localName !== "textarea") continue;
+  for (const element of documentState(document).textControls ?? []) {
     const state = elementState(element), editor = state.textAreaState;
     if (!editor?.focused) continue;
     const selectionColor = parseColor(state.selectionStyle?.backgroundColor ?? "rgba(59, 130, 246, 0.42)");
@@ -1267,7 +1364,7 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
     "top", "right", "bottom", "left",
     "padding", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft",
     "margin", "marginTop", "marginRight", "marginBottom", "marginLeft",
-    "borderWidth", "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth", "gap",
+    "borderWidth", "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth", "gap", "rowGap", "columnGap",
   ];
   for (const property of pixelLengths) {
     const value = result[property];
@@ -1321,16 +1418,15 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
       : (result[edge] ?? borderWidth);
     result[edge] = width > 0 ? width : 0;
   }
-  // fixed: insets are viewport-relative. absolute: insets are containing-block
-  // relative; when top+bottom or left+right are both set, CSS stretches the box.
-  // Taffy needs an explicit pixel width/height for that stretch (same bridge as fixed).
-  if (style.position === "fixed" || style.position === "absolute") {
+  // fixed: insets and percentages are viewport-relative, but Taffy positions
+  // absolute boxes against their parent, so bridge them to viewport pixels.
+  // absolute: Taffy already resolves insets, percentages, and inset stretching
+  // against the parent (containing block), so leave them untouched.
+  if (style.position === "fixed") {
     const left = fixedInset(style.left, viewport.width, fontSize, viewport);
     const right = fixedInset(style.right, viewport.width, fontSize, viewport);
     const top = fixedInset(style.top, viewport.height, fontSize, viewport);
     const bottom = fixedInset(style.bottom, viewport.height, fontSize, viewport);
-    // For absolute, percent insets still resolve against the viewport here only as a
-    // fallback when the containing block equals the viewport (full-bleed overlays).
     if (result.widthPercent !== undefined) {
       result.width = viewport.width * result.widthPercent;
       delete result.widthPercent;
@@ -1344,6 +1440,15 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
       result.height = Math.max(0, viewport.height - top - bottom);
     }
   }
+  // Forward CSS Grid longhands to the native Taffy bridge (string track lists).
+  for (const name of [
+    "gridTemplateColumns", "gridTemplateRows", "gridAutoFlow",
+    "gridAutoColumns", "gridAutoRows", "gridColumn", "gridRow",
+  ]) {
+    if (style[name] != null && style[name] !== "") result[name] = style[name];
+  }
+  if (style.rowGap != null && result.rowGap === undefined) result.rowGap = style.rowGap;
+  if (style.columnGap != null && result.columnGap === undefined) result.columnGap = style.columnGap;
   return result;
 }
 
@@ -1373,6 +1478,8 @@ function defaultElementStyle(name) {
   }
   return reset;
 }
+
+let blankTaffyStyle = null;
 
 function markGeometryDirty(document, affectsControls = true) {
   document.geometryDirty = true;
@@ -1411,42 +1518,18 @@ function documentHasTransformedContent(document) {
   return value;
 }
 
-function applyScrollDeltaToBoxes(scroller, deltaX, deltaY) {
-  if (!deltaX && !deltaY) return true;
-  const doc = documentState(scroller.document);
-  const boxes = doc.boxesSnapshot;
-  if (!boxes || doc.geometryDirty) return false;
-  const byElement = new Map(boxes.map((box) => [box.element, box]));
-  const hostBox = byElement.get(scroller);
-  if (!hostBox) return false;
-  // Translate descendants in the retained snapshot. The scroller's own box and
-  // clip stay put; this keeps hit-testing correct without a full layout walk.
-  const under = new Set();
-  const stack = [...scroller.children];
-  while (stack.length) {
-    const element = stack.pop();
-    under.add(element);
-    for (let index = 0; index < element.children.length; index++) stack.push(element.children[index]);
-  }
-  for (let index = 0; index < boxes.length; index++) {
-    const box = boxes[index];
-    if (!under.has(box.element)) continue;
-    const next = {
-      ...box,
-      x: box.x - deltaX,
-      y: box.y - deltaY,
-      borderBox: { ...box.borderBox, x: box.borderBox.x - deltaX, y: box.borderBox.y - deltaY },
-      paddingBox: { ...box.paddingBox, x: box.paddingBox.x - deltaX, y: box.paddingBox.y - deltaY },
-      contentBox: { ...box.contentBox, x: box.contentBox.x - deltaX, y: box.contentBox.y - deltaY },
-      marginBox: { ...box.marginBox, x: box.marginBox.x - deltaX, y: box.marginBox.y - deltaY },
-      clip: box.clip ? { ...box.clip } : null,
-    };
-    boxes[index] = next;
-    byElement.set(box.element, next);
-  }
-  doc.geometryGeneration = (doc.geometryGeneration ?? 0) + 1;
-  doc.hitTestCache = null;
-  return true;
+/**
+ * A scroll layer host only moves its layer's sampled region: paint geometry
+ * stays valid and screen-space boxes are re-derived on demand. Anything else
+ * (a scroller not yet assembled as a layer host) reassembles geometry.
+ */
+function markScrolled(element) {
+  const doc = documentState(element.document);
+  doc.scrollGeneration = (doc.scrollGeneration ?? 0) + 1;
+  (doc.cvScrolledHosts ??= new Set()).add(element);
+  doc.cvScrollAt = performance.now();
+  if (elementState(element).isLayerHost && !doc.geometryDirty) noteLayerScrolled(element);
+  else markGeometryDirty(doc, false);
 }
 
 function queueScrollEvent(element) {
@@ -1465,6 +1548,13 @@ function updateVideoVolume(element) {
   else setVideoAudioVolume(video.audioId, element.muted ? 0 : video.volume, video.currentTime);
 }
 
+// Inherited properties that change descendants' text measurement.
+const INHERITED_TEXT_PROPERTIES = ["fontSize", "fontFamily", "fontWeight", "fontStyle", "letterSpacing",
+  "lineHeight", "textTransform", "whiteSpace", "overflowWrap", "wordBreak"];
+function inheritsTextChange(changed) {
+  return INHERITED_TEXT_PROPERTIES.some(property => changed.has(property));
+}
+
 // Keep this in sync with the properties consumed by styleForTaffy() and
 // textMetrics(). Paint-only changes should not send the whole tree to the
 // layout worker on every animation frame.
@@ -1478,6 +1568,8 @@ const LAYOUT_STYLE_PROPERTIES = new Set([
   "borderRightWidth", "borderBottomWidth", "borderLeftWidth", "overflow", "boxSizing", "aspectRatio",
   "font", "fontFamily", "fontSize", "fontStyle", "fontWeight", "lineHeight", "letterSpacing", "whiteSpace",
   "textAlign", "textOverflow", "textTransform",
+  "gridTemplateColumns", "gridTemplateRows", "gridAutoFlow", "gridAutoColumns", "gridAutoRows", "gridColumn", "gridRow",
+  "contentVisibility", "containIntrinsicSize", "containIntrinsicWidth", "containIntrinsicHeight",
 ]);
 const HIT_TEST_TRANSITION_PROPERTIES = new Set(["transform", "perspective", "zIndex", "display", "visibility"]);
 // These do not change tessellated layout-space meshes. Carousel poses rewrite
@@ -1498,13 +1590,16 @@ const HIT_STRUCTURE_PROPERTIES = new Set([
 ]);
 
 const styleData = new WeakMap();
+const TRANSITION_CONTROLS = new Set(["transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction"]);
+const ANIMATION_CONTROLS = new Set([
+  "animation", "animationName", "animationDuration", "animationTimingFunction",
+  "animationDelay", "animationIterationCount", "animationDirection", "animationFillMode", "animationPlayState",
+]);
+
 function refreshStyleValues(state) {
   const next = { ...state.baseValues, ...state.hostValues, ...state.classValues };
-  const transitionControls = new Set(["transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction"]);
-  const animationControls = new Set([
-    "animation", "animationName", "animationDuration", "animationTimingFunction",
-    "animationDelay", "animationIterationCount", "animationDirection", "animationFillMode", "animationPlayState",
-  ]);
+  const transitionControls = TRANSITION_CONTROLS;
+  const animationControls = ANIMATION_CONTROLS;
   const keys = [...new Set([...Object.keys(state.values), ...Object.keys(next)])]
     .sort((a, b) => Number(transitionControls.has(b) || animationControls.has(b)) - Number(transitionControls.has(a) || animationControls.has(a)));
   const changed = new Set();
@@ -1555,6 +1650,7 @@ function refreshStyleValues(state) {
     }
   }
   syncCssAnimations(state);
+  if (changed.has("contentVisibility") && state.element?.document) noteContentVisibility(state.element, markGeometryDirty);
   for (const property of changed) {
     if (MESH_REVISION_IGNORED.has(property)) continue;
     state.meshRevision = (state.meshRevision ?? 0) + 1;
@@ -1652,7 +1748,7 @@ export class Element extends EventTarget {
     this.parent = null;
     this.children = [];
     this.attributes = new Map();
-    const state = { image: null, imageLoad: null, imageLoadState: "empty", imageLoadSticky: false, imageConstructor: false, imageAwaySince: null, currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null,
+    const state = { image: null, imageLoad: null, imageLoadState: "empty", imageLoadSticky: false, imageConstructor: false, imageAwaySince: null, imageMaxEdge: 0, currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null,
       selectionStyle: {}, textAreaState: null, inputValue: "", selectionStart: 0, selectionEnd: 0, selectionDirection: "none",
       scrollLeft: 0, scrollTop: 0,
       renderScrollLeft: null, renderTextOriginX: null, renderCaretX: null,
@@ -1660,12 +1756,18 @@ export class Element extends EventTarget {
     registerElementState(this, state);
     const docState = documentState(document);
     docState.elements.add(this);
+    (docState.textMetricsDirtyElements ??= new Set()).add(this);
+    docState.textMetricsDirty = true;
     if (this.localName === "input" || this.localName === "textarea") {
       docState.textControls ??= new Set();
       docState.textControls.add(this);
     }
     Object.defineProperty(this, "style", { value: new CSSStyleDeclaration(this, { ...defaultElementStyle(this.localName) }), enumerable: true });
-    state.handle = documentState(document).layoutTree.createNode(this._taffyStyle());
+    // The style is empty here and classes arrive next; send the real one once
+    // at layout time instead of converting it now and again after each change.
+    state.handle = documentState(document).layoutTree.createNode(blankTaffyStyle ??= styleForTaffy({}, 16, documentState(document).viewport));
+    (documentState(document).pendingStyleSync ??= new Set()).add(this);
+    if (this.localName === "img") (documentState(document).imageElements ??= new Set()).add(this);
   }
 
   addEventListener(type, callback, options) {
@@ -1995,7 +2097,10 @@ export class Element extends EventTarget {
       // Marker-only class tokens (no resolved CSS change) must not bump paint
       // or layout — same short-circuit as setHostStyle when nothing changed.
       if (changed.size) {
-        this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
+        this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
+      } else if ((nerdIcon(this)?.glyph ?? null) !== (elementState(this).nerdGlyph ?? null)) {
+        // Nerd Font icon tokens resolve to no CSS but change the element's text.
+        this._styleChanged("class");
       }
     } else if (name === "hidden") this._styleChanged();
     if (name === "muted" && this.localName === "video") {
@@ -2023,7 +2128,7 @@ export class Element extends EventTarget {
       state.hasResponsiveUtilities = false;
       state.classValues = {};
       const changed = refreshStyleValues(state);
-      this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
+      this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
     } else if (name === "hidden") this._styleChanged();
     if (name === "muted" && this.localName === "video") {
       updateVideoVolume(this);
@@ -2093,9 +2198,36 @@ export class Element extends EventTarget {
   get muted() { return this.hasAttribute("muted"); }
   set muted(value) { if (value) this.setAttribute("muted", ""); else this.removeAttribute("muted"); }
 
+  get srcObject() {
+    return this.localName === "video" ? (elementState(this).video.srcObject ?? null) : undefined;
+  }
+  set srcObject(value) {
+    if (this.localName !== "video") return;
+    if (value !== null && value !== undefined && !(value instanceof MediaStream)) {
+      throw new TypeError("HTMLVideoElement.srcObject must be a MediaStream or null");
+    }
+    const video = elementState(this).video;
+    if ((video.srcObject ?? null) === (value ?? null)) return;
+    video.srcObject = null;
+    this._setVideoSource("");
+    video.srcObject = value ?? null;
+    if (video.srcObject) {
+      video.duration = Infinity;
+      if (this.autoplay) this.play().catch(error => this.dispatchEvent(Object.assign(new Event("error"), { error })));
+    }
+  }
+
   async play() {
     if (this.localName !== "video") return;
     const video = elementState(this).video;
+    if (video.srcObject) {
+      if (!video.paused) return;
+      video.paused = false;
+      video.ended = false;
+      this.dispatchEvent(new Event("play"));
+      this._startMediaStream();
+      return;
+    }
     if (!this.src && !video.streamMode) throw new Error("video has no source");
     // Idempotent: Vitrola syncCarouselMedia / onattach call play() while already
     // playing. Each restart stop_worker+clears packets+re-demuxes (~seconds),
@@ -2171,6 +2303,56 @@ export class Element extends EventTarget {
     video.streamDecodeStarted = true;
     video.streamFrameGeneration = -1;
     video._heldStreamFrame = null;
+  }
+
+  // Live MediaStream playback: show each new picture of the first live video
+  // track, polled at the display refresh rate.
+  _startMediaStream() {
+    const video = elementState(this).video, token = ++video.token;
+    const startedAt = performance.now();
+    video.streamFrameGeneration = 0;
+    const pump = () => {
+      video.timer = null;
+      if (token !== video.token || video.paused || !video.srcObject) return;
+      const view = this.document?.defaultView;
+      if (view?.closed) return;
+      const track = video.srcObject.getVideoTracks().find(candidate => candidate.readyState === "live" && candidate.enabled);
+      const frame = view && track ? readVideoTrackFrame(track, video.streamFrameGeneration) : null;
+      if (frame) {
+        const dimensionsChanged = video.width !== frame.width || video.height !== frame.height;
+        if (video.textureId !== null && dimensionsChanged) {
+          view.deleteImageTexture(video.textureId);
+          video.textureId = null;
+        }
+        if (video.textureId === null) video.textureId = view.createImageTexture(frame.width, frame.height, frame.data);
+        else view.updateImageTexture(video.textureId, frame.data);
+        // Pixels stay available for canvas drawImage(video) readback.
+        video.image = { textureId: video.textureId, width: frame.width, height: frame.height, pixels: frame.data };
+        video.width = frame.width;
+        video.height = frame.height;
+        video.streamFrameGeneration = frame.generation;
+        video.currentTime = (performance.now() - startedAt) / 1000;
+        if (!video.metadataLoaded) {
+          video.metadataLoaded = true;
+          this.dispatchEvent(new Event("loadedmetadata"));
+        }
+        if (dimensionsChanged) {
+          this._styleChanged();
+          if (video.dataLoaded) this.dispatchEvent(new Event("resize"));
+        }
+        if (!video.dataLoaded) {
+          video.dataLoaded = true;
+          this.dispatchEvent(new Event("loadeddata"));
+          this.dispatchEvent(new Event("canplay"));
+          this.dispatchEvent(new Event("playing"));
+        }
+        this.dispatchEvent(new Event("timeupdate"));
+      }
+      const refreshRate = view?.refreshRate?.() || 60;
+      video.timer = setTimeout(pump, 1000 / refreshRate);
+      video.timer.unref?.();
+    };
+    pump();
   }
 
   _startVideoAudio(time) {
@@ -2688,9 +2870,21 @@ export class Element extends EventTarget {
     if (elementState(this).imageLoadState !== "pending" || request !== elementState(this).imageRequest) return;
     elementState(this).imageLoadState = "loading";
     elementState(this).currentSrc = source;
-    loadImage(source, window).then((result) => {
+    // Decode stays on worker threads. Only GPU upload + DOM events run on the
+    // main thread, and those are paced through enqueueImageCompletion so a
+    // burst of finished decodes cannot stall scroll/input for hundreds of ms.
+    // maxEdge from scheduler layout snapshot when available — never force layout here.
+    // Prefer layout box when known. Without it, cap hard so a dense gallery
+    // cannot enqueue dozens of multi-megapixel full-res decodes on first paint.
+    // Full-res still available via decode()/sticky or explicit imageMaxEdge.
+    const configured = Number(elementState(this).imageMaxEdge);
+    const maxEdge = Math.min(
+      8192,
+      Math.max(64, Number.isFinite(configured) && configured > 0 ? configured : 512),
+    );
+    loadImage(source, window, maxEdge).then((result) => {
       if (request !== elementState(this).imageRequest) {
-        window.deleteImageTexture(result.textureId);
+        try { window.deleteImageTexture(result.textureId); } catch { /* ignore */ }
         requestImageLoadSchedule(this.document);
         return;
       }
@@ -2698,15 +2892,26 @@ export class Element extends EventTarget {
         textureId: result.textureId,
         width: result.width,
         height: result.height,
-        pixels: result.pixels,
+        pixels: null,
       };
       clearPaintSegments(this);
       this._styleChanged("image");
+      try {
+        const ds = documentState(this.document);
+        // The decoded size only matters to layout when this image takes its
+        // size from it; a thumbnail with a definite width and height repaints.
+        const sizedByImage = this.style.width === undefined || this.style.height === undefined
+          || this.style.width === "auto" || this.style.height === "auto";
+        if (sizedByImage) ds.dirty = true;
+        ds.paintDirtyElements ??= new Set();
+        ds.paintDirtyElements.add(this);
+        // Prefer paint-local dirty over full sceneGeneration bump per thumb.
+        ds.paintGeneration = (ds.paintGeneration ?? 0) + 1;
+      } catch { /* ignore */ }
       elementState(this).imageLoadState = "loaded";
       elementState(this).resolveImageLoad?.(result);
       this.dispatchEvent(new Event("load"));
       elementState(this).resolveImageLoad = elementState(this).rejectImageLoad = null;
-      // Free a pool slot for the next local/network prefetch candidate.
       requestImageLoadSchedule(this.document);
     }, (error) => {
       if (request !== elementState(this).imageRequest) {
@@ -2744,6 +2949,7 @@ export class Element extends EventTarget {
     if (paintOnlyClass) {
       doc.livePaintElements ??= new Set();
       doc.livePaintElements.add(this);
+      (doc.livePaintStamps ??= new Map()).set(this, doc.presentId ?? 0);
       doc.livePaintDirty = true;
       doc.transitionFrameGeneration = (doc.transitionFrameGeneration ?? 0) + 1;
     } else if (noteScrollLayerPaintChange(this) !== "content") {
@@ -2770,13 +2976,28 @@ export class Element extends EventTarget {
     doc.paintDirtyElements ??= new Set();
     doc.paintDirtyElements.add(this);
     if (this === this.document.body) doc.defaultView?._syncBodyWindowAppearance();
-    if (property !== undefined && !LAYOUT_STYLE_PROPERTIES.has(property)) return;
+    // Nerd Font icon classes are text content: a class change that swaps the
+    // glyph must re-measure this element even when no layout property changed.
+    let glyphChanged = false;
+    if (property === "class") {
+      const glyph = nerdIcon(this)?.glyph ?? null;
+      const state = elementState(this);
+      if (glyph !== (state.nerdGlyph ?? null)) {
+        state.nerdGlyph = glyph;
+        glyphChanged = true;
+      }
+    }
+    if (property !== undefined && !LAYOUT_STYLE_PROPERTIES.has(property) && !glyphChanged) return;
     doc.textMetricsDirty = true;
-    doc.layoutTree.setStyle(elementState(this).handle, this._taffyStyle());
+    (doc.textMetricsDirtyElements ??= new Set()).add(this);
+    // Converting and sending the style once per element at layout time keeps
+    // a burst of class/attribute writes (building a subtree) linear.
+    (doc.pendingStyleSync ??= new Set()).add(this);
     if (inheritedFontChanged) {
       const refreshDescendants = element => {
         for (const child of element.children) {
-          doc.layoutTree.setStyle(elementState(child).handle, child._taffyStyle());
+          doc.textMetricsDirtyElements.add(child);
+          doc.pendingStyleSync.add(child);
           refreshDescendants(child);
         }
       };
@@ -2839,13 +3060,14 @@ export class Element extends EventTarget {
       && Object.keys(next).every(key => Object.is(next[key], state.classValues[key]))) return false;
     state.classValues = next;
     const changed = refreshStyleValues(state);
-    this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", changed.has("fontSize"));
+    this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
     return changed.size > 0;
   }
 
   _taffyStyle() {
     const style = { ...styleData.get(this.style).values, ...(this.hidden && { display: "none" }) };
     for (const property of Object.keys(style)) style[property] = computedStyleValue(this.style, property);
+    applyIntrinsicSize(this, style);
     const fontSize = Number.parseFloat(inheritedStyle(this, "fontSize", 16)) || 16;
     if (this.localName === "img") {
       const imageStyle = { ...style };
@@ -2887,11 +3109,8 @@ export class Element extends EventTarget {
     const next = Math.max(0, Number(value) || 0);
     const state = elementState(this);
     if (next === state.scrollLeft) return;
-    const previous = state.scrollLeft;
     state.scrollLeft = next;
-    if (!applyScrollDeltaToBoxes(this, next - previous, 0)) {
-      markGeometryDirty(documentState(this.document), false);
-    }
+    markScrolled(this);
     queueScrollEvent(this);
     requestImageLoadSchedule(this.document);
   }
@@ -2901,11 +3120,8 @@ export class Element extends EventTarget {
     const next = Math.max(0, Number(value) || 0);
     const state = elementState(this);
     if (next === state.scrollTop) return;
-    const previous = state.scrollTop;
     state.scrollTop = next;
-    if (!applyScrollDeltaToBoxes(this, 0, next - previous)) {
-      markGeometryDirty(documentState(this.document), false);
-    }
+    markScrolled(this);
     queueScrollEvent(this);
     requestImageLoadSchedule(this.document);
   }
@@ -2926,11 +3142,12 @@ export class Element extends EventTarget {
       throw new TypeError("child must belong to the same document");
     }
     if (child === this || this.isDescendantOf(child)) throw new Error("layout tree cycle");
+    const moved = child.parent === this;
     if (child.parent) child.parent.removeChild(child);
     this.children.push(child);
     child.parent = this;
     recordMutation({ type: "childList", target: this, addedNodes: [child], removedNodes: [], previousSibling: this.children.at(-2) ?? null, nextSibling: null });
-    child._styleChanged(undefined, true);
+    this.#childInserted(child, moved);
     this.#syncChildren();
     return child;
   }
@@ -2942,12 +3159,13 @@ export class Element extends EventTarget {
     if (!(child instanceof Element) || child.document !== this.document) throw new TypeError("child must belong to the same document");
     if (child === this || this.isDescendantOf(child)) throw new Error("layout tree cycle");
     if (child === referenceChild) return child;
+    const moved = child.parent === this;
     if (child.parent) child.parent.removeChild(child);
     const insertionIndex = this.children.indexOf(referenceChild);
     this.children.splice(insertionIndex, 0, child);
     child.parent = this;
     recordMutation({ type: "childList", target: this, addedNodes: [child], removedNodes: [], previousSibling: this.children[insertionIndex - 1] ?? null, nextSibling: referenceChild });
-    child._styleChanged(undefined, true);
+    this.#childInserted(child, moved);
     this.#syncChildren();
     return child;
   }
@@ -2963,7 +3181,9 @@ export class Element extends EventTarget {
     child.parent = null;
     recordMutation({ type: "childList", target: this, addedNodes: [], removedNodes: [child], previousSibling, nextSibling });
     if (child.localName === "video") child.pause();
-    child._styleChanged(undefined, true);
+    // A detached subtree is neither laid out nor painted; only this element's
+    // structure changed.
+    this.#structureChanged();
     this.#syncChildren();
     return child;
   }
@@ -2975,9 +3195,35 @@ export class Element extends EventTarget {
     return false;
   }
 
+  #childInserted(child, moved = false) {
+    // Inherited styles (em lengths, fonts) resolve against the new ancestry.
+    // Subtrees assembled while detached are refreshed once, when they connect;
+    // reordering within the same parent keeps the same ancestry.
+    if (!moved && this.#connected()) child._styleChanged(undefined, true);
+    else this.#structureChanged();
+  }
+
+  #connected() {
+    const body = this.document.body;
+    for (let node = this; node; node = node.parent) if (node === body) return true;
+    return false;
+  }
+
+  #structureChanged() {
+    const doc = documentState(this.document);
+    doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
+    doc.staticPaintGeneration = (doc.staticPaintGeneration ?? 0) + 1;
+    doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
+    doc.paintOrderGeneration = (doc.paintOrderGeneration ?? 0) + 1;
+    doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
+    (doc.paintDirtyElements ??= new Set()).add(this);
+  }
+
   #syncChildren() {
     const doc = documentState(this.document);
-    doc.layoutTree.setChildren(elementState(this).handle, this.children.map((child) => elementState(child).handle));
+    // Appending n children one by one would otherwise send the growing child
+    // list to the layout tree n times. Layout flushes it once per parent.
+    (doc.pendingChildSync ??= new Set()).add(this);
     // Structural DOM changes outside baked scroll textures (modals, stage mounts)
     // must rebuild the scroll-scene base. Changes inside a promoted scroller only
     // dirty that texture — same classification as _styleChanged.
@@ -2986,6 +3232,26 @@ export class Element extends EventTarget {
     }
     doc.dirty = true;
     markGeometryDirty(doc);
+  }
+}
+
+function flushChildSync(doc) {
+  const styles = doc.pendingStyleSync;
+  if (styles?.size) {
+    doc.pendingStyleSync = new Set();
+    for (const element of styles) {
+      // Contents of a skipped subtree are sent when they are released.
+      if (insideSkippedContent(element)) continue;
+      doc.layoutTree.setStyle(elementState(element).handle, element._taffyStyle());
+    }
+  }
+  const pending = doc.pendingChildSync;
+  if (!pending?.size) return;
+  doc.pendingChildSync = new Set();
+  for (const parent of pending) {
+    if (insideSkippedContent(parent)) continue;
+    const children = isContentSkipped(parent) ? [] : parent.children.map((child) => elementState(child).handle);
+    doc.layoutTree.setChildren(elementState(parent).handle, children);
   }
 }
 
@@ -3044,15 +3310,24 @@ export class Document extends EventTarget {
         // Renderers must observe the current viewport and DOM, just like geometry
         // getters. Keep this before the geometry cache lookup in #boxes().
         if (documentState(this).defaultView) this.#layoutSync(timings);
+        return this.#liveBoxes(timings);
+      },
+      // Paint geometry: scroll-layer content stays in layer space, so a scroll
+      // alone never reassembles it.
+      paintBoxes: (timings) => {
+        if (documentState(this).defaultView) this.#layoutSync(timings);
         return this.#boxes(timings);
       },
       renderBoxes: (elements, timings) => {
         this.#layoutSync();
         return this.#boxes(timings, elements);
       },
+      liveSnapshot: () => this.#liveOf(documentState(this).boxesSnapshot),
+      liveLookup: () => this.#liveLookup(),
       rect: (element) => {
         this.#layoutSync();
-        const box = this.#boxes().find((entry) => entry.element === element);
+        this.#boxes();
+        const box = documentState(this).boxesSnapshot && this.#liveLookup()(element);
         return box ? new DOMRect(box.x, box.y, box.width, box.height) : new DOMRect();
       },
     });
@@ -3091,10 +3366,16 @@ export class Document extends EventTarget {
     const doc = documentState(this);
     if (doc.textMetricsDirty === false) return;
     doc.textMetricsDirty = false;
-    for (const element of doc.elements) {
+    // Only elements whose own style, text, or inherited text properties changed
+    // (or that were just created/inserted) can have new metrics.
+    const dirty = doc.textMetricsDirtyElements ?? doc.elements;
+    doc.textMetricsDirtyElements = new Set();
+    for (const element of dirty) {
       const state = elementState(element);
       const isTextControl = element.localName === "input" || element.localName === "textarea";
       if (!renderedText(element) && !isTextControl) continue;
+      // Skipped contents are measured when they are released.
+      if (isContentSkipped(element) || insideSkippedContent(element)) continue;
       const metrics = textMetrics(element);
       if (state.sentTextMetrics === metrics.key) continue;
       state.sentTextMetrics = metrics.key;
@@ -3133,6 +3414,7 @@ export class Document extends EventTarget {
     }
     if (documentState(this).dirty || !documentState(this).layoutSnapshot) {
       const start = performance.now();
+      flushChildSync(documentState(this));
       const result = await documentState(this).layoutTree.layout(width, height, elementState(this.body).handle);
       const elapsed = performance.now() - start;
       if (timings) {
@@ -3184,7 +3466,15 @@ export class Document extends EventTarget {
           state.layoutTree.setStyle(elementState(element).handle, element._taffyStyle());
         }
       }
-      const result = documentState(this).layoutTree.layoutSync(width, height, elementState(this.body).handle);
+      let result;
+      for (let pass = 0; ; pass++) {
+        flushChildSync(documentState(this));
+        result = documentState(this).layoutTree.layoutSync(width, height, elementState(this.body).handle);
+        documentState(this).layoutSnapshot = result.boxes;
+        // Releasing or skipping contents moves what is below them: lay out again.
+        if (pass >= 3 || !reconcileContentVisibility(this, markGeometryDirty, { force: true })) break;
+        this.#prepareText();
+      }
       documentState(this).layoutSnapshot = result.boxes;
       documentState(this).dirty = !!state.transitionLayoutDirty;
       markGeometryDirty(documentState(this));
@@ -3193,6 +3483,33 @@ export class Document extends EventTarget {
     if (timings) timings.layout = performance.now() - started;
     if (didReflow) requestImageLoadSchedule(this);
     if (didReflow) notifyResizeObservers();
+  }
+
+  /** Screen-space boxes at the current scroll offsets, derived from the
+   *  assembled snapshot when only scroll positions changed since. */
+  #liveBoxes(timings) {
+    return this.#liveOf(this.#boxes(timings));
+  }
+
+  #liveLookup() {
+    const state = documentState(this);
+    const boxes = state.boxesSnapshot;
+    if (!boxes) return () => undefined;
+    const cached = state.liveLookup;
+    if (cached?.scrollGeneration === (state.scrollGeneration ?? 0) && cached.source === boxes) return cached.lookup;
+    const lookup = liveBoxLookup(boxes);
+    state.liveLookup = { scrollGeneration: state.scrollGeneration ?? 0, source: boxes, lookup };
+    return lookup;
+  }
+
+  #liveOf(boxes) {
+    const state = documentState(this);
+    if (!boxes || (state.boxesScrollGeneration ?? 0) === (state.scrollGeneration ?? 0)) return boxes;
+    const cached = state.liveBoxes;
+    if (cached?.scrollGeneration === state.scrollGeneration && cached.source === boxes) return cached.boxes;
+    const live = liveScreenBoxes(boxes);
+    state.liveBoxes = { scrollGeneration: state.scrollGeneration, source: boxes, boxes: live };
+    return live;
   }
 
   #boxes(timings, selectedElements = null) {
@@ -3216,6 +3533,7 @@ export class Document extends EventTarget {
     else {
       const collect = (element) => {
         elements.push(element);
+        if (isContentSkipped(element)) return;
         for (const child of element.children) collect(child);
       };
       collect(this.body);
@@ -3243,8 +3561,9 @@ export class Document extends EventTarget {
       fixedOffsets.set(element, offset);
       return offset;
     };
+    const layoutSnapshot = state.layoutSnapshot;
     const raw = elements.map((element) => {
-      const box = documentState(this).layoutSnapshot?.[elementState(element).handle] ?? { x: 0, y: 0, width: 0, height: 0 };
+      const box = layoutSnapshot?.[elementState(element).handle] ?? { x: 0, y: 0, width: 0, height: 0 };
       const fixed = offsetFor(element);
       const margin = { top: box.marginTop ?? 0, right: box.marginRight ?? 0, bottom: box.marginBottom ?? 0, left: box.marginLeft ?? 0 };
       const border = { top: box.borderTop ?? 0, right: box.borderRight ?? 0, bottom: box.borderBottom ?? 0, left: box.borderLeft ?? 0 };
@@ -3258,7 +3577,16 @@ export class Document extends EventTarget {
         width: box.width + margin.left + margin.right,
         height: box.height + margin.top + margin.bottom,
       };
-      return { element, ...borderBox, margin, border, padding, marginBox, borderBox, paddingBox, contentBox, fixedRoot: fixed.root };
+      // One explicit shape for every box (fields set later are pre-declared),
+      // so the passes below stay monomorphic.
+      return { element, x: borderBox.x, y: borderBox.y, width: borderBox.width, height: borderBox.height,
+        margin, border, padding, marginBox, borderBox, paddingBox, contentBox, fixedRoot: fixed.root,
+        clip: null, scrollWidth: 0, scrollHeight: 0,
+        // Scroll layers: the nearest scrolling ancestor whose content is
+        // painted into its own texture, that content's screen origin at this
+        // assembly, and the clip contributed only by ancestors inside it.
+        layerHost: null, layerOriginX: 0, layerOriginY: 0, innerClip: null,
+        isLayerHost: false, assembledScrollLeft: 0, assembledScrollTop: 0 };
     });
     const byElement = new Map(raw.map((box) => [box.element, box]));
     const overflowBehaviors = new Map();
@@ -3268,57 +3596,70 @@ export class Document extends EventTarget {
       let width = box.paddingBox.width;
       let height = box.paddingBox.height;
       for (const child of box.element.children) {
-        if (child.style.position === "fixed") continue;
-        if (selectedElements && !byElement.has(child)) continue;
         const childBox = byElement.get(child);
+        if (!childBox || childBox.fixedRoot === child) continue;
         const childExtent = extents.get(child) ?? { width: childBox.width, height: childBox.height };
         width = Math.max(width, childBox.x - box.paddingBox.x + childExtent.width + childBox.margin.right + box.padding.right);
         height = Math.max(height, childBox.y - box.paddingBox.y + childExtent.height + childBox.margin.bottom + box.padding.bottom);
       }
       extents.set(box.element, { width, height });
     }
+    // Boxes are in pre-order, so each element's scroll offset and clip follow
+    // from its parent's (O(n) instead of walking every ancestor per box). A
+    // fixed element starts a new scope: no ancestor scroll or clip applies.
+    const behaviorOf = (element) => {
+      let behavior = overflowBehaviors.get(element);
+      if (!behavior) {
+        behavior = {
+          clipX: clipsOverflow(element, 'x'), clipY: clipsOverflow(element, 'y'),
+          scrollX: canScroll(element, 'x'), scrollY: canScroll(element, 'y'),
+        };
+        overflowBehaviors.set(element, behavior);
+      }
+      return behavior;
+    };
+    const scopes = new Map();
     const boxes = raw.map((box) => {
-      let x = box.x;
-      let y = box.y;
-      let clip = null;
-      for (let parent = box.element.parent; parent; parent = parent.parent) {
-        if (box.fixedRoot && parent === box.fixedRoot.parent) break;
+      const parent = box.element.parent;
+      const parentScope = parent && box.fixedRoot !== box.element ? scopes.get(parent) : null;
+      let scrollX = 0, scrollY = 0, clip = null;
+      let layerHost = null, layerOriginX = 0, layerOriginY = 0, innerClip = null;
+      if (parentScope) {
         const parentBox = byElement.get(parent);
-        let behavior = overflowBehaviors.get(parent);
-        if (!behavior) {
-          behavior = {
-            clipX: clipsOverflow(parent, 'x'), clipY: clipsOverflow(parent, 'y'),
-            scrollX: canScroll(parent, 'x'), scrollY: canScroll(parent, 'y'),
-          };
-          overflowBehaviors.set(parent, behavior);
-        }
-        const { clipX, clipY, scrollX, scrollY } = behavior;
-        if (scrollX) x -= parent.scrollLeft;
-        if (scrollY) y -= parent.scrollTop;
-        if ((clipX || clipY) && parentBox) {
-          let clipLeft = parentBox.paddingBox.x;
-          let clipTop = parentBox.paddingBox.y;
-          for (let ancestor = parent.parent; ancestor; ancestor = ancestor.parent) {
-            let ancestorBehavior = overflowBehaviors.get(ancestor);
-            if (!ancestorBehavior) {
-              ancestorBehavior = {
-                clipX: clipsOverflow(ancestor, 'x'), clipY: clipsOverflow(ancestor, 'y'),
-                scrollX: canScroll(ancestor, 'x'), scrollY: canScroll(ancestor, 'y'),
-              };
-              overflowBehaviors.set(ancestor, ancestorBehavior);
-            }
-            if (ancestorBehavior.scrollX) clipLeft -= ancestor.scrollLeft;
-            if (ancestorBehavior.scrollY) clipTop -= ancestor.scrollTop;
-          }
-          const next = {
-            x: clipX ? clipLeft : 0,
-            y: clipY ? clipTop : 0,
-            width: clipX ? parentBox.paddingBox.width : state.viewport.width,
-            height: clipY ? parentBox.paddingBox.height : state.viewport.height,
+        const behavior = behaviorOf(parent);
+        scrollX = parentScope.scrollX + (behavior.scrollX ? parent.scrollLeft : 0);
+        scrollY = parentScope.scrollY + (behavior.scrollY ? parent.scrollTop : 0);
+        clip = parentScope.clip;
+        ({ layerHost, layerOriginX, layerOriginY, innerClip } = parentScope);
+        let next = null;
+        if ((behavior.clipX || behavior.clipY) && parentBox) {
+          // The parent was already translated by its own scroll scope below.
+          next = {
+            x: behavior.clipX ? parentBox.paddingBox.x : 0,
+            y: behavior.clipY ? parentBox.paddingBox.y : 0,
+            width: behavior.clipX ? parentBox.paddingBox.width : state.viewport.width,
+            height: behavior.clipY ? parentBox.paddingBox.height : state.viewport.height,
           };
           clip = clip ? intersect(clip, next) : next;
         }
+        if (parentBox?.isLayerHost) {
+          // Content of a scroll layer lives in the layer's own space: its
+          // origin moves with the host's scroll and the host does not clip it.
+          layerHost = parent;
+          layerOriginX = parentBox.paddingBox.x - parent.scrollLeft;
+          layerOriginY = parentBox.paddingBox.y - parent.scrollTop;
+          innerClip = null;
+        } else if (next) {
+          innerClip = innerClip ? intersect(innerClip, next) : next;
+        }
       }
+      scopes.set(box.element, { scrollX, scrollY, clip, layerHost, layerOriginX, layerOriginY, innerClip });
+      box.layerHost = layerHost;
+      box.layerOriginX = layerOriginX;
+      box.layerOriginY = layerOriginY;
+      box.innerClip = innerClip;
+      const x = box.x - scrollX;
+      const y = box.y - scrollY;
       const extent = extents.get(box.element);
       const clientWidth = box.paddingBox.width;
       const clientHeight = box.paddingBox.height;
@@ -3360,15 +3701,32 @@ export class Document extends EventTarget {
         box.element.scrollLeft = Math.min(oldScrollLeft, newMaxLeft);
         box.element.scrollTop = Math.min(oldScrollTop, newMaxTop);
       }
-      const translatedBorderBox = { ...box.borderBox, x, y };
-      const translatedPaddingBox = { ...box.paddingBox, x: box.paddingBox.x + (x - box.x), y: box.paddingBox.y + (y - box.y) };
-      const translatedContentBox = { ...box.contentBox, x: box.contentBox.x + (x - box.x), y: box.contentBox.y + (y - box.y) };
-      const translatedMarginBox = { ...box.marginBox, x: box.marginBox.x + (x - box.x), y: box.marginBox.y + (y - box.y) };
-      return { ...box, x, y, borderBox: translatedBorderBox, paddingBox: translatedPaddingBox, contentBox: translatedContentBox, marginBox: translatedMarginBox, clip, scrollWidth: box.element.scrollWidth, scrollHeight: box.element.scrollHeight };
+      // These rects were created for this pass; translate them in place rather
+      // than copying every box (this runs for the whole tree on each layout).
+      const dx = x - box.x, dy = y - box.y;
+      box.borderBox.x = x; box.borderBox.y = y;
+      box.paddingBox.x += dx; box.paddingBox.y += dy;
+      box.contentBox.x += dx; box.contentBox.y += dy;
+      box.marginBox.x += dx; box.marginBox.y += dy;
+      box.x = x; box.y = y;
+      box.clip = clip;
+      box.scrollWidth = box.element.scrollWidth;
+      box.scrollHeight = box.element.scrollHeight;
+      // A scroller whose content overflows paints that content into a scroll
+      // layer; scrolling it then only moves the layer's sampled region.
+      const behavior = behaviorOf(box.element);
+      box.isLayerHost = !box.element.hidden && box.element.style.display !== "none"
+        && ((userScrollableStyle(box.element, "x") && extent.width > clientWidth + 0.5)
+          || (userScrollableStyle(box.element, "y") && extent.height > clientHeight + 0.5));
+      elementState(box.element).isLayerHost = box.isLayerHost;
+      box.assembledScrollLeft = box.element.scrollLeft;
+      box.assembledScrollTop = box.element.scrollTop;
+      return box;
     });
     if (timings) timings.assembly = performance.now() - assemblyStart;
     if (!selectedElements) {
       documentState(this).boxesSnapshot = boxes;
+      documentState(this).boxesScrollGeneration = documentState(this).scrollGeneration ?? 0;
       documentState(this).geometryDirty = false;
       // Fresh scroll-adjusted boxes after reflow — recompute the image pool.
       requestImageLoadSchedule(this);
@@ -3380,57 +3738,35 @@ export class Document extends EventTarget {
 
   scrollAt(x, y, deltaX = 0, deltaY = 0, target = null) {
     if (![x, y, deltaX, deltaY].every(Number.isFinite)) return false;
-    const state = documentState(this);
-    const cache = state.hitTestCache;
-    const tryCachedTarget = target => {
-      if (!target || !cache || cache.sceneGeneration !== state.sceneGeneration
-        || cache.controlGeometryGeneration !== state.controlGeometryGeneration) return null;
-      for (let element = target; element; element = element.parentElement) {
-        const scrollX = canScrollByUser(element, "x"), scrollY = canScrollByUser(element, "y");
-        if ((!scrollX || !deltaX) && (!scrollY || !deltaY)) continue;
-        const box = cache.byElement.get(element);
-        if (!box || x < box.x || y < box.y || x >= box.x + box.width || y >= box.y + box.height) continue;
-        if (box.clip && (x < box.clip.x || y < box.clip.y || x >= box.clip.x + box.clip.width || y >= box.clip.y + box.clip.height)) continue;
-        let ancestorsCurrent = true;
-        for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
-          if (!canScroll(ancestor, "x") && !canScroll(ancestor, "y")) continue;
-          const old = cache.scrollOffsets.get(ancestor);
-          if (!old || old[0] !== ancestor.scrollLeft || old[1] !== ancestor.scrollTop) {
-            ancestorsCurrent = false;
-            break;
-          }
-        }
-        if (!ancestorsCurrent) return null;
-        const maxX = Math.max(0, box.scrollWidth - box.paddingBox.width);
-        const maxY = Math.max(0, box.scrollHeight - box.paddingBox.height);
-        const nextX = scrollX ? Math.max(0, Math.min(maxX, element.scrollLeft + deltaX)) : element.scrollLeft;
-        const nextY = scrollY ? Math.max(0, Math.min(maxY, element.scrollTop + deltaY)) : element.scrollTop;
-        if (nextX !== element.scrollLeft || nextY !== element.scrollTop) {
-          element.scrollLeft = nextX;
-          element.scrollTop = nextY;
-          return true;
-        }
-      }
-      return false;
-    };
-    const cachedResult = tryCachedTarget(target);
-    if (cachedResult !== null) return cachedResult;
-    const boxes = documentBoxes(this);
-    for (let i = boxes.length - 1; i >= 0; i--) {
-      const box = boxes[i];
-      const scrollX = canScrollByUser(box.element, 'x');
-      const scrollY = canScrollByUser(box.element, 'y');
-      if ((!scrollX || !deltaX) && (!scrollY || !deltaY)) continue;
-      if (x < box.x || y < box.y || x >= box.x + box.width || y >= box.y + box.height) continue;
-      if (box.clip && (x < box.clip.x || y < box.clip.y || x >= box.clip.x + box.clip.width || y >= box.clip.y + box.clip.height)) continue;
+    const scrollBox = (element, box) => {
+      const scrollX = canScrollByUser(element, "x"), scrollY = canScrollByUser(element, "y");
+      if ((!scrollX || !deltaX) && (!scrollY || !deltaY)) return false;
+      if (x < box.x || y < box.y || x >= box.x + box.width || y >= box.y + box.height) return false;
+      if (box.clip && (x < box.clip.x || y < box.clip.y || x >= box.clip.x + box.clip.width || y >= box.clip.y + box.clip.height)) return false;
       const maxX = Math.max(0, box.scrollWidth - box.paddingBox.width);
       const maxY = Math.max(0, box.scrollHeight - box.paddingBox.height);
-      const nextX = scrollX ? Math.max(0, Math.min(maxX, box.element.scrollLeft + deltaX)) : box.element.scrollLeft;
-      const nextY = scrollY ? Math.max(0, Math.min(maxY, box.element.scrollTop + deltaY)) : box.element.scrollTop;
-      if (nextX === box.element.scrollLeft && nextY === box.element.scrollTop) continue;
-      box.element.scrollLeft = nextX;
-      box.element.scrollTop = nextY;
+      const nextX = scrollX ? Math.max(0, Math.min(maxX, element.scrollLeft + deltaX)) : element.scrollLeft;
+      const nextY = scrollY ? Math.max(0, Math.min(maxY, element.scrollTop + deltaY)) : element.scrollTop;
+      if (nextX === element.scrollLeft && nextY === element.scrollTop) return false;
+      element.scrollLeft = nextX;
+      element.scrollTop = nextY;
       return true;
+    };
+    // With a target, only its ancestors can scroll: look them up one by one
+    // instead of scanning (and copying) every box in the document.
+    if (target) {
+      this.#layoutSync();
+      this.#boxes();
+      const lookup = this.#liveLookup();
+      for (let element = target; element; element = element.parentElement) {
+        const box = lookup(element);
+        if (box && scrollBox(element, box)) return true;
+      }
+      return false;
+    }
+    const boxes = documentBoxes(this);
+    for (let i = boxes.length - 1; i >= 0; i--) {
+      if (scrollBox(boxes[i].element, boxes[i])) return true;
     }
     return false;
   }

@@ -101,6 +101,8 @@ function toMilliseconds(token) {
 }
 
 function transitionOptions(state, property) {
+  // Without a shorthand or a duration every duration resolves to 0s: no transition.
+  if (state.values.transition === undefined && state.values.transitionDuration === undefined) return null;
   const targetName = kebab(property);
   const shorthand = state.values.transition;
   const properties = splitList(String(shorthand ?? state.values.transitionProperty ?? "all"));

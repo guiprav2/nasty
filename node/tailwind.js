@@ -7,6 +7,7 @@ const LENGTHS = new Set([
   "width", "height", "minWidth", "minHeight", "maxWidth", "maxHeight", "top", "right", "bottom", "left",
   "padding", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft", "margin", "marginTop", "marginRight", "marginBottom", "marginLeft",
   "gap", "rowGap", "columnGap", "borderWidth", "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth",
+  "containIntrinsicWidth", "containIntrinsicHeight",
   "fontSize", "lineHeight", "letterSpacing", "borderRadius", "borderTopLeftRadius", "borderTopRightRadius", "borderBottomLeftRadius", "borderBottomRightRadius",
 ]);
 const UNITLESS = new Set(["opacity", "flex", "flexGrow", "flexShrink", "zIndex", "order", "fontWeight", "aspectRatio"]);
@@ -33,6 +34,7 @@ const CSS_PROPERTIES = new Set([
   "caretColor",
   // csswg-drafts#14598: separate edge + margin (threshold) longhands.
   "overflowAnchorEdge", "overflowAnchorMargin",
+  "contentVisibility", "containIntrinsicSize",
 ]);
 const BREAKPOINTS = { sm: 640, md: 768, lg: 1024, xl: 1280, "2xl": 1536 };
 const kebabToCamel = value => value.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -128,7 +130,7 @@ function utilityStyle(utility) {
   const ringColor = /^ring-(.+)$/.exec(utility);
   if (ringColor && colorValue(ringColor[1])) return ["__ringColor", colorValue(ringColor[1])];
   const fixed = {
-    block: ["display", "block"], flex: ["display", "flex"], "inline-flex": ["display", "flex"], grid: [["display", "flex"], ["flexWrap", "wrap"]], hidden: ["display", "none"], invisible: ["visibility", "hidden"], visible: ["visibility", "visible"],
+    block: ["display", "block"], flex: ["display", "flex"], "inline-flex": ["display", "flex"], grid: ["display", "grid"], hidden: ["display", "none"], invisible: ["visibility", "hidden"], visible: ["visibility", "visible"],
     "flex-row": ["flexDirection", "row"], "flex-row-reverse": ["flexDirection", "row-reverse"], "flex-col": ["flexDirection", "column"], "flex-col-reverse": ["flexDirection", "column-reverse"],
     "flex-wrap": ["flexWrap", "wrap"], "flex-nowrap": ["flexWrap", "nowrap"], "flex-wrap-reverse": ["flexWrap", "wrap-reverse"],
     // These Tailwind shorthands expand to their standard CSS longhands so the
@@ -157,6 +159,9 @@ function utilityStyle(utility) {
     "overflow-visible": [["overflow", "visible"], ["overflowX", "visible"], ["overflowY", "visible"]],
     "overflow-x-hidden": ["overflowX", "hidden"], "overflow-x-auto": ["overflowX", "auto"], "overflow-x-scroll": ["overflowX", "scroll"], "overflow-x-visible": ["overflowX", "visible"],
     "overflow-y-hidden": ["overflowY", "hidden"], "overflow-y-auto": ["overflowY", "auto"], "overflow-y-scroll": ["overflowY", "scroll"], "overflow-y-visible": ["overflowY", "visible"],
+    "content-auto": ["contentVisibility", "auto"],
+    "content-hidden": ["contentVisibility", "hidden"],
+    "content-visible": ["contentVisibility", "visible"],
     "overflow-anchor-edge-none": ["overflowAnchorEdge", "none"],
     "overflow-anchor-edge-auto": ["overflowAnchorEdge", "auto"],
     "overflow-anchor-edge-start": ["overflowAnchorEdge", "start"],
@@ -241,6 +246,19 @@ function utilityStyle(utility) {
     }
     return null;
   }
+  // contain-intrinsic-size-[200px_58px] / -width-[N] / -height-[N]: the size a
+  // content-visibility:auto element reports while its contents are skipped.
+  const intrinsic = /^contain-intrinsic-(size|width|height)-(.+)$/.exec(utility);
+  if (intrinsic) {
+    let raw = intrinsic[2];
+    if (raw.startsWith("[") && raw.endsWith("]")) raw = raw.slice(1, -1);
+    const parts = raw.split("_").map(part => parseLength(/^-?(?:\d+\.?\d*|\.\d+)$/.test(part) ? `${part}px` : part));
+    if (!parts.length || parts.length > 2 || parts.some(part => !Number.isFinite(part))) return null;
+    if (intrinsic[1] === "width") return ["containIntrinsicWidth", parts[0]];
+    if (intrinsic[1] === "height") return ["containIntrinsicHeight", parts[0]];
+    const [width, height = parts[0]] = parts;
+    return [["containIntrinsicSize", `${width}px ${height}px`], ["containIntrinsicWidth", width], ["containIntrinsicHeight", height]];
+  }
   const duration = /^duration-(\d+)$/.exec(utility);
   if (duration) return ["transitionDuration", `${duration[1]}ms`];
   const caret = /^caret-(.+)$/.exec(utility);
@@ -274,6 +292,49 @@ function utilityStyle(utility) {
     const props = map[corner];
     if (!props) return null;
     return props.map(p => [p, value]);
+  }
+
+  const gridCols = /^grid-cols-(.+)$/.exec(utility);
+  if (gridCols) {
+    const value = gridCols[1];
+    if (value === "none") return ["gridTemplateColumns", "none"];
+    if (value === "subgrid") return ["gridTemplateColumns", "subgrid"];
+    if (/^\d+$/.test(value)) return ["gridTemplateColumns", `repeat(${value}, minmax(0, 1fr))`];
+    if (value.startsWith("[") && value.endsWith("]")) {
+      const raw = value.slice(1, -1).replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_").trim();
+      return raw ? ["gridTemplateColumns", raw] : null;
+    }
+    return null;
+  }
+  const gridRows = /^grid-rows-(.+)$/.exec(utility);
+  if (gridRows) {
+    const value = gridRows[1];
+    if (value === "none") return ["gridTemplateRows", "none"];
+    if (/^\d+$/.test(value)) return ["gridTemplateRows", `repeat(${value}, minmax(0, 1fr))`];
+    if (value.startsWith("[") && value.endsWith("]")) {
+      const raw = value.slice(1, -1).replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_").trim();
+      return raw ? ["gridTemplateRows", raw] : null;
+    }
+    return null;
+  }
+  const colSpan = /^col-span-(.+)$/.exec(utility);
+  if (colSpan) {
+    const value = colSpan[1];
+    if (value === "full") return ["gridColumn", "1 / -1"];
+    if (/^\d+$/.test(value)) return ["gridColumn", `span ${value}`];
+    return null;
+  }
+  const rowSpan = /^row-span-(.+)$/.exec(utility);
+  if (rowSpan) {
+    const value = rowSpan[1];
+    if (value === "full") return ["gridRow", "1 / -1"];
+    if (/^\d+$/.test(value)) return ["gridRow", `span ${value}`];
+    return null;
+  }
+  const gridFlow = /^grid-flow-(.+)$/.exec(utility);
+  if (gridFlow) {
+    const map = { row: "row", col: "column", "row-dense": "row dense", "col-dense": "column dense", dense: "dense" };
+    return map[gridFlow[1]] ? ["gridAutoFlow", map[gridFlow[1]]] : null;
   }
   const tracking = /^tracking-(.+)$/.exec(utility);
   if (tracking) {
@@ -500,7 +561,19 @@ export function resolveTailwind(className, width = 0) {
 
 // Tailwind's selection variant styles the standard ::selection pseudo-element;
 // keep its standard CSS declarations separate from the element's CSSOM.
+const selectionCache = new Map();
+// Element construction resolves selection styles for every class change; cache
+// like resolveTailwind (results are frozen).
 export function resolveTailwindSelection(className, width = 0) {
+  const key = `${width}\0${className}`;
+  const cached = selectionCache.get(key);
+  if (cached) return cached;
+  const values = resolveSelectionUncached(className, width);
+  selectionCache.set(key, values);
+  if (selectionCache.size > 1024) selectionCache.delete(selectionCache.keys().next().value);
+  return values;
+}
+function resolveSelectionUncached(className, width) {
   const utilities = String(className).split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index }))
     .filter(token => token.variants.includes("selection")
       && active(token.variants.filter(variant => variant !== "selection"), width));

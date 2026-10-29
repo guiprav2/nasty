@@ -15,7 +15,7 @@ LINKER="$TOOLCHAIN/${TARGET}${ANDROID_API}-clang"
 for path in "$ANDROID_SDK_ROOT/platform-tools/adb" "$LINKER" "$NODE_MOBILE_ROOT/bin/$ABI/libnode.so"; do
   [[ -e "$path" ]] || { echo "Missing Android build input: $path" >&2; exit 2; }
 done
-rustup target list --installed | rg -qx "$TARGET" || {
+rustup target list --installed | grep -qx "$TARGET" || {
   echo "Rust target $TARGET is not installed. Run: rustup target add $TARGET" >&2
   exit 2
 }

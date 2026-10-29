@@ -406,12 +406,14 @@ export function resetCanvasContext(context) {
 export function imageSurface(element) {
   const state = elementState(element);
   if (state.canvasContext) return canvasSurface(state.canvasContext);
-  if (!state.image?.pixels) return null;
-  if (!state.rasterImage || state.rasterImageSource !== state.image) {
-    const { width, height, pixels } = state.image;
-    state.rasterImage = createCanvas(width, height);
+  const image = element.localName === 'video' ? state.video?.image : state.image;
+  if (!image?.pixels) return null;
+  if (!state.rasterImage || state.rasterImageSource !== image) {
+    const { width, height, pixels } = image;
+    // Live video replaces its picture every frame; reuse a same-sized raster.
+    if (state.rasterImage?.width !== width || state.rasterImage?.height !== height) state.rasterImage = createCanvas(width, height);
     state.rasterImage.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(pixels), width, height), 0, 0);
-    state.rasterImageSource = state.image;
+    state.rasterImageSource = image;
   }
   return state.rasterImage;
 }

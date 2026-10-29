@@ -62,31 +62,33 @@ function normalizeChildren(document, children) {
   });
 }
 
+function scanNode(document, current, attached) {
+  if (!nodeBindings.has(current) && !lifecycle.has(current)) return;
+  const isAttached = attached && connected(document, current);
+  const wasAttached = attachedState.get(current) === true;
+  if (isAttached === wasAttached) return;
+  attachedState.set(current, isAttached);
+  lifecycle.get(current)?.[isAttached ? "attach" : "detach"]?.(current);
+}
+
 function scan(document, nodes, attached) {
   for (const node of nodes) {
-    const list = [node, ...node.querySelectorAll("*")];
-    for (const current of list) {
-      if (!nodeBindings.has(current) && !lifecycle.has(current)) continue;
-      const isAttached = attached && connected(document, current);
-      const wasAttached = attachedState.get(current) === true;
-      if (isAttached === wasAttached) continue;
-      attachedState.set(current, isAttached);
-      lifecycle.get(current)?.[isAttached ? "attach" : "detach"]?.(current);
-    }
+    scanNode(document, node, attached);
+    for (const current of node.querySelectorAll("*")) scanNode(document, current, attached);
   }
 }
 
-function updateBound(document) {
-  for (const callback of globalListeners.beforeUpdate) callback();
+function updateBound(document, nodes = null, notify = true) {
+  if (notify) for (const callback of globalListeners.beforeUpdate) callback();
   const state = roots.get(document);
-  for (const node of state?.bound || []) {
+  for (const node of nodes ?? state?.bound ?? []) {
     if (!connected(document, node)) continue;
     for (const binding of nodeBindings.get(node) || []) {
       try { binding.update(); }
       catch (error) { console.error("Dominant binding update failed:", error); }
     }
   }
-  for (const callback of globalListeners.update) callback();
+  if (notify) for (const callback of globalListeners.update) callback();
 }
 
 export function dominant(document) {
@@ -106,11 +108,19 @@ export function dominant(document) {
       for (const node of record.addedNodes || []) {
         scan(document, [node], true);
         const descendants = [node, ...node.querySelectorAll("*")];
-        for (const child of descendants) if (nodeBindings.has(child) || lifecycle.has(child)) state.bound.add(child);
+        for (const child of descendants) {
+          if (!(nodeBindings.has(child) || lifecycle.has(child)) || state.bound.has(child)) continue;
+          state.bound.add(child);
+          added.add(child);
+        }
       }
     }
-    updateBound(document);
+    // Only newly attached nodes need their first binding pass; nodes that were
+    // merely reordered (d.map) are already current.
+    if (added.size) updateBound(document, [...added], false);
+    added.clear();
   });
+  const added = new Set();
   observer.observe(document.body, { childList: true, subtree: true });
   observers.set(document, observer);
 
@@ -248,11 +258,14 @@ export function dominant(document) {
     comment: () => marker(),
     resolve: value => typeof value === "function" ? value() : value,
     updateSync() {
-      updateBound(document);
-      for (const node of state.bound) scan(document, [node], true);
+      updateBound(document, null, true);
+      // Every node with bindings or lifecycle hooks is in `bound` itself, so
+      // check each once instead of re-walking every bound subtree.
+      for (const node of state.bound) scanNode(document, node, true);
       // Bindings can change class/hidden after the first pass; flush once more
-      // so display:none reaches layout before paint.
-      updateBound(document);
+      // so display:none reaches layout before paint. App state has not changed
+      // in between, so update listeners fire once for the whole flush.
+      updateBound(document, null, false);
     },
     update() {
       if (state.scheduled) return Promise.resolve();

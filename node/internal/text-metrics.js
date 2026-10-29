@@ -12,6 +12,8 @@ function loadFamilies(stack) {
 }
 const context = createCanvas(1, 1).getContext('2d');
 const fontBounds = new Map();
+// GlobalFonts.has is a slow native lookup; families only change by registration.
+const resolvedFamilies = new Map();
 export function inherited(element, name, fallback) {
   for (let current = element; current; current = current.parent) {
     const value = current.style[name];
@@ -34,6 +36,14 @@ export function textStyle(element) {
   if (!requestedFamilies.some(name => name.toLowerCase() === 'dejavu sans')) requestedFamilies.push('DejaVu Sans');
   const family = requestedFamilies.map(name => `'${name}'`).join(', ');
   loadFamilies(requestedFamilies.join(', '));
+  // The face Skia measures with is the first family it can satisfy. Native
+  // text shaping draws with that same family so layout and paint agree.
+  const stackKey = requestedFamilies.join(',');
+  let resolvedFamily = resolvedFamilies.get(stackKey);
+  if (resolvedFamily === undefined) {
+    resolvedFamily = requestedFamilies.find(name => GlobalFonts.has(name)) ?? systemFontFamily;
+    resolvedFamilies.set(stackKey, resolvedFamily);
+  }
   const rawSpacing = inherited(element, 'letterSpacing', 0);
   const spacing = parseFloat(rawSpacing) * (String(rawSpacing).endsWith('em') ? size : 1) || 0;
   const rawLine = inherited(element, 'lineHeight', 'normal');
@@ -47,14 +57,14 @@ export function textStyle(element) {
         : lineValue.endsWith('rem') ? parseFloat(lineValue) * 16
           : lineValue.endsWith('%') ? parseFloat(lineValue) * size / 100 : parseFloat(lineValue);
   const overflowWrap = inherited(element, 'overflowWrap', 'normal');
-  return { size, spacing, line, font, color: inherited(element, 'color', '#000'),
+  return { size, spacing, line, font, family: resolvedFamily, color: inherited(element, 'color', '#000'),
     wrap: element.localName !== 'input' && !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')),
     breakWords: element.localName === 'textarea' || overflowWrap === 'anywhere' || overflowWrap === 'break-word' };
 }
 export function textMetrics(element) {
   const style = textStyle(element);
   let text = renderedText(element);
-  if (!nerdIcon(element) && inherited(element, 'textTransform', '') === 'uppercase') text = text.toUpperCase();
+  text = transformedText(element, text);
   // Color affects paint only. Keeping it out of the measurement key prevents
   // animated text colors from invalidating Taffy's layout tree.
   const key = JSON.stringify([text, style.size, style.spacing, style.line, style.font, style.wrap, style.breakWords]);
@@ -72,6 +82,59 @@ export function textMetrics(element) {
   state.textMetrics = { key, style, tokens, words, space,
     breakWords: style.breakWords ? tokens.map(word => word === '\n' ? null : [...word].map(character => context.measureText(character).width)) : null };
   return state.textMetrics;
+}
+/**
+ * Splits an element's text into the lines Taffy's text measure produced for a
+ * content box `width` (same greedy algorithm as workers/layout.js), so native
+ * shaping draws exactly the laid-out lines instead of re-wrapping them.
+ */
+export function layoutTextLines(element, width) {
+  // Layout keeps these metrics current (Document#prepareText runs before any
+  // box is read), so paint can reuse them without re-keying.
+  const metrics = elementState(element).textMetrics ?? textMetrics(element);
+  const { tokens, words, space, breakWords, style } = metrics;
+  if (!style.wrap) return null;
+  const state = elementState(element);
+  if (state.textLines?.metrics === metrics && state.textLines.width === width) return state.textLines.lines;
+  const limit = width;
+  const lines = [];
+  let line = '', lineWidth = 0;
+  const flush = () => { lines.push(line); line = ''; lineWidth = 0; };
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index], word = words[index];
+    if (word < 0) { flush(); continue; }
+    const next = lineWidth ? lineWidth + space + word : word;
+    if (next > limit + .01 && lineWidth > 0) flush();
+    const characters = breakWords?.[index];
+    if (characters && word > limit + .01) {
+      const glyphs = [...token];
+      let fragment = '', fragmentWidth = 0;
+      if (lineWidth) { line += ' '; lineWidth += space; }
+      glyphs.forEach((glyph, glyphIndex) => {
+        const glyphWidth = characters[glyphIndex] ?? 0;
+        if (fragmentWidth > 0 && lineWidth + fragmentWidth + glyphWidth > limit + .01) {
+          line += fragment; flush(); fragment = ''; fragmentWidth = 0;
+        }
+        fragment += glyph; fragmentWidth += glyphWidth;
+      });
+      line += fragment; lineWidth += fragmentWidth;
+    } else {
+      line += (lineWidth ? ' ' : '') + token;
+      lineWidth += (lineWidth ? space : 0) + word;
+    }
+  }
+  lines.push(line);
+  state.textLines = { metrics, width, lines };
+  return lines;
+}
+/** Text after CSS text-transform, as layout measures it. */
+export function transformedText(element, text) {
+  if (nerdIcon(element)) return text;
+  const transform = inherited(element, 'textTransform', '');
+  if (transform === 'uppercase') return text.toUpperCase();
+  if (transform === 'lowercase') return text.toLowerCase();
+  if (transform === 'capitalize') return text.replace(/(^|\s)(\S)/gu, (_, gap, first) => gap + first.toUpperCase());
+  return text;
 }
 export function measureText(element, text) {
   const style = textStyle(element);

@@ -301,7 +301,8 @@ export class ElementAnimation {
       this._finishTimer = null;
       if (this.playState === "running") this.sample();
     }, wait);
-    this._finishTimer.unref?.();
+    // A finite animation keeps the process alive until it finishes, like any
+    // pending timer, so `await animation.finished` settles.
   }
 
   #settleFinished() {

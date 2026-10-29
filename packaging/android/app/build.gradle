@@ -4,6 +4,16 @@ plugins {
 
 def repositoryRoot = rootProject.file('../..')
 def generatedAssets = layout.buildDirectory.dir('generated/nastyAssets')
+// -PnastyApp=<name> packages another Nasty app; each has an entry script and manifest.
+def nastyApp = (findProperty('nastyApp') ?: 'tour').toString()
+def nastyApps = [
+    tour: [id: 'org.nasty.tour', entry: 'node/examples/tour.js', manifest: 'src/main/AndroidManifest.xml'],
+    dyndyn: [id: 'org.nasty.dyndyn', entry: 'node/examples/dyndyn/mobile.js', manifest: 'src/dyndyn/AndroidManifest.xml'],
+]
+def nastyAppConfig = nastyApps[nastyApp]
+if (nastyAppConfig == null) throw new GradleException("Unknown nastyApp '${nastyApp}'")
+// Android Skia binding for @napi-rs/canvas, unpacked outside node_modules by the APK script.
+def canvasAndroid = findProperty('nastyCanvasAndroid')
 
 tasks.register('prepareNastyAssets', Sync) {
     into generatedAssets
@@ -13,6 +23,15 @@ tasks.register('prepareNastyAssets', Sync) {
     }
     from(repositoryRoot.toPath().resolve('node/node_modules').toFile()) {
         into 'nasty/node/node_modules'
+        exclude '@napi-rs/canvas-linux-*/**'
+    }
+    from(repositoryRoot.toPath().resolve('fonts').toFile()) {
+        into 'nasty/fonts'
+    }
+    if (canvasAndroid) {
+        from(file(canvasAndroid)) {
+            into 'nasty/node/node_modules/@napi-rs/canvas-android-arm64'
+        }
     }
 }
 
@@ -23,6 +42,7 @@ tasks.register('generateNastyAssetManifest') {
         def payloadRoot = new File(generatedAssets.get().asFile, 'nasty')
         def manifest = new File(payloadRoot, 'files.list')
         manifest.parentFile.mkdirs()
+        new File(payloadRoot, 'entry').text = nastyAppConfig.entry + '\n'
         manifest.text = fileTree(payloadRoot)
             .files
             .findAll { it != manifest }
@@ -39,7 +59,7 @@ android {
     buildToolsVersion '35.0.0'
 
     defaultConfig {
-        applicationId 'org.nasty.tour'
+        applicationId nastyAppConfig.id
         minSdk 26
         targetSdk 28
         versionCode 1
@@ -50,6 +70,7 @@ android {
     sourceSets {
         main {
             assets.srcDir generatedAssets
+            manifest.srcFile nastyAppConfig.manifest
             jniLibs.srcDirs = ['src/main/jniLibs']
         }
     }

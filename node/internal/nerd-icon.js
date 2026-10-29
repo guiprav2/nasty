@@ -2,7 +2,8 @@ import { elementState } from './dom-state.js';
 import { nerdGlyphs } from './nerd-glyphs.js';
 
 export function nerdIcon(element) {
-  if (!element.classList.contains('nf')) return null;
+  // Most elements have no icon class; skip the token parse for them.
+  if (!element.className.includes('nf') || !element.classList.contains('nf')) return null;
   for (const name of element.classList) {
     const glyph = nerdGlyphs.get(name);
     if (glyph) return { glyph };

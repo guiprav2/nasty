@@ -1,9 +1,23 @@
+import { styleMeshRevision } from './css-transitions.js';
 const scrollableModes = new Set(['auto', 'scroll']);
 const clippingModes = new Set(['hidden', 'clip', 'auto', 'scroll']);
 const programmaticScrollModes = new Set(['hidden', 'auto', 'scroll']);
 const AUTO_OVERFLOW_ANCHOR_MARGIN_FRACTION = 0.1;
 
+// Overflow modes depend only on the element's own style; cache them per style
+// revision (overflow properties bump it). Box assembly asks for every element.
+const modeCache = new WeakMap();
 export function overflowMode(element, axis) {
+  const revision = styleMeshRevision(element.style);
+  let cached = modeCache.get(element);
+  if (!cached || cached.revision !== revision) {
+    cached = { revision, x: computeOverflowMode(element, 'x'), y: computeOverflowMode(element, 'y') };
+    modeCache.set(element, cached);
+  }
+  return axis === 'x' ? cached.x : cached.y;
+}
+
+function computeOverflowMode(element, axis) {
   const style = element.style;
   const value = style[axis === 'x' ? 'overflowX' : 'overflowY'] ?? style.overflow ?? 'visible';
   const other = style[axis === 'x' ? 'overflowY' : 'overflowX'] ?? style.overflow ?? 'visible';
@@ -65,6 +79,11 @@ export function clipsOverflow(element, axis) {
 
 export function canScroll(element, axis) {
   return programmaticScrollModes.has(overflowMode(element, axis));
+}
+
+/** overflow:auto/scroll on `axis`, by style alone (no layout metrics). */
+export function userScrollableStyle(element, axis) {
+  return scrollableModes.has(overflowMode(element, axis));
 }
 
 export function canScrollByUser(element, axis) {

@@ -1,12 +1,14 @@
 import { documentState, elementState } from "./internal/dom-state.js";
+import { assembledMap, prepareScrollLayers, scrollLayerQuads } from "./internal/gpu-scroll-layers.js";
 import { computedStyleValue, getStyleTransitionState, hasActiveStyleTransition, styleHasAnimations, styleMeshRevision } from "./internal/css-transitions.js";
-import { canvasCommands, canvasSurface } from "./canvas-2d.js";
-import { prepareScrollLayers } from "./internal/scroll-layers.js";
+import { canvasCommands, canvasSurface, canvasTriangleBuffer } from "./canvas-2d.js";
 import { objectFitLayout, objectPositionFractions } from "./internal/object-fit.js";
+import { renderedText } from "./internal/nerd-icon.js";
 import { transformMatrix as parseCssTransform } from "./internal/css-transform.js";
 
 const SIDES = ["Top", "Right", "Bottom", "Left"];
-const transformedListElements = new WeakMap();
+const transformedListTextLayers = new WeakMap();
+const transformedListCanvases = new WeakMap();
 const transformedScenes = new WeakMap();
 const paintOrders = new WeakMap();
 const opacityCache = new WeakMap();
@@ -367,13 +369,27 @@ function translatePaintSegment(source, dx, dy) {
       values[offset + 9] += dx;
       values[offset + 10] += dy;
       offset += 21;
+    } else if (kind === 7) {
+      // GPU box: rect, gradient line, and active clip rects move with it.
+      values[offset + 1] += dx; values[offset + 2] += dy;
+      values[offset + 29] += dx; values[offset + 30] += dy;
+      values[offset + 31] += dx; values[offset + 32] += dy;
+      if (values[offset + 43] > 0) { values[offset + 41] += dx; values[offset + 42] += dy; }
+      if (values[offset + 47] > 0) { values[offset + 45] += dx; values[offset + 46] += dy; }
+      offset += 53;
     } else return null;
   }
   return values;
 }
 
-export function displayListElements(list) {
-  return transformedListElements.get(list) ?? null;
+/** GPU canvas program buffers referenced by a display list's tag 10 record. */
+export function displayListCanvas(list) {
+  return transformedListCanvases.get(list) ?? null;
+}
+
+/** Element → text paint layer for a transformed display list (tag 9 markers). */
+export function displayListTextLayers(list) {
+  return transformedListTextLayers.get(list) ?? null;
 }
 
 export function parseColor(value) {
@@ -526,6 +542,15 @@ function gradientColor(stops, at) {
   const leftStop = stops[right - 1], rightStop = stops[right];
   const t = Math.max(0, Math.min(1, (at - leftStop.position) / Math.max(1e-9, rightStop.position - leftStop.position)));
   return leftStop.color.map((channel, index) => channel + (rightStop.color[index] - channel) * t);
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+}
+
+function unionRect(a, b) {
+  const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+  return { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y };
 }
 
 function intersection(a, b) {
@@ -757,7 +782,7 @@ function childPerspectiveMatrix(box) {
 // Layout boxes use document coordinates; compose local transforms from the
 // root down so a parent transform also moves and projects every descendant.
 export function createBoxProjector(boxes) {
-  const byElement = new Map(boxes.map((box) => [box.element, box]));
+  const byElement = assembledMap(boxes);
   const worldMatrices = new Map();
   const worldMatrix = (box) => {
     const cached = worldMatrices.get(box.element);
@@ -1077,13 +1102,107 @@ function roundedRectPolygon(rect, radius, corners = null) {
 
 // Display-list v3 stores screen-space triangles. JS performs the small per-box
 // CSS matrix/projection work; Rust only expands records and submits GPU geometry.
-export function buildTransformedDisplayList(boxes, width, height, overlays = []) {
+// Style-derived paint for an untransformed element, drawn entirely as GPU
+// box/image instances. Cached per style revision; live transitions and
+// animations recompute it every frame. null means the element needs the
+// tessellated path (canvas, video, blur, radial or many-stop gradients,
+// blurred shadows, mixed border colors).
+const fastRecipes = new WeakMap();
+function fastPaintRecipe(element) {
+  const style = element.style;
+  const live = hasActiveStyleTransition(style) || styleHasAnimations(style);
+  const revision = styleMeshRevision(style);
+  const cached = fastRecipes.get(element);
+  if (!live && cached && cached.revision === revision) return cached.recipe;
+  const recipe = buildFastRecipe(element);
+  if (!live) fastRecipes.set(element, { revision, recipe });
+  return recipe;
+}
+function buildFastRecipe(element) {
+  const style = element.style;
+  if (element.localName === "canvas" || element.localName === "video") return null;
+  if (parseFilterBlur(computedStyleValue(style, "filter") ?? style.filter) > 0) return null;
+  if (style.backdropFilter && style.backdropFilter !== "none") return null;
+  const gradientValue = computedStyleValue(style, "backgroundImage");
+  const hasGradient = gradientValue && gradientValue !== "none";
+  const gradient = hasGradient ? gradientStops(gradientValue) : null;
+  if (hasGradient && (!gradient || gradient.kind !== "linear" || gradient.stops.length > 4)) return null;
+  const shadow = String(paintStyleValue(style, "boxShadow") ?? "");
+  let ring = null;
+  if (shadow && shadow !== "none") {
+    const match = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(shadow);
+    if (!match) return null;
+    ring = { spread: Number(match[1]), color: parseColor(match[2]) };
+  }
+  const borderActive = SIDES.map((side) => {
+    const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
+    return borderStyle !== "none" && borderStyle !== "hidden";
+  });
+  const borderColors = SIDES.map((side, index) => borderActive[index] ? borderColorFor(style, side) : null);
+  const firstBorder = borderColors.find(Boolean) ?? null;
+  if (borderColors.some((color) => color && color !== firstBorder)) return null;
+  return {
+    background: parseColor(computedStyleValue(style, "backgroundColor")),
+    gradient,
+    ring,
+    borderActive,
+    borderColor: firstBorder ? parseColor(firstBorder) : null,
+    objectFit: style.objectFit ?? "fill",
+    objectPosition: objectPositionFractions(computedStyleValue(style, "objectPosition")),
+    corners: null,
+  };
+}
+
+// Textured quads that show a scroll layer's tiles in its host at the current
+// scroll offset: one image-triangles command per tile (tag 1).
+function layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip) {
+  const imageClip = intersection(hostBox.clip ?? viewport, viewport);
+  if (imageClip.width <= 0 || imageClip.height <= 0) return null;
+  const values = [];
+  let commands = 0;
+  for (const quad of scrollLayerQuads(layer, hostBox)) {
+    const corners = [
+      [quad.x, quad.y, quad.u0, quad.v0], [quad.x + quad.width, quad.y, quad.u1, quad.v0],
+      [quad.x + quad.width, quad.y + quad.height, quad.u1, quad.v1], [quad.x, quad.y + quad.height, quad.u0, quad.v1],
+    ].map(([x, y, u, v]) => {
+      const point = projectPoint(hostBox, x, y);
+      return Number.isFinite(point.x) && Number.isFinite(point.y)
+        ? { x: point.x, y: point.y, u, v, reciprocalW: point.reciprocalW ?? 1 } : null;
+    });
+    if (!corners.every(Boolean)) continue;
+    // Keep UV attributes intact: only axis-aligned clipping for scroll textures.
+    let clipped = clipTexturedPolygon(corners, imageClip);
+    if (windowClip?.length) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const point of windowClip) {
+        minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
+        maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
+      }
+      clipped = clipTexturedPolygon(clipped, { x: minX, y: minY, width: maxX - minX, height: maxY - minY });
+    }
+    if (clipped.length < 3) continue;
+    const triangles = [];
+    for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
+    values.push(1, quad.textureId, imageClip.x, imageClip.y, imageClip.width, imageClip.height, triangles.length);
+    for (const point of triangles) values.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+    commands++;
+  }
+  return commands ? { values: Float32Array.from(values), commands } : null;
+}
+
+/**
+ * `options.layerPaint`: `boxes` are a scroll layer's content in a region's own
+ * space; nothing is cached against the window and `options.scrollLayerState`
+ * supplies the layers nested inside it.
+ */
+export function buildTransformedDisplayList(boxes, width, height, overlays = [], options = {}) {
+  const layerPaint = !!options.layerPaint;
   resetReplayArena();
   const document = boxes[0]?.element.ownerDocument;
   const documentData = document ? documentState(document) : null;
   const generation = documentData?.staticPaintGeneration ?? documentData?.sceneGeneration ?? 0;
   const transitionGeneration = documentData?.transitionFrameGeneration ?? 0;
-  const cacheable = !!document;
+  const cacheable = !!document && !layerPaint;
   // Video frames update the existing GPU texture in place. Keeping a <video>
   // in the tree must not disable the transformed-scene cache — that rebuilt
   // the whole carousel on every decoded frame.
@@ -1098,24 +1217,32 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   }
   // Pose/class updates mark live chrome. After a few quiet frames, bake them
   // back into the scroll-scene base so idle presents can hit the cache.
+  // Each element settles on its own: one image's class flip, or a pose on one
+  // card, must not keep the rest of the document uncached while other
+  // elements keep changing.
   const livePaintElements = documentData?.livePaintElements;
-  if (livePaintElements?.size && !documentData.livePaintDirty && !activeTransitionElements?.size) {
-    documentData.livePaintSettleFrames = (documentData.livePaintSettleFrames ?? 0) + 1;
-    if (documentData.livePaintSettleFrames >= 3) {
-      livePaintElements.clear();
-      documentData.livePaintSettleFrames = 0;
-      documentData.scrollSceneContentGeneration = (documentData.scrollSceneContentGeneration ?? 0) + 1;
+  if (!layerPaint && livePaintElements?.size) {
+    const presentId = documentData.presentId ?? 0;
+    const stamps = documentData.livePaintStamps;
+    let settled = false;
+    for (const element of livePaintElements) {
+      const stamp = stamps?.get(element) ?? presentId;
+      if (presentId - stamp >= 3 && !activeTransitionElements?.has(element)) {
+        livePaintElements.delete(element);
+        stamps?.delete(element);
+        settled = true;
+      }
     }
-  } else if (documentData?.livePaintDirty) {
-    documentData.livePaintDirty = false;
-    documentData.livePaintSettleFrames = 0;
+    if (settled) documentData.scrollSceneContentGeneration = (documentData.scrollSceneContentGeneration ?? 0) + 1;
   }
+  if (documentData && !layerPaint) documentData.livePaintDirty = false;
   const hasLivePaint = !!livePaintElements?.size;
   const hasActiveTransitions = !!activeTransitionElements?.size || hasLivePaint;
   const window = documentData?.defaultView ?? null;
-  const scrollLayerState = window && document
-    ? prepareScrollLayers(window, document, boxes)
-    : { layers: new Map(), covered: new Set() };
+  // Scroll containers are drawn directly as clipped GPU draws at their current
+  // offsets; no CPU-baked scroll textures.
+  const scrollLayerState = options.scrollLayerState
+    ?? (layerPaint || !window ? { layers: new Map(), covered: new Set() } : prepareScrollLayers(window, document, boxes));
   const scrollLayers = scrollLayerState.layers;
   const scrollCovered = scrollLayerState.covered;
   const cached = fullSceneCacheable && !scrollLayers.size && transformedScenes.get(boxes);
@@ -1123,7 +1250,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       && cached.width === width && cached.height === height) {
     return cached.compose(overlays);
   }
-  const scrollSceneCache = documentData?.scrollSceneCache;
+  const scrollSceneCache = layerPaint ? null : documentData?.scrollSceneCache;
   const scrollSceneContentGeneration = documentData?.scrollSceneContentGeneration ?? 0;
   // Reuse the scroll-scene base whenever contentGeneration matches. Live
   // transition/animation chrome is excluded from that base and repainted below
@@ -1199,45 +1326,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     };
     for (const [hostElement, layer] of scrollLayers) {
       const hostBox = boxesByElement.get(hostElement) ?? layer.hostBox;
-      const view = hostBox.paddingBox;
-      if (!layer.textureId || view.width <= 0 || view.height <= 0) continue;
-      const scrollLeft = Math.max(0, Math.min(Math.max(0, layer.contentWidth - view.width), hostElement.scrollLeft || 0));
-      const scrollTop = Math.max(0, Math.min(Math.max(0, layer.contentHeight - view.height), hostElement.scrollTop || 0));
-      // UVs are relative to the GPU texture, which may be wider than the logical
-      // content so RGBA rows stay on WGPU's 256-byte copy alignment.
-      const textureWidth = layer.textureWidth || layer.contentWidth;
-      const textureHeight = layer.textureHeight || layer.contentHeight;
-      const u0 = scrollLeft / textureWidth, v0 = scrollTop / textureHeight;
-      const u1 = (scrollLeft + view.width) / textureWidth, v1 = (scrollTop + view.height) / textureHeight;
-      const corners = [
-        [view.x, view.y, u0, v0], [view.x + view.width, view.y, u1, v0],
-        [view.x + view.width, view.y + view.height, u1, v1], [view.x, view.y + view.height, u0, v1],
-      ].map(([x, y, u, v]) => {
-        const point = projectPoint(hostBox, x, y);
-        return Number.isFinite(point.x) && Number.isFinite(point.y)
-          ? { x: point.x, y: point.y, u, v, reciprocalW: point.reciprocalW ?? 1 } : null;
-      });
-      if (!corners.every(Boolean)) continue;
-      const imageClip = intersection(hostBox.clip ?? viewport, viewport);
-      if (imageClip.width <= 0 || imageClip.height <= 0) continue;
-      let clipped = clipTexturedPolygon(corners, imageClip);
-      if (windowClip?.length) {
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const point of windowClip) {
-          minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
-          maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
-        }
-        clipped = clipTexturedPolygon(clipped, { x: minX, y: minY, width: maxX - minX, height: maxY - minY });
-      }
-      if (clipped.length < 3) continue;
-      const triangles = [];
-      for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
-      const layerValues = [1, layer.textureId, imageClip.x, imageClip.y, imageClip.width, imageClip.height, triangles.length];
-      for (const point of triangles) layerValues.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+      const quads = layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip);
+      if (!quads) continue;
       const slot = scrollSceneCache.layerSlots.get(hostElement);
-      if (slot !== undefined) sceneParts[slot] = Float32Array.from(layerValues);
-      else sceneParts.push(Float32Array.from(layerValues));
-      commandCount += 1;
+      if (slot !== undefined) sceneParts[slot] = quads.values;
+      else sceneParts.push(quads.values);
+      commandCount += quads.commands;
       for (let current = hostElement; current?.nodeType === 1; current = current.parentElement ?? current.parent) {
         visibleElements.add(current);
       }
@@ -1287,7 +1381,6 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         combined[1] += overlayCommands;
       }
       const displayList = Buffer.from(combined.buffer);
-      transformedListElements.set(displayList, visibleElements);
       return displayList;
     };
     return compose(overlays);
@@ -1430,7 +1523,48 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   let scrollSceneCachedVisible = null;
   const scenePartOwners = [];
   const scenePartCommands = [];
+  // Text is drawn natively per layer at TextLayer markers. When an element's
+  // paint overlaps text already in the current layer (a toast or menu over
+  // labels), close the layer first so that text stays underneath it.
+  let frameCanvas = null;
+  let textLayer = 0;
+  let layerText = [];
+  let layerTextBounds = null;
+  let pendingText = null;
+  const textLayers = new Map();
+  const commitPendingText = () => {
+    if (!pendingText) return;
+    layerText.push(pendingText.rect);
+    layerTextBounds = layerTextBounds ? unionRect(layerTextBounds, pendingText.rect) : { ...pendingText.rect };
+    textLayers.set(pendingText.element, textLayer);
+    pendingText = null;
+  };
+  const closeTextLayer = () => {
+    sceneParts.push(Float32Array.of(9, textLayer));
+    scenePartOwners.push(null);
+    scenePartCommands.push(1);
+    commandCount++;
+    textLayer++;
+    layerText = [];
+    layerTextBounds = null;
+  };
+  // Shadows and rings (after entries) sit outside their element and never
+  // cover its own content, so they do not close a text layer.
+  let paintingAfter = false;
+  const coversLayerText = (owner) => {
+    if (!layerTextBounds || !owner || paintingAfter) return false;
+    const box = boxesByElement.get(owner);
+    if (!box) return false;
+    const shadow = String(paintStyleValue(owner.style, "boxShadow") ?? "");
+    const ring = /^0 0 0 (\d+(?:\.\d+)?)px/.exec(shadow);
+    const spread = !shadow || shadow === "none" ? 0 : ring ? Number(ring[1]) : 48;
+    const rect = { x: box.borderBox.x - spread, y: box.borderBox.y - spread,
+      width: box.borderBox.width + spread * 2, height: box.borderBox.height + spread * 2 };
+    if (!rectsOverlap(rect, layerTextBounds)) return false;
+    return layerText.some((text) => rectsOverlap(rect, text));
+  };
   const pushScenePart = (part, owner, commands = 1) => {
+    if (part.length && coversLayerText(owner)) closeTextLayer();
     sceneParts.push(part);
     scenePartOwners.push(owner);
     scenePartCommands.push(commands);
@@ -1448,43 +1582,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     // Refresh scroll-layer quads in their cached slots (same as the quiet hit path).
     for (const [hostElement, layer] of scrollLayers) {
       const hostBox = boxesByElement.get(hostElement) ?? layer.hostBox;
-      const view = hostBox.paddingBox;
-      if (!layer.textureId || view.width <= 0 || view.height <= 0) continue;
-      const scrollLeft = Math.max(0, Math.min(Math.max(0, layer.contentWidth - view.width), hostElement.scrollLeft || 0));
-      const scrollTop = Math.max(0, Math.min(Math.max(0, layer.contentHeight - view.height), hostElement.scrollTop || 0));
-      const textureWidth = layer.textureWidth || layer.contentWidth;
-      const textureHeight = layer.textureHeight || layer.contentHeight;
-      const u0 = scrollLeft / textureWidth, v0 = scrollTop / textureHeight;
-      const u1 = (scrollLeft + view.width) / textureWidth, v1 = (scrollTop + view.height) / textureHeight;
-      const corners = [
-        [view.x, view.y, u0, v0], [view.x + view.width, view.y, u1, v0],
-        [view.x + view.width, view.y + view.height, u1, v1], [view.x, view.y + view.height, u0, v1],
-      ].map(([x, y, u, v]) => {
-        const point = projectPoint(hostBox, x, y);
-        return Number.isFinite(point.x) && Number.isFinite(point.y)
-          ? { x: point.x, y: point.y, u, v, reciprocalW: point.reciprocalW ?? 1 } : null;
-      });
-      if (!corners.every(Boolean)) continue;
-      const imageClip = intersection(hostBox.clip ?? viewport, viewport);
-      if (imageClip.width <= 0 || imageClip.height <= 0) continue;
-      let clipped = clipTexturedPolygon(corners, imageClip);
-      if (windowClip?.length) {
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const point of windowClip) {
-          minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
-          maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
-        }
-        clipped = clipTexturedPolygon(clipped, { x: minX, y: minY, width: maxX - minX, height: maxY - minY });
-      }
-      if (clipped.length < 3) continue;
-      const triangles = [];
-      for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
-      const layerValues = [1, layer.textureId, imageClip.x, imageClip.y, imageClip.width, imageClip.height, triangles.length];
-      for (const point of triangles) layerValues.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+      const quads = layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip);
+      if (!quads) continue;
       const slot = scrollSceneCache.layerSlots.get(hostElement);
-      if (slot !== undefined) sceneParts[slot] = Float32Array.from(layerValues);
-      else pushScenePart(Float32Array.from(layerValues), null, 1);
-      commandCount += 1;
+      if (slot !== undefined) sceneParts[slot] = quads.values;
+      else pushScenePart(quads.values, null, quads.commands);
+      commandCount += quads.commands;
       addVisibleAncestors(hostElement);
     }
   }
@@ -1600,6 +1703,202 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     roundedClipCache.set(element, { generation, value });
     return value;
   };
+  // Describes every clip that actually cuts this element's paint, relative to
+  // its own box. Clips that fully contain the element are omitted, so moving an
+  // element together with the clips that cut it (scrolling a rounded thumbnail,
+  // or anything inside the rounded window body) keeps the same signature and
+  // its cached segment can be translated instead of re-tessellated.
+  // True when [left, right] × [top, bottom] lies inside the rounded rect, so
+  // that clip cannot cut it.
+  // A rounded clip only differs from its rect inside the four r × r corner
+  // squares; bounds that miss all of them see it as a plain rect.
+  const touchesCorners = (rect, radius, left, top, right, bottom) => radius > 0
+    && ((left < rect.x + radius || right > rect.x + rect.width - radius)
+      && (top < rect.y + radius || bottom > rect.y + rect.height - radius));
+  const insideClip = (rect, radius, left, top, right, bottom) => left >= rect.x && top >= rect.y
+    && right <= rect.x + rect.width && bottom <= rect.y + rect.height
+    && !touchesCorners(rect, radius, left, top, right, bottom);
+  const clipRadius = (style, rect) => {
+    const radiusText = String(style.borderRadius ?? "");
+    const raw = Number.parseFloat(radiusText) || 0;
+    return radiusText.trim().endsWith("%") ? Math.min(rect.width, rect.height) * raw / 100 : raw;
+  };
+  // The clips that cut a GPU box's bounds, as at most two rounded rects
+  // { x, y, width, height, radius }. Rect-only clips are intersected into one.
+  // null when the stack needs more than two rounded clips or a clip ancestor
+  // is transformed; such elements keep the tessellated path.
+  // Overflow clips above an element, nearest last, memoized through the parent
+  // for this frame. `transformed` marks a chain the GPU box path cannot use.
+  const clipChains = new Map();
+  const clipChain = (element) => {
+    const parent = element.parentElement ?? element.parent;
+    if (!parent || parent.nodeType !== 1) return { clips: [], transformed: false };
+    const memo = clipChains.get(parent);
+    if (memo) return memo;
+    const above = clipChain(parent);
+    let chain = above;
+    const style = parent.style;
+    if ([style.overflow, style.overflowX, style.overflowY]
+      .some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll")) {
+      const parentBox = boxesByElement.get(parent);
+      if (parentBox) {
+        const padding = parentBox.paddingBox ?? parentBox.borderBox;
+        chain = { clips: [...above.clips, { ...padding, radius: clipRadius(style, padding) }],
+          transformed: above.transformed || hasTransform(parent) };
+      }
+    } else if (hasTransform(parent)) chain = { clips: above.clips, transformed: true };
+    clipChains.set(parent, chain);
+    return chain;
+  };
+  const gpuBoxClips = (element, left, top, right, bottom) => {
+    const chain = clipChain(element);
+    if (chain.transformed) return null;
+    const rounded = [];
+    let rect = null;
+    // The window corners are already a clip when the body itself clips overflow.
+    const bodyClips = bodyBox && [bodyStyle?.overflow, bodyStyle?.overflowX, bodyStyle?.overflowY]
+      .some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll");
+    if (windowClip && !bodyClips && !insideClip({ x: 0, y: 0, width, height }, windowRadius, left, top, right, bottom)) {
+      rounded.push({ x: 0, y: 0, width, height, radius: windowRadius });
+    }
+    for (const clip of chain.clips) {
+      if (insideClip(clip, clip.radius, left, top, right, bottom)) continue;
+      if (touchesCorners(clip, clip.radius, left, top, right, bottom)) rounded.push(clip);
+      else rect = rect ? intersection(rect, clip) : { ...clip };
+    }
+    if (rect && (rect.width <= 0 || rect.height <= 0)) rect = { x: 0, y: 0, width: -1, height: -1 };
+    const clips = rect ? [...rounded, { ...rect, radius: 0 }] : rounded;
+    return clips.length > 2 ? null : clips;
+  };
+  // One GPU box instance (display-list tag 7). `fill` is a solid color or a
+  // linear gradient { stops: [{ color, position }], line: [x0, y0, x1, y1] }.
+  const pushGpuBox = (rect, corners, fill, border, borderColor, clips) => {
+    const stops = fill?.stops ?? [{ color: fill ?? [0, 0, 0, 0], position: 0 }];
+    values.push(7, rect.x, rect.y, rect.width, rect.height, corners.tl, corners.tr, corners.br, corners.bl);
+    for (let index = 0; index < 4; index++) values.push(...(stops[Math.min(index, stops.length - 1)].color));
+    for (let index = 0; index < 4; index++) values.push(stops[Math.min(index, stops.length - 1)].position);
+    values.push(...(fill?.line ?? [0, 0, 0, 0]));
+    values.push(...border, ...(borderColor ?? [0, 0, 0, 0]));
+    for (let index = 0; index < 2; index++) {
+      const clip = clips[index];
+      values.push(...(clip ? [clip.x, clip.y, clip.width, clip.height] : [0, 0, 0, 0]));
+    }
+    values.push(clips[0]?.radius ?? 0, clips[1]?.radius ?? 0, stops.length, 0);
+    commandCount++;
+  };
+  // One textured GPU instance (display-list tag 8) for an image texture.
+  const pushImageBox = (textureId, rect, uv, corners, clips, imageOpacity) => {
+    values.push(8, textureId, rect.x, rect.y, rect.width, rect.height, uv[0], uv[1], uv[2], uv[3],
+      corners.tl, corners.tr, corners.br, corners.bl);
+    for (let index = 0; index < 2; index++) {
+      const clip = clips[index];
+      values.push(...(clip ? [clip.x, clip.y, clip.width, clip.height] : [0, 0, 0, 0]));
+    }
+    values.push(clips[0]?.radius ?? 0, clips[1]?.radius ?? 0, imageOpacity, 0);
+    commandCount++;
+  };
+  // Paints an untransformed element from its recipe as GPU instances. Returns
+  // false when its clip stack needs the tessellated path.
+  const fastPaint = (element, box, after, recipe, opacity) => {
+    const borderBox = box.borderBox;
+    const cornersOf = () => {
+      if (recipe.corners?.width !== borderBox.width || recipe.corners?.height !== borderBox.height) {
+        recipe.corners = { width: borderBox.width, height: borderBox.height,
+          value: cornerRadiiFor(element.style, borderBox.width, borderBox.height) };
+      }
+      return recipe.corners.value;
+    };
+    if (after) {
+      const ring = recipe.ring;
+      if (!ring?.color) return true;
+      const spread = ring.spread;
+      const ringRect = { x: borderBox.x - spread, y: borderBox.y - spread,
+        width: borderBox.width + spread * 2, height: borderBox.height + spread * 2 };
+      const clips = gpuBoxClips(element, ringRect.x, ringRect.y, ringRect.x + ringRect.width, ringRect.y + ringRect.height);
+      if (!clips) return false;
+      const corners = cornersOf();
+      const grow = (radius) => radius > 0 ? radius + spread : 0;
+      pushGpuBox(ringRect, { tl: grow(corners.tl), tr: grow(corners.tr), br: grow(corners.br), bl: grow(corners.bl) },
+        null, [spread, spread, spread, spread], withOpacity(ring.color, opacity), clips);
+      return true;
+    }
+    const clips = gpuBoxClips(element, borderBox.x, borderBox.y, borderBox.x + borderBox.width, borderBox.y + borderBox.height);
+    if (!clips) return false;
+    addVisibleAncestors(element);
+    const noBorder = [0, 0, 0, 0];
+    if (recipe.background && recipe.background[3] > 0) {
+      pushGpuBox(borderBox, cornersOf(), withOpacity(recipe.background, opacity), noBorder, null, clips);
+    }
+    if (recipe.gradient) {
+      pushGpuBox(borderBox, cornersOf(), {
+        stops: recipe.gradient.stops.map(({ color, position }) => ({ color: withOpacity(color, opacity), position })),
+        line: gradientLine(recipe.gradient.direction, borderBox),
+      }, noBorder, null, clips);
+    }
+    const image = elementState(element).image;
+    const content = box.contentBox;
+    if (image && content.width > 0 && content.height > 0) {
+      const [positionX, positionY] = recipe.objectPosition;
+      const layout = objectFitLayout(image.width, image.height, content.width, content.height, recipe.objectFit, positionX, positionY);
+      const dest = { x: content.x + layout.x, y: content.y + layout.y, width: layout.width, height: layout.height };
+      // Crop to the content box and adjust UVs, so overflow never draws.
+      const shown = intersection(dest, content);
+      if (shown.width > 0 && shown.height > 0 && dest.width > 0 && dest.height > 0) {
+        const u = (x) => layout.u0 + (x - dest.x) / dest.width * (layout.u1 - layout.u0);
+        const v = (y) => layout.v0 + (y - dest.y) / dest.height * (layout.v1 - layout.v0);
+        pushImageBox(image.textureId, shown, [u(shown.x), v(shown.y), u(shown.x + shown.width), v(shown.y + shown.height)],
+          cornersOf(), clips, opacity);
+      }
+    }
+    const widths = SIDES.map((side, index) => recipe.borderActive[index] ? (box.border[side.toLowerCase()] || 0) : 0);
+    if (recipe.borderColor && widths.some((value) => value > 0)) {
+      pushGpuBox(borderBox, cornersOf(), null, widths, withOpacity(recipe.borderColor, opacity), clips);
+    }
+    return true;
+  };
+  // CSS linear-gradient line through the box for a direction keyword or angle.
+  const gradientLine = (direction, rect) => {
+    const { x, y, width: w, height: h } = rect;
+    const corner = { "to top right": [h, -w], "to bottom right": [h, w], "to bottom left": [-h, w], "to top left": [-h, -w] }[direction];
+    const sides = { "to top": 0, "to right": 90, "to bottom": 180, "to left": 270 };
+    let dx, dy;
+    if (corner) {
+      const length = Math.hypot(corner[0], corner[1]) || 1;
+      dx = corner[0] / length; dy = corner[1] / length;
+    } else {
+      const degrees = sides[direction] ?? Number.parseFloat(direction);
+      const radians = (Number.isFinite(degrees) ? degrees : 180) * Math.PI / 180;
+      dx = Math.sin(radians); dy = -Math.cos(radians);
+    }
+    const half = (Math.abs(w * dx) + Math.abs(h * dy)) / 2;
+    const cx = x + w / 2, cy = y + h / 2;
+    return [cx - dx * half, cy - dy * half, cx + dx * half, cy + dy * half];
+  };
+  const clipSignature = (box) => {
+    const shadow = String(paintStyleValue(box.element.style, "boxShadow") ?? "");
+    const ring = /^0 0 0 (\d+(?:\.\d+)?)px/.exec(shadow);
+    const spread = !shadow || shadow === "none" ? 0 : ring ? Number(ring[1]) : 48;
+    const left = box.x - spread, top = box.y - spread;
+    const right = box.x + box.width + spread, bottom = box.y + box.height + spread;
+    const inside = (rect, radius) => insideClip(rect, radius, left, top, right, bottom);
+    const parts = [];
+    if (!inside({ x: 0, y: 0, width, height }, windowClip ? windowRadius : 0)) parts.push(`v${-box.x},${-box.y}`);
+    for (let ancestor = box.element.parentElement ?? box.element.parent; ancestor; ancestor = ancestor.parentElement ?? ancestor.parent) {
+      const style = ancestor.style;
+      if (![style.overflow, style.overflowX, style.overflowY]
+        .some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll")) continue;
+      const ancestorBox = boxesByElement.get(ancestor);
+      if (!ancestorBox) continue;
+      if (hasTransform(ancestor)) return null;
+      const rect = ancestorBox.paddingBox ?? ancestorBox.borderBox;
+      const radiusText = String(style.borderRadius ?? "");
+      const raw = Number.parseFloat(radiusText) || 0;
+      const radius = radiusText.trim().endsWith("%") ? Math.min(rect.width, rect.height) * raw / 100 : raw;
+      if (inside(rect, radius)) continue;
+      parts.push(`${rect.x - box.x},${rect.y - box.y},${rect.width},${rect.height},${radiusText}`);
+    }
+    return parts.join("|");
+  };
   const clipStatus = (box, transformed) => {
     if (transformed || hasRoundedClip(box.element)) return "partial";
     const clip = intersection(box.clip ?? viewport, viewport);
@@ -1615,7 +1914,11 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       || hasTransitionInPaintAncestry(element)) return;
     const entries = paintSegments.get(element) ?? {};
     entries[after ? "after" : "before"] = {
-      generation,
+      // Validity is element-local: its own paint style revision and effective
+      // opacity, plus the box/clip/viewport checks below. Unrelated DOM or
+      // layout changes elsewhere do not invalidate this segment.
+      revision: styleMeshRevision(element.style),
+      opacity: opacityFor(element, documentData?.paintGeneration ?? 0),
       width,
       height,
       x: box.x,
@@ -1624,6 +1927,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       boxHeight: box.height,
       clip: box.clip ? { ...box.clip } : null,
       status: clipStatus(box, hasTransform(element)),
+      clipKey: hasTransform(element) ? null : clipSignature(box),
       visible,
       commands: commandCount - beforeCommands,
       values: Float32Array.from(segmentValues.slice(start)),
@@ -1632,55 +1936,15 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   };
   const scrollLayerSlots = new Map();
   const emitScrollContent = (hostElement, hostBox) => {
-
     const layer = scrollLayers.get(hostElement);
-    if (!layer?.textureId) return;
-    const view = hostBox.paddingBox;
-    if (view.width <= 0 || view.height <= 0) return;
-    const scrollLeft = Math.max(0, Math.min(Math.max(0, layer.contentWidth - view.width), hostElement.scrollLeft || 0));
-    const scrollTop = Math.max(0, Math.min(Math.max(0, layer.contentHeight - view.height), hostElement.scrollTop || 0));
-    const textureWidth = layer.textureWidth || layer.contentWidth;
-    const textureHeight = layer.textureHeight || layer.contentHeight;
-    const u0 = scrollLeft / textureWidth;
-    const v0 = scrollTop / textureHeight;
-    const u1 = (scrollLeft + view.width) / textureWidth;
-    const v1 = (scrollTop + view.height) / textureHeight;
-    const corners = [
-      [view.x, view.y, u0, v0],
-      [view.x + view.width, view.y, u1, v0],
-      [view.x + view.width, view.y + view.height, u1, v1],
-      [view.x, view.y + view.height, u0, v1],
-    ].map(([x, y, u, v]) => {
-      const point = projectPoint(hostBox, x, y);
-      return Number.isFinite(point.x) && Number.isFinite(point.y)
-        ? { x: point.x, y: point.y, u, v, reciprocalW: point.reciprocalW ?? 1 }
-        : null;
-    });
-    if (!corners.every(Boolean)) return;
-    const imageClip = intersection(hostBox.clip ?? viewport, viewport);
-    if (imageClip.width <= 0 || imageClip.height <= 0) return;
-    // Keep UV attributes intact: only axis-aligned clipping for scroll textures.
-    let clipped = clipTexturedPolygon(corners, imageClip);
-    if (windowClip?.length) {
-      // Approximate the rounded window with its AABB so we do not run
-      // clipConvexPolygon on textured vertices (can degenerate the quad).
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      for (const point of windowClip) {
-        minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
-        maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
-      }
-      clipped = clipTexturedPolygon(clipped, { x: minX, y: minY, width: maxX - minX, height: maxY - minY });
-    }
-    if (clipped.length < 3) return;
-    const triangles = [];
-    for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
-    const layerValues = [1, layer.textureId, imageClip.x, imageClip.y, imageClip.width, imageClip.height, triangles.length];
-    for (const point of triangles) layerValues.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+    if (!layer) return 0;
+    const quads = layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip);
+    if (!quads) return 0;
     scrollLayerSlots.set(hostElement, sceneParts.length);
-    sceneParts.push(Float32Array.from(layerValues));
-
-    commandCount += 1;
+    sceneParts.push(quads.values);
+    commandCount += quads.commands;
     addVisibleAncestors(hostElement);
+    return quads.commands;
   };
   const clipsOverflowStyle = (style) => [style?.overflow, style?.overflowX, style?.overflowY]
     .some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll");
@@ -1754,6 +2018,18 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     if (matrix !== IDENTITY_MATRIX) outerClipByMatrix.set(matrix, result);
     return result;
   };
+  // Whether any ancestor is hidden, memoized through the parent for this frame.
+  const hiddenAncestors = new Map();
+  const hiddenAbove = (element) => {
+    const parent = element.parentElement;
+    if (!parent) return false;
+    let hidden = hiddenAncestors.get(parent);
+    if (hidden === undefined) {
+      hidden = parent.hidden || parent.style.display === "none" || parent.style.visibility === "hidden" || hiddenAbove(parent);
+      hiddenAncestors.set(parent, hidden);
+    }
+    return hidden;
+  };
   const paintProfile = process.env.NASTY_BENCH_PROFILE ? { n: 0, ms: 0, image: 0, gradient: 0, skip: 0, replay: 0, capture: 0, keyMs: 0, clipMs: 0, replayMs: 0, opacityMs: 0, transformMs: 0 } : null;
   for (const entry of cachedPaintOrder(document, paintBoxes)) {
     const paintStarted = paintProfile ? performance.now() : 0;
@@ -1761,11 +2037,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     const element = box.element;
     const after = !!entry.after;
     if (element.hidden || element.style.display === "none" || element.style.visibility === "hidden") continue;
-    let hiddenAncestor = false;
-    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
-      if (parent.hidden || parent.style.display === "none" || parent.style.visibility === "hidden") { hiddenAncestor = true; break; }
-    }
-    if (hiddenAncestor) continue;
+    if (hiddenAbove(element)) continue;
     let captureState = null;
     // Reused scroll base already has static chrome + scroll quads. Emit live
     // transition/animation chrome, and also any element that never made it into
@@ -1795,10 +2067,31 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       if (box.x + box.width <= clip.x || box.y + box.height <= clip.y
           || box.x >= clip.x + clip.width || box.y >= clip.y + clip.height) continue;
     }
+    commitPendingText();
+    paintingAfter = after;
+    if (!after && renderedText(element)) {
+      const textRect = intersection(box.contentBox, box.clip ? intersection(box.clip, viewport) : viewport);
+      if (textRect.width > 0 && textRect.height > 0) pendingText = { element, rect: textRect };
+    }
+    if (!transformed && !paintMode.capture) {
+      const recipe = fastPaintRecipe(element);
+      if (recipe) {
+        values = [];
+        const fastBefore = commandCount;
+        if (fastPaint(element, box, after, recipe, opacity)) {
+          if (values.length) pushScenePart(Float32Array.from(values), element, commandCount - fastBefore);
+          values = [];
+          continue;
+        }
+        commandCount = fastBefore;
+        values = [];
+      }
+    }
     const segmentCacheable = cacheable && !hasTransitionInPaintAncestry(element);
     const previousSegment = segmentCacheable && element.localName !== "canvas" && element.localName !== "video"
       ? paintSegments.get(element)?.[after ? "after" : "before"] : null;
-    if (previousSegment?.generation === generation && previousSegment.width === width && previousSegment.height === height) {
+    if (previousSegment && previousSegment.revision === styleMeshRevision(element.style) && previousSegment.opacity === opacity
+        && previousSegment.width === width && previousSegment.height === height) {
       const status = clipStatus(box, transformed);
       if (previousSegment.x === box.x && previousSegment.y === box.y
         && previousSegment.boxWidth === box.width && previousSegment.boxHeight === box.height
@@ -1811,6 +2104,19 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         if (previousSegment.visible) addVisibleAncestors(element);
         continue;
       }
+      const clipKey = !transformed && previousSegment.clipKey != null ? clipSignature(box) : null;
+      if (clipKey != null && clipKey === previousSegment.clipKey
+          && previousSegment.boxWidth === box.width && previousSegment.boxHeight === box.height) {
+        const translated = translatePaintSegment(previousSegment.values, box.x - previousSegment.x, box.y - previousSegment.y);
+        if (translated) {
+          pushScenePart(translated, element, previousSegment.commands);
+          if (process.env.NASTY_BENCH_PROFILE) paintSegmentDiagnostics.translated++;
+          commandCount += previousSegment.commands;
+          if (previousSegment.visible) addVisibleAncestors(element);
+          saveSegment(element, box, after, 0, beforeCommands, previousSegment.visible, translated);
+          continue;
+        }
+      }
       if (!after && status === "inside" && previousSegment.status === "inside") {
         const translated = translatePaintSegment(previousSegment.values, box.x - previousSegment.x, box.y - previousSegment.y);
         if (translated) {
@@ -1818,7 +2124,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
           if (process.env.NASTY_BENCH_PROFILE) paintSegmentDiagnostics.translated++;
           commandCount += previousSegment.commands;
           addVisibleAncestors(element);
-          saveSegment(element, box, false, segmentStart, beforeCommands, true, translated);
+          saveSegment(element, box, false, 0, beforeCommands, true, translated);
           continue;
         }
       }
@@ -1887,9 +2193,18 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
       };
       const { x, y, width: ringWidth, height } = box.borderBox;
-      const clipRegions = clipsFor(box);
       const corners = cornerRadiiFor(box.element.style, ringWidth, height);
-      pushRoundedRing(box, { x, y, width: ringWidth, height }, spread, color, corners, project, clipRegions);
+      const ringRect = { x: x - spread, y: y - spread, width: ringWidth + spread * 2, height: height + spread * 2 };
+      const ringClips = !transformed && !paintMode.capture
+        ? gpuBoxClips(element, ringRect.x, ringRect.y, ringRect.x + ringRect.width, ringRect.y + ringRect.height) : null;
+      if (ringClips && color) {
+        const grow = (radius) => radius > 0 ? radius + spread : 0;
+        pushGpuBox(ringRect, { tl: grow(corners.tl), tr: grow(corners.tr), br: grow(corners.br), bl: grow(corners.bl) },
+          null, [spread, spread, spread, spread], color, ringClips);
+      } else {
+        const clipRegions = clipsFor(box);
+        pushRoundedRing(box, { x, y, width: ringWidth, height }, spread, color, corners, project, clipRegions);
+      }
       saveSegment(element, box, after, segmentStart, beforeCommands, false);
       if (values.length) pushScenePart(Float32Array.from(values), element, commandCount - beforeCommands);
       values = [];
@@ -1928,20 +2243,32 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         continue;
       }
     }
-    const clipRegions = clipsFor(box);
     const project = (x, y) => {
       const point = projectPoint(box, box.x + x, box.y + y);
       return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
     };
-    const corners = paintMode.capture ? null : [
+    // Untransformed boxes: an axis-aligned test against the clip rect decides
+    // visibility; the GPU applies the exact (rounded) clip.
+    if (!transformed && !paintMode.capture) {
+      const visibleRect = intersection(box.clip ?? viewport, viewport);
+      if (!(box.x + box.width > visibleRect.x && box.y + box.height > visibleRect.y
+          && box.x < visibleRect.x + visibleRect.width && box.y < visibleRect.y + visibleRect.height)) {
+        saveSegment(element, box, after, segmentStart, beforeCommands, false);
+        values = [];
+        continue;
+      }
+    }
+    let clipRegionsValue = null;
+    const lazyClipRegions = () => clipRegionsValue ??= clipsFor(box);
+    const corners = paintMode.capture || !transformed ? null : [
       project(0, 0), project(box.width, 0),
       project(box.width, box.height), project(0, box.height),
     ];
-    if (paintMode.capture) {
+    if (paintMode.capture || !transformed) {
       addVisibleAncestors(box.element);
     } else if (corners.every(Boolean)) {
       let clippedBounds = corners.map((point) => ({ x: point.x, y: point.y }));
-      for (const region of clipRegions) clippedBounds = clipConvexPolygon(clippedBounds, region);
+      for (const region of lazyClipRegions()) clippedBounds = clipConvexPolygon(clippedBounds, region);
       const visible = clippedBounds.length >= 3
         && Math.max(...clippedBounds.map((point) => point.x)) > 0
         && Math.min(...clippedBounds.map((point) => point.x)) < width
@@ -1968,7 +2295,26 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     const backgroundColor = withOpacity(parseColor(computedStyleValue(style, "backgroundColor")), opacity);
     const filterBlur = parseFilterBlur(computedStyleValue(style, "filter") ?? style.filter);
     const gradient = gradientStops(computedStyleValue(style, "backgroundImage"));
-    if (gradient?.kind === "radial") {
+    // GPU boxes draw backgrounds, linear gradients, borders, and rounded clips
+    // in the fragment shader. Transformed or blurred paint keeps tessellation.
+    const gpuClips = !transformed && !paintMode.capture && !(filterBlur > 0)
+      && (!gradient || (gradient.kind === "linear" && gradient.stops.length <= 4))
+      ? gpuBoxClips(element, box.borderBox.x, box.borderBox.y,
+        box.borderBox.x + box.borderBox.width, box.borderBox.y + box.borderBox.height)
+      : null;
+    const gpuBox = !!gpuClips;
+    if (gpuBox) {
+      const noBorder = [0, 0, 0, 0];
+      if (backgroundColor && backgroundColor[3] > 0) {
+        pushGpuBox(box.borderBox, borderCorners, backgroundColor, noBorder, null, gpuClips);
+      }
+      if (gradient) {
+        pushGpuBox(box.borderBox, borderCorners, {
+          stops: gradient.stops.map(({ color, position }) => ({ color: withOpacity(color, opacity), position })),
+          line: gradientLine(gradient.direction, box.borderBox),
+        }, noBorder, null, gpuClips);
+      }
+    } else if (gradient?.kind === "radial") {
       // Native WGPU radial-gradient: one circle instance per adjacent color-stop
       // pair, with per-pixel mix(t) along radius (CSS color-stop interpolation).
       const localCx = (box.borderBox.x - box.x) + box.borderBox.width * 0.5;
@@ -2005,8 +2351,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
           clipH = Math.max(0, bottom - top);
         };
         clipBounds(0, 0, width, height);
-        if (clipRegions?.length) {
-          for (const region of clipRegions) {
+        if (lazyClipRegions()?.length) {
+          for (const region of lazyClipRegions()) {
             if (!region || region.length < 3) continue;
             let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
             for (const point of region) {
@@ -2090,13 +2436,13 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
           [backgroundColor[0], backgroundColor[1], backgroundColor[2], backgroundColor[3] * alphaScale],
           project,
           Math.min(width, height) / 2,
-          clipRegions,
+          lazyClipRegions(),
         );
       }
     } else {
-      push(box, box.borderBox, backgroundColor, project, radius, clipRegions);
+      push(box, box.borderBox, backgroundColor, project, radius, lazyClipRegions());
     }
-    if (gradient?.kind === "linear") {
+    if (!gpuBox && gradient?.kind === "linear") {
       const direction = gradient.direction;
       const horizontal = direction === "to right" || direction === "to left";
       const reverse = direction === "to top" || direction === "to left";
@@ -2110,13 +2456,31 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         const a = reverse ? 1 - end : start;
         const b = reverse ? 1 - start : end;
         const position = (a + b) / 2;
+        // Strips share exact edges. GPU rasterization covers each pixel once,
+        // so translucent stops do not double-blend into seams.
+        const from = horizontal ? box.borderBox.x + box.borderBox.width * start : box.borderBox.y + box.borderBox.height * start;
+        const to = horizontal ? box.borderBox.x + box.borderBox.width * end : box.borderBox.y + box.borderBox.height * end;
         const rect = horizontal
-          ? { x: box.borderBox.x + box.borderBox.width * start, y: box.borderBox.y, width: box.borderBox.width / strips + 0.25, height: box.borderBox.height }
-          : { x: box.borderBox.x, y: box.borderBox.y + box.borderBox.height * start, width: box.borderBox.width, height: box.borderBox.height / strips + 0.25 };
-        push(box, rect, withOpacity(gradientColor(gradient.stops, position), opacity), project, radius, clipRegions);
+          ? { x: from, y: box.borderBox.y, width: to - from, height: box.borderBox.height }
+          : { x: box.borderBox.x, y: from, width: box.borderBox.width, height: to - from };
+        push(box, rect, withOpacity(gradientColor(gradient.stops, position), opacity), project, radius, lazyClipRegions());
       }
     }
-    if (box.element.localName === "canvas") {
+    // A canvas whose 2D context recorded GPU geometry draws as a native canvas
+    // program; only contexts that fell back to raster upload a texture.
+    let canvasOnGpu = false;
+    if (box.element.localName === "canvas" && !transformed && !paintMode.capture && !frameCanvas && opacity >= 0.999
+        && Math.abs(box.contentBox.x) < 0.01 && Math.abs(box.contentBox.y) < 0.01) {
+      const program = canvasTriangleBuffer(elementState(box.element).canvasContext, box.contentBox.width, box.contentBox.height);
+      if (program) {
+        frameCanvas = program;
+        canvasOnGpu = true;
+        const clip = intersection(box.clip ? intersection(box.clip, viewport) : viewport, box.contentBox);
+        values.push(10, clip.x, clip.y, clip.width, clip.height);
+        commandCount++;
+      }
+    }
+    if (box.element.localName === "canvas" && !canvasOnGpu) {
       const state = elementState(box.element);
       const surface = canvasSurface(state.canvasContext);
       const window = box.element.ownerDocument?.defaultView;
@@ -2171,7 +2535,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
     }
     const { borderBox, border } = box;
     const state = elementState(box.element);
-    const image = state.image ?? state.video?.image;
+    const image = canvasOnGpu ? null : state.image ?? state.video?.image;
     const content = box.contentBox;
     if (image && content.width > 0 && content.height > 0) {
       const fit = style.objectFit ?? "fill";
@@ -2196,7 +2560,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         // that same space: viewport first, then overflow/window regions. Using the
         // untransformed content box here used to chop floating/spinning images.
         let clipped = paintMode.capture ? corners : clipTexturedPolygon(corners, viewport);
-        for (const region of clipRegions) clipped = clipConvexPolygon(clipped, region);
+        for (const region of lazyClipRegions()) clipped = clipConvexPolygon(clipped, region);
         if (!paintMode.capture) clipped = clipConvexPolygon(clipped, windowClip);
         if (clipped.length >= 3) {
           const triangles = [];
@@ -2224,9 +2588,13 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
       const firstColor = colors.find((color, i) => active[i] && color);
       const uniformColor = !!firstColor && colors.every((color, i) => !active[i] || color === firstColor);
       const anyRadius = borderCorners.tl > 0 || borderCorners.tr > 0 || borderCorners.br > 0 || borderCorners.bl > 0;
-      if (anyRadius && uniformWidth && uniformColor && firstColor) {
+      if (gpuBox && uniformColor && firstColor) {
+        // Drawn after the image/canvas content, as CSS paints borders above it.
+        pushGpuBox(borderBox, borderCorners, null, [thicknesses[0], thicknesses[1], thicknesses[2], thicknesses[3]],
+          withOpacity(parseColor(firstColor), opacity), gpuClips);
+      } else if (anyRadius && uniformWidth && uniformColor && firstColor) {
         const thickness = thicknesses.find((value, i) => active[i]) || 0;
-        pushRoundedRing(box, borderBox, thickness, withOpacity(parseColor(firstColor), opacity), borderCorners, project, clipRegions);
+        pushRoundedRing(box, borderBox, thickness, withOpacity(parseColor(firstColor), opacity), borderCorners, project, lazyClipRegions());
       } else {
         for (let index = 0; index < SIDES.length; index++) {
           if (!active[index] || !colors[index]) continue;
@@ -2245,7 +2613,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
             const rounded = roundedRectPolygon(borderBox, 0, borderCorners);
             push(box, rect, withOpacity(parseColor(colors[index]), opacity), project, 0, [...clipRegions, rounded]);
           } else {
-            push(box, rect, withOpacity(parseColor(colors[index]), opacity), project, 0, clipRegions);
+            push(box, rect, withOpacity(parseColor(colors[index]), opacity), project, 0, lazyClipRegions());
           }
         }
       }
@@ -2307,16 +2675,17 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
         const clip = intersection(box.clip ?? viewport, viewport);
         if (box.x + box.width > clip.x && box.y + box.height > clip.y
             && box.x < clip.x + clip.width && box.y < clip.y + clip.height) {
-          const beforeParts = sceneParts.length;
-          emitScrollContent(element, box);
-          if (sceneParts.length > beforeParts) {
+          const emitted = emitScrollContent(element, box);
+          if (emitted) {
             scenePartOwners.push(null);
-            scenePartCommands.push(1);
+            scenePartCommands.push(emitted);
           }
         }
       }
     }
   }
+  commitPendingText();
+  closeTextLayer();
   const assembleStarted = process.env.NASTY_BENCH_PROFILE ? performance.now() : 0;
   const sceneLength = 2 + sceneParts.reduce((total, part) => total + part.length, 0);
   const scene = new Float32Array(sceneLength);
@@ -2331,9 +2700,15 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   if (process.env.NASTY_BENCH_PROFILE && paintProfile) paintProfile.sceneFloats = sceneLength;
   if (process.env.NASTY_BENCH_PROFILE && paintProfile) (globalThis.__nastyPaintLog ??= []).push(paintProfile.ms);
   const compose = overlays => {
+  if (process.env.NASTY_BENCH_PROFILE) {
+    const total = globalThis.__nastySegmentTotals ??= { exact: 0, translated: 0, outside: 0, missed: 0 };
+    for (const key of Object.keys(total)) total[key] += paintSegmentDiagnostics[key] - (paintSegmentDiagnostics[`_${key}`] ?? 0);
+    for (const key of Object.keys(total)) paintSegmentDiagnostics[`_${key}`] = paintSegmentDiagnostics[key];
+  }
   if (process.env.NASTY_BENCH_PROFILE && paintSegmentDiagnostics.frames % 30 === 0) {
     console.error("NASTY_SEGMENTS", { ...paintSegmentDiagnostics, generation, elements: boxes.length, paintElements: paintBoxes.length, paintProfile });
-    Object.assign(paintSegmentDiagnostics, { frames: 0, cacheable: 0, exact: 0, translated: 0, outside: 0, missed: 0 });
+    Object.assign(paintSegmentDiagnostics, { frames: 0, cacheable: 0, exact: 0, translated: 0, outside: 0, missed: 0,
+      _exact: 0, _translated: 0, _outside: 0, _missed: 0 });
   }
   values = [5, 0];
   commandCount = 0;
@@ -2363,13 +2738,14 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [])
   combined.set(values.slice(2), scene.length);
   combined[1] += commandCount;
   const displayList = Buffer.from(combined.buffer);
-  transformedListElements.set(displayList, visibleElements);
+  transformedListTextLayers.set(displayList, textLayers);
+  if (frameCanvas) transformedListCanvases.set(displayList, frameCanvas);
   return displayList;
   };
   if (fullSceneCacheable && !activeTransitionElements?.size) transformedScenes.set(boxes, { generation, transitionGeneration, width, height, compose });
   // Publish a reusable scroll-scene base that omits live transition/animation
   // chrome. Those elements are repainted on top of the reused base each frame.
-  if (documentData && scrollLayers.size) {
+  if (documentData && !layerPaint && scrollLayers.size) {
     const baseParts = [];
     const layerSlots = new Map();
     const activeLayerSlots = reusedScrollBase && scrollSceneCache

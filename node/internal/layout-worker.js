@@ -1,7 +1,12 @@
 import { Worker } from "node:worker_threads";
+import { LayoutEngine, boxesFromValues } from "./layout-engine.js";
 
+// Documents lay out in thread by default: layoutSync blocks the caller anyway,
+// and posting mutations to a worker plus waking it cost far more than Taffy's
+// compute for typical trees. NASTY_LAYOUT_WORKER=1 keeps the worker thread.
 export class LayoutWorker {
-  #worker;
+  #worker = null;
+  #engine = null;
   #nextId = 1;
   #pending = new Map();
   #version = 0;
@@ -15,6 +20,10 @@ export class LayoutWorker {
   #pendingCreates = [];
 
   constructor() {
+    if (process.env.NASTY_LAYOUT_WORKER !== "1") {
+      this.#engine = new LayoutEngine();
+      return;
+    }
     this.#worker = new Worker(new URL("../workers/layout.js", import.meta.url));
     this.#worker.on("message", (message) => {
       if (message.id === 0) {
@@ -67,6 +76,7 @@ export class LayoutWorker {
     this.#pendingStyles.clear();
     this.#pendingChildren.clear();
     this.#pendingTextMetrics.clear();
+    if (this.#engine) return Promise.resolve(this.#engine.initialize(nodes, root));
     return this.#send("init", { nodes, root });
   }
 
@@ -93,6 +103,7 @@ export class LayoutWorker {
   }
 
   async layout(width, height, root = 0) {
+    if (this.#engine) return this.layoutSync(width, height, root);
     if (this.#workerError) {
       const error = this.#workerError;
       this.#workerError = null;
@@ -102,10 +113,19 @@ export class LayoutWorker {
     const result = await this.#send("layout", {
       width, height, root, version: requestedVersion, mutations: this.#takeMutations(),
     });
-    return { ...result, stale: result.version !== this.#version };
+    // Detached nodes have no layout; give them the zero box the sync path uses.
+    const boxes = Array.from(result.boxes, (box) => box ?? zeroBox());
+    return { ...result, boxes, stale: result.version !== this.#version };
   }
 
   layoutSync(width, height, root = 0) {
+    if (this.#engine) {
+      const started = performance.now();
+      this.#engine.applyMutations(this.#takeMutations());
+      const { values, count, reachable } = this.#engine.compute(width, height, root);
+      const computeMs = performance.now() - started;
+      return { boxes: boxesFromValues(values, count, reachable), version: this.#version, stale: false, computeMs, workerMs: computeMs };
+    }
     if (this.#workerError) {
       const error = this.#workerError;
       this.#workerError = null;
@@ -142,9 +162,19 @@ export class LayoutWorker {
   }
 
   close() {
+    if (!this.#worker) return Promise.resolve();
     // Closing a document must not keep Node alive while the worker is winding
     // down, especially when close is initiated by the native window manager.
     this.#worker.unref();
     return this.#worker.terminate();
   }
+}
+
+function zeroBox() {
+  return {
+    x: 0, y: 0, width: 0, height: 0,
+    marginTop: 0, marginRight: 0, marginBottom: 0, marginLeft: 0,
+    borderTop: 0, borderRight: 0, borderBottom: 0, borderLeft: 0,
+    paddingTop: 0, paddingRight: 0, paddingBottom: 0, paddingLeft: 0,
+  };
 }
