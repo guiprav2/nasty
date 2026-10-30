@@ -15,10 +15,10 @@ import { clipsOverflow } from './overflow.js';
 // trigger and then goes further than the trigger (release out to TARGET, skip
 // in from TARGET), so a scroll causes one relayout per viewport travelled
 // instead of one per row.
-const RELEASE_TRIGGER = 3;
-const RELEASE_TARGET = 6;
-const SKIP_TARGET = 8;
-const SKIP_TRIGGER = 10;
+const RELEASE_TRIGGER = 4;
+const RELEASE_TARGET = 8;
+const SKIP_TARGET = 10;
+const SKIP_TRIGGER = 12;
 // Skipping only gives memory back, so it waits until scrolling has settled;
 // a scroll then relays out only when it nears the released frontier.
 const SETTLE_MS = 300;
