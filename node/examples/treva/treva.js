@@ -13,6 +13,8 @@ import {
   extOf,
   visibleImages,
   plural,
+  gridWindow,
+  listWindow,
 } from "./model.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -100,6 +102,18 @@ const SORT_LABEL = {
   modified: "Modified",
 };
 
+// The two scrollers. Writing state.scroll.grid / .list (as the filter and sort
+// handlers do) asks for a reset to the top, applied at the next update.
+let gridScroller = null;
+let listScroller = null;
+const scrollReset = { grid: false, list: false };
+const scrollControl = {
+  get grid() { return gridScroller?.scrollTop ?? 0; },
+  set grid(_value) { scrollReset.grid = true; },
+  get list() { return listScroller?.scrollTop ?? 0; },
+  set list(_value) { scrollReset.list = true; },
+};
+
 const state = {
   status: "idle",
   folderName: "",
@@ -123,7 +137,7 @@ const state = {
   scan: { errors: 0 },
   viewportW: 1100,
   viewportH: 720,
-  scroll: { grid: 0, list: 0 },
+  scroll: scrollControl,
   viewport: { grid: 0, gridH: 0, list: 0, listH: 0 },
   generation: 0,
 };
@@ -1039,20 +1053,23 @@ function reimagineTabs() {
 
 // --- Gallery / folder scan ---
 
-// Per-update cache, as in Treva's app.js: bindings share one sorted list.
+// The filtered, sorted list is shared by every binding and rebuilt only when
+// what it depends on changes (updates also happen on every scroll window shift).
 let frame = {};
 
 function invalidate() {
   frame.visible = null;
 }
 
-d.on("beforeUpdate", invalidate);
-
 // Sidebar file list window, as in Treva's app.js (ROW_H rows, overscan).
 const ROW_H = 58;
 
 function visible() {
-  if (frame.visible) return frame.visible;
+  const key = `${state.filter}\u0000${state.recursive}\u0000${state.sortKey}\u0000${state.sortDir}`;
+  if (frame.visible && frame.key === key && frame.source === state.images && frame.count === state.images.length) return frame.visible;
+  frame.key = key;
+  frame.source = state.images;
+  frame.count = state.images.length;
   frame.visible = visibleImages(state.images, {
     filter: state.filter,
     recursive: state.recursive,
@@ -1061,6 +1078,80 @@ function visible() {
   });
   return frame.visible;
 }
+
+// Virtualization: only the rows near the viewport exist in the DOM, between
+// spacers that keep the scroll height whole. TREVA_VIRTUALIZE=0 attaches every
+// image instead (the engine paints and lays out all of it), for regression tests.
+const VIRTUALIZE = process.env.TREVA_VIRTUALIZE !== "0";
+const GRID_OVERSCAN_ROWS = 8;
+const LIST_OVERSCAN_ROWS = 20;
+const GRID_MARGIN_ROWS = 3;
+const LIST_MARGIN_ROWS = 8;
+let gridAnchor = null;
+let listAnchor = null;
+let lastGridWindow = null;
+let lastListWindow = null;
+
+// Reading a scroller's client size forces layout, and every binding of an update
+// asks for the window: measure once per viewport configuration instead.
+const measured = { grid: null, list: null };
+
+function clientSize(name, el, fallbackWidth, fallbackHeight) {
+  const key = `${state.viewportW}x${state.viewportH}|${state.sidebarOpen}|${state.narrow}|${state.screen}`;
+  const known = measured[name];
+  if (known && known.key === key) return known;
+  const size = { key, width: el?.clientWidth || fallbackWidth, height: el?.clientHeight || fallbackHeight };
+  // Only trust a measurement of an attached scroller.
+  if (el) measured[name] = size;
+  return size;
+}
+
+// The rendered range stays put while the viewport (plus a small margin) is
+// inside it, so the DOM changes once every several rows of scrolling and not on
+// every frame; it is re-centered, with the full overscan, only when needed.
+function steadyWindow(last, fresh, needed) {
+  const same = last && last.cols === fresh.cols && last.totalH === fresh.totalH && last.rowH === fresh.rowH;
+  return same && needed.start >= last.start && needed.end <= last.end ? last : fresh;
+}
+
+function gridWin() {
+  gridScroller ??= gridAnchor?.parentElement ?? null;
+  const el = gridScroller;
+  const size = clientSize("grid", el, state.viewportW - (state.sidebarOpen && !state.narrow ? 288 : 0), 600);
+  const options = { count: visible().length, thumb: state.thumb, width: size.width, scrollTop: el?.scrollTop || 0, viewHeight: size.height };
+  const next = steadyWindow(lastGridWindow, gridWindow({ ...options, overscan: GRID_OVERSCAN_ROWS }),
+    gridWindow({ ...options, overscan: GRID_MARGIN_ROWS }));
+  lastGridWindow = next;
+  return next;
+}
+
+function listWin() {
+  listScroller ??= listAnchor?.parentElement ?? null;
+  const el = listScroller;
+  const size = clientSize("list", el, 0, 600);
+  const options = { count: visible().length, rowH: ROW_H, scrollTop: el?.scrollTop || 0, viewHeight: size.height };
+  const next = steadyWindow(lastListWindow, listWindow({ ...options, overscan: LIST_OVERSCAN_ROWS }),
+    listWindow({ ...options, overscan: LIST_MARGIN_ROWS }));
+  lastListWindow = next;
+  return next;
+}
+
+function onGridScroll() {
+  if (!VIRTUALIZE) return;
+  const before = lastGridWindow;
+  if (gridWin() !== before) d.update();
+}
+
+function onListScroll() {
+  if (!VIRTUALIZE) return;
+  const before = lastListWindow;
+  if (listWin() !== before) d.update();
+}
+
+d.on("beforeUpdate", () => {
+  if (scrollReset.grid) { scrollReset.grid = false; if (gridScroller) gridScroller.scrollTop = 0; }
+  if (scrollReset.list) { scrollReset.list = false; if (listScroller) listScroller.scrollTop = 0; }
+});
 
 let _byIdSource = null;
 let _byId = null;
@@ -1148,7 +1239,7 @@ function thumbButton(im) {
       "data-path": im.path,
       title: im.path,
       class: [
-        `relative min-w-0 w-full overflow-hidden rounded-md bg-[${C.ink800}] text-left cursor-pointer content-auto`,
+        `relative min-w-0 w-full overflow-hidden rounded-md bg-[${C.ink800}] text-left cursor-pointer`,
         // Explicit square size from virtualizer — more reliable than aspect-square alone
         // for giving <img> a non-zero content box to paint into.
         "aspect-square w-full",
@@ -1201,6 +1292,46 @@ function thumbButton(im) {
   );
 }
 
+// The grid's contents: a window of cells between a tall spacer, or every cell.
+function gridContent() {
+  if (!VIRTUALIZE) {
+    // Every image is attached; only image loading is gated by the engine.
+    return d.el(
+      "div",
+      {
+        class: ["grid w-full gap-2.5 p-3", () => `grid-cols-[repeat(auto-fill,minmax(${state.thumb}px,1fr))]`],
+        "data-testid": "grid-inner",
+      },
+      d.map(() => visible().map(im => im.id), (id) => {
+        const im = imageById(id);
+        return im ? thumbButton(im) : null;
+      }),
+    );
+  }
+  gridAnchor = d.el(
+    "div",
+    { class: ["relative w-full", () => `h-[${Math.ceil(gridWin().totalH)}px]`] },
+    d.el(
+      "div",
+      {
+        class: ["absolute inset-x-0 grid gap-2.5 px-3", () => {
+          const w = gridWin();
+          return `top-[${Math.round(w.offset)}px] grid-cols-[repeat(${w.cols},minmax(0,1fr))]`;
+        }],
+        "data-testid": "grid-inner",
+      },
+      d.map(() => {
+        const w = gridWin();
+        return visible().slice(w.start, w.end).map(im => im.id);
+      }, (id) => {
+        const im = imageById(id);
+        return im ? thumbButton(im) : null;
+      }),
+    ),
+  );
+  return gridAnchor;
+}
+
 function gallery() {
   return d.el(
     "div",
@@ -1217,19 +1348,9 @@ function gallery() {
         class: "min-h-0 h-full flex-1 overflow-auto",
         "data-testid": "grid",
         "data-scrollroot": "grid",
+        onscroll: onGridScroll,
       },
-      // Every image is attached; only image loading is gated by the engine.
-      d.el(
-        "div",
-        {
-          class: ["grid w-full gap-2.5 p-3", () => `grid-cols-[repeat(auto-fill,minmax(${state.thumb}px,1fr))]`],
-          "data-testid": "grid-inner",
-        },
-        d.map(() => visible().map(im => im.id), (id) => {
-          const im = imageById(id);
-          return im ? thumbButton(im) : null;
-        }),
-      ),
+      gridContent(),
       d.if(
         () => visible().length === 0,
         d.el(
@@ -1385,6 +1506,67 @@ function sortDropdown() {
   );
 }
 
+function fileRow(im) {
+  return d.el(
+            "button",
+            {
+              type: "button",
+              "data-testid": "file-row",
+              class: [
+                `flex h-[${ROW_H}px] w-full items-center gap-3 border-b border-stone-400/4 px-3 text-left hover:bg-white/5 cursor-pointer`,
+                () => (im.id === state.currentId ? `bg-[${C.gold300}]/15` : ""),
+              ],
+              onclick: () => activateImage(im),
+            },
+            d.el(
+              "div",
+              {
+                class: [
+                  `h-10 w-10 shrink-0 overflow-hidden rounded bg-[${C.ink800}]`,
+                  () =>
+                    im.id === state.currentId
+                      ? `ring-2 ring-[${C.gold300}]`
+                      : "ring-1 ring-stone-400/6",
+                ],
+              },
+              d.el("img", {
+                alt: "",
+                class: "h-full w-full object-cover",
+                src: fileUrlFor(im),
+              }),
+            ),
+            d.el(
+              "div",
+              { class: "min-w-0 flex-1" },
+              d.el("div", { class: "truncate text-sm text-stone-100" }, im.name),
+              d.el(
+                "div",
+                { class: "truncate text-xs text-stone-500" },
+                d.text(() => directoryLabel(im)),
+              ),
+            ),
+          );
+}
+
+// The sidebar list: a window of rows between two spacers, or every row.
+function fileListContent() {
+  if (!VIRTUALIZE) return d.map(() => visible(), fileRow);
+  listAnchor = d.el(
+    "div",
+    { class: "w-full" },
+    d.el("div", { class: () => `h-[${Math.round(listWin().offset)}px]` }),
+    d.el("div", {}, d.map(() => {
+      const w = listWin();
+      return visible().slice(w.start, w.end);
+    }, fileRow)),
+    d.el("div", { class: () => {
+      const w = listWin();
+      return `h-[${Math.max(0, Math.round(w.totalH - w.offset - (w.end - w.start) * ROW_H))}px]`;
+    } }),
+  );
+  return listAnchor;
+}
+
 function sidebar() {
   return d.el(
     "aside",
@@ -1453,50 +1635,9 @@ function sidebar() {
       {
         class: "min-h-0 flex-1 overflow-auto",
         "data-testid": "file-list",
+        onscroll: onListScroll,
       },
-      d.map(
-        () => visible(),
-        im =>
-          d.el(
-            "button",
-            {
-              type: "button",
-              "data-testid": "file-row",
-              class: [
-                `flex h-[${ROW_H}px] w-full items-center gap-3 border-b border-stone-400/4 px-3 text-left hover:bg-white/5 cursor-pointer content-auto`,
-                () => (im.id === state.currentId ? `bg-[${C.gold300}]/15` : ""),
-              ],
-              onclick: () => activateImage(im),
-            },
-            d.el(
-              "div",
-              {
-                class: [
-                  `h-10 w-10 shrink-0 overflow-hidden rounded bg-[${C.ink800}]`,
-                  () =>
-                    im.id === state.currentId
-                      ? `ring-2 ring-[${C.gold300}]`
-                      : "ring-1 ring-stone-400/6",
-                ],
-              },
-              d.el("img", {
-                alt: "",
-                class: "h-full w-full object-cover",
-                src: fileUrlFor(im),
-              }),
-            ),
-            d.el(
-              "div",
-              { class: "min-w-0 flex-1" },
-              d.el("div", { class: "truncate text-sm text-stone-100" }, im.name),
-              d.el(
-                "div",
-                { class: "truncate text-xs text-stone-500" },
-                d.text(() => directoryLabel(im)),
-              ),
-            ),
-          ),
-      ),
+      fileListContent(),
     ),
   );
 }

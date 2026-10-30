@@ -20,9 +20,9 @@ const MAX_TILE_EDGE = 2048;
 // to tiles within one host viewport of the visible area (released beyond two).
 const RESIDENT_ALLOCATE = 1;
 const RESIDENT_RELEASE = 2;
-// Tiles beyond the visible area are created a few per frame, nearest first,
-// so a very tall layer never stalls one frame creating gigabytes of targets.
-const MAX_NEW_TILES_PER_FRAME = 6;
+// Every tile that has painted content is created and painted at once: scrolling
+// never reveals a texture that has not been painted yet. Apps with content too
+// large for that virtualize it.
 const BUDGET_TOTAL_SHARE = 0.25;
 const BUDGET_FREE_SHARE = 0.5;
 const BUDGET_RELEASE_HYSTERESIS = 0.75;
@@ -352,6 +352,13 @@ function chooseBandedLayers(plans) {
 
 /** Returns the rects of tiles created now; the caller paints them. */
 function allocateTiles(window, layer, hostBox, width, height, geometry, banded) {
+  const painted = layerIndexFor(layer).painted;
+  const hasContent = (tile) => {
+    for (let band = Math.floor(tile.y / BAND_HEIGHT), last = Math.floor((tile.y + tile.height) / BAND_HEIGHT); band <= last; band++) {
+      if (painted.has(band)) return true;
+    }
+    return false;
+  };
   const { limit, columns, rows } = geometry;
   const view = hostBox.paddingBox;
   const host = hostBox.element;
@@ -367,8 +374,12 @@ function allocateTiles(window, layer, hostBox, width, height, geometry, banded) 
       const tile = layer.tiles.get(key);
       if (!tile) {
         if (banded && !reachesTile(wanted, view, RESIDENT_ALLOCATE, left, top)) continue;
+        const onScreen = reachesTile(wanted, view, 0, left, top);
+        // Everything that paints gets its texture now, wherever it is; only
+        // empty stretches (a virtualized list's spacers) have none.
+        if (!banded && !onScreen && !hasContent(wanted)) continue;
         keep.add(key);
-        missing.push({ key, wanted, visible: reachesTile(wanted, view, 0, left, top),
+        missing.push({ key, wanted, visible: onScreen,
           distance: Math.abs(wanted.y + wanted.height / 2 - (top + view.height / 2)) + Math.abs(wanted.x + wanted.width / 2 - (left + view.width / 2)) });
       } else if (banded && !reachesTile(wanted, view, RESIDENT_RELEASE, left, top)) {
         continue;
@@ -383,12 +394,9 @@ function allocateTiles(window, layer, hostBox, width, height, geometry, banded) 
     }
   }
   missing.sort((a, b) => Number(b.visible) - Number(a.visible) || a.distance - b.distance);
-  let created = 0;
-  for (const { key, wanted, visible } of missing) {
-    if (!visible && created >= MAX_NEW_TILES_PER_FRAME) continue;
+  for (const { key, wanted } of missing) {
     layer.tiles.set(key, { id: window.createLayerTexture(wanted.width, wanted.height), ...wanted });
     fresh.push(wanted);
-    created++;
   }
   for (const [key, tile] of layer.tiles) {
     if (keep.has(key)) continue;
@@ -454,7 +462,6 @@ export function prepareScrollLayers(window, document, boxes) {
     const host = hostBox.element;
     layer.depth = hostDepth(hostBox, byElement);
     layer.outer = hostBox.layerHost ? ensureLayer(hostBox.layerHost) : null;
-    const fresh = allocateTiles(window, layer, hostBox, width, height, geometry, layer.banded);
     const patch = doc.boxPatch;
     if (patch && patch.boxes === boxes && layer.source === patch.base
         && layer.contentWidth === width && layer.contentHeight === height) {
@@ -503,6 +510,8 @@ export function prepareScrollLayers(window, document, boxes) {
       layer.contentWidth = width;
       layer.contentHeight = height;
     }
+    // Allocate once the bounds say where content is (tiles exist only where it paints).
+    const fresh = allocateTiles(window, layer, hostBox, width, height, geometry, layer.banded);
     // Paint changes reach every descendant painted in this layer. Mark the
     // changed elements that live in it, then walk each painted element's
     // ancestors once (changed x painted pairs would be quadratic).
@@ -586,11 +595,15 @@ const BAND_HEIGHT = 512;
 function createLayerIndex(layer) {
   const index = {
     always: [], bands: new Map(), stale: 0,
+    // Bands of layer height where something paints; tiles are only made where content is.
+    painted: new Set(),
     add(element, entry) {
-      if (entry.transformed) { this.always.push([element, entry]); return; }
       const rect = entry.rect;
-      if (!(rect.width > 0 && rect.height > 0)) return;
+      const sized = rect.width > 0 && rect.height > 0;
       const first = Math.floor(rect.y / BAND_HEIGHT), last = Math.floor((rect.y + rect.height) / BAND_HEIGHT);
+      if (sized && entry.paints) for (let band = first; band <= last; band++) this.painted.add(band);
+      if (entry.transformed) { this.always.push([element, entry]); return; }
+      if (!sized) return;
       for (let band = first; band <= last; band++) {
         let list = this.bands.get(band);
         if (!list) this.bands.set(band, list = []);

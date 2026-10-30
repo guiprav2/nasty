@@ -8,14 +8,12 @@ import native from "../internal/native.js";
 import { PRESENTS, SIGNAL, STATE } from "../internal/remote-window-protocol.js";
 import { ScrollCompositor } from "./scroll-compositor.js";
 
-const { options, shared, port } = workerData;
+const { options, shared, port, events: eventsPort } = workerData;
 const signal = new Int32Array(shared, 0, 4);
 const state = new Float64Array(shared, 16, 64);
 const replies = port;
 
 let window = null;
-let events = [];
-let pendingError = null;
 let pollTimer = null;
 let closing = false;
 let deferredError = null;
@@ -66,11 +64,12 @@ function pump() {
       forward.push(...scrolled.syncs);
     }
     if (forward.length) {
-      events.push(...forward);
+      // Post first, then count: the counter never runs ahead of what can be read.
+      eventsPort.postMessage(forward);
       Atomics.add(signal, SIGNAL.EVENTS, 1);
     }
   } catch (error) {
-    pendingError = error;
+    eventsPort.postMessage({ pumpError: { name: error?.name, message: error?.message ?? String(error), stack: error?.stack } });
     Atomics.add(signal, SIGNAL.EVENTS, 1);
   }
   publish();
@@ -84,18 +83,6 @@ function schedulePoll() {
 }
 
 function invoke(method, args) {
-  if (method === "drainEvents") {
-    // Fresh events first, then hand over everything buffered.
-    pump();
-    if (pendingError) {
-      const error = pendingError;
-      pendingError = null;
-      throw error;
-    }
-    const taken = events;
-    events = [];
-    return { events: taken, seq: Atomics.load(signal, SIGNAL.EVENTS) };
-  }
   if (method === "setScrollScene") return compositor.setScene(args[0]);
   if (method === "__injectEvent") { injected.push(args[0]); return undefined; }
   if (method === "presentTransformed") {

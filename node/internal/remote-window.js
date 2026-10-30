@@ -42,6 +42,7 @@ export class RemoteWindow {
   #signal;
   #state;
   #seenEvents = 0;
+  #events;
 
   constructor(options = {}) {
     const shared = new SharedArrayBuffer(16 + 64 * 8);
@@ -49,10 +50,15 @@ export class RemoteWindow {
     this.#state = new Float64Array(shared, 16, 64);
     const { port1, port2 } = new MessageChannel();
     this.#replies = port1;
+    // Events travel on their own port: the window thread posts them as it pumps and
+    // this thread reads what has arrived, so receiving them never waits on the window thread.
+    const events = new MessageChannel();
+    this.#events = events.port1;
     this.#worker = new Worker(new URL("../workers/window-host.js", import.meta.url), {
-      workerData: { options, shared, port: port2 },
-      transferList: [port2],
+      workerData: { options, shared, port: port2, events: events.port2 },
+      transferList: [port2, events.port2],
     });
+    events.port1.unref();
     // The page's own timers keep the process alive, like a native window did.
     this.#worker.unref();
     port1.unref();
@@ -128,10 +134,15 @@ export class RemoteWindow {
 
   drainEvents() {
     this.#state[STATE.MAIN_POLLED_AT] = Date.now();
-    // The host counts what it buffers; nothing new means no call.
-    if (Atomics.load(this.#signal, SIGNAL.EVENTS) === this.#seenEvents) return [];
-    const { events, seq } = this.call("drainEvents", []);
-    this.#seenEvents = seq;
+    // The host counts what it posts; nothing new means nothing to read.
+    const posted = Atomics.load(this.#signal, SIGNAL.EVENTS);
+    if (posted === this.#seenEvents) return [];
+    this.#seenEvents = posted;
+    const events = [];
+    for (let message = receiveMessageOnPort(this.#events); message; message = receiveMessageOnPort(this.#events)) {
+      if (message.message.pumpError) throw this.#error(message.message.pumpError);
+      events.push(...message.message);
+    }
     return events;
   }
 }
