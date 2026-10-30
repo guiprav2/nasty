@@ -1136,6 +1136,12 @@ export class Window extends NativeWindow {
     this.#presentationTimer = setTimeout(() => {
       this.#presentationTimer = null;
       if (this.closed || !this.#document) return;
+      // The previous frame is still being presented: leave this thread free for
+      // other work instead of blocking on it, and come back shortly.
+      if (this.presentBusy) {
+        this.#scheduleAutomaticPresentation(1);
+        return;
+      }
       const frameStarted = performance.now();
       this.presentDocument();
       if (this.closed || !this.#document) return;

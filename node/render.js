@@ -2607,6 +2607,25 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       } else if (anyRadius && uniformWidth && uniformColor && firstColor) {
         const thickness = thicknesses.find((value, i) => active[i]) || 0;
         pushRoundedRing(box, borderBox, thickness, withOpacity(parseColor(firstColor), opacity), borderCorners, project, lazyClipRegions());
+      } else if (anyRadius && uniformWidth) {
+        // Differently coloured sides of a rounded box: each side owns the arc of
+        // the ring between the diagonals that join the box's corners to the
+        // inner corners, as in CSS (a circle with two coloured sides is two 90° arcs).
+        const thickness = thicknesses.find((value, i) => active[i]) || 0;
+        const { x, y, width, height } = borderBox;
+        const reach = (radius) => Math.min(Math.max(radius || 0, thickness), width / 2, height / 2);
+        const tl = reach(borderCorners.tl), tr = reach(borderCorners.tr), br = reach(borderCorners.br), bl = reach(borderCorners.bl);
+        const wedges = {
+          Top: [{ x, y }, { x: x + width, y }, { x: x + width - tr, y: y + tr }, { x: x + tl, y: y + tl }],
+          Right: [{ x: x + width, y }, { x: x + width, y: y + height }, { x: x + width - br, y: y + height - br }, { x: x + width - tr, y: y + tr }],
+          Bottom: [{ x: x + width, y: y + height }, { x, y: y + height }, { x: x + bl, y: y + height - bl }, { x: x + width - br, y: y + height - br }],
+          Left: [{ x, y: y + height }, { x, y }, { x: x + tl, y: y + tl }, { x: x + bl, y: y + height - bl }],
+        };
+        for (let index = 0; index < SIDES.length; index++) {
+          if (!active[index] || !colors[index]) continue;
+          pushRoundedRing(box, borderBox, thickness, withOpacity(parseColor(colors[index]), opacity), borderCorners, project,
+            [...lazyClipRegions(), wedges[SIDES[index]]]);
+        }
       } else {
         for (let index = 0; index < SIDES.length; index++) {
           if (!active[index] || !colors[index]) continue;
@@ -2623,7 +2642,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
           // each strip to the rounded outer polygon so corners stay round.
           if (anyRadius) {
             const rounded = roundedRectPolygon(borderBox, 0, borderCorners);
-            push(box, rect, withOpacity(parseColor(colors[index]), opacity), project, 0, [...clipRegions, rounded]);
+            push(box, rect, withOpacity(parseColor(colors[index]), opacity), project, 0, [...lazyClipRegions(), rounded]);
           } else {
             push(box, rect, withOpacity(parseColor(colors[index]), opacity), project, 0, lazyClipRegions());
           }

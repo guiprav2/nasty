@@ -68,6 +68,8 @@ const ICONS = {
   folder: "nf-md-folder",
   grid: "nf-md-view_grid",
   image: "nf-md-image",
+  loading: "nf-md-loading",
+  waiting: "nf-md-progress_clock",
   chevronDown: "nf-md-chevron_down",
   check: "nf-md-check",
   imageSmaller: "nf-md-image_minus",
@@ -129,6 +131,8 @@ const state = {
   screen: "gallery",
   slideshow: false,
   help: false,
+  // While a folder opens: { phase: "scanning" | "rendering", count, total }.
+  opening: null,
   dragOver: false,
   sidebarOpen: true,
   narrow: false,
@@ -1182,11 +1186,13 @@ function fileUrlFor(im) {
 // Thumb <img src> stays set for the life of the node. Visibility admission and
 // decode isolation are engine responsibilities — the app must not remove src.
 
-async function listImages(rootPath) {
+async function listImages(rootPath, onProgress = null) {
   const exts = [...IMAGE_EXT];
   // One glob with brace expansion is faster than 16 separate walks.
   const patterns = [`**/*.{${exts.join(",")}}`];
-  const absPaths = await fg(patterns, {
+  const absPaths = [];
+  let reported = 0;
+  const stream = fg.stream(patterns, {
     cwd: rootPath,
     absolute: true,
     onlyFiles: true,
@@ -1206,6 +1212,15 @@ async function listImages(rootPath) {
     // Keep directory order stable-ish; we sort via visibleImages anyway.
     followSymbolicLinks: false,
   });
+  // Entries arrive as the walk finds them, so a long scan can report progress.
+  for await (const entry of stream) {
+    absPaths.push(entry);
+    if (onProgress && absPaths.length - reported >= 200) {
+      reported = absPaths.length;
+      onProgress(reported);
+    }
+  }
+  if (onProgress) onProgress(absPaths.length);
   const root = rootPath.endsWith(sep) ? rootPath : rootPath + sep;
   return absPaths.map((absPath, index) => {
     const rel = absPath.startsWith(root)
@@ -1673,8 +1688,23 @@ async function chooseFolder() {
 
     // Glob off the critical path already; yield once so the picker dialog can
     // dismiss and a frame can paint before we build the gallery DOM.
-    const images = await listImages(rootPath);
+    state.opening = { phase: "scanning", count: 0, total: 0 };
+    d.update();
+    let lastShown = 0;
+    const images = await listImages(rootPath, (count) => {
+      state.opening.count = count;
+      const now = performance.now();
+      if (now - lastShown > 120) { lastShown = now; d.update(); }
+    });
     await new Promise((r) => setImmediate(r));
+    if (!VIRTUALIZE && images.length > 500) {
+      // Attaching everything blocks this thread until it is laid out and painted:
+      // say so first, and let that message reach the screen before it starts.
+      state.opening = { phase: "rendering", count: images.length, total: images.length };
+      d.update();
+      await nextFrame();
+      await nextFrame();
+    }
     state.images = images;
     invalidate();
     state.status = "ready";
@@ -1687,14 +1717,22 @@ async function chooseFolder() {
         : `Opened “${state.folderName}” · no images found`,
     );
     d.update();
+    state.opening = null;
+    d.update();
     // After gallery mounts, nudge admission once layout boxes exist.
     queueMicrotask(() => {
       try { d.update(); } catch { /* ignore */ }
     });
   } catch (err) {
+    state.opening = null;
+    d.update();
     if (err && (err.name === "AbortError" || /abort/i.test(String(err.message || err)))) return;
     showToast(err && err.message ? err.message : String(err));
   }
+}
+
+function nextFrame() {
+  return new Promise((resolve) => win.requestAnimationFrame(() => resolve()));
 }
 
 function reopen() {
@@ -1853,6 +1891,43 @@ function dragOverlay() {
         { class: `rounded-xl border-2 border-dashed border-[${C.copper500}] px-10 py-8 text-center` },
         d.el("div", { class: "font-display text-3xl" }, "Drop a folder"),
         d.el("p", { class: "mt-2 text-sm text-stone-400" }, "Every image inside it will be listed here."),
+      ),
+    ),
+  );
+}
+
+// Shown while a folder opens. Scanning animates; rendering everything (virtualization
+// off) blocks this thread, so that message is static and says why.
+function openingOverlay() {
+  return d.if(
+    () => !!state.opening,
+    d.el(
+      "div",
+      {
+        class: "absolute inset-0 z-[85] flex items-center justify-center bg-black/55",
+        "data-testid": "opening",
+      },
+      d.el(
+        "div",
+        { class: `flex w-80 flex-col items-center gap-3 rounded-2xl border border-stone-400/9 bg-[${C.ink900}] px-6 py-6 text-center` },
+        d.if(
+          () => state.opening?.phase === "scanning",
+          // A ring with two coloured sides, spun.
+          d.el("div", { class: `h-8 w-8 rounded-full border-[3px] border-transparent border-t-[${C.gold300}] border-l-[${C.gold300}] animate-spin` }),
+        ),
+        d.if(
+          () => state.opening?.phase === "rendering",
+          icon("waiting", `h-8 w-8 text-3xl text-[${C.gold300}]`),
+        ),
+        d.el("div", { class: "font-display text-xl text-stone-100" },
+          d.text(() => (state.opening?.phase === "rendering" ? "Preparing every image" : "Scanning folder"))),
+        d.el("div", { class: "text-sm text-stone-400", "data-testid": "opening-detail" },
+          d.text(() => {
+            const open = state.opening;
+            if (!open) return "";
+            if (open.phase === "rendering") return `Laying out and painting ${plural(open.total, "image")}. This can take a minute; the window stays responsive.`;
+            return open.count ? `${plural(open.count, "image")} found so far` : "Looking for images";
+          })),
       ),
     ),
   );
@@ -2060,6 +2135,7 @@ function shell() {
     ),
     helpModal(),
     dragOverlay(),
+    openingOverlay(),
     toast(),
     // Header dropdown layers (portaled as fixed overlays).
     indexMenu(),

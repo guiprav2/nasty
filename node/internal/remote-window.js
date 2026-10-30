@@ -11,6 +11,8 @@ import native from "./native.js";
 import { FIRE_AND_FORGET, PRESENTS, SIGNAL, STATE } from "./remote-window-protocol.js";
 
 const CALL_TIMEOUT_MS = 60_000;
+// Decode job ids handed out before the native pool has assigned its own.
+const PROVISIONAL_JOB_BASE = 1e12;
 
 /**
  * Whether windows run on their own thread. NASTY_RENDER_WORKER=1 / 0 force it;
@@ -34,7 +36,7 @@ function compact(value) {
 }
 
 const SPECIAL = new Set(["size", "cursorPosition", "refreshRate", "isMaximized", "imageDecodePending",
-  "imageDecodeReady", "imageDecodeInFlight", "drainEvents", "closed", "constructor", "maxTextureDimension", "setScrollScene"]);
+  "imageDecodeReady", "imageDecodeInFlight", "drainEvents", "closed", "constructor", "maxTextureDimension", "setScrollScene", "submitImageDecode"]);
 
 export class RemoteWindow {
   #worker;
@@ -43,6 +45,7 @@ export class RemoteWindow {
   #state;
   #seenEvents = 0;
   #events;
+  #jobs = 0;
 
   constructor(options = {}) {
     const shared = new SharedArrayBuffer(16 + 64 * 8);
@@ -126,6 +129,21 @@ export class RemoteWindow {
   imageDecodeInFlight() { return this.#state[STATE.DECODE_IN_FLIGHT]; }
   /** Pumps of the OS event loop by the window thread so far. */
   get heartbeat() { return this.#state[STATE.HEARTBEAT]; }
+
+  /**
+   * Starts an image decode without waiting for the window thread: the job id is
+   * made up here, and the window thread reports the decode's events under it.
+   */
+  submitImageDecode(source, maxEdge) {
+    const id = PROVISIONAL_JOB_BASE + ++this.#jobs;
+    this.fire("submitImageDecode", [id, source, maxEdge]);
+    return id;
+  }
+
+  /** Whether a presented frame is still on its way to the screen. */
+  get presentBusy() {
+    return Atomics.load(this.#signal, SIGNAL.PRESENTS_SUBMITTED) - Atomics.load(this.#signal, SIGNAL.PRESENTS_DONE) >= 1;
+  }
 
   /** Tells the window thread which layers of the next presented list it may scroll on its own. */
   setScrollScene(scene) {

@@ -22,6 +22,8 @@ const compositor = new ScrollCompositor();
 const MAIN_BUSY_AFTER_MS = 50;
 // Events for the compositor that did not come from the OS (tests).
 let injected = [];
+// Native decode job id → the provisional id the main thread was given.
+const jobs = new Map();
 
 function publish() {
   if (!window) return;
@@ -55,7 +57,13 @@ function pump() {
     const busy = Date.now() - state[STATE.MAIN_POLLED_AT] > MAIN_BUSY_AFTER_MS;
     const forward = [];
     for (const event of drained) {
-      if ((event.type ?? event.kind) === "wheel" && compositor.wheel(event, busy)) continue;
+      const type = event.type ?? event.kind;
+      if (type === "wheel" && compositor.wheel(event, busy)) continue;
+      if ((type === "image-ready" || type === "image-error") && jobs.has(event.deltaX)) {
+        const provisional = jobs.get(event.deltaX);
+        jobs.delete(event.deltaX);
+        event.deltaX = provisional;
+      }
       forward.push(event);
     }
     const scrolled = compositor.flush();
@@ -84,6 +92,12 @@ function schedulePoll() {
 
 function invoke(method, args) {
   if (method === "setScrollScene") return compositor.setScene(args[0]);
+  if (method === "submitImageDecode") {
+    const [provisional, source, maxEdge] = args;
+    const job = window.submitImageDecode(source, maxEdge);
+    jobs.set(Number(job?.id ?? job), provisional);
+    return undefined;
+  }
   if (method === "__injectEvent") { injected.push(args[0]); return undefined; }
   if (method === "presentTransformed") {
     const [list, ...rest] = args.map(revive);

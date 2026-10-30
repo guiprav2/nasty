@@ -23,7 +23,7 @@ export const STATE = {
 // Failures surface on the next synchronous call.
 export const FIRE_AND_FORGET = new Set([
   "renderLayer", "updateTextPlacement", "setTextRunsNow", "setDragBlocked", "setBodyTransparency",
-  "setSizeConstraints", "setScrollScene", "present", "presentOrdered", "presentTransformed", "presentWithImages",
+  "setSizeConstraints", "setScrollScene", "submitImageDecode", "present", "presentOrdered", "presentTransformed", "presentWithImages",
 ]);
 
 // A presented frame is on the GPU before the next one starts: one in flight, so
