@@ -1485,6 +1485,7 @@ if (state.entered) {
 }
 
 const win = new Window({
+  appId: "vitrola",
   title: "Vitrola",
   width: initialWindowSize.width,
   height: initialWindowSize.height,

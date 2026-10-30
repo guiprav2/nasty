@@ -1,11 +1,11 @@
 import native from "./internal/native.js";
-import { resolve, sep } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { LayoutWorker } from "./internal/layout-worker.js";
 import "./internal/locale-compare.js";
 import "./internal/web-globals.js";
 import { RemoteWindow, renderWorkerEnabled } from "./internal/remote-window.js";
-import { availableParallelism, cpus } from "node:os";
+import { availableParallelism, cpus, homedir } from "node:os";
 import { MediaStream, mediaDevices, readVideoTrackFrame } from "./webrtc.js";
 import { loadImage, unloadImage } from "./image-decoder.js";
 
@@ -51,7 +51,7 @@ import { syncDocumentTextForPresent } from "./internal/dom-text.js";
 import { DOMRect } from "./dom-rect.js";
 import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startInterpolableTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
 import { computeTransform } from "./internal/css-transform.js";
-import { createElementAnimation, isAnimationControlProperty, syncCssAnimations } from "./internal/css-animations.js";
+import { createElementAnimation, isAnimationControlProperty, registerKeyframes, syncCssAnimations } from "./internal/css-animations.js";
 import { buildTransformedDisplayList, clearPaintSegments, displayListCanvas, displayListScrollScene, displayListTextLayers, parseColor } from "./render.js";
 import { scrollHostElement } from "./internal/scroll-quads.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
@@ -66,6 +66,8 @@ import { nerdIcon, renderedText } from "./internal/nerd-icon.js";
 import { canScroll, canScrollByUser, clipsOverflow, overflowAnchorPolicy, overflowMode, userScrollableStyle } from "./internal/overflow.js";
 import { applyIntrinsicSize, insideSkippedContent, isContentSkipped, noteContentVisibility, reconcileContentVisibility } from './internal/content-visibility.js';
 import { assembledMap, liveBoxLookup, liveScreenBoxes, noteLayerScrolled, noteScrollLayerPaintChange, paintScrollLayers } from "./internal/gpu-scroll-layers.js";
+import { paintTransformedText } from "./internal/transformed-text.js";
+import { cachedImageSource } from "./internal/image-cache.js";
 import {
   clearImageLoadSticky,
   isDetachedImage,
@@ -179,6 +181,7 @@ function readAudioOutputs() {
 // The native window runs on its own thread where the platform allows (see
 // internal/remote-window.js), so a busy main thread cannot freeze it.
 const CV_BATCH_COST_CAP_MS = 500;
+const DRAG_HIT_TEST_INTERVAL_MS = 120;
 const NativeWindow = renderWorkerEnabled() ? RemoteWindow : native.Window;
 
 export class Window extends NativeWindow {
@@ -216,6 +219,8 @@ export class Window extends NativeWindow {
   #dragHitTestGeneration = -1;
   #dragHitTestTransformGeneration = -1;
   #dragHitTestGeometryGeneration = -1;
+  #dragHitTestAt = -Infinity;
+  #dragHitTestTimer = null;
   #presentationTimer = null;
   #documentPresented = false;
   #eventTarget = new EventTarget();
@@ -253,12 +258,27 @@ export class Window extends NativeWindow {
     }
     if (typeof initialVsync !== 'boolean') throw new TypeError('vsync must be a boolean');
     if (typeof initialMaximized !== 'boolean') throw new TypeError('maximized must be a boolean');
-    super({ ...options,
+    // App data: appId names the app's directory ($HOME/.<appId>); its cache lives in
+    // <userDataPath>/cache. Without an appId there is no user data, so no caching.
+    const { appId = null, userDataPath: userDataOption, cachePath: cacheOption, ...nativeOptions } = options;
+    if (appId !== null && (typeof appId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(appId))) {
+      throw new TypeError('appId must be a string of letters, digits, ".", "_" or "-"');
+    }
+    for (const [name, value] of [['userDataPath', userDataOption], ['cachePath', cacheOption]]) {
+      if (value !== undefined && value !== null && typeof value !== 'string') throw new TypeError(`${name} must be a string or null`);
+    }
+    if (appId === null) console.warn("Nasty: Window created without an appId; user data and caching are disabled.");
+    const userDataPath = userDataOption !== undefined ? userDataOption : appId ? join(homedir(), `.${appId}`) : null;
+    const cachePath = cacheOption !== undefined ? cacheOption : userDataPath ? join(userDataPath, 'cache') : null;
+    super({ ...nativeOptions,
       width: typeof initialWidth === "number" ? Math.max(1, initialWidth) : 960,
       height: typeof initialHeight === "number" ? Math.max(1, initialHeight) : 600,
       visible: showAfterSizing ? false : options.visible,
       resizable: initialResizable, orientation: initialOrientation, borderless: initialBorderless,
       dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized, vsync: initialVsync });
+    this.#appId = appId;
+    this.#userDataPath = userDataPath;
+    this.#cachePath = cachePath;
     this.#width = initialWidth;
     this.#height = initialHeight;
     this.#resizable = initialResizable;
@@ -369,6 +389,22 @@ export class Window extends NativeWindow {
       && this.#dragHitTestControlGeneration === state?.controlGeometryGeneration
       && this.#dragHitTestGeneration === state?.hitTestGeneration
       && this.#dragHitTestTransformGeneration === (state?.hitTestTransformGeneration ?? 0)) return;
+    // Layout moving under a cursor that has not moved (resizing the window, say)
+    // does not need a fresh hit test every frame: it only decides whether a press
+    // would drag the window. Refresh shortly after the changes stop instead.
+    const sinceLast = performance.now() - this.#dragHitTestAt;
+    if (this.#dragHitTestDocument === document && this.#dragHitTestX === position.x && this.#dragHitTestY === position.y
+        && sinceLast < DRAG_HIT_TEST_INTERVAL_MS) {
+      if (this.#dragHitTestTimer === null) {
+        this.#dragHitTestTimer = setTimeout(() => {
+          this.#dragHitTestTimer = null;
+          if (!super.closed) this._syncDragHitTest();
+        }, DRAG_HIT_TEST_INTERVAL_MS - sinceLast + 5);
+        this.#dragHitTestTimer.unref?.();
+      }
+      return;
+    }
+    this.#dragHitTestAt = performance.now();
     const target = document?.elementFromPoint(position.x, position.y) ?? null;
     const blocked = this.#dragAnywhere !== false && blocksWindowDrag(target);
     this.#dragHitTestDocument = document;
@@ -432,6 +468,23 @@ export class Window extends NativeWindow {
     super.setMaximizable(value);
     this.#maximizable = value;
   }
+
+  #appId;
+  #userDataPath;
+  #cachePath;
+  /** Host-level: the app's id, or null. */
+  get appId() { return this.#appId; }
+  /** Host-level: the app's data directory ($HOME/.<appId> by default), or null. */
+  get userDataPath() { return this.#userDataPath; }
+  /** Host-level: the app's cache directory (<userDataPath>/cache by default), or null. */
+  get cachePath() { return this.#cachePath; }
+
+  /**
+   * Host-level: register keyframes for `animate-[name_duration_…]` classes. Each
+   * frame is `{ offset, class }` with Tailwind classes. Register before creating
+   * elements that use the name.
+   */
+  registerKeyframes(name, keyframes) { return registerKeyframes(name, keyframes); }
 
   get maximized() { return super.isMaximized(); }
   set maximized(value) {
@@ -635,7 +688,9 @@ export class Window extends NativeWindow {
           dispatchDomEvent(this.#hoveredElement, "pointerleave", fields);
           dispatchDomEvent(this.#hoveredElement, "mouseleave", fields);
         }
+        const previous = this.#hoveredElement;
         this.#hoveredElement = target;
+        updateHoverChain(previous, target);
         if (target) {
           dispatchDomEvent(target, "pointerenter", fields);
           dispatchDomEvent(target, "mouseenter", fields);
@@ -1087,6 +1142,9 @@ export class Window extends NativeWindow {
       const list = buildTransformedDisplayList(boxes, size.width, size.height, overlays);
       benchmarkMark("displayList");
       syncDocumentTextForPresent(this, this.#document, displayListTextLayers(list));
+      // Rotated/scaled text is drawn upright into its own textures; one that just
+      // became drawable is repainted so the next frame maps it into place.
+      for (const element of paintTransformedText(this)) element._styleChanged("class");
       benchmarkMark("text");
       // Scroll-layer content is drawn into its textures only where it changed;
       // its text was just placed in layer space above.
@@ -1412,7 +1470,10 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
   const overflowY = overflowMode({ style: result }, "y");
   if (result.minWidth === undefined && ["hidden", "auto", "scroll"].includes(overflowX)) result.minWidth = 0;
   if (result.minHeight === undefined && ["hidden", "auto", "scroll"].includes(overflowY)) result.minHeight = 0;
-  if (result.position === "static") {
+  // Taffy has no sticky positioning: lay the box out in flow, as relative
+  // without insets. Its scroll-dependent offset is applied when it is painted.
+  if (result.position === "sticky") result.position = "relative";
+  if (result.position === "static" || style.position === "sticky") {
     for (const name of ["top", "right", "bottom", "left", "topPercent", "rightPercent", "bottomPercent", "leftPercent"]) delete result[name];
   }
   if (typeof result.aspectRatio === "string") {
@@ -1713,7 +1774,10 @@ function refreshStyleValues(state) {
         state.values[property] = after;
         continue;
       }
-      if (isPaintColorProperty(property)) startColorTransition(state, property, String(after));
+      // Like CSS, an element's first style never transitions: only one already in
+      // a document has a before-change style to transition from.
+      if (!state.element?.isConnected) state.transitions.delete(property);
+      else if (isPaintColorProperty(property)) startColorTransition(state, property, String(after));
       else if (property === "opacity") startNumberTransition(state, property, after);
       else if (!["transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction"].includes(property)) {
         startInterpolableTransition(state, property, after);
@@ -2189,7 +2253,9 @@ export class Element extends EventTarget {
       const width = documentState(this.document).viewport.width;
       const state = styleData.get(this.style);
       state.hasResponsiveUtilities = /(?:^|\s)(?:sm|md|lg|xl|2xl):/.test(value);
-      const styles = resolveTailwind(value, width);
+      state.hasHoverUtilities = /(?:^|\s|:)hover:/.test(value);
+      state.hasGroupHoverUtilities = /(?:^|\s|:)group-hover:/.test(value);
+      const styles = resolveTailwind(value, width, interactionState(this, state));
       state.classValues = styles;
       state.selectionValues = resolveTailwindSelection(value, width);
       elementState(this).selectionStyle = state.selectionValues;
@@ -2982,7 +3048,14 @@ export class Element extends EventTarget {
       8192,
       Math.max(64, Number.isFinite(configured) && configured > 0 ? configured : elementState(this).imageLoadSticky ? 8192 : 512),
     );
-    loadImage(source, window, maxEdge).then((result) => {
+    cachedImageSource(source, window.cachePath && join(window.cachePath, "images")).then((path) => {
+      if (request !== elementState(this).imageRequest) return null;
+      return loadImage(path, window, maxEdge);
+    }).then((result) => {
+      if (!result) {
+        requestImageLoadSchedule(this.document);
+        return;
+      }
       if (request !== elementState(this).imageRequest) {
         try { window.deleteImageTexture(result.textureId); } catch { /* ignore */ }
         requestImageLoadSchedule(this.document);
@@ -3150,8 +3223,8 @@ export class Element extends EventTarget {
 
   _refreshTailwind(width) {
     const state = styleData.get(this.style);
-    if (!state.hasResponsiveUtilities) return false;
-    const next = resolveTailwind(this.className, width);
+    if (!state.hasResponsiveUtilities && !state.hasHoverUtilities && !state.hasGroupHoverUtilities) return false;
+    const next = resolveTailwind(this.className, width, interactionState(this, state));
     const nextSelection = resolveTailwindSelection(this.className, width);
     if (JSON.stringify(nextSelection) !== JSON.stringify(state.selectionValues)) {
       state.selectionValues = nextSelection;
@@ -3337,6 +3410,19 @@ export class Element extends EventTarget {
   }
 }
 
+const VIEWPORT_UNIT = /(?:\d|\))\s*(?:vw|vh|vmin|vmax|dvw|dvh|svw|svh|lvw|lvh)\b/;
+
+/** Whether any of an element's style values is a length in viewport units. */
+function usesViewportUnits(element) {
+  const values = styleData.get(element.style)?.values;
+  if (!values) return true;
+  for (const key in values) {
+    const value = values[key];
+    if (typeof value === "string" && VIEWPORT_UNIT.test(value)) return true;
+  }
+  return false;
+}
+
 /** Elements that get boxes, in pre-order: skipped content-visibility contents get none. */
 function collectBoxElements(element, into) {
   into.push(element);
@@ -3436,7 +3522,7 @@ export class Document extends EventTarget {
       // alone never reassembles it.
       paintBoxes: (timings) => {
         if (documentState(this).defaultView) this.#layoutSync(timings);
-        return this.#boxes(timings);
+        return this.#withLiveSticky(this.#boxes(timings));
       },
       renderBoxes: (elements, timings) => {
         this.#layoutSync();
@@ -3526,7 +3612,10 @@ export class Document extends EventTarget {
       documentState(this).viewport = { width, height };
       setHostStyle(this.body, { width, height });
       for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(width);
+      // Responsive classes that changed queued themselves above. Besides those, only
+      // styles written in viewport units depend on the viewport.
       for (const element of documentState(this).elements) {
+        if (!usesViewportUnits(element)) continue;
         const elementData = elementState(element);
         documentState(this).layoutTree.setStyle(elementData.handle, element._taffyStyle());
       }
@@ -3569,7 +3658,10 @@ export class Document extends EventTarget {
         setHostStyle(this.body, { width, height });
       }
       for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(width);
+      // Responsive classes that changed queued themselves above. Besides those, only
+      // styles written in viewport units depend on the viewport.
       for (const element of documentState(this).elements) {
+        if (!usesViewportUnits(element)) continue;
         const elementData = elementState(element);
         documentState(this).layoutTree.setStyle(elementData.handle, element._taffyStyle());
       }
@@ -3639,6 +3731,23 @@ export class Document extends EventTarget {
     return this.#liveOf(this.#boxes(timings));
   }
 
+  /**
+   * Paint boxes: `boxes` with each position: sticky subtree at its live offset,
+   * since the window draws those over their scroll layer. The result's
+   * `assembled` is `boxes`, which scroll layers keep keying their content by.
+   */
+  #withLiveSticky(boxes) {
+    const state = documentState(this);
+    if (!boxes || !state.hasSticky) return boxes;
+    const cached = state.stickyPaintBoxes;
+    if (cached && cached.scrollGeneration === (state.scrollGeneration ?? 0) && cached.source === boxes) return cached.boxes;
+    const live = liveBoxLookup(boxes);
+    const result = boxes.map((box) => (box.sticky ? live(box.element) : box));
+    result.assembled = boxes;
+    state.stickyPaintBoxes = { scrollGeneration: state.scrollGeneration ?? 0, source: boxes, boxes: result };
+    return result;
+  }
+
   #liveLookup() {
     const state = documentState(this);
     const boxes = state.boxesSnapshot;
@@ -3652,9 +3761,10 @@ export class Document extends EventTarget {
 
   #liveOf(boxes) {
     const state = documentState(this);
-    if (!boxes || (state.boxesScrollGeneration ?? 0) === (state.scrollGeneration ?? 0)) return boxes;
+    // Sticky subtrees are assembled in flow and always need their live offset.
+    if (!boxes || (!state.hasSticky && (state.boxesScrollGeneration ?? 0) === (state.scrollGeneration ?? 0))) return boxes;
     const cached = state.liveBoxes;
-    if (cached?.scrollGeneration === state.scrollGeneration && cached.source === boxes) return cached.boxes;
+    if (cached && cached.scrollGeneration === state.scrollGeneration && cached.source === boxes) return cached.boxes;
     const live = liveScreenBoxes(boxes);
     state.liveBoxes = { scrollGeneration: state.scrollGeneration, source: boxes, boxes: live };
     return live;
@@ -3714,7 +3824,9 @@ export class Document extends EventTarget {
         // painted into its own texture, that content's screen origin at this
         // assembly, and the clip contributed only by ancestors inside it.
         layerHost: null, layerOriginX: 0, layerOriginY: 0, innerClip: null,
-        isLayerHost: false, assembledScrollLeft: 0, assembledScrollTop: 0 };
+        isLayerHost: false, assembledScrollLeft: 0, assembledScrollTop: 0,
+        // position: sticky: the subtree's root, its scroll container and resolved insets.
+        sticky: null };
     });
     const byElement = new Map(raw.map((box) => [box.element, box]));
     if (seed) byElement.set(seed.parent, seed.parentBox);
@@ -3794,6 +3906,23 @@ export class Document extends EventTarget {
       box.layerOriginX = layerOriginX;
       box.layerOriginY = layerOriginY;
       box.innerClip = innerClip;
+      // A sticky subtree is laid out in flow; gpu-scroll-layers offsets it
+      // against its scroll container (its nearest layer host) when it is drawn.
+      const parentSticky = parent ? byElement.get(parent)?.sticky : null;
+      box.sticky = parentSticky && parentSticky.host === layerHost ? parentSticky : null;
+      if (layerHost && box.element.style.position === "sticky") {
+        const port = byElement.get(layerHost)?.paddingBox ?? state.viewport;
+        const fontSize = Number.parseFloat(inheritedStyle(box.element, "fontSize", 16)) || 16;
+        const style = box.element.style;
+        box.sticky = {
+          root: box.element, host: layerHost,
+          top: fixedInset(style.top, port.height, fontSize, state.viewport),
+          right: fixedInset(style.right, port.width, fontSize, state.viewport),
+          bottom: fixedInset(style.bottom, port.height, fontSize, state.viewport),
+          left: fixedInset(style.left, port.width, fontSize, state.viewport),
+        };
+        state.hasSticky = true;
+      }
       const x = box.x - scrollX;
       const y = box.y - scrollY;
       const extent = extents.get(box.element);
@@ -4059,6 +4188,44 @@ function capturedPointerTarget(document) {
   if (element.isConnected) return element;
   releaseCapturedPointer(document, 1);
   return null;
+}
+
+// :hover state for Tailwind's hover: and group-hover: variants. Like CSS, an element
+// counts as hovered while the pointer is over it or any of its descendants.
+const GROUP_CLASS = /(?:^|\s)group(?:\s|$)/;
+function interactionState(element, state) {
+  if (!state.hasHoverUtilities && !state.hasGroupHoverUtilities) return undefined;
+  let groupHover = false;
+  if (state.hasGroupHoverUtilities) {
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (elementState(ancestor).hovered && GROUP_CLASS.test(ancestor.className)) { groupHover = true; break; }
+    }
+  }
+  return { hover: !!elementState(element).hovered, groupHover };
+}
+
+function updateHoverChain(previous, next) {
+  const chain = element => {
+    const elements = new Set();
+    for (let current = element; current?.style; current = current.parentElement) elements.add(current);
+    return elements;
+  };
+  const before = chain(previous), after = chain(next);
+  const flipped = [];
+  for (const element of before) if (!after.has(element)) { elementState(element).hovered = false; flipped.push(element); }
+  for (const element of after) if (!before.has(element)) { elementState(element).hovered = true; flipped.push(element); }
+  const refresh = new Set();
+  const collectGroupDescendants = element => {
+    for (const child of element.children ?? []) {
+      if (styleData.get(child.style)?.hasGroupHoverUtilities) refresh.add(child);
+      collectGroupDescendants(child);
+    }
+  };
+  for (const element of flipped) {
+    if (styleData.get(element.style)?.hasHoverUtilities) refresh.add(element);
+    if (GROUP_CLASS.test(element.className)) collectGroupDescendants(element);
+  }
+  for (const element of refresh) element._refreshTailwind(documentState(element.document).viewport.width);
 }
 
 function dispatchDomEvent(target, type, fields = {}) {

@@ -22,7 +22,7 @@ export const STATE = {
 // runs them in order, so a later synchronous call still sees their effects.
 // Failures surface on the next synchronous call.
 export const FIRE_AND_FORGET = new Set([
-  "renderLayer", "updateTextPlacement", "setTextRunsNow", "setDragBlocked", "setBodyTransparency",
+  "renderLayer", "updateTextPlacement", "setTextRunsNow", "setTextRunAt", "setDragBlocked", "setBodyTransparency",
   "setSizeConstraints", "setScrollScene", "submitImageDecode", "present", "presentOrdered", "presentTransformed", "presentWithImages",
 ]);
 

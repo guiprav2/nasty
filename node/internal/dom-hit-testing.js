@@ -1,5 +1,5 @@
 import { documentPaintBoxes, documentState } from './dom-state.js';
-import { liveHostLookup } from './gpu-scroll-layers.js';
+import { liveShiftLookup } from './gpu-scroll-layers.js';
 import { createBoxProjector } from '../render.js';
 import { canScrollByUser, clipsOverflow } from './overflow.js';
 
@@ -180,7 +180,7 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
       byElement: new Map(boxes.map(box => [box.element, box])),
       project: createBoxProjector(boxes),
       radii: new Map(),
-      hostOf: liveHostLookup(boxes),
+      shiftOf: liveShiftLookup(boxes),
       scrollGeneration: state.scrollGeneration ?? 0,
     };
     const order = new Map(boxes.map((box, index) => [box.element, index]));
@@ -201,7 +201,7 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
       cache.lastComplete = false;
     }
     if (cache.scrollGeneration !== (state.scrollGeneration ?? 0)) {
-      cache.hostOf = liveHostLookup(cache.boxes);
+      cache.shiftOf = liveShiftLookup(cache.boxes);
       cache.scrollGeneration = state.scrollGeneration ?? 0;
       cache.lastX = NaN;
       cache.lastComplete = false;
@@ -213,11 +213,12 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
       cache.lastComplete = false;
     }
   }
-  const { byElement, project, paintOrder, hostOf } = cache;
+  const { byElement, project, paintOrder, shiftOf } = cache;
   const insideView = (view, px, py) => px >= view.x && py >= view.y && px < view.x + view.width && py < view.y + view.height;
   // A scroll container's layer content is assembled at its scroll offsets of
-  // that moment; the query point moves instead of every box.
-  const shift = (box) => (box.layerHost ? hostOf(box.layerHost) : null);
+  // that moment (a sticky subtree also by its sticky offset); the query point
+  // moves instead of every box.
+  const shift = (box) => (box.layerHost ? shiftOf(box) : null);
   if (cache.lastX === x && cache.lastY === y && cache.lastHits) {
     if (cache.lastComplete) return stopAtFirst ? cache.lastHits.slice(0, 1) : cache.lastHits.slice();
     if (stopAtFirst && cache.lastHits.length) return cache.lastHits.slice(0, 1);

@@ -11,7 +11,7 @@ const registry = new FontRegistry().register(family, async () => {
   sourceReadCount++;
   return readFile(fontPath);
 });
-const window = new Window({ resizable: "none", title: "Nasty lazy custom font", width: 960, height: 600 });
+const window = new Window({ appId: "nasty-custom-fonts", resizable: "none", title: "Nasty lazy custom font", width: 960, height: 600 });
 console.log(`GPU adapter: ${window.adapterName()}; refresh: ${window.refreshRate().toFixed(3)} Hz`);
 console.log(`${fontLabel} source: ${fontPath} (host-installed, not bundled)`);
 console.log("Move the pointer over the window; press Escape or close the window to exit.");

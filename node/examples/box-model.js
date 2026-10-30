@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Document, Window } from "../index.js";
 
-const window = new Window({ resizable: "none", title: "Nasty box model", width: 720, height: 480 });
+const window = new Window({ appId: "nasty-box-model", resizable: "none", title: "Nasty box model", width: 720, height: 480 });
 const doc = new Document();
 window.document = doc;
 const element = (id, classes = "") => {

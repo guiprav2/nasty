@@ -3,7 +3,7 @@ import { performance } from "node:perf_hooks";
 import { Document, Window } from "../index.js";
 
 const frameLimit = Number(process.env.NASTY_TRANSITION_FRAMES ?? 180);
-const window = new Window({ resizable: "none", title: "Nasty CSS transitions", width: 720, height: 480 });
+const window = new Window({ appId: "nasty-transitions", resizable: "none", title: "Nasty CSS transitions", width: 720, height: 480 });
 const document = new Document();
 window.document = document;
 document.body.className = "flex justify-center items-center gap-6";

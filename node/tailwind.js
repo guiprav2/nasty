@@ -106,6 +106,30 @@ function colorValue(value) {
   const alpha = Math.max(0, Math.min(1, Number(alphaText) / 100));
   return `rgba(${channels[0]}, ${channels[1]}, ${channels[2]}, ${alpha})`;
 }
+const ANIMATION_DIRECTIONS = new Set(["normal", "reverse", "alternate", "alternate-reverse"]);
+const ANIMATION_FILLS = new Set(["none", "forwards", "backwards", "both"]);
+function animationLonghands(raw) {
+  const tokens = [];
+  for (let i = 0, depth = 0, start = 0; i <= raw.length; i++) {
+    if (raw[i] === "(") depth++;
+    else if (raw[i] === ")") depth--;
+    else if (i === raw.length || (raw[i] === "_" && depth === 0)) { if (i > start) tokens.push(raw.slice(start, i)); start = i + 1; }
+  }
+  const values = { animationDuration: "0s", animationTimingFunction: "ease", animationDelay: "0s",
+    animationIterationCount: "1", animationDirection: "normal", animationFillMode: "none" };
+  let timeCount = 0;
+  for (const token of tokens) {
+    if (/^-?\d*\.?\d+(?:ms|s)$/.test(token)) values[timeCount++ ? "animationDelay" : "animationDuration"] = token;
+    else if (/^(?:linear|ease|ease-in|ease-out|ease-in-out|step-start|step-end)$|^(?:cubic-bezier|steps)\(/.test(token)) values.animationTimingFunction = token.replace(/,/g, ", ");
+    else if (token === "infinite" || /^\d*\.?\d+$/.test(token)) values.animationIterationCount = token;
+    else if (ANIMATION_DIRECTIONS.has(token)) values.animationDirection = token;
+    else if (ANIMATION_FILLS.has(token)) values.animationFillMode = token;
+    else values.animationName = token;
+  }
+  if (!values.animationName) return null;
+  return Object.entries(values);
+}
+
 function utilityStyle(utility) {
   if (utility.startsWith("[") && utility.endsWith("]")) return arbitraryValue(utility);
   const gradient = /^bg-gradient-to-(t|tr|r|br|b|bl|l|tl)$/.exec(utility);
@@ -123,6 +147,10 @@ function utilityStyle(utility) {
     const signed = negative ? (typeof amount === "number" ? -amount : `-${amount}`) : amount;
     return [[`__translate${axis.toUpperCase()}`, signed]];
   }
+  // animate-[name_duration_easing_delay_iterations_direction_fill] runs keyframes
+  // registered with registerKeyframes, like Tailwind's arbitrary animation value.
+  const animation = /^animate-\[(.+)\]$/.exec(utility);
+  if (animation) return animationLonghands(animation[1]);
   const perspective = /^perspective-\[(.+)\]$/.exec(utility);
   if (perspective) return ["perspective", perspective[1]];
   const ringWidth = /^ring(?:-(\d+))?$/.exec(utility);
@@ -140,7 +168,7 @@ function utilityStyle(utility) {
     "flex-initial": [["flexGrow", 0], ["flexShrink", 1], ["flexBasis", "auto"]],
     "flex-none": [["flexGrow", 0], ["flexShrink", 0], ["flexBasis", "auto"]],
     "aspect-auto": ["aspectRatio", "auto"], "aspect-square": ["aspectRatio", "1 / 1"], "aspect-video": ["aspectRatio", "16 / 9"],
-    grow: ["flexGrow", 1], shrink: ["flexShrink", 1], static: ["position", "static"], relative: ["position", "relative"], absolute: ["position", "absolute"], fixed: ["position", "fixed"],
+    grow: ["flexGrow", 1], shrink: ["flexShrink", 1], static: ["position", "static"], relative: ["position", "relative"], absolute: ["position", "absolute"], fixed: ["position", "fixed"], sticky: ["position", "sticky"],
     "items-start": ["alignItems", "flex-start"], "items-end": ["alignItems", "flex-end"], "items-center": ["alignItems", "center"], "items-stretch": ["alignItems", "stretch"],
     "justify-start": ["justifyContent", "flex-start"], "justify-end": ["justifyContent", "flex-end"], "justify-center": ["justifyContent", "center"], "justify-between": ["justifyContent", "space-between"], "justify-around": ["justifyContent", "space-around"], "justify-evenly": ["justifyContent", "space-evenly"],
     "font-display": ["fontFamily", "Fraunces, ui-serif, Georgia, serif"],
@@ -426,6 +454,19 @@ function utilityStyle(utility) {
       ];
     }
   }
+  const negativeMargin = /^-(m[xytrbl]?-.+)$/.exec(utility);
+  if (negativeMargin && !utility.endsWith("-auto")) {
+    const pair = /^(m[xytrbl]?)-(.+)$/.exec(negativeMargin[1]);
+    const amount = spacing(pair[2]);
+    if (amount === undefined) return null;
+    const negated = typeof amount === "number" ? -amount : `-${amount}`;
+    const map = {
+      m: ["margin", "marginTop", "marginRight", "marginBottom", "marginLeft"],
+      mx: ["marginLeft", "marginRight"], my: ["marginTop", "marginBottom"],
+      mt: ["marginTop"], mr: ["marginRight"], mb: ["marginBottom"], ml: ["marginLeft"],
+    }[pair[1]];
+    return map.map(property => [property, negated]);
+  }
   const pair = /^(p[xytrbl]?|m[xytrbl]?|gap(?:-[xy])?|w|h|min-w|min-h|max-w|max-h|basis|grow|shrink)-(.+)$/.exec(utility);
   if (pair) {
     const [, prefix, value] = pair;
@@ -500,13 +541,18 @@ function utilityStyle(utility) {
   return null;
 }
 
-function active(variants, width) {
-  return variants.every(variant => BREAKPOINTS[variant] !== undefined && width >= BREAKPOINTS[variant]);
+// Interaction variants follow CSS :hover: `hover:` applies while the element or a
+// descendant is hovered, `group-hover:` while an ancestor marked `group` is.
+function active(variants, width, interaction) {
+  return variants.every(variant => BREAKPOINTS[variant] !== undefined ? width >= BREAKPOINTS[variant]
+    : variant === "hover" ? !!interaction?.hover
+      : variant === "group-hover" ? !!interaction?.groupHover
+        : false);
 }
 
-export function resolveTailwind(className, width = 0) {
+export function resolveTailwind(className, width = 0, interaction) {
   className = String(className);
-  const key = `${width}\0${className}`;
+  const key = `${width}\0${interaction?.hover ? 1 : 0}${interaction?.groupHover ? 1 : 0}\0${className}`;
   const cached = classCache.get(key);
   if (cached) {
     classCache.delete(key);
@@ -514,7 +560,7 @@ export function resolveTailwind(className, width = 0) {
     return cached;
   }
   const utilities = className.split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index }))
-    .filter(token => !token.variants.includes("selection") && active(token.variants, width));
+    .filter(token => !token.variants.includes("selection") && active(token.variants, width, interaction));
   utilities.sort((a, b) => Number(a.important) - Number(b.important)
     || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
     || a.variants.length - b.variants.length || a.index - b.index);

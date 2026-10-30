@@ -2,7 +2,7 @@ import os from "node:os";
 import { performance } from "node:perf_hooks";
 import { Document, Window } from "../index.js";
 
-const window = new Window({ resizable: "none", title: "Nasty input and textarea", width: 960, height: 600 });
+const window = new Window({ appId: "nasty-input", resizable: "none", title: "Nasty input and textarea", width: 960, height: 600 });
 const refreshRate = window.refreshRate() > 0 ? window.refreshRate() : 60;
 let budget = 1000 / refreshRate;
 const viewport = window.size();

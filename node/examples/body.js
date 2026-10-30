@@ -1,6 +1,6 @@
 import { Document, Window } from "../index.js";
 
-const window = new Window({ title: "Nasty body className", width: 900, height: 500, borderless: true, dragAnywhere: true });
+const window = new Window({ appId: "nasty-body", title: "Nasty body className", width: 900, height: 500, borderless: true, dragAnywhere: true });
 const document = new Document();
 window.document = document;
 

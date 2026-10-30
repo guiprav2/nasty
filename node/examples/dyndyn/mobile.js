@@ -137,6 +137,7 @@ function join(invite) {
 }
 
 const win = new Window({
+  appId: "dyndyn",
   title: "Dyndyn",
   width: 480,
   height: 860,

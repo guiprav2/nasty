@@ -6,7 +6,7 @@ if (!source) {
   process.exit(2);
 }
 
-const window = new Window({ title: "Nasty video", width: 960, height: 600, resizable: "both" });
+const window = new Window({ appId: "nasty-video", title: "Nasty video", width: 960, height: 600, resizable: "both" });
 const document = new Document();
 window.document = document;
 

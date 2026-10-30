@@ -5,6 +5,9 @@ const COLOR_PROPERTIES = new Set([
   "color", "backgroundColor", "borderColor", "borderTopColor", "borderRightColor", "borderBottomColor", "borderLeftColor",
 ]);
 const NUMBER_PROPERTIES = new Set(["opacity"]);
+// CSS initial values, so a transition from or to an unset property still runs.
+const NUMBER_INITIAL_VALUES = { opacity: 1 };
+const numberOrInitial = (property, value) => Number(value === undefined || value === "" ? NUMBER_INITIAL_VALUES[property] : value);
 const styleTransitionStates = new WeakMap();
 
 export class TransitionEvent extends Event {
@@ -69,9 +72,18 @@ export function hasActiveStyleTransition(style, now = performance.now()) {
   let active = false;
   for (const [property, transition] of state.transitions) {
     if (now < transition.started + transition.duration) active = true;
-    else state.transitions.delete(property);
+    else finishTransition(state, property, transition);
   }
   return active;
+}
+
+// Every way a transition can be seen to end (a style sample or the per-frame sweep)
+// goes through here, so transitionend fires exactly once either way.
+function finishTransition(state, property, transition) {
+  state.transitions.delete(property);
+  queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
+    propertyName: kebab(property), elapsedTime: transition.duration / 1000,
+  })));
 }
 
 const kebab = (name) => name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
@@ -105,13 +117,15 @@ function transitionOptions(state, property) {
   if (state.values.transition === undefined && state.values.transitionDuration === undefined) return null;
   const targetName = kebab(property);
   const shorthand = state.values.transition;
-  const properties = splitList(String(shorthand ?? state.values.transitionProperty ?? "all"));
   const durations = splitList(String(state.values.transitionDuration ?? "0s"));
   const delays = splitList(String(state.values.transitionDelay ?? "0s"));
   const easings = splitList(String(state.values.transitionTimingFunction ?? "ease"));
-  const selectedProperty = properties.find((name) => name === "all" || name === targetName || name === property);
-  if (!selectedProperty) return null;
+  // Shorthand entries ("all 150ms ease") name their property inside each entry and
+  // are matched below; only the longhand list is a bare list of property names.
   if (shorthand === undefined) {
+    const properties = splitList(String(state.values.transitionProperty ?? "all"));
+    const selectedProperty = properties.find((name) => name === "all" || name === targetName || name === property);
+    if (!selectedProperty) return null;
     const index = properties.indexOf(selectedProperty);
     const duration = Math.max(0, toMilliseconds(durations[index % durations.length]) ?? 0);
     if (!duration) return null;
@@ -200,8 +214,8 @@ export function startNumberTransition(state, property, target, now = performance
   if (!NUMBER_PROPERTIES.has(property)) return;
   const options = transitionOptions(state, property);
   if (!options) { state.transitions.delete(property); return; }
-  const current = Number(sampleNumberTransition(state, property, now));
-  const to = Number(target);
+  const current = numberOrInitial(property, sampleNumberTransition(state, property, now));
+  const to = numberOrInitial(property, target);
   if (!Number.isFinite(current) || !Number.isFinite(to)) { state.transitions.delete(property); return; }
   const previous = state.transitions.get(property);
   let duration = options.duration;
@@ -250,19 +264,13 @@ function sampleInterpolableTransition(state, property, now = performance.now()) 
   const t = timingProgress(transition.easing, progress);
   if (transition.numeric) {
     if (progress >= 1) {
-      state.transitions.delete(property);
-      queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
-        propertyName: kebab(property), elapsedTime: transition.duration / 1000,
-      })));
+      finishTransition(state, property, transition);
       return state.values[property];
     }
     return transition.from + (transition.to - transition.from) * t;
   }
   if (progress >= 1) {
-    state.transitions.delete(property);
-    queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
-      propertyName: kebab(property), elapsedTime: transition.duration / 1000,
-    })));
+    finishTransition(state, property, transition);
     return state.values[property];
   }
   let index = 0;
@@ -279,10 +287,7 @@ function sampleNumberTransition(state, property, now = performance.now()) {
   const progress = Math.max(0, Math.min(1, (now - transition.started) / transition.duration));
   const t = timingProgress(transition.easing, progress);
   if (progress >= 1) {
-    state.transitions.delete(property);
-    queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
-      propertyName: kebab(property), elapsedTime: transition.duration / 1000,
-    })));
+    finishTransition(state, property, transition);
     return state.values[property];
   }
   return transition.from + (transition.to - transition.from) * t;
@@ -303,10 +308,7 @@ export function sampleColorTransition(state, property, now = performance.now()) 
   const progress = Math.max(0, Math.min(1, (now - transition.started) / transition.duration));
   const t = timingProgress(transition.easing, progress);
   if (progress >= 1) {
-    state.transitions.delete(property);
-    queueMicrotask(() => state.element.dispatchEvent(new TransitionEvent("transitionend", {
-      propertyName: kebab(property), elapsedTime: transition.duration / 1000,
-    })));
+    finishTransition(state, property, transition);
     return authoredColorValue(state, property);
   }
   const rgba = transition.from.map((value, index) => value + (transition.to[index] - value) * t);

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Document, Window } from "../index.js";
 
 const initStart = performance.now();
-const window = new Window({ visible: false, width: 800, height: 300, resizable: "none" });
+const window = new Window({ appId: "nasty-threaded-layout", visible: false, width: 800, height: 300, resizable: "none" });
 const document = new Document();
 window.document = document;
 const nodes = [document.body];

@@ -10,6 +10,7 @@ import { Document, Window } from "../index.js";
 
 const frameLimit = Number(process.env.NASTY_RADIAL_FRAMES ?? 0);
 const window = new Window({
+  appId: "nasty-radial",
   title: "Nasty CSS radial-gradient",
   width: 800,
   height: 600,

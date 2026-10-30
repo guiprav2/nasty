@@ -1097,14 +1097,19 @@ let lastGridWindow = null;
 let lastListWindow = null;
 
 // Reading a scroller's client size forces layout, and every binding of an update
-// asks for the window: measure once per viewport configuration instead.
+// asks for the window. The scrollers fill the window, so after one real
+// measurement a resize only moves their size by the window's change: measure again
+// only when the layout itself changes (sidebar, screen).
 const measured = { grid: null, list: null };
 
 function clientSize(name, el, fallbackWidth, fallbackHeight) {
-  const key = `${state.viewportW}x${state.viewportH}|${state.sidebarOpen}|${state.narrow}|${state.screen}`;
+  const layoutKey = `${state.sidebarOpen}|${state.narrow}|${state.screen}`;
   const known = measured[name];
-  if (known && known.key === key) return known;
-  const size = { key, width: el?.clientWidth || fallbackWidth, height: el?.clientHeight || fallbackHeight };
+  if (known && known.layoutKey === layoutKey) {
+    return { width: known.width + (state.viewportW - known.viewportW), height: known.height + (state.viewportH - known.viewportH) };
+  }
+  const size = { layoutKey, viewportW: state.viewportW, viewportH: state.viewportH,
+    width: el?.clientWidth || fallbackWidth, height: el?.clientHeight || fallbackHeight };
   // Only trust a measurement of an attached scroller.
   if (el) measured[name] = size;
   return size;
@@ -2159,6 +2164,7 @@ doc.body.appendChild(shell());
 d.updateSync();
 
 win = new Window({
+  appId: "treva",
   title: "Treva",
   width: 1100,
   height: 720,

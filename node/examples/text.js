@@ -3,7 +3,7 @@ import os from "node:os";
 import { Window } from "../index.js";
 
 const initStart = performance.now();
-const window = new Window({ resizable: "none", title: "Nasty system-font text", width: 960, height: 600 });
+const window = new Window({ appId: "nasty-text", resizable: "none", title: "Nasty system-font text", width: 960, height: 600 });
 console.log(`GPU adapter: ${window.adapterName()}`);
 console.log(`surface format: ${window.surfaceFormat()}; present mode: ${window.presentMode()}`);
 console.log(`window and GPU initialization: ${(performance.now() - initStart).toFixed(1)} ms`);

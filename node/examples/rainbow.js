@@ -357,7 +357,7 @@ class DirectEventSource {
 }
 
 let netOnly = options.netOnly;
-const window = new Window({ title: 'Rainbow — process field', width: 1180, height: 760, resizable: 'both', borderless: true, dragAnywhere: 'Ctrl', maximizable: true, maximized: true });
+const window = new Window({ appId: "rainbow", title: 'Rainbow — process field', width: 1180, height: 760, resizable: 'both', borderless: true, dragAnywhere: 'Ctrl', maximizable: true, maximized: true });
 const document = new Document(); window.document = document;
 const ui = createRainbowUI(document);
 ui.setGlowMode(options.glow);

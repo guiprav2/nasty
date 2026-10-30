@@ -4,7 +4,7 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { Document, Window } from "../index.js";
 
-const window = new Window({ visible: false, width: 800, height: 300, resizable: "none" });
+const window = new Window({ appId: "nasty-layout", visible: false, width: 800, height: 300, resizable: "none" });
 const doc = new Document();
 window.document = doc;
 const element = (owner, id, classes = "") => {

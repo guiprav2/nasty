@@ -39,12 +39,19 @@ export function findFontFiles(family) {
     .sort().map(file => join(directory, file));
 }
 const nativeFonts = new Map();
+// Color emoji fallback. The face is large, so it only travels with runs that contain
+// emoji; cosmic-text's fallback then finds it for codepoints the run's fonts lack.
+export const EMOJI_FAMILY = 'Noto Color Emoji';
+const EMOJI_PATTERN = /\p{Extended_Pictographic}/u;
+function nativeFontsFor(family) {
+  if (!nativeFonts.has(family)) nativeFonts.set(family, findFontFiles(family).map(file => ({ family, data: readFileSync(file) })));
+  return nativeFonts.get(family);
+}
 export function fontsForRuns(runs) {
   const result = [];
-  for (const family of new Set(runs.flatMap(run => fontFamilies(run.fontFamily)))) {
-    if (!nativeFonts.has(family)) nativeFonts.set(family, findFontFiles(family).map(file => ({ family, data: readFileSync(file) })));
-    result.push(...nativeFonts.get(family));
-  }
+  const families = new Set(runs.flatMap(run => fontFamilies(run.fontFamily)));
+  if (runs.some(run => EMOJI_PATTERN.test(run.text ?? ''))) families.add(EMOJI_FAMILY);
+  for (const family of families) result.push(...nativeFontsFor(family));
   return result;
 }
 /** Font sources are selected by fontFamily, with automatic root fonts/ lookup. */

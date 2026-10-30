@@ -1,5 +1,5 @@
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
-import { findFontFiles, fontFamilies, systemFontFamily } from '../font-registry.js';
+import { EMOJI_FAMILY, findFontFiles, fontFamilies, systemFontFamily } from '../font-registry.js';
 import { elementState } from './dom-state.js';
 import { nerdIcon, renderedText } from './nerd-icon.js';
 const loaded = new Set();
@@ -34,6 +34,9 @@ export function textStyle(element) {
     requestedFamilies.push(systemFontFamily);
   }
   if (!requestedFamilies.some(name => name.toLowerCase() === 'dejavu sans')) requestedFamilies.push('DejaVu Sans');
+  // Paint falls back to the bundled color emoji face (font-registry.js); measure
+  // with it too, or emoji are laid out at the placeholder glyph's width.
+  if (!requestedFamilies.includes(EMOJI_FAMILY)) requestedFamilies.push(EMOJI_FAMILY);
   const family = requestedFamilies.map(name => `'${name}'`).join(', ');
   loadFamilies(requestedFamilies.join(', '));
   // The face Skia measures with is the first family it can satisfy. Native

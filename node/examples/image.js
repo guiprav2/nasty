@@ -28,7 +28,7 @@ const jpegPath = join(fixtureDir, "gradient.jpg");
 await writeFile(fixturePath, PNG.sync.write(png));
 await writeFile(jpegPath, jpeg.encode({ data: png.data, width, height }, 80).data);
 
-const window = new Window({ resizable: "none", title: "Nasty image element", width: 720, height: 480 });
+const window = new Window({ appId: "nasty-image", resizable: "none", title: "Nasty image element", width: 720, height: 480 });
 const document = new Document();
 const sourceLessImage = document.createElement("img");
 assert.equal(sourceLessImage.complete, true, "an img with no src is complete");

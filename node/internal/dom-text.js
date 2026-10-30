@@ -1,10 +1,11 @@
 import { fontsForRuns } from '../font-registry.js';
 import { documentPaintBoxes, documentState, elementState } from './dom-state.js';
-import { layerContentBoxes, scrollLayerTarget } from './gpu-scroll-layers.js';
+import { layerContentBoxes, paintsInLayer, scrollLayerTarget } from './gpu-scroll-layers.js';
 import { computedStyleValue, hasActiveStyleTransition, styleMeshRevision } from './css-transitions.js';
 import { createBoxProjector, parseColor } from '../render.js';
 import { fontFamilyForElement, isPlaceholderText, renderedText } from './nerd-icon.js';
 import { layoutTextLines, measureText, textStyle as measuredTextStyle, transformedText } from './text-metrics.js';
+import { beginTransformedTextPass, endTransformedTextPass, noteTransformedText, rotatesText, TRANSFORMED_TEXT_TARGET } from './transformed-text.js';
 import { clipsOverflow } from './overflow.js';
 
 const windows = new WeakMap();
@@ -194,7 +195,7 @@ function textEntries(document, textLayers = null) {
   const allBoxes = documentPaintBoxes(document);
   // Window text and each scroll layer's text are placed in their own space:
   // layer runs are in content coordinates and carry the layer's target.
-  const groups = [{ boxes: allBoxes.filter((box) => !box.layerHost), target: 0 }];
+  const groups = [{ boxes: allBoxes.filter((box) => !paintsInLayer(box)), target: 0 }];
   const seenHosts = new Set();
   for (const box of allBoxes) {
     if (!box.layerHost || seenHosts.has(box.layerHost)) continue;
@@ -234,9 +235,13 @@ function textEntriesFor(entries, boxes, target, textLayers, styleFrame, hiddenMe
       : bounds.y;
     // Optical 1px down-shift: Taffy flex centering sits glyphs a hair high in
     // vertically centered containers (buttons, inputs, align-items center).
-    const textOrigin = projectPoint(box, textState?.renderTextOriginX ?? bounds.x,
-      textY + (verticallyCentered ? 1 : 0));
-    const transformedWidth = bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
+    // Text whose element (or an ancestor) rotates, scales or skews is drawn upright
+    // into its own texture, which the display list maps through the transform.
+    const rotated = rotatesText(projectPoint.matrixFor(box));
+    const originX = textState?.renderTextOriginX ?? bounds.x;
+    const originY = textY + (verticallyCentered ? 1 : 0);
+    const textOrigin = rotated ? { x: originX, y: originY } : projectPoint(box, originX, originY);
+    const transformedWidth = rotated ? bounds.width : bounds.width * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
     if (![textOrigin.x, textOrigin.y, transformedWidth, fontSize, lineHeight].every(Number.isFinite)
         || transformedWidth < 0 || fontSize <= 0 || lineHeight <= 0) continue;
     const whiteSpace = resolvedStyle.whiteSpace;
@@ -255,15 +260,29 @@ function textEntriesFor(entries, boxes, target, textLayers, styleFrame, hiddenMe
     const lines = element.localName === 'textarea' ? null : layoutTextLines(element, bounds.width);
     const wrap = element.localName === 'textarea' && whiteSpace !== 'nowrap';
     const base = { x: textOrigin.x, y: textOrigin.y, width: transformedWidth + 0.01, fontSize,
-      layer: target ? 0 : textLayers?.get(element) ?? 0,
-      target,
+      layer: target || rotated ? 0 : textLayers?.get(element) ?? 0,
+      target: rotated ? TRANSFORMED_TEXT_TARGET : target,
       lineHeight,
       fontFamily: resolvedStyle.fontFamily,
       fontWeight: resolvedStyle.fontWeight,
       textAlign, color, wrap,
       breakWords: resolvedStyle.breakWords };
-    const visibleClip = textClip(box, clip, resolvedStyle.clipX, resolvedStyle.clipY);
-    if (visibleClip) Object.assign(base, { clipX: visibleClip.x, clipY: visibleClip.y, clipWidth: visibleClip.width, clipHeight: visibleClip.height });
+    if (rotated) {
+      // Room around the content box for glyph overhang (italics, emoji, descenders).
+      const pad = Math.ceil(fontSize * 0.5) + 2;
+      const border = box.borderBox ?? box;
+      const left = Math.min(border.x, bounds.x) - pad, top = Math.min(border.y, bounds.y) - pad;
+      const right = Math.max(border.x + border.width, bounds.x + bounds.width) + pad;
+      const bottom = Math.max(border.y + border.height, bounds.y + bounds.height) + pad;
+      const rect = { x: left, y: top, width: right - left, height: bottom - top };
+      Object.assign(base, { clipX: rect.x, clipY: rect.y, clipWidth: rect.width, clipHeight: rect.height });
+      noteTransformedText(element, rect, border, JSON.stringify([text, color, fontSize, lineHeight,
+        resolvedStyle.fontFamily, resolvedStyle.fontWeight, textAlign, resolvedStyle.letterSpacing,
+        originX - rect.x, originY - rect.y, bounds.width]));
+    } else {
+      const visibleClip = textClip(box, clip, resolvedStyle.clipX, resolvedStyle.clipY);
+      if (visibleClip) Object.assign(base, { clipX: visibleClip.x, clipY: visibleClip.y, clipWidth: visibleClip.width, clipHeight: visibleClip.height });
+    }
     if (!resolvedStyle.letterSpacing || element.localName === 'input' || element.localName === 'textarea') {
       entries.push({ element, part: 0, run: { ...base, text: lines ? lines.join('\n') : text } });
       continue;
@@ -370,7 +389,9 @@ function syncTextRuns(window, document, textLayers) {
   lastSyncDetails.set(window, details);
   let state = windows.get(window);
   if (!state) windows.set(window, state = { slots: [], owners: [], slotOf: new Map() });
+  beginTransformedTextPass();
   const entries = document ? textEntries(document, textLayers) : [];
+  endTransformedTextPass(window);
   details.runs = entries.length;
   if (!state.slots.length && !entries.length) return;
   const previous = state.slots;
@@ -451,7 +472,7 @@ function syncTextRuns(window, document, textLayers) {
  * (run index, paint layer) pairs for the prepared runs of `elements`, which
  * `renderLayer` draws into a scroll layer. Run positions are in layer space.
  */
-export function layerTextRunPairs(window, elements, textLayers = null) {
+export function layerTextRunPairs(window, elements, textLayers = null, onlyTransformed = false) {
   const state = windows.get(window);
   const pairs = [];
   if (!state) return pairs;
@@ -459,7 +480,12 @@ export function layerTextRunPairs(window, elements, textLayers = null) {
     const parts = state.slotOf.get(element);
     if (!parts) continue;
     const layer = textLayers?.get(element) ?? 0;
-    for (const slot of parts) if (slot !== undefined) pairs.push(slot, layer);
+    for (const slot of parts) {
+      if (slot === undefined) continue;
+      // Transformed text has its own texture (transformed-text.js), never a tile's.
+      if ((state.slots[slot]?.target === TRANSFORMED_TEXT_TARGET) !== onlyTransformed) continue;
+      pairs.push(slot, layer);
+    }
   }
   return pairs;
 }

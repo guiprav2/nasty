@@ -1139,18 +1139,42 @@ impl BackdropResources {
             })
         };
         let simple_shader = format!("{shader_source}\n@group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler; @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{ return textureSample(tex,samp,i.uv); }}");
+        // One axis of a Gaussian with standard deviation params.z (in texels of the
+        // downsampled copy), sampled densely out to 3σ. Each tap pair of adjacent
+        // texels is read with one bilinear fetch at their weighted midpoint.
         let blur_shader = format!("{shader_source}
             @group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler;
             @group(0) @binding(2) var<uniform> params: vec4<f32>;
             @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{
-                let d = params.xy / vec2<f32>(textureDimensions(tex)) * max(params.z, 0.5);
-                var c = textureSample(tex,samp,i.uv) * 0.227027;
-                c += textureSample(tex,samp,i.uv + d*1.0) * 0.1945946; c += textureSample(tex,samp,i.uv - d*1.0) * 0.1945946;
-                c += textureSample(tex,samp,i.uv + d*2.0) * 0.1216216; c += textureSample(tex,samp,i.uv - d*2.0) * 0.1216216;
-                c += textureSample(tex,samp,i.uv + d*3.0) * 0.0702703; c += textureSample(tex,samp,i.uv - d*3.0) * 0.0702703;
-                return c;
+                let texel = params.xy / vec2<f32>(textureDimensions(tex));
+                let sigma = max(params.z, 0.5);
+                let reach = min(i32(ceil(sigma * 3.0)), 192);
+                let falloff = -0.5 / (sigma * sigma);
+                var sum = textureSampleLevel(tex, samp, i.uv, 0.0);
+                var total = 1.0;
+                for (var k = 1; k <= reach; k = k + 2) {{
+                    let a = f32(k);
+                    let b = a + 1.0;
+                    let wa = exp(a * a * falloff);
+                    let wb = exp(b * b * falloff);
+                    let w = wa + wb;
+                    let offset = texel * ((a * wa + b * wb) / w);
+                    sum += (textureSampleLevel(tex, samp, i.uv + offset, 0.0) + textureSampleLevel(tex, samp, i.uv - offset, 0.0)) * w;
+                    total += 2.0 * w;
+                }}
+                return sum / total;
             }}");
-        let downsample_pipeline = make_pipeline("Nasty backdrop downsample pipeline", simple_shader.clone(), &simple_layout);
+        // 4×4 box average: four bilinear fetches, each the mean of a 2×2 block.
+        let downsample_shader = format!("{shader_source}
+            @group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler;
+            @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{
+                let t = 1.0 / vec2<f32>(textureDimensions(tex));
+                return 0.25 * (textureSampleLevel(tex, samp, i.uv + t * vec2(-1.0, -1.0), 0.0)
+                    + textureSampleLevel(tex, samp, i.uv + t * vec2(1.0, -1.0), 0.0)
+                    + textureSampleLevel(tex, samp, i.uv + t * vec2(-1.0, 1.0), 0.0)
+                    + textureSampleLevel(tex, samp, i.uv + t * vec2(1.0, 1.0), 0.0));
+            }}");
+        let downsample_pipeline = make_pipeline("Nasty backdrop downsample pipeline", downsample_shader, &simple_layout);
         let composite_pipeline = make_pipeline("Nasty backdrop composite pipeline", simple_shader, &simple_layout);
         let blur_pipeline = make_pipeline("Nasty backdrop blur pipeline", blur_shader, &layout);
         Self { source, small, horizontal, blurred,
@@ -4341,7 +4365,11 @@ impl Renderer {
             while segment_start < draw_order.len() {
                 if let DrawOrder::BackdropBlur { x, y, width, height, radius } = &draw_order[segment_start] {
                     if !self.surface_copy_src {
-                        return Err("GPU surface does not support copy-out required for backdrop-filter".into());
+                        // Draw the rest of the frame unblurred rather than failing it.
+                        static WARNED: std::sync::Once = std::sync::Once::new();
+                        WARNED.call_once(|| eprintln!("Nasty: GPU surface cannot copy out; backdrop-filter blur is skipped"));
+                        segment_start += 1;
+                        continue;
                     }
                     self.encode_backdrop_blur(&mut encoder, &frame.as_ref().expect("window frame").texture, *x, *y, *width, *height, *radius)?;
                     segment_start += 1;
@@ -4569,7 +4597,8 @@ impl Renderer {
                                     .map_err(|error| format!("render text: {error}"))?;
                             }
                         },
-                        DrawOrder::BackdropBlur { .. } => unreachable!(),
+                        // Layer textures have no window backdrop to sample; skip the blur.
+                        DrawOrder::BackdropBlur { .. } => {},
                     }
                 }
             }
@@ -4614,7 +4643,8 @@ impl Renderer {
         let right = (x + width).ceil().clamp(0.0, self.config.width as f32) as u32;
         let bottom = (y + height).ceil().clamp(0.0, self.config.height as f32) as u32;
         if right <= left || bottom <= top { return Ok(()); }
-        let margin = radius.max(0.0).ceil() as u32 + 2;
+        // The Gaussian reaches 3σ past the rect; copy that much context around it.
+        let margin = (radius.max(0.0) * 3.0).ceil() as u32 + 4;
         let source_left = left.saturating_sub(margin);
         let source_top = top.saturating_sub(margin);
         let source_right = right.saturating_add(margin).min(self.config.width);
@@ -4631,7 +4661,8 @@ impl Renderer {
             wgpu::TexelCopyTextureInfo { texture: &resources.source, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::Extent3d { width: source_width, height: source_height, depth_or_array_layers: 1 },
         );
-        let sigma = (radius.max(0.0) / 12.0).max(0.5);
+        // CSS blur(r) is a Gaussian with standard deviation r; the copy is at 1/4 scale.
+        let sigma = (radius.max(0.0) / 4.0).max(0.5);
         self.queue.write_buffer(&resources.horizontal_params, 0, bytemuck::cast_slice(&[1.0_f32, 0.0, sigma, 0.0]));
         self.queue.write_buffer(&resources.vertical_params, 0, bytemuck::cast_slice(&[0.0_f32, 1.0, sigma, 0.0]));
         for (label, texture, pipeline, bind_group, w, h) in [
@@ -7794,6 +7825,19 @@ fn parse_transformed_display_list(
                 clip_height: record[3] as f64,
             });
             cursor = end;
+        } else if tag == 11.0 {
+            // [x, y, width, height, radius]: blur what is already drawn under the rect
+            // (CSS backdrop-filter: blur()), before the element itself paints.
+            let record = values
+                .get(cursor..cursor + 5)
+                .ok_or_else(|| Error::new(Status::InvalidArg, "truncated backdrop blur"))?;
+            if record.iter().any(|value| !value.is_finite()) || record[2] < 0.0 || record[3] < 0.0 || record[4] < 0.0 {
+                return Err(Error::new(Status::InvalidArg, "backdrop blur has invalid bounds or radius"));
+            }
+            order.push(DrawOrder::BackdropBlur {
+                x: record[0], y: record[1], width: record[2], height: record[3], radius: record[4],
+            });
+            cursor += 5;
         } else if tag == 9.0 {
             let layer = *values
                 .get(cursor)

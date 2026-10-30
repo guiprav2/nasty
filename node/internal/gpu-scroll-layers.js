@@ -76,26 +76,43 @@ function shiftBox(box, dx, dy) {
  * re-intersects it with its host's (live) visible area.
  */
 export function liveScreenBoxes(boxes) {
-  const assembled = new Map();
-  for (const box of boxes) assembled.set(box.element, box);
-  const live = new Map();
-  const hosts = new Map();
-  return boxes.map((box) => {
-    if (!box.layerHost) { live.set(box.element, box); return box; }
-    let host = hosts.get(box.layerHost);
-    if (!host) {
-      const hostBox = assembled.get(box.layerHost);
-      const hostLive = live.get(box.layerHost) ?? hostBox;
-      const dx = hostLive.x - hostBox.x - (box.layerHost.scrollLeft - hostBox.assembledScrollLeft);
-      const dy = hostLive.y - hostBox.y - (box.layerHost.scrollTop - hostBox.assembledScrollTop);
-      const view = hostLive.clip ? intersect(hostLive.paddingBox, hostLive.clip) : hostLive.paddingBox;
-      hosts.set(box.layerHost, host = { dx, dy, view });
+  const { liveOf } = liveLookups(boxes);
+  return boxes.map((box) => liveOf(box.element));
+}
+
+/**
+ * How far a position: sticky subtree is displaced from its place in flow:
+ * enough to keep its root's border box inside the scrollport, inset by the
+ * root's top/right/bottom/left, without leaving its containing block. `host`
+ * is the scroll container's live shift (see liveLookups).
+ */
+function stickyOffset(sticky, assembled, host) {
+  const box = assembled.get(sticky.root);
+  if (!box) return { x: 0, y: 0 };
+  const parent = sticky.root.parentElement ?? sticky.root.parent;
+  // A sticky child of the scroll container itself is limited only by the
+  // scrollport: its containing block is the whole scrolled content.
+  const block = parent && parent !== sticky.host ? assembled.get(parent)?.contentBox : null;
+  const port = host.port;
+  const rect = box.borderBox;
+  const axis = (start, size, portStart, portSize, blockStart, blockSize, before, after, marginBefore, marginAfter) => {
+    const end = start + size;
+    if (before !== undefined && start < portStart + before) {
+      const room = block ? blockStart + blockSize - end - marginAfter : Infinity;
+      return Math.max(0, Math.min(portStart + before - start, room));
     }
-    const next = shiftBox(box, host.dx, host.dy);
-    next.clip = next.innerClip ? intersect(next.innerClip, host.view) : host.view;
-    live.set(box.element, next);
-    return next;
-  });
+    if (after !== undefined && end > portStart + portSize - after) {
+      const room = block ? blockStart - start + marginBefore : -Infinity;
+      return Math.min(0, Math.max(portStart + portSize - after - end, room));
+    }
+    return 0;
+  };
+  return {
+    x: axis(rect.x + host.dx, rect.width, port.x, port.width, (block?.x ?? 0) + host.dx, block?.width ?? 0,
+      sticky.left, sticky.right, box.margin.left, box.margin.right),
+    y: axis(rect.y + host.dy, rect.height, port.y, port.height, (block?.y ?? 0) + host.dy, block?.height ?? 0,
+      sticky.top, sticky.bottom, box.margin.top, box.margin.bottom),
+  };
 }
 
 const assembledMaps = new WeakMap();
@@ -122,8 +139,22 @@ function liveLookups(boxes) {
     const dx = hostLive.x - hostBox.x - (host.scrollLeft - hostBox.assembledScrollLeft);
     const dy = hostLive.y - hostBox.y - (host.scrollTop - hostBox.assembledScrollTop);
     const view = hostLive.clip ? intersect(hostLive.paddingBox, hostLive.clip) : hostLive.paddingBox;
-    hosts.set(host, info = { dx, dy, view });
+    hosts.set(host, info = { dx, dy, view, port: hostLive.paddingBox });
     return info;
+  };
+  const stickies = new Map();
+  // A box's displacement from assembly: its host's scroll, plus its sticky
+  // root's offset when it is in a position: sticky subtree.
+  const shiftOf = (box) => {
+    const host = hostOf(box.layerHost);
+    if (!box.sticky) return host;
+    let shift = stickies.get(box.sticky.root);
+    if (!shift) {
+      const offset = stickyOffset(box.sticky, assembled, host);
+      shift = { dx: host.dx + offset.x, dy: host.dy + offset.y, view: host.view, port: host.port };
+      stickies.set(box.sticky.root, shift);
+    }
+    return shift;
   };
   const liveOf = (element) => {
     let live = memo.get(element);
@@ -132,14 +163,14 @@ function liveLookups(boxes) {
     if (!box) return undefined;
     if (!box.layerHost) live = box;
     else {
-      const host = hostOf(box.layerHost);
-      live = shiftBox(box, host.dx, host.dy);
-      live.clip = live.innerClip ? intersect(live.innerClip, host.view) : host.view;
+      const shift = shiftOf(box);
+      live = shiftBox(box, shift.dx, shift.dy);
+      live.clip = live.innerClip ? intersect(live.innerClip, shift.view) : shift.view;
     }
     memo.set(element, live);
     return live;
   };
-  return { liveOf, hostOf };
+  return { liveOf, hostOf, shiftOf };
 }
 
 /**
@@ -160,17 +191,36 @@ export function liveHostLookup(boxes) {
 }
 
 /**
+ * How far a layer box has moved since assembly: { dx, dy } to add to its
+ * assembled coordinates (its host's scroll and any sticky offset), and its
+ * host's live visible view.
+ */
+export function liveShiftLookup(boxes) {
+  return liveLookups(boxes).shiftOf;
+}
+
+/**
+ * Whether `box` is painted into its host's layer texture. A position: sticky
+ * subtree is not: it moves against the scrolled content, so the window draws it
+ * over the layer at its live offset.
+ */
+export function paintsInLayer(box) {
+  return !!box.layerHost && !box.sticky;
+}
+
+/**
  * Boxes painted into `host`'s layer, in layer content space: the host's
  * scrolled content origin is (0, 0) and only clips inside the layer apply.
  * Nested layer hosts are included (they composite their own layer); their
  * content is not.
  */
 export function layerContentBoxes(boxes, host) {
+  boxes = boxes.assembled ?? boxes;
   let byHost = contentBoxCache.get(boxes);
   if (!byHost) {
     byHost = new Map();
     for (const box of boxes) {
-      if (!box.layerHost) continue;
+      if (!paintsInLayer(box)) continue;
       let list = byHost.get(box.layerHost);
       if (!list) byHost.set(box.layerHost, list = []);
       const content = shiftBox(box, -box.layerOriginX, -box.layerOriginY);
@@ -424,26 +474,36 @@ function hostDepth(box, byElement) {
 /**
  * Allocate layer textures for this frame and collect what changed in them.
  * Painting waits for paintScrollLayers, after text runs are placed.
- * Returns { layers: Map<host, layer>, covered: Set<element> } for the window
- * display list: covered elements are drawn inside layers; only outermost hosts
- * are composited by the window.
+ * Returns { layers: Map<host, layer>, covered: Set<element>, stickyRoots } for
+ * the window display list: covered elements are drawn inside layers; only
+ * outermost hosts are composited by the window. Sticky roots head subtrees the
+ * window draws over their layer at a scroll-dependent offset.
  */
 export function prepareScrollLayers(window, document, boxes) {
   const doc = documentState(document);
+  // Paint boxes with live sticky subtrees derive from the assembled boxes, which
+  // the layers' content (everything but those subtrees) is keyed by.
+  boxes = boxes.assembled ?? boxes;
   // These depend only on the assembled boxes: reuse them until geometry changes.
   let structure = structures.get(boxes);
   if (!structure) {
     const byElement = assembledMap(boxes);
     const covered = new Set();
     const hosts = [];
+    const stickyRoots = new Set();
+    const stickyHosts = new Set();
     for (const box of boxes) {
-      if (box.layerHost) covered.add(box.element);
+      if (paintsInLayer(box)) covered.add(box.element);
       if (box.isLayerHost) hosts.push(box);
+      if (box.sticky?.root === box.element) {
+        stickyRoots.add(box.element);
+        stickyHosts.add(box.sticky.host);
+      }
     }
-    structure = { byElement, covered, hosts };
+    structure = { byElement, covered, hosts, stickyRoots, stickyHosts };
     structures.set(boxes, structure);
   }
-  const { byElement, covered, hosts } = structure;
+  const { byElement, covered, hosts, stickyRoots, stickyHosts } = structure;
   const windowLayers = new Map();
   const live = new Set(hosts.map((box) => box.element));
   for (const host of doc.scrollLayerHosts ?? []) if (!live.has(host)) releaseLayer(window, host);
@@ -461,14 +521,15 @@ export function prepareScrollLayers(window, document, boxes) {
   for (const { hostBox, layer, width, height, geometry } of plans) {
     const host = hostBox.element;
     layer.depth = hostDepth(hostBox, byElement);
-    layer.outer = hostBox.layerHost ? ensureLayer(hostBox.layerHost) : null;
+    // A host in a sticky subtree is drawn by the window, so its layer is too.
+    layer.outer = paintsInLayer(hostBox) ? ensureLayer(hostBox.layerHost) : null;
     const patch = doc.boxPatch;
     if (patch && patch.boxes === boxes && layer.source === patch.base
         && layer.contentWidth === width && layer.contentHeight === height) {
       // The boxes differ from the layer's only where a patch replaced subtrees.
       const kept = new Set();
       for (const box of patch.added) {
-        if (box.layerHost !== host) continue;
+        if (box.layerHost !== host || !paintsInLayer(box)) continue;
         const entry = boundsEntry(layerSpaceBox(box));
         const previous = layer.bounds.get(box.element);
         layer.bounds.set(box.element, entry);
@@ -549,14 +610,15 @@ export function prepareScrollLayers(window, document, boxes) {
     }
     if (!layer.painted) layer.dirty = [{ x: 0, y: 0, width, height }];
     else layer.dirty.push(...fresh);
-    if (!hostBox.layerHost) windowLayers.set(host, layerInfo(layer, hostBox));
+    if (!paintsInLayer(hostBox)) windowLayers.set(host, layerInfo(layer, hostBox, stickyHosts.has(host) || !!hostBox.sticky));
   }
   doc.scrollLayerFrame = { boxes, hosts };
-  return { layers: windowLayers, covered };
+  return { layers: windowLayers, covered, stickyRoots };
 }
 
-function layerInfo(layer, hostBox) {
+function layerInfo(layer, hostBox, hasSticky) {
   return {
+    hasSticky,
     tiles: [...layer.tiles.values()],
     contentWidth: layer.contentWidth,
     contentHeight: layer.contentHeight,

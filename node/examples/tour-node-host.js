@@ -118,6 +118,7 @@ export async function install() {
   const requestedWidth = 1280;
   const requestedHeight = 720;
   const nativeWindow = new Window({
+    appId: "tour",
     resizable: "none",
     orientation: process.platform === "android" ? "landscape" : "auto",
     title: "Nasty — JavaScript & DOM, full circle",

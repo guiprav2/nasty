@@ -204,7 +204,7 @@ function rotateInvite() {
 layoutGrid();
 rotateInvite();
 
-const win = new Window({ title: "Dyndyn", width: 1100, height: 720, resizable: "both" });
+const win = new Window({ appId: "dyndyn", title: "Dyndyn", width: 1100, height: 720, resizable: "both" });
 win.document = document;
 win.addEventListener("close", () => {
   clearTimeout(rotationTimer);

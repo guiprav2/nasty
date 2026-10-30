@@ -6,7 +6,7 @@ import { Document, Window } from "../index.js";
 const frameLimit = Number(process.env.NASTY_TRANSFORM_FRAMES ?? 600);
 const viewport = { width: 720, height: 480 };
 
-const window = new Window({ resizable: "none", title: "Nasty CSS 3D transforms", ...viewport });
+const window = new Window({ appId: "nasty-transforms-3d", resizable: "none", title: "Nasty CSS 3D transforms", ...viewport });
 const document = new Document();
 window.document = document;
 document.body.className = "flex flex-wrap justify-center content-center items-center gap-2";

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { Window } from "../index.js";
 
 const initializationStart = performance.now();
-const window = new Window({ resizable: "none", title: "Nasty GPU display list", width: "960px", height: "600px" });
+const window = new Window({ appId: "nasty-window", resizable: "none", title: "Nasty GPU display list", width: "960px", height: "600px" });
 const initializationMs = performance.now() - initializationStart;
 console.log(`GPU adapter: ${window.adapterName()}`);
 console.log(`surface format: ${window.surfaceFormat()}`);

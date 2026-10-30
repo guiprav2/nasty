@@ -1,5 +1,6 @@
 import { documentState, elementState } from "./internal/dom-state.js";
 import { assembledMap, prepareScrollLayers, scrollLayerQuads } from "./internal/gpu-scroll-layers.js";
+import { transformedTextTexture } from "./internal/transformed-text.js";
 import { clipTexturedPolygon, quadCommands, scrollHostId } from "./internal/scroll-quads.js";
 import { computedStyleValue, getStyleTransitionState, hasActiveStyleTransition, styleHasAnimations, styleMeshRevision } from "./internal/css-transitions.js";
 import { canvasCommands, canvasSurface, canvasTriangleBuffer } from "./canvas-2d.js";
@@ -1127,6 +1128,7 @@ function buildFastRecipe(element) {
 // them at another scroll offset (see internal/scroll-quads.js). Only layers
 // drawn without a transform qualify: the window thread can scroll those alone.
 const layerQuadParts = new WeakMap();
+const EMPTY_SET = new Set();
 const transformedListScrollScene = new WeakMap();
 
 function isIdentityProjection(projectPoint, box) {
@@ -1150,7 +1152,9 @@ function layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip) {
     const point = projectPoint(hostBox, x, y);
     return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
   }, imageClip, clipBox);
-  if (result && isIdentityProjection(projectPoint, hostBox)) {
+  // A layer with sticky content cannot be scrolled without the main thread,
+  // which places the sticky subtree for each offset.
+  if (result && !layer.hasSticky && isIdentityProjection(projectPoint, hostBox)) {
     const view = hostBox.paddingBox;
     layerQuadParts.set(result.values, { commands: result.commands, descriptor: {
       hostId: scrollHostId(hostBox.element),
@@ -1239,7 +1243,6 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   }
   if (documentData && !layerPaint) documentData.livePaintDirty = false;
   const hasLivePaint = !!livePaintElements?.size;
-  const hasActiveTransitions = !!activeTransitionElements?.size || hasLivePaint;
   const window = documentData?.defaultView ?? null;
   // Scroll containers are drawn directly as clipped GPU draws at their current
   // offsets; no CPU-baked scroll textures.
@@ -1247,6 +1250,10 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     ?? (layerPaint || !window ? { layers: new Map(), covered: new Set() } : prepareScrollLayers(window, document, boxes));
   const scrollLayers = scrollLayerState.layers;
   const scrollCovered = scrollLayerState.covered;
+  // A position: sticky subtree moves against its scrolled layer on every scroll,
+  // so it is always live chrome: left out of the reusable base and redrawn.
+  const stickyRoots = scrollLayerState.stickyRoots ?? EMPTY_SET;
+  const hasActiveTransitions = !!activeTransitionElements?.size || hasLivePaint || stickyRoots.size > 0;
   const cached = fullSceneCacheable && !scrollLayers.size && transformedScenes.get(boxes);
   if (!hasActiveTransitions && cached && cached.generation === generation && cached.transitionGeneration === transitionGeneration
       && cached.width === width && cached.height === height) {
@@ -1264,32 +1271,32 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       && scrollSceneCache.hostKeys.every((element) => scrollLayers.has(element)));
   // Quiet frames need a complete base (stripsAnimated false). Animated frames
   // need a base that already omitted live chrome (stripsAnimated true).
-  // Refuse quiet reuse when the box set includes elements the cached base never
-  // painted — otherwise newly mounted overlays (dialogs) stay invisible until
-  // some unrelated contentGeneration bump.
-  let scrollSceneQuietReusable = scrollSceneReusable && !hasActiveTransitions && !scrollSceneCache.stripsAnimated;
-  if (scrollSceneQuietReusable) {
+  // Refuse any reuse when the box set includes painting elements the cached base
+  // never painted: a reused frame would append them after everything else, so a
+  // newly mounted image (a cross-fade layer) would draw over all geometry, and
+  // quiet frames would leave newly mounted overlays (dialogs) invisible.
+  const baseKnowsBoxes = () => {
     // The answer depends only on the box list, what layers cover and the cached
     // base, so a frame that changed none of them (a scroll) reuses it.
     const memo = scrollSceneCache.quietMemo;
-    if (memo && memo.boxes === boxes && memo.covered === scrollCovered) scrollSceneQuietReusable = memo.ok;
-    else {
-      const known = scrollSceneCache.knownElements ??= new Set(scrollSceneCache.visibleElements);
-      let ok = true;
-      for (const box of boxes) {
-        if (scrollCovered.has(box.element)) continue;
-        if (known.has(box.element)) continue;
-        const style = box.element.style;
-        const paints = (style.backgroundColor && style.backgroundColor !== "transparent")
-          || (style.backgroundImage && style.backgroundImage !== "none")
-          || box.element.localName === "img" || box.element.localName === "video"
-          || box.element.localName === "canvas";
-        if (paints) { ok = false; break; }
-      }
-      scrollSceneCache.quietMemo = { boxes, covered: scrollCovered, ok };
-      scrollSceneQuietReusable = ok;
+    if (memo && memo.boxes === boxes && memo.covered === scrollCovered) return memo.ok;
+    const known = scrollSceneCache.knownElements ??= new Set(scrollSceneCache.visibleElements);
+    let ok = true;
+    for (const box of boxes) {
+      if (scrollCovered.has(box.element)) continue;
+      if (known.has(box.element)) continue;
+      const style = box.element.style;
+      const paints = (style.backgroundColor && style.backgroundColor !== "transparent")
+        || (style.backgroundImage && style.backgroundImage !== "none")
+        || box.element.localName === "img" || box.element.localName === "video"
+        || box.element.localName === "canvas";
+      if (paints) { ok = false; break; }
     }
-  }
+    scrollSceneCache.quietMemo = { boxes, covered: scrollCovered, ok };
+    return ok;
+  };
+  const scrollSceneQuietReusable = scrollSceneReusable && !hasActiveTransitions && !scrollSceneCache.stripsAnimated
+    && baseKnowsBoxes();
   if (scrollSceneQuietReusable) {
     const boxesByElement = assembledMap(boxes);
     const projectPoint = createBoxProjector(boxes);
@@ -1445,7 +1452,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     if (cached !== undefined) return cached;
     const parent = element.parentElement ?? element.parent;
     const transitioning = !!activeTransitionElements?.has(element)
-      || !!livePaintElements?.has(element)
+      || !!livePaintElements?.has(element) || stickyRoots.has(element)
       || !!(parent && hasTransitionInPaintAncestry(parent));
     transitionAncestryCache.set(element, transitioning);
     return transitioning;
@@ -1544,8 +1551,54 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   let layerTextBounds = null;
   let pendingText = null;
   const textLayers = new Map();
+  // Rotated, scaled or skewed text was drawn upright into a texture; map it
+  // through the element's transform right after the element's own paint.
+  const emitTransformedText = (element, texture) => {
+    const box = boxesByElement.get(element);
+    if (!box) return false;
+    const border = box.borderBox ?? box;
+    const left = border.x + texture.dx, top = border.y + texture.dy;
+    const right = left + texture.textureWidth, bottom = top + texture.textureHeight;
+    const corners = [[left, top, 0, 0], [right, top, 1, 0], [right, bottom, 1, 1], [left, bottom, 0, 1]].map(([x, y, u, v]) => {
+      const point = projectPoint(box, x, y);
+      return Number.isFinite(point.x) && Number.isFinite(point.y) ? { ...point, u, v } : null;
+    });
+    if (!corners.every(Boolean)) return true;
+    let clipped = paintMode.capture ? corners : clipTexturedPolygon(corners, viewport);
+    for (const region of clipsFor(box)) clipped = clipConvexPolygon(clipped, region);
+    if (!paintMode.capture) clipped = clipConvexPolygon(clipped, windowClip);
+    if (clipped.length < 3) return true;
+    const scissor = screenSpaceBounds(clipped, viewport);
+    if (!(scissor.width > 0 && scissor.height > 0)) return true;
+    const part = [1, texture.textureId, scissor.x, scissor.y, scissor.width, scissor.height, (clipped.length - 2) * 3];
+    for (let i = 1; i < clipped.length - 1; i++) {
+      for (const point of [clipped[0], clipped[i], clipped[i + 1]]) part.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+    }
+    pushScenePart(Float32Array.from(part), element);
+    commandCount++;
+    return true;
+  };
+  const emitBackdropBlur = (element, box) => {
+    const radius = parseFilterBlur(paintStyleValue(element.style, "backdropFilter"));
+    if (!(radius > 0) || opacityFor(element, documentData?.paintGeneration ?? 0) <= 0.001) return;
+    const border = box.borderBox ?? box;
+    const corners = [[border.x, border.y], [border.x + border.width, border.y],
+      [border.x + border.width, border.y + border.height], [border.x, border.y + border.height]]
+      .map(([x, y]) => projectPoint(box, x, y));
+    if (!corners.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))) return;
+    let rect = screenSpaceBounds(corners, viewport);
+    if (box.clip) rect = intersection(rect, box.clip);
+    if (!(rect.width > 0 && rect.height > 0)) return;
+    pushScenePart(Float32Array.of(11, rect.x, rect.y, rect.width, rect.height, radius), element);
+    commandCount++;
+  };
   const commitPendingText = () => {
     if (!pendingText) return;
+    const texture = transformedTextTexture(pendingText.element);
+    if (texture && emitTransformedText(pendingText.element, texture)) {
+      pendingText = null;
+      return;
+    }
     layerText.push(pendingText.rect);
     layerTextBounds = layerTextBounds ? unionRect(layerTextBounds, pendingText.rect) : { ...pendingText.rect };
     textLayers.set(pendingText.element, textLayer);
@@ -1581,7 +1634,14 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     scenePartOwners.push(owner);
     scenePartCommands.push(commands);
   };
-  if (scrollSceneReusable && hasActiveTransitions && scrollSceneCache?.stripsAnimated) {
+  // The reused base was built with that frame's live elements stripped out. It is
+  // only valid while exactly the same elements are live: one that went live since
+  // is still in the base (it would draw twice), and one that settled was stripped
+  // from it (it would vanish). Either way, rebuild the whole scene this frame.
+  const liveNow = new Set([...(activeTransitionElements ?? []), ...(livePaintElements ?? []), ...stickyRoots]);
+  const sameLiveSet = !!scrollSceneCache?.liveRoots && scrollSceneCache.liveRoots.size === liveNow.size
+    && [...liveNow].every((element) => scrollSceneCache.liveRoots.has(element));
+  if (scrollSceneReusable && hasActiveTransitions && scrollSceneCache?.stripsAnimated && sameLiveSet && baseKnowsBoxes()) {
     for (const part of scrollSceneCache.baseParts) {
       sceneParts.push(part);
       scenePartOwners.push(null);
@@ -1591,6 +1651,10 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     scrollSceneCachedVisible = new Set(scrollSceneCache.visibleElements);
     for (const element of scrollSceneCachedVisible) visibleElements.add(element);
     reusedScrollBase = true;
+    // The base already holds text-layer markers 0..count-1 with its elements'
+    // layers; continue after them so this frame's layers never repeat one.
+    textLayer = scrollSceneCache.textLayerCount ?? 0;
+    for (const [element, layer] of scrollSceneCache.textLayers ?? []) textLayers.set(element, layer);
     // Refresh scroll-layer quads in their cached slots (same as the quiet hit path).
     for (const [hostElement, layer] of scrollLayers) {
       const hostBox = boxesByElement.get(hostElement) ?? layer.hostBox;
@@ -2059,6 +2123,13 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       const inCachedBase = scrollSceneCachedVisible?.has(element);
       if (!hasTransitionInPaintAncestry(element) && inCachedBase) continue;
     }
+    // Commit the previous element's text before this element counts its commands:
+    // transformed text emits its own scene part, which must not be attributed to
+    // (and cached with) this element's segment.
+    commitPendingText();
+    // backdrop-filter: blur() blurs what is already drawn under the element, so it
+    // goes in ahead of the element's own paint. Layer textures have no backdrop.
+    if (!after && !layerPaint) emitBackdropBlur(element, box);
     const beforeCommands = commandCount;
     const segmentStart = values.length;
     const transformStarted = paintProfile ? performance.now() : 0;
@@ -2079,7 +2150,6 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       if (box.x + box.width <= clip.x || box.y + box.height <= clip.y
           || box.x >= clip.x + clip.width || box.y >= clip.y + clip.height) continue;
     }
-    commitPendingText();
     paintingAfter = after;
     if (!after && renderedText(element)) {
       const textRect = intersection(box.contentBox, box.clip ? intersection(box.clip, viewport) : viewport);
@@ -2717,6 +2787,44 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   }
   commitPendingText();
   closeTextLayer();
+  // A reused scroll-scene base omits live transition/animation chrome. Put each
+  // live part back where its owner sat in paint order, so a fading or spinning
+  // element keeps its stacking instead of drawing over everything.
+  let reorderedLayerSlots = null;
+  if (reusedScrollBase && scrollSceneCache?.liveSlots?.size) {
+    const baseCount = scrollSceneCache.baseParts.length;
+    const slotFor = (owner) => {
+      for (let element = owner; element; element = element.parentElement ?? element.parent) {
+        const slot = scrollSceneCache.liveSlots.get(element);
+        if (slot !== undefined) return slot;
+      }
+      return Infinity;
+    };
+    const buckets = new Map();
+    const trailing = [];
+    for (let index = baseCount; index < sceneParts.length; index++) {
+      const owner = scenePartOwners[index];
+      const slot = owner ? slotFor(owner) : Infinity;
+      if (slot === Infinity || slot > baseCount) { trailing.push(index); continue; }
+      if (!buckets.has(slot)) buckets.set(slot, []);
+      buckets.get(slot).push(index);
+    }
+    const order = [];
+    for (let index = 0; index < baseCount; index++) {
+      for (const live of buckets.get(index) ?? []) order.push(live);
+      order.push(index);
+    }
+    for (const live of buckets.get(baseCount) ?? []) order.push(live);
+    order.push(...trailing);
+    const newIndexOf = new Map(order.map((oldIndex, newIndex) => [oldIndex, newIndex]));
+    const parts = order.map((index) => sceneParts[index]);
+    const owners = order.map((index) => scenePartOwners[index]);
+    const commands = order.map((index) => scenePartCommands[index]);
+    sceneParts.splice(0, sceneParts.length, ...parts);
+    scenePartOwners.splice(0, scenePartOwners.length, ...owners);
+    scenePartCommands.splice(0, scenePartCommands.length, ...commands);
+    reorderedLayerSlots = new Map([...scrollSceneCache.layerSlots].map(([host, slot]) => [host, newIndexOf.get(slot) ?? slot]));
+  }
   const assembleStarted = process.env.NASTY_BENCH_PROFILE ? performance.now() : 0;
   const sceneLength = 2 + sceneParts.reduce((total, part) => total + part.length, 0);
   const scene = new Float32Array(sceneLength);
@@ -2777,15 +2885,19 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   };
   if (fullSceneCacheable && !activeTransitionElements?.size) transformedScenes.set(boxes, { generation, transitionGeneration, width, height, compose });
   // Publish a reusable scroll-scene base that omits live transition/animation
-  // chrome. Those elements are repainted on top of the reused base each frame.
-  if (documentData && !layerPaint && scrollLayers.size) {
+  // chrome. Those elements are repainted each frame and put back at the slot
+  // recorded for them in liveSlots.
+  // Only a full frame republishes it: a reused frame's own text-layer markers
+  // would otherwise accumulate in the base, drawing the same text again each frame.
+  if (documentData && !layerPaint && scrollLayers.size && !reusedScrollBase) {
     const baseParts = [];
     const layerSlots = new Map();
     const activeLayerSlots = reusedScrollBase && scrollSceneCache
-      ? scrollSceneCache.layerSlots
+      ? reorderedLayerSlots ?? scrollSceneCache.layerSlots
       : scrollLayerSlots;
     let baseCommands = 0;
     let stripsAnimated = false;
+    const liveSlots = new Map();
     for (let index = 0; index < sceneParts.length; index++) {
       let isLayer = false;
       for (const [host, slot] of activeLayerSlots) {
@@ -2794,6 +2906,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       const owner = scenePartOwners[index];
       if (!isLayer && owner && hasTransitionInPaintAncestry(owner)) {
         stripsAnimated = true;
+        if (!liveSlots.has(owner)) liveSlots.set(owner, baseParts.length);
         continue;
       }
       baseParts.push(retainedScenePart(sceneParts[index]));
@@ -2805,8 +2918,11 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     // would truncate those commands on the next reuse.
     if (reusedScrollBase && scrollSceneCache) {
       let appendedCommands = 0;
-      const priorCount = scrollSceneCache.baseParts.length;
-      for (let index = priorCount; index < sceneParts.length; index++) {
+      // Live parts were interleaved back into the base, so find the newly
+      // appended ones by identity rather than by position.
+      const priorParts = new Set(scrollSceneCache.baseParts);
+      for (let index = 0; index < sceneParts.length; index++) {
+        if (priorParts.has(sceneParts[index])) continue;
         let isLayer = false;
         for (const [, slot] of activeLayerSlots) {
           if (slot === index) { isLayer = true; break; }
@@ -2828,6 +2944,10 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       hostKeys: [...scrollLayers.keys()],
       visibleElements: [...visibleElements],
       stripsAnimated,
+      liveSlots,
+      liveRoots: liveNow,
+      textLayers: new Map(textLayers),
+      textLayerCount: textLayer,
     };
   }
   return compose(overlays);
