@@ -63,7 +63,7 @@ import { ResizeObserver, notifyResizeObservers } from "./internal/resize-observe
 import { nerdIcon, renderedText } from "./internal/nerd-icon.js";
 import { canScroll, canScrollByUser, clipsOverflow, overflowAnchorPolicy, overflowMode, userScrollableStyle } from "./internal/overflow.js";
 import { applyIntrinsicSize, insideSkippedContent, isContentSkipped, noteContentVisibility, reconcileContentVisibility } from './internal/content-visibility.js';
-import { liveBoxLookup, liveScreenBoxes, noteLayerScrolled, noteScrollLayerPaintChange, paintScrollLayers } from "./internal/gpu-scroll-layers.js";
+import { assembledMap, liveBoxLookup, liveScreenBoxes, noteLayerScrolled, noteScrollLayerPaintChange, paintScrollLayers } from "./internal/gpu-scroll-layers.js";
 import {
   clearImageLoadSticky,
   isDetachedImage,
@@ -1521,7 +1521,10 @@ function defaultElementStyle(name) {
 
 let blankTaffyStyle = null;
 
-function markGeometryDirty(document, affectsControls = true) {
+function markGeometryDirty(document, affectsControls = true, benign = false) {
+  // Changes that a patched layout fully accounts for (content-visibility toggles,
+  // the layout itself) are benign; anything else forces box assembly from scratch.
+  if (!benign) document.geometryOtherGeneration = (document.geometryOtherGeneration ?? 0) + 1;
   document.geometryDirty = true;
   document.geometryGeneration = (document.geometryGeneration ?? 0) + 1;
   if (affectsControls) document.controlGeometryGeneration = (document.controlGeometryGeneration ?? 0) + 1;
@@ -3302,6 +3305,13 @@ export class Element extends EventTarget {
   }
 }
 
+/** Elements that get boxes, in pre-order: skipped content-visibility contents get none. */
+function collectBoxElements(element, into) {
+  into.push(element);
+  if (isContentSkipped(element)) return;
+  for (const child of element.children) collectBoxElements(child, into);
+}
+
 function flushChildSync(doc) {
   const styles = doc.pendingStyleSync;
   if (styles?.size) {
@@ -3309,7 +3319,18 @@ function flushChildSync(doc) {
     for (const element of styles) {
       // Contents of a skipped subtree are sent when they are released.
       if (insideSkippedContent(element)) continue;
-      doc.layoutTree.setStyle(elementState(element).handle, element._taffyStyle());
+      const data = elementState(element);
+      const style = element._taffyStyle();
+      // A content-visibility element's own style is compared with what was last
+      // sent: only when unchanged can toggling it be laid out as a subtree.
+      if (data.cvMode === "auto" || data.cvMode === "hidden") {
+        const key = JSON.stringify(style);
+        if (data.cvStyleKey !== key) {
+          if (doc.cvBatch?.has(element)) doc.cvStyleChanged = true;
+          data.cvStyleKey = key;
+        }
+      }
+      doc.layoutTree.setStyle(data.handle, style);
     }
   }
   const pending = doc.pendingChildSync;
@@ -3494,6 +3515,7 @@ export class Document extends EventTarget {
       // request was in flight. Never let its older viewport overwrite that work.
       if (!result.stale && state.viewport.width === width && state.viewport.height === height) {
         state.layoutSnapshot = result.boxes;
+        state.layoutPatch = null;
         state.dirty = false;
         markGeometryDirty(state);
       }
@@ -3534,17 +3556,44 @@ export class Document extends EventTarget {
         }
       }
       let result;
+      // Toggling content-visibility cells changes only what is inside them: when
+      // every pending mutation is confined to those cells and they keep their
+      // size, only their subtrees are laid out and the old layout is patched.
+      let patchBase = null;
+      let patchCells = null;
+      let patchedOnly = true;
       for (let pass = 0; ; pass++) {
+        const batch = state.cvBatch;
+        state.cvBatch = null;
+        state.cvStyleChanged = false;
         flushChildSync(documentState(this));
-        result = documentState(this).layoutTree.layoutSync(width, height, elementState(this.body).handle);
+        result = null;
+        if (batch?.size && !didReflow && !transitionLayoutPass && !state.cvStyleChanged
+            && state.layoutSnapshot && state.boxesSnapshot) {
+          result = state.layoutTree.layoutSyncWithin(width, height, elementState(this.body).handle,
+            [...batch].map((element) => elementState(element).handle), state.layoutSnapshot);
+        }
+        if (result) {
+          patchBase ??= state.boxesSnapshot;
+          patchCells ??= new Set();
+          for (const element of batch) patchCells.add(element);
+        } else {
+          patchedOnly = false;
+          result = documentState(this).layoutTree.layoutSync(width, height, elementState(this.body).handle);
+        }
         documentState(this).layoutSnapshot = result.boxes;
+        // A patched layout moves nothing outside the cells that were toggled, so
+        // only a full layout can bring other cells into or out of range.
+        if (result.patched) { state.cvSlack = 0; break; }
         // Releasing or skipping contents moves what is below them: lay out again.
         if (pass >= 3 || !reconcileContentVisibility(this, markGeometryDirty, { force: true })) break;
         this.#prepareText();
       }
+      state.layoutPatch = patchedOnly && patchCells ? { cells: patchCells, base: patchBase } : null;
+      state.cvBatch = null;
       documentState(this).layoutSnapshot = result.boxes;
       documentState(this).dirty = !!state.transitionLayoutDirty;
-      markGeometryDirty(documentState(this));
+      markGeometryDirty(documentState(this), true, true);
       didReflow = true;
     }
     if (timings) timings.layout = performance.now() - started;
@@ -3579,34 +3628,14 @@ export class Document extends EventTarget {
     return live;
   }
 
-  #boxes(timings, selectedElements = null) {
+  /**
+   * Boxes for `elements` (pre-order), assembled from the layout snapshot. With a
+   * `seed` the elements are one subtree whose parent's assembled box is reused.
+   */
+  #assemble(elements, seed = null) {
     const state = documentState(this);
-    if (selectedElements) {
-      const cached = state.renderBoxCache.get(selectedElements);
-      if (cached?.generation === state.geometryGeneration) {
-        if (timings) timings.assembly = 0;
-        return cached.boxes;
-      }
-      const boxes = this.#boxes(timings).filter(box => selectedElements.has(box.element));
-      state.renderBoxCache.set(selectedElements, { generation: state.geometryGeneration, boxes });
-      return boxes;
-    }
-    if (!selectedElements && !state.geometryDirty && state.boxesSnapshot) {
-      if (timings) timings.assembly = 0;
-      return state.boxesSnapshot;
-    }
-    const elements = [];
-    if (selectedElements) elements.push(...selectedElements);
-    else {
-      const collect = (element) => {
-        elements.push(element);
-        if (isContentSkipped(element)) return;
-        for (const child of element.children) collect(child);
-      };
-      collect(this.body);
-    }
-    const assemblyStart = timings && performance.now();
     const fixedOffsets = new WeakMap();
+    if (seed) fixedOffsets.set(seed.parent, seed.parentBox.fixed);
     const offsetFor = element => {
       const cached = fixedOffsets.get(element);
       if (cached) return cached;
@@ -3647,7 +3676,7 @@ export class Document extends EventTarget {
       // One explicit shape for every box (fields set later are pre-declared),
       // so the passes below stay monomorphic.
       return { element, x: borderBox.x, y: borderBox.y, width: borderBox.width, height: borderBox.height,
-        margin, border, padding, marginBox, borderBox, paddingBox, contentBox, fixedRoot: fixed.root,
+        margin, border, padding, marginBox, borderBox, paddingBox, contentBox, fixedRoot: fixed.root, fixed, scope: null, index: 0,
         clip: null, scrollWidth: 0, scrollHeight: 0,
         // Scroll layers: the nearest scrolling ancestor whose content is
         // painted into its own texture, that content's screen origin at this
@@ -3656,6 +3685,7 @@ export class Document extends EventTarget {
         isLayerHost: false, assembledScrollLeft: 0, assembledScrollTop: 0 };
     });
     const byElement = new Map(raw.map((box) => [box.element, box]));
+    if (seed) byElement.set(seed.parent, seed.parentBox);
     const overflowBehaviors = new Map();
     const extents = new Map();
     for (let i = raw.length - 1; i >= 0; i--) {
@@ -3686,6 +3716,7 @@ export class Document extends EventTarget {
       return behavior;
     };
     const scopes = new Map();
+    if (seed) scopes.set(seed.parent, seed.parentBox.scope);
     const boxes = raw.map((box) => {
       const parent = box.element.parent;
       const parentScope = parent && box.fixedRoot !== box.element ? scopes.get(parent) : null;
@@ -3694,8 +3725,12 @@ export class Document extends EventTarget {
       if (parentScope) {
         const parentBox = byElement.get(parent);
         const behavior = behaviorOf(parent);
-        scrollX = parentScope.scrollX + (behavior.scrollX ? parent.scrollLeft : 0);
-        scrollY = parentScope.scrollY + (behavior.scrollY ? parent.scrollTop : 0);
+        // The seed parent was assembled earlier, at the scroll offsets it recorded.
+        const seeded = seed && parent === seed.parent;
+        const parentScrollLeft = seeded ? parentBox.assembledScrollLeft : parent.scrollLeft;
+        const parentScrollTop = seeded ? parentBox.assembledScrollTop : parent.scrollTop;
+        scrollX = parentScope.scrollX + (behavior.scrollX ? parentScrollLeft : 0);
+        scrollY = parentScope.scrollY + (behavior.scrollY ? parentScrollTop : 0);
         clip = parentScope.clip;
         ({ layerHost, layerOriginX, layerOriginY, innerClip } = parentScope);
         let next = null;
@@ -3713,14 +3748,16 @@ export class Document extends EventTarget {
           // Content of a scroll layer lives in the layer's own space: its
           // origin moves with the host's scroll and the host does not clip it.
           layerHost = parent;
-          layerOriginX = parentBox.paddingBox.x - parent.scrollLeft;
-          layerOriginY = parentBox.paddingBox.y - parent.scrollTop;
+          layerOriginX = parentBox.paddingBox.x - parentScrollLeft;
+          layerOriginY = parentBox.paddingBox.y - parentScrollTop;
           innerClip = null;
         } else if (next) {
           innerClip = innerClip ? intersect(innerClip, next) : next;
         }
       }
-      scopes.set(box.element, { scrollX, scrollY, clip, layerHost, layerOriginX, layerOriginY, innerClip });
+      const scope = { scrollX, scrollY, clip, layerHost, layerOriginX, layerOriginY, innerClip };
+      scopes.set(box.element, scope);
+      box.scope = scope;
       box.layerHost = layerHost;
       box.layerOriginX = layerOriginX;
       box.layerOriginY = layerOriginY;
@@ -3790,10 +3827,89 @@ export class Document extends EventTarget {
       box.assembledScrollTop = box.element.scrollTop;
       return box;
     });
+    return boxes;
+  }
+
+  /**
+   * Splices re-assembled subtrees of the toggled content-visibility cells into
+   * the previous boxes, when the layout was patched and nothing else changed
+   * geometry since. Returns null to assemble everything instead.
+   */
+  #patchBoxes() {
+    const state = documentState(this);
+    const patch = state.layoutPatch;
+    state.layoutPatch = null;
+    const previous = state.boxesSnapshot;
+    if (!patch || !previous || state.boxesSnapshot !== patch.base
+        || (state.geometryOtherGeneration ?? 0) !== (state.assembledOtherGeneration ?? 0)) return null;
+    const known = assembledMap(previous);
+    // Cells inside another toggled cell are covered by the outer one.
+    const cells = [];
+    for (const cell of patch.cells) {
+      let nested = false;
+      for (let ancestor = cell.parent; ancestor && !nested; ancestor = ancestor.parent) nested = patch.cells.has(ancestor);
+      if (nested) continue;
+      const box = known.get(cell);
+      if (!box || !cell.parent || !known.get(cell.parent)) return null;
+      cells.push(box);
+    }
+    cells.sort((a, b) => a.index - b.index);
+    const out = [];
+    let cursor = 0;
+    for (const old of cells) {
+      const cell = old.element;
+      // The cell's previous subtree is the run of descendants after it.
+      let end = old.index + 1;
+      while (end < previous.length) {
+        let inside = false;
+        for (let ancestor = previous[end].element.parent; ancestor && !inside; ancestor = ancestor.parent) inside = ancestor === cell;
+        if (!inside) break;
+        end++;
+      }
+      const elements = [];
+      collectBoxElements(cell, elements);
+      const fresh = this.#assemble(elements, { parent: cell.parent, parentBox: known.get(cell.parent) });
+      // Ancestors' scroll extents include this cell's: they only stay valid if it is unchanged.
+      if (Math.abs(fresh[0].scrollWidth - old.scrollWidth) > 0.5 || Math.abs(fresh[0].scrollHeight - old.scrollHeight) > 0.5) return null;
+      for (let i = cursor; i < old.index; i++) out.push(previous[i]);
+      for (const box of fresh) out.push(box);
+      cursor = end;
+    }
+    for (let i = cursor; i < previous.length; i++) out.push(previous[i]);
+    return out;
+  }
+
+  #boxes(timings, selectedElements = null) {
+    const state = documentState(this);
+    if (selectedElements) {
+      const cached = state.renderBoxCache.get(selectedElements);
+      if (cached?.generation === state.geometryGeneration) {
+        if (timings) timings.assembly = 0;
+        return cached.boxes;
+      }
+      const boxes = this.#boxes(timings).filter(box => selectedElements.has(box.element));
+      state.renderBoxCache.set(selectedElements, { generation: state.geometryGeneration, boxes });
+      return boxes;
+    }
+    if (!selectedElements && !state.geometryDirty && state.boxesSnapshot) {
+      if (timings) timings.assembly = 0;
+      return state.boxesSnapshot;
+    }
+    const assemblyStart = timings && performance.now();
+    const patched = !selectedElements && this.#patchBoxes();
+    let boxes = patched;
+    if (!boxes) {
+      const elements = [];
+      if (selectedElements) elements.push(...selectedElements);
+      else collectBoxElements(this.body, elements);
+      boxes = this.#assemble(elements);
+    }
+    boxes.forEach((box, index) => { box.index = index; });
     if (timings) timings.assembly = performance.now() - assemblyStart;
     if (!selectedElements) {
       documentState(this).boxesSnapshot = boxes;
       documentState(this).boxesScrollGeneration = documentState(this).scrollGeneration ?? 0;
+      documentState(this).assembledOtherGeneration = documentState(this).geometryOtherGeneration ?? 0;
       documentState(this).geometryDirty = false;
       // Fresh scroll-adjusted boxes after reflow — recompute the image pool.
       requestImageLoadSchedule(this);

@@ -1276,9 +1276,15 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   // Refuse quiet reuse when the box set includes elements the cached base never
   // painted — otherwise newly mounted overlays (dialogs) stay invisible until
   // some unrelated contentGeneration bump.
-  const scrollSceneQuietReusable = scrollSceneReusable && !hasActiveTransitions && !scrollSceneCache.stripsAnimated
-    && (() => {
-      const known = new Set(scrollSceneCache.visibleElements);
+  let scrollSceneQuietReusable = scrollSceneReusable && !hasActiveTransitions && !scrollSceneCache.stripsAnimated;
+  if (scrollSceneQuietReusable) {
+    // The answer depends only on the box list, what layers cover and the cached
+    // base, so a frame that changed none of them (a scroll) reuses it.
+    const memo = scrollSceneCache.quietMemo;
+    if (memo && memo.boxes === boxes && memo.covered === scrollCovered) scrollSceneQuietReusable = memo.ok;
+    else {
+      const known = scrollSceneCache.knownElements ??= new Set(scrollSceneCache.visibleElements);
+      let ok = true;
       for (const box of boxes) {
         if (scrollCovered.has(box.element)) continue;
         if (known.has(box.element)) continue;
@@ -1287,10 +1293,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
           || (style.backgroundImage && style.backgroundImage !== "none")
           || box.element.localName === "img" || box.element.localName === "video"
           || box.element.localName === "canvas";
-        if (paints) return false;
+        if (paints) { ok = false; break; }
       }
-      return true;
-    })();
+      scrollSceneCache.quietMemo = { boxes, covered: scrollCovered, ok };
+      scrollSceneQuietReusable = ok;
+    }
+  }
   if (scrollSceneQuietReusable) {
     const boxesByElement = assembledMap(boxes);
     const projectPoint = createBoxProjector(boxes);

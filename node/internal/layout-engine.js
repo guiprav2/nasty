@@ -10,6 +10,9 @@ export class LayoutEngine {
   #childLists = [];
   #measurements = new Map();
   #measure = (input) => this.#measureNode(input);
+  // Output of the last layout, patched in place by patchWithin.
+  #lastValues = null;
+  #lastReachable = null;
 
   constructor() {
     this.#tree.setRounding(false);
@@ -90,7 +93,90 @@ export class LayoutEngine {
       out[target + 1] = (parent >= 0 ? out[parent * 16 + 1] : 0) + local[source + 1];
       for (let field = 2; field < 16; field++) out[target + field] = local[source + field];
     }
+    this.#lastValues = out;
+    this.#lastReachable = reachable;
     return { values: out, count, reachable };
+  }
+
+  /** Whether a layout exists that patchWithin can build on. */
+  get hasLayout() { return this.#lastValues !== null; }
+
+  /**
+   * Re-lays out only the subtrees of `boundaries` (node indexes) against the
+   * size they had in the last layout, and patches that layout in place.
+   * Returns null, leaving the last layout untouched, when the pending mutations
+   * reach outside those subtrees or a boundary would change size or margins;
+   * the caller then lays out the whole tree.
+   */
+  patchWithin(boundaries, mutations, root) {
+    const values = this.#lastValues;
+    // Nodes created since the last full layout have no slots in it.
+    if (!values || !boundaries.length || this.#handles.length * 16 > values.length) return null;
+    const rootIndex = this.#handles.indexOf(this.#handles[root] ?? this.#root);
+    const inside = new Set(boundaries);
+    // Mutations to attached nodes must sit inside a boundary; detached ones do nothing.
+    const confined = (node) => {
+      for (let current = node; ; current = this.#parents[current]) {
+        if (inside.has(current)) return true;
+        const parent = this.#parents[current];
+        if (parent === undefined || parent < 0) return current !== rootIndex;
+      }
+    };
+    for (const payload of mutations?.styles || []) if (!confined(payload.node)) return null;
+    for (const payload of mutations?.textMetrics || []) if (!confined(payload.node)) return null;
+    for (const payload of mutations?.children || []) if (!confined(payload.node)) return null;
+    const laid = [];
+    for (const boundary of boundaries) {
+      const width = values[boundary * 16 + 2], height = values[boundary * 16 + 3];
+      if (!(width > 0 || height > 0) || this.#parents[boundary] < 0) return null;
+      this.#tree.compute(this.#handles[boundary], width, height, this.#measure);
+      const order = [];
+      const pending = [boundary];
+      while (pending.length) {
+        const index = pending.pop();
+        order.push(index);
+        const kids = this.#childLists[index] || [];
+        for (let i = kids.length - 1; i >= 0; i--) pending.push(kids[i]);
+      }
+      const packed = this.#tree.layoutsPacked(order.map((index) => this.#handles[index]));
+      const local = packed.byteOffset % 4 === 0
+        ? new Float32Array(packed.buffer, packed.byteOffset, packed.length / 4)
+        : new Float32Array(Uint8Array.from(packed).buffer);
+      // The boundary itself must come out as before: same size and margins.
+      if (Math.abs(local[2] - width) > 0.02 || Math.abs(local[3] - height) > 0.02) return null;
+      for (let field = 4; field < 8; field++) if (Math.abs(local[field] - values[boundary * 16 + field]) > 0.02) return null;
+      laid.push({ boundary, order, local });
+    }
+    const written = [];
+    for (const { boundary, order, local } of laid) {
+      for (let position = 1; position < order.length; position++) {
+        const index = order[position];
+        const parent = this.#parents[index];
+        const source = position * 16, target = index * 16;
+        values[target] = values[parent * 16] + local[source];
+        values[target + 1] = values[parent * 16 + 1] + local[source + 1];
+        for (let field = 2; field < 16; field++) values[target + field] = local[source + field];
+        written.push(index);
+      }
+    }
+    // Nodes that left the live tree (skipped contents) lose their boxes.
+    const reachable = [];
+    const live = new Uint8Array(this.#handles.length);
+    const walk = [rootIndex];
+    while (walk.length) {
+      const index = walk.pop();
+      reachable.push(index);
+      live[index] = 1;
+      for (const child of this.#childLists[index] || []) walk.push(child);
+    }
+    const dropped = [];
+    for (const index of this.#lastReachable) {
+      if (live[index]) continue;
+      values.fill(0, index * 16, index * 16 + 16);
+      dropped.push(index);
+    }
+    this.#lastReachable = reachable;
+    return { values, count: this.#handles.length, reachable, written, dropped };
   }
 
   #measureNode({ node, knownWidth, knownHeight, availableWidth, minContent }) {
@@ -141,22 +227,25 @@ const ZERO_BOX = Object.freeze({
  * object; every other handle shares one frozen zero box, so a layout costs the
  * live tree rather than every node ever created.
  */
+export function boxFromValues(values, index) {
+  const offset = index * 16;
+  return {
+    x: values[offset], y: values[offset + 1], width: values[offset + 2], height: values[offset + 3],
+    marginTop: values[offset + 4], marginRight: values[offset + 5], marginBottom: values[offset + 6], marginLeft: values[offset + 7],
+    borderTop: values[offset + 8], borderRight: values[offset + 9], borderBottom: values[offset + 10], borderLeft: values[offset + 11],
+    paddingTop: values[offset + 12], paddingRight: values[offset + 13], paddingBottom: values[offset + 14], paddingLeft: values[offset + 15],
+  };
+}
+
+export { ZERO_BOX };
+
 export function boxesFromValues(values, count, reachable = null) {
   const boxes = new Array(count);
-  const make = (index) => {
-    const offset = index * 16;
-    boxes[index] = {
-      x: values[offset], y: values[offset + 1], width: values[offset + 2], height: values[offset + 3],
-      marginTop: values[offset + 4], marginRight: values[offset + 5], marginBottom: values[offset + 6], marginLeft: values[offset + 7],
-      borderTop: values[offset + 8], borderRight: values[offset + 9], borderBottom: values[offset + 10], borderLeft: values[offset + 11],
-      paddingTop: values[offset + 12], paddingRight: values[offset + 13], paddingBottom: values[offset + 14], paddingLeft: values[offset + 15],
-    };
-  };
   if (!reachable) {
-    for (let index = 0; index < count; index++) make(index);
+    for (let index = 0; index < count; index++) boxes[index] = boxFromValues(values, index);
     return boxes;
   }
   boxes.fill(ZERO_BOX);
-  for (const index of reachable) make(index);
+  for (const index of reachable) boxes[index] = boxFromValues(values, index);
   return boxes;
 }

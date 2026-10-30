@@ -1,5 +1,5 @@
 import { Worker } from "node:worker_threads";
-import { LayoutEngine, boxesFromValues } from "./layout-engine.js";
+import { LayoutEngine, ZERO_BOX, boxFromValues, boxesFromValues } from "./layout-engine.js";
 
 // Documents lay out in thread by default: layoutSync blocks the caller anyway,
 // and posting mutations to a worker plus waking it cost far more than Taffy's
@@ -159,6 +159,27 @@ export class LayoutWorker {
       computeMs: Atomics.load(header, 2) / 1000,
       workerMs: Atomics.load(header, 3) / 1000,
     };
+  }
+
+  /**
+   * Lays out only the subtrees of `boundaries` (node handles) and patches the
+   * previous boxes. Returns null when that is not possible (the pending
+   * mutations are consumed either way, so lay out fully afterwards).
+   * `boxes` is the snapshot to patch; the result shares every unchanged box.
+   */
+  layoutSyncWithin(width, height, root, boundaries, boxes) {
+    if (!this.#engine || !this.#engine.hasLayout || !boxes) return null;
+    const mutations = this.#takeMutations();
+    this.#engine.applyMutations(mutations);
+    const started = performance.now();
+    const patch = this.#engine.patchWithin(boundaries, mutations, root);
+    if (!patch) return null;
+    const next = boxes.slice();
+    for (const index of patch.dropped) next[index] = ZERO_BOX;
+    for (const index of patch.written) next[index] = boxFromValues(patch.values, index);
+    const computeMs = performance.now() - started;
+    return { boxes: next, version: this.#version, stale: false, computeMs, workerMs: computeMs,
+      patched: { written: patch.written, dropped: patch.dropped } };
   }
 
   close() {

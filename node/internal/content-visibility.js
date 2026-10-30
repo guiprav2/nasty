@@ -58,7 +58,8 @@ export function applyIntrinsicSize(element, style) {
 
 function requestRelayout(doc, markGeometryDirty) {
   doc.dirty = true;
-  markGeometryDirty(doc);
+  // Benign: a patched layout accounts for this toggle (see Document#layoutSync).
+  markGeometryDirty(doc, true, true);
 }
 
 function releaseSubtree(doc, element) {
@@ -83,6 +84,7 @@ function setSkipped(doc, element, skipped, markGeometryDirty) {
   }
   state.cvSkipped = skipped;
   doc.imageActiveDirty = true;
+  (doc.cvBatch ??= new Set()).add(element);
   (doc.pendingStyleSync ??= new Set()).add(element);
   (doc.pendingChildSync ??= new Set()).add(element);
   if (!skipped) releaseSubtree(doc, element);
@@ -108,10 +110,6 @@ export function noteContentVisibility(element, markGeometryDirty) {
     cvElements.delete(element);
     setSkipped(doc, element, false, markGeometryDirty);
   }
-}
-
-function overlaps(a, b) {
-  return a.x <= b.x + b.width && b.x <= a.x + a.width && a.y <= b.y + b.height && b.y <= a.y + a.height;
 }
 
 function intersection(a, b) {
@@ -186,9 +184,10 @@ export function reconcileContentVisibility(document, markGeometryDirty, { force 
     };
     return regionOf;
   };
-  const within = (rect, region) => region.width >= 0 && overlaps(rect, region);
-  const candidates = [];
-  // Siblings share their ancestors, so each ancestor is classified once.
+  const within = (x, y, width, height, region) => region.width >= 0
+    && x <= region.x + region.width && region.x <= x + width && y <= region.y + region.height && region.y <= y + height;
+  // Siblings share their ancestors: offsets, skipped state and regions are
+  // worked out once per parent, and each element costs a little arithmetic.
   const skippedMemo = new Map();
   const insideSkipped = (node) => {
     if (!node) return false;
@@ -199,18 +198,32 @@ export function reconcileContentVisibility(document, markGeometryDirty, { force 
     }
     return value;
   };
-  for (const element of elements) {
-    const parent = element.parent;
-    if (!parent) continue;
-    // A skipped ancestor has no layout of its own for this element.
-    if (insideSkipped(parent)) continue;
-    const data = elementState(element);
-    const box = snapshot[data.handle];
-    if (!box) continue;
-    const outer = offsetOf(parent);
-    candidates.push({ element, skipped: data.cvSkipped === true,
-      rect: { x: box.x - outer.x, y: box.y - outer.y, width: box.width, height: box.height } });
-  }
+  const releaseTrigger = regions(RELEASE_TRIGGER);
+  const skipTrigger = regions(SKIP_TRIGGER);
+  const groups = new Map();
+  const groupOf = (parent) => {
+    let group = groups.get(parent);
+    if (!group) {
+      const outer = offsetOf(parent);
+      group = { parent, x: outer.x, y: outer.y, skipped: insideSkipped(parent),
+        release: releaseTrigger(parent), skipTrigger: skipTrigger(parent) };
+      groups.set(parent, group);
+    }
+    return group;
+  };
+  const eachCandidate = (visit) => {
+    for (const element of elements) {
+      const parent = element.parent;
+      if (!parent) continue;
+      const group = groupOf(parent);
+      // A skipped ancestor has no layout of its own for this element.
+      if (group.skipped) continue;
+      const data = elementState(element);
+      const box = snapshot[data.handle];
+      if (!box) continue;
+      visit(element, data.cvSkipped === true, box.x - group.x, box.y - group.y, box.width, box.height, group);
+    }
+  };
   const scrolling = now - (doc.cvScrollAt ?? -Infinity) < SETTLE_MS;
   const recheck = (delay) => {
     if (doc.cvSettleTimer) return;
@@ -221,26 +234,28 @@ export function reconcileContentVisibility(document, markGeometryDirty, { force 
     doc.cvSettleTimer.unref?.();
   };
   if (scrolling) recheck(SETTLE_MS + 20);
-  const releaseTrigger = regions(RELEASE_TRIGGER);
-  const skipTrigger = regions(SKIP_TRIGGER);
   // Scrolling moves a rect relative to its region by at most the scroll distance,
   // and a skipped cell cannot reach the release band before covering its gap.
   let slack = Infinity;
-  for (const { element, rect, skipped } of candidates) {
-    if (!skipped) continue;
-    const region = releaseTrigger(element.parent);
-    if (region.width < 0) { slack = 0; break; }
-    const gapX = Math.max(0, region.x - (rect.x + rect.width), rect.x - (region.x + region.width));
-    const gapY = Math.max(0, region.y - (rect.y + rect.height), rect.y - (region.y + region.height));
-    slack = Math.min(slack, Math.max(gapX, gapY));
-    if (slack === 0) break;
-  }
+  let triggered = false;
+  eachCandidate((element, skipped, x, y, width, height, group) => {
+    if (skipped) {
+      const region = group.release;
+      if (region.width < 0) { slack = 0; return; }
+      const gapX = Math.max(0, region.x - (x + width), x - (region.x + region.width));
+      const gapY = Math.max(0, region.y - (y + height), y - (region.y + region.height));
+      const gap = Math.max(gapX, gapY);
+      if (gap < slack) slack = gap;
+      if (gap === 0) triggered = true;
+    } else if (!scrolling && !within(x, y, width, height, group.skipTrigger)) triggered = true;
+  });
   doc.cvSlack = slack;
-  const triggered = candidates.some(({ element, rect, skipped }) => skipped
-    ? within(rect, releaseTrigger(element.parent)) : !scrolling && !within(rect, skipTrigger(element.parent)));
   if (!triggered) return false;
   const inView = regions(0);
-  const urgent = candidates.some(({ element, rect, skipped }) => skipped && within(rect, inView(element.parent)));
+  let urgent = false;
+  eachCandidate((element, skipped, x, y, width, height, group) => {
+    if (skipped && !urgent && within(x, y, width, height, inView(group.parent))) urgent = true;
+  });
   const wait = (urgent ? URGENT_FACTOR : COOLDOWN_FACTOR) * (doc.cvBatchCost ?? 0) - (now - (doc.cvBatchAt ?? -Infinity));
   if (wait > 0) {
     // The retry timer owns the next scan; scrolling alone should not trigger more.
@@ -251,10 +266,10 @@ export function reconcileContentVisibility(document, markGeometryDirty, { force 
   const releaseTarget = regions(RELEASE_TARGET);
   const skipTarget = regions(SKIP_TARGET);
   let changed = false;
-  for (const { element, rect, skipped } of candidates) {
-    if (skipped && within(rect, releaseTarget(element.parent))) changed = setSkipped(doc, element, false, markGeometryDirty) || changed;
-    else if (!scrolling && !skipped && !within(rect, skipTarget(element.parent))) changed = setSkipped(doc, element, true, markGeometryDirty) || changed;
-  }
+  eachCandidate((element, skipped, x, y, width, height, group) => {
+    if (skipped && within(x, y, width, height, releaseTarget(group.parent))) changed = setSkipped(doc, element, false, markGeometryDirty) || changed;
+    else if (!scrolling && !skipped && !within(x, y, width, height, skipTarget(group.parent))) changed = setSkipped(doc, element, true, markGeometryDirty) || changed;
+  });
   if (changed) {
     doc.cvBatchAt = now;
     // The next frames pay for the relayout; presentDocument records what they cost.
