@@ -6,6 +6,7 @@
 // Tiles: content is split into a grid of at most TILE_EDGE texels per side.
 // The trailing column/row textures grow by doubling (keeping their content)
 // as the content grows, so a growing list does not reallocate per row.
+import { scrollQuads } from "./scroll-quads.js";
 import os from 'node:os';
 import { documentState, elementState } from './dom-state.js';
 import { buildTransformedDisplayList, displayListCanvas, displayListTextLayers } from '../render.js';
@@ -559,27 +560,7 @@ function layerInfo(layer, hostBox) {
  * host's current scroll offset, in the host box's coordinate space.
  */
 export function scrollLayerQuads(layer, hostBox) {
-  const host = hostBox.element;
-  const view = hostBox.paddingBox;
-  if (view.width <= 0 || view.height <= 0) return [];
-  const left = Math.round(Math.max(0, Math.min(Math.max(0, layer.contentWidth - view.width), host.scrollLeft || 0)));
-  const top = Math.round(Math.max(0, Math.min(Math.max(0, layer.contentHeight - view.height), host.scrollTop || 0)));
-  const visible = { x: left, y: top, width: view.width, height: view.height };
-  // Layer texels map 1:1 to device pixels: snap the quad origin, as compositors do.
-  const originX = Math.round(view.x), originY = Math.round(view.y);
-  const quads = [];
-  for (const tile of layer.tiles) {
-    const area = intersect(visible, intersect({ x: tile.x, y: tile.y, width: tile.width, height: tile.height },
-      { x: 0, y: 0, width: layer.contentWidth, height: layer.contentHeight }));
-    if (area.width <= 0 || area.height <= 0) continue;
-    quads.push({
-      textureId: tile.id,
-      x: originX + area.x - left, y: originY + area.y - top, width: area.width, height: area.height,
-      u0: (area.x - tile.x) / tile.width, v0: (area.y - tile.y) / tile.height,
-      u1: (area.x + area.width - tile.x) / tile.width, v1: (area.y + area.height - tile.y) / tile.height,
-    });
-  }
-  return quads;
+  return scrollQuads(layer, hostBox.paddingBox, hostBox.element.scrollLeft, hostBox.element.scrollTop);
 }
 
 /** A content box (layer space, clip = inner clip) as the layer tracks it. */

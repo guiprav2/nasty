@@ -1,5 +1,6 @@
 import { documentState, elementState } from "./internal/dom-state.js";
 import { assembledMap, prepareScrollLayers, scrollLayerQuads } from "./internal/gpu-scroll-layers.js";
+import { clipTexturedPolygon, quadCommands, scrollHostId } from "./internal/scroll-quads.js";
 import { computedStyleValue, getStyleTransitionState, hasActiveStyleTransition, styleHasAnimations, styleMeshRevision } from "./internal/css-transitions.js";
 import { canvasCommands, canvasSurface, canvasTriangleBuffer } from "./canvas-2d.js";
 import { objectFitLayout, objectPositionFractions } from "./internal/object-fit.js";
@@ -944,39 +945,6 @@ function parseFilterBlur(value) {
   return Number.isFinite(radius) && radius > 0 ? radius : 0;
 }
 
-function clipTexturedPolygon(polygon, rect) {
-  const inside = [
-    (point) => point.x >= rect.x,
-    (point) => point.x <= rect.x + rect.width,
-    (point) => point.y >= rect.y,
-    (point) => point.y <= rect.y + rect.height,
-  ];
-  const intersectionAt = (a, b, edge) => {
-    const vertical = edge < 2;
-    const coordinate = edge === 0 ? rect.x : edge === 1 ? rect.x + rect.width : edge === 2 ? rect.y : rect.y + rect.height;
-    const t = vertical ? (coordinate - a.x) / (b.x - a.x) : (coordinate - a.y) / (b.y - a.y);
-    return {
-      x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t,
-      u: a.u + (b.u - a.u) * t, v: a.v + (b.v - a.v) * t,
-      reciprocalW: a.reciprocalW + (b.reciprocalW - a.reciprocalW) * t,
-    };
-  };
-  for (let edge = 0; edge < inside.length; edge++) {
-    const input = polygon;
-    polygon = [];
-    if (!input.length) break;
-    let previous = input.at(-1);
-    for (const current of input) {
-      const previousInside = inside[edge](previous);
-      const currentInside = inside[edge](current);
-      if (currentInside !== previousInside) polygon.push(intersectionAt(previous, current, edge));
-      if (currentInside) polygon.push(current);
-      previous = current;
-    }
-  }
-  return polygon;
-}
-
 function paintOrder(boxes) {
   const members = new Set(boxes.map((box) => box.element));
   const children = new Map();
@@ -1155,39 +1123,62 @@ function buildFastRecipe(element) {
 
 // Textured quads that show a scroll layer's tiles in its host at the current
 // scroll offset: one image-triangles command per tile (tag 1).
+// Display-list blocks of scroll-layer quads, with what is needed to recompute
+// them at another scroll offset (see internal/scroll-quads.js). Only layers
+// drawn without a transform qualify: the window thread can scroll those alone.
+const layerQuadParts = new WeakMap();
+const transformedListScrollScene = new WeakMap();
+
+function isIdentityProjection(projectPoint, box) {
+  const near = (point, x, y) => Math.abs(point.x - x) < 1e-6 && Math.abs(point.y - y) < 1e-6 && Math.abs((point.reciprocalW ?? 1) - 1) < 1e-9;
+  return near(projectPoint(box, 0, 0), 0, 0) && near(projectPoint(box, 64, 0), 64, 0) && near(projectPoint(box, 0, 64), 0, 64);
+}
+
 function layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip) {
   const imageClip = intersection(hostBox.clip ?? viewport, viewport);
   if (imageClip.width <= 0 || imageClip.height <= 0) return null;
-  const values = [];
-  let commands = 0;
-  for (const quad of scrollLayerQuads(layer, hostBox)) {
-    const corners = [
-      [quad.x, quad.y, quad.u0, quad.v0], [quad.x + quad.width, quad.y, quad.u1, quad.v0],
-      [quad.x + quad.width, quad.y + quad.height, quad.u1, quad.v1], [quad.x, quad.y + quad.height, quad.u0, quad.v1],
-    ].map(([x, y, u, v]) => {
-      const point = projectPoint(hostBox, x, y);
-      return Number.isFinite(point.x) && Number.isFinite(point.y)
-        ? { x: point.x, y: point.y, u, v, reciprocalW: point.reciprocalW ?? 1 } : null;
-    });
-    if (!corners.every(Boolean)) continue;
-    // Keep UV attributes intact: only axis-aligned clipping for scroll textures.
-    let clipped = clipTexturedPolygon(corners, imageClip);
-    if (windowClip?.length) {
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      for (const point of windowClip) {
-        minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
-        maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
-      }
-      clipped = clipTexturedPolygon(clipped, { x: minX, y: minY, width: maxX - minX, height: maxY - minY });
+  let clipBox = null;
+  if (windowClip?.length) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const point of windowClip) {
+      minX = Math.min(minX, point.x); minY = Math.min(minY, point.y);
+      maxX = Math.max(maxX, point.x); maxY = Math.max(maxY, point.y);
     }
-    if (clipped.length < 3) continue;
-    const triangles = [];
-    for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
-    values.push(1, quad.textureId, imageClip.x, imageClip.y, imageClip.width, imageClip.height, triangles.length);
-    for (const point of triangles) values.push(point.x, point.y, point.u, point.v, point.reciprocalW);
-    commands++;
+    clipBox = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
-  return commands ? { values: Float32Array.from(values), commands } : null;
+  const result = quadCommands(scrollLayerQuads(layer, hostBox), (x, y) => {
+    const point = projectPoint(hostBox, x, y);
+    return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
+  }, imageClip, clipBox);
+  if (result && isIdentityProjection(projectPoint, hostBox)) {
+    const view = hostBox.paddingBox;
+    layerQuadParts.set(result.values, { commands: result.commands, descriptor: {
+      hostId: scrollHostId(hostBox.element),
+      tiles: layer.tiles.map((tile) => ({ id: tile.id, x: tile.x, y: tile.y, width: tile.width, height: tile.height })),
+      contentWidth: layer.contentWidth, contentHeight: layer.contentHeight,
+      view: { x: view.x, y: view.y, width: view.width, height: view.height },
+      imageClip, windowClipBox: clipBox,
+      scrollLeft: hostBox.element.scrollLeft || 0, scrollTop: hostBox.element.scrollTop || 0,
+    } });
+  }
+  return result;
+}
+
+/** Where each scroll layer's quads sit in a finished scene (offsets in floats). */
+function layerSegments(sceneParts) {
+  const segments = [];
+  let offset = 2;
+  for (const part of sceneParts) {
+    const entry = layerQuadParts.get(part);
+    if (entry) segments.push({ hostId: entry.descriptor.hostId, offset, length: part.length, commands: entry.commands, descriptor: entry.descriptor });
+    offset += part.length;
+  }
+  return segments.length ? segments : null;
+}
+
+/** The scroll layers in a display list and how to recompute them, or null. */
+export function displayListScrollScene(list) {
+  return transformedListScrollScene.get(list) ?? null;
 }
 
 /**
@@ -1361,6 +1352,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     scene[1] = commandCount;
     let sceneOffset = 2;
     for (const part of sceneParts) { scene.set(part, sceneOffset); sceneOffset += part.length; }
+    const quietSegments = layerSegments(sceneParts);
     const compose = (overlayList) => {
       // Quiet reuse keeps the cached base; input caret/selection overlays still
       // need a light rebuild on top so they are not frozen with the scene.
@@ -1400,6 +1392,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
         combined[1] += overlayCommands;
       }
       const displayList = Buffer.from(combined.buffer);
+      if (quietSegments) transformedListScrollScene.set(displayList, quietSegments);
       return displayList;
     };
     return compose(overlays);
@@ -2715,6 +2708,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     scene.set(part, sceneOffset);
     sceneOffset += part.length;
   }
+  const fullSegments = layerSegments(sceneParts);
   if (process.env.NASTY_BENCH_PROFILE && paintProfile) paintProfile.assemble = performance.now() - assembleStarted;
   if (process.env.NASTY_BENCH_PROFILE && paintProfile) paintProfile.sceneFloats = sceneLength;
   if (process.env.NASTY_BENCH_PROFILE && paintProfile) (globalThis.__nastyPaintLog ??= []).push(paintProfile.ms);
@@ -2759,6 +2753,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   const displayList = Buffer.from(combined.buffer);
   transformedListTextLayers.set(displayList, textLayers);
   if (frameCanvas) transformedListCanvases.set(displayList, frameCanvas);
+  if (fullSegments) transformedListScrollScene.set(displayList, fullSegments);
   return displayList;
   };
   if (fullSceneCacheable && !activeTransitionElements?.size) transformedScenes.set(boxes, { generation, transitionGeneration, width, height, compose });

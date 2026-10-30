@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import { LayoutWorker } from "./internal/layout-worker.js";
 import "./internal/locale-compare.js";
 import "./internal/web-globals.js";
+import { RemoteWindow, renderWorkerEnabled } from "./internal/remote-window.js";
 import { availableParallelism, cpus } from "node:os";
 import { MediaStream, mediaDevices, readVideoTrackFrame } from "./webrtc.js";
 import { loadImage, unloadImage } from "./image-decoder.js";
@@ -51,7 +52,8 @@ import { DOMRect } from "./dom-rect.js";
 import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startInterpolableTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
 import { computeTransform } from "./internal/css-transform.js";
 import { createElementAnimation, isAnimationControlProperty, syncCssAnimations } from "./internal/css-animations.js";
-import { buildTransformedDisplayList, clearPaintSegments, displayListCanvas, displayListTextLayers, parseColor } from "./render.js";
+import { buildTransformedDisplayList, clearPaintSegments, displayListCanvas, displayListScrollScene, displayListTextLayers, parseColor } from "./render.js";
+import { scrollHostElement } from "./internal/scroll-quads.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics } from "./internal/text-metrics.js";
 import { blocksWindowDrag, elementsFromPoint as hitTestElementsFromPoint, trackClickListener } from "./internal/dom-hit-testing.js";
@@ -174,7 +176,12 @@ function readAudioOutputs() {
   }
   return cachedAudioOutputs.map(output => ({ ...output }));
 }
-export class Window extends native.Window {
+// The native window runs on its own thread where the platform allows (see
+// internal/remote-window.js), so a busy main thread cannot freeze it.
+const CV_BATCH_COST_CAP_MS = 500;
+const NativeWindow = renderWorkerEnabled() ? RemoteWindow : native.Window;
+
+export class Window extends NativeWindow {
   #document = null;
   #documentSizeConstraintsKey = null;
   #bodyAppearanceKey = null;
@@ -200,6 +207,8 @@ export class Window extends native.Window {
   #pendingWheelScroll = null;
   #animationFrames = new Map();
   #nextAnimationFrame = 0;
+  // Last scroll the window thread applied on its own, per host, that this thread has taken over.
+  #scrollAcks = new Map();
   #dragHitTestDocument = null;
   #dragHitTestX = NaN;
   #dragHitTestY = NaN;
@@ -554,8 +563,21 @@ export class Window extends native.Window {
     if (!this.#document) this.#eventTimer.unref?.();
   }
 
+  /** The window thread scrolled a layer while this thread was busy: take its offsets over. */
+  #applyScrollSync({ hostId, left, top, seq }) {
+    const host = scrollHostElement(hostId);
+    if (!host) return;
+    this.#scrollAcks.set(hostId, seq);
+    host.scrollLeft = left;
+    host.scrollTop = top;
+  }
+
   #routeNativeEvent(nativeEvent) {
     const eventType = nativeEvent.type || nativeEvent.kind;
+    if (eventType === "scroll-sync") {
+      this.#applyScrollSync(nativeEvent);
+      return;
+    }
     if (eventType !== "wheel") this.#commitPendingWheelScroll();
     // Image decode completions are window-level only (texture handles).
     if (eventType === "image-ready" || eventType === "image-error") {
@@ -1073,6 +1095,9 @@ export class Window extends native.Window {
       benchmarkMark("scrollLayers");
       try {
         const canvas = displayListCanvas(list);
+        // A window thread can scroll the layers in this list by itself (see workers/scroll-compositor.js).
+        const scrollScene = displayListScrollScene(list);
+        super.setScrollScene?.(scrollScene ? { segments: scrollScene, acks: Object.fromEntries(this.#scrollAcks) } : null);
         result = super.presentTransformed(list, canvas?.triangles, canvas?.circles, canvas?.beziers, canvas?.operations);
       } catch (error) {
         if (super.closed) this.#stopMedia();
@@ -1095,7 +1120,8 @@ export class Window extends native.Window {
       const content = documentState(this.#document);
       if (content.cvBatchFrames > 0) {
         content.cvBatchFrames--;
-        content.cvBatchCost = Math.max(content.cvBatchCost ?? 0, performance.now() - presentStarted);
+        // Capped: a huge first layout (opening a big folder) must not hold off the releases that follow.
+        content.cvBatchCost = Math.min(CV_BATCH_COST_CAP_MS, Math.max(content.cvBatchCost ?? 0, performance.now() - presentStarted));
       }
     }
     if (!this.#documentPresented) {
