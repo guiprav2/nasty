@@ -1813,7 +1813,7 @@ export class Element extends EventTarget {
     if (this.localName === "img") {
       const documentData = documentState(document);
       (documentData.imageElements ??= new Set()).add(this);
-      documentData.imageActiveDirty = true;
+      documentData.imageActive?.add(this);
     }
   }
 
@@ -3855,6 +3855,8 @@ export class Document extends EventTarget {
     }
     cells.sort((a, b) => a.index - b.index);
     const out = [];
+    const removed = [];
+    const added = [];
     let cursor = 0;
     for (const old of cells) {
       const cell = old.element;
@@ -3872,10 +3874,13 @@ export class Document extends EventTarget {
       // Ancestors' scroll extents include this cell's: they only stay valid if it is unchanged.
       if (Math.abs(fresh[0].scrollWidth - old.scrollWidth) > 0.5 || Math.abs(fresh[0].scrollHeight - old.scrollHeight) > 0.5) return null;
       for (let i = cursor; i < old.index; i++) out.push(previous[i]);
-      for (const box of fresh) out.push(box);
+      for (const box of fresh) { out.push(box); added.push(box); }
+      for (let i = old.index; i < end; i++) removed.push(previous[i].element);
       cursor = end;
     }
     for (let i = cursor; i < previous.length; i++) out.push(previous[i]);
+    // Lets scroll-layer bookkeeping update only what the patch replaced.
+    state.boxPatch = { base: previous, boxes: out, removed, added };
     return out;
   }
 
@@ -3899,6 +3904,7 @@ export class Document extends EventTarget {
     const patched = !selectedElements && this.#patchBoxes();
     let boxes = patched;
     if (!boxes) {
+      documentState(this).boxPatch = null;
       const elements = [];
       if (selectedElements) elements.push(...selectedElements);
       else collectBoxElements(this.body, elements);

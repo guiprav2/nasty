@@ -198,6 +198,7 @@ function ensureLayer(host) {
       contentHeight: 0,
       source: null,
       bounds: new Map(),
+      index: null,
       dirty: [],
       painted: false,
       depth: 0,
@@ -453,19 +454,42 @@ export function prepareScrollLayers(window, document, boxes) {
     layer.depth = hostDepth(hostBox, byElement);
     layer.outer = hostBox.layerHost ? ensureLayer(hostBox.layerHost) : null;
     const fresh = allocateTiles(window, layer, hostBox, width, height, geometry, layer.banded);
-    const content = layerContentBoxes(boxes, host);
-    if (layer.source !== boxes || layer.contentWidth !== width || layer.contentHeight !== height) {
+    const patch = doc.boxPatch;
+    if (patch && patch.boxes === boxes && layer.source === patch.base
+        && layer.contentWidth === width && layer.contentHeight === height) {
+      // The boxes differ from the layer's only where a patch replaced subtrees.
+      const kept = new Set();
+      for (const box of patch.added) {
+        if (box.layerHost !== host) continue;
+        const entry = boundsEntry(layerSpaceBox(box));
+        const previous = layer.bounds.get(box.element);
+        layer.bounds.set(box.element, entry);
+        if (layer.index) { layer.index.add(box.element, entry); if (previous) layer.index.stale++; }
+        kept.add(box.element);
+        if (previous?.key === entry.key) continue;
+        if (entry.paints) layer.dirty.push(entry.rect);
+        if (previous?.paints) layer.dirty.push(previous.rect);
+      }
+      for (const element of patch.removed) {
+        if (kept.has(element)) continue;
+        const previous = layer.bounds.get(element);
+        if (!previous) continue;
+        if (previous.paints) layer.dirty.push(previous.rect);
+        layer.bounds.delete(element);
+        if (layer.index) layer.index.stale++;
+      }
+      layer.source = boxes;
+    } else if (layer.source !== boxes || layer.contentWidth !== width || layer.contentHeight !== height) {
+      const content = layerContentBoxes(boxes, host);
       const bounds = new Map();
       for (const box of content) {
-        const rect = paintBounds(box);
-        const key = `${rect.x},${rect.y},${rect.width},${rect.height}|${box.clip ? `${box.clip.x},${box.clip.y},${box.clip.width},${box.clip.height}` : ""}`;
-        const paints = paintsItself(box.element);
-        bounds.set(box.element, { rect, key, paints, transformed: hasTransform(box.element) });
+        const entry = boundsEntry(box);
+        bounds.set(box.element, entry);
         const previous = layer.bounds.get(box.element);
-        if (previous?.key === key) continue;
+        if (previous?.key === entry.key) continue;
         // Moving or resizing something that draws nothing itself (a wrapper)
         // changes only its children, which are compared on their own.
-        if (paints) layer.dirty.push(rect);
+        if (entry.paints) layer.dirty.push(entry.rect);
         if (previous?.paints) layer.dirty.push(previous.rect);
       }
       for (const [element, previous] of layer.bounds) if (!bounds.has(element) && previous.paints) layer.dirty.push(previous.rect);
@@ -473,6 +497,7 @@ export function prepareScrollLayers(window, document, boxes) {
         layer.dirty.push({ x: 0, y: 0, width: layer.contentWidth, height: layer.contentHeight });
       }
       layer.bounds = bounds;
+      layer.index = null;
       layer.source = boxes;
       layer.contentWidth = width;
       layer.contentHeight = height;
@@ -557,57 +582,75 @@ export function scrollLayerQuads(layer, hostBox) {
   return quads;
 }
 
-// Painting a tile only needs the boxes that can reach it. Content boxes are
-// bucketed by the bands of layer height they overlap, once per assembled
-// content list, so a tile visits its own bands instead of the whole layer.
-const BAND_HEIGHT = 512;
-const contentIndexes = new WeakMap();
-
-function contentIndexFor(layer, content) {
-  let entry = contentIndexes.get(layer.bounds);
-  if (entry?.content === content) return entry;
-  const always = [];
-  const bands = new Map();
-  for (let i = 0; i < content.length; i++) {
-    const bounds = layer.bounds.get(content[i].element);
-    if (!bounds || bounds.transformed) { always.push(i); continue; }
-    const rect = bounds.rect;
-    if (!(rect.width > 0 && rect.height > 0)) continue;
-    const first = Math.floor(rect.y / BAND_HEIGHT), last = Math.floor((rect.y + rect.height) / BAND_HEIGHT);
-    for (let band = first; band <= last; band++) {
-      let list = bands.get(band);
-      if (!list) bands.set(band, list = []);
-      list.push(i);
-    }
-  }
-  entry = { content, always, bands };
-  contentIndexes.set(layer.bounds, entry);
-  return entry;
+/** A content box (layer space, clip = inner clip) as the layer tracks it. */
+function boundsEntry(box) {
+  const rect = paintBounds(box);
+  const key = `${rect.x},${rect.y},${rect.width},${rect.height}|${box.clip ? `${box.clip.x},${box.clip.y},${box.clip.width},${box.clip.height}` : ""}`;
+  return { rect, key, paints: paintsItself(box.element), transformed: hasTransform(box.element) };
 }
 
-function paintRegion(window, document, layer, content, nested, rect) {
-  const index = contentIndexFor(layer, content);
+/** An assembled box in its layer's own space. */
+function layerSpaceBox(box) {
+  const content = shiftBox(box, -box.layerOriginX, -box.layerOriginY);
+  content.clip = content.innerClip;
+  return content;
+}
+
+// Painting a tile only needs the boxes that can reach it. A layer keeps its
+// bounds bucketed by the bands of layer height they overlap, updated as
+// patches replace entries, so a tile visits its own bands and never the whole
+// layer. Entries replaced since indexing are skipped by identity.
+const BAND_HEIGHT = 512;
+
+function createLayerIndex(layer) {
+  const index = {
+    always: [], bands: new Map(), stale: 0,
+    add(element, entry) {
+      if (entry.transformed) { this.always.push([element, entry]); return; }
+      const rect = entry.rect;
+      if (!(rect.width > 0 && rect.height > 0)) return;
+      const first = Math.floor(rect.y / BAND_HEIGHT), last = Math.floor((rect.y + rect.height) / BAND_HEIGHT);
+      for (let band = first; band <= last; band++) {
+        let list = this.bands.get(band);
+        if (!list) this.bands.set(band, list = []);
+        list.push([element, entry]);
+      }
+    },
+  };
+  for (const [element, entry] of layer.bounds) index.add(element, entry);
+  return index;
+}
+
+function layerIndexFor(layer) {
+  // Replaced entries pile up in the bands; start over when they outnumber the live ones.
+  if (!layer.index || layer.index.stale > layer.bounds.size) layer.index = createLayerIndex(layer);
+  return layer.index;
+}
+
+function paintRegion(window, document, layer, byElement, nested, rect) {
+  const index = layerIndexFor(layer);
   for (const tile of layer.tiles.values()) {
     const region = intersect(rect, { x: tile.x, y: tile.y, width: tile.width, height: tile.height });
     if (region.width <= 0 || region.height <= 0) continue;
-    const candidates = new Set(index.always);
+    const picked = new Map();
+    const consider = ([element, entry]) => {
+      if (picked.has(element) || layer.bounds.get(element) !== entry) return;
+      if (!entry.transformed) {
+        const r = entry.rect;
+        if (!(r.x < region.x + region.width && r.x + r.width > region.x
+          && r.y < region.y + region.height && r.y + r.height > region.y)) return;
+      }
+      const box = byElement.get(element);
+      if (box) picked.set(element, box);
+    };
+    for (const item of index.always) consider(item);
     for (let band = Math.floor(region.y / BAND_HEIGHT), last = Math.floor((region.y + region.height) / BAND_HEIGHT); band <= last; band++) {
       const list = index.bands.get(band);
-      if (list) for (const i of list) candidates.add(i);
+      if (list) for (const item of list) consider(item);
     }
-    // Paint order is content order.
-    const order = [...candidates].sort((a, b) => a - b);
-    const boxes = [];
-    for (const i of order) {
-      const box = content[i];
-      const bounds = layer.bounds.get(box.element);
-      if (bounds && !bounds.transformed) {
-        const r = bounds.rect;
-        if (!(r.x < region.x + region.width && r.x + r.width > region.x
-          && r.y < region.y + region.height && r.y + r.height > region.y)) continue;
-      }
-      boxes.push(shiftBox(box, -region.x, -region.y));
-    }
+    // Paint order is document order.
+    const boxes = [...picked.values()].sort((a, b) => a.index - b.index)
+      .map((box) => shiftBox(layerSpaceBox(box), -region.x, -region.y));
     const nestedLayers = new Map();
     for (const box of boxes) {
       const inner = box.isLayerHost && nested.get(box.element);
@@ -647,8 +690,8 @@ export function paintScrollLayers(window, document) {
     const area = rects.reduce((total, rect) => total + rect.width * rect.height, 0);
     if (rects.length > MAX_DIRTY_RECTS || area > width * height * FULL_REPAINT_SHARE) rects = [{ x: 0, y: 0, width, height }];
     layer.dirty = [];
-    const content = layerContentBoxes(frame.boxes, hostBox.element);
-    for (const rect of rects) paintRegion(window, document, layer, content, nested, rect);
+    const byElement = assembledMap(frame.boxes);
+    for (const rect of rects) paintRegion(window, document, layer, byElement, nested, rect);
     layer.painted = true;
     // An inner layer's new pixels show through its outer layer at the host.
     if (layer.outer) {

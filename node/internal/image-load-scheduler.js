@@ -148,6 +148,30 @@ function activeImageSet(document, state) {
     state.imageActive = active;
     state.imageAway = away;
     state.imageActiveDirty = false;
+    state.imageToggles = [];
+    return active;
+  }
+  // Cells toggled since the last pass: only the images inside them change sides.
+  const toggles = state.imageToggles;
+  if (toggles?.length) {
+    state.imageToggles = [];
+    const registry = state.imageElements;
+    const visit = (node, skipped) => {
+      if (registry.has(node)) {
+        if (skipped) {
+          state.imageActive.delete(node);
+          const data = elementState(node);
+          if (data.imageLoadState === "loaded" || data.imageLoadState === "loading") state.imageAway.push(node);
+        } else state.imageActive.add(node);
+      }
+      // A nested skipped cell keeps its own contents skipped.
+      const childSkipped = skipped || elementState(node).cvSkipped === true;
+      for (const child of node.children) visit(child, childSkipped);
+    };
+    for (const cell of new Set(toggles)) {
+      const skipped = elementState(cell).cvSkipped === true;
+      for (const child of cell.children) visit(child, skipped || insideSkippedContent(cell));
+    }
   }
   return state.imageActive;
 }
@@ -293,6 +317,8 @@ function evictSkippedImages(window, state, now) {
   const away = state.imageAway;
   if (!away?.length) return soonest;
   state.imageAway = away.filter((element) => {
+    // Released again since it was set aside: the active pass owns it.
+    if (state.imageActive?.has(element)) return false;
     const data = elementState(element);
     if (data.imageLoadState !== "loaded" && data.imageLoadState !== "loading") return false;
     if (data.imageLoadSticky) return false;

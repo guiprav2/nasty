@@ -83,7 +83,7 @@ function setSkipped(doc, element, skipped, markGeometryDirty) {
     if (box && box.height > 0) state.cvLastSize = { width: box.width, height: box.height };
   }
   state.cvSkipped = skipped;
-  doc.imageActiveDirty = true;
+  (doc.imageToggles ??= []).push(element);
   (doc.cvBatch ??= new Set()).add(element);
   (doc.pendingStyleSync ??= new Set()).add(element);
   (doc.pendingChildSync ??= new Set()).add(element);
@@ -238,6 +238,8 @@ export function reconcileContentVisibility(document, markGeometryDirty, { force 
   // and a skipped cell cannot reach the release band before covering its gap.
   let slack = Infinity;
   let triggered = false;
+  let urgent = false;
+  const inView = regions(0);
   eachCandidate((element, skipped, x, y, width, height, group) => {
     if (skipped) {
       const region = group.release;
@@ -246,16 +248,15 @@ export function reconcileContentVisibility(document, markGeometryDirty, { force 
       const gapY = Math.max(0, region.y - (y + height), y - (region.y + region.height));
       const gap = Math.max(gapX, gapY);
       if (gap < slack) slack = gap;
-      if (gap === 0) triggered = true;
+      if (gap === 0) {
+        triggered = true;
+        // Cells in view that are still blank get a shorter cooldown.
+        if (!urgent && within(x, y, width, height, inView(group.parent))) urgent = true;
+      }
     } else if (!scrolling && !within(x, y, width, height, group.skipTrigger)) triggered = true;
   });
   doc.cvSlack = slack;
   if (!triggered) return false;
-  const inView = regions(0);
-  let urgent = false;
-  eachCandidate((element, skipped, x, y, width, height, group) => {
-    if (skipped && !urgent && within(x, y, width, height, inView(group.parent))) urgent = true;
-  });
   const wait = (urgent ? URGENT_FACTOR : COOLDOWN_FACTOR) * (doc.cvBatchCost ?? 0) - (now - (doc.cvBatchAt ?? -Infinity));
   if (wait > 0) {
     // The retry timer owns the next scan; scrolling alone should not trigger more.
