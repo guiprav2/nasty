@@ -280,6 +280,13 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
   return hits.slice();
 }
 
+// ARIA widget roles are interactive wherever they appear: dragging one must
+// reach the page instead of moving the window.
+const DRAG_INTERACTIVE_ROLES = new Set([
+  'button', 'checkbox', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'radio',
+  'scrollbar', 'searchbox', 'slider', 'spinbutton', 'switch', 'tab', 'textbox', 'treeitem',
+]);
+
 export function blocksWindowDrag(target) {
   for (let element = target; element; element = element.parent) {
     if (!element.hasAttribute?.('contenteditable')) continue;
@@ -290,6 +297,7 @@ export function blocksWindowDrag(target) {
   for (let element = target; element; element = element.parent) {
     if (canScrollByUser(element, 'x') || canScrollByUser(element, 'y')) return true;
     if (hasClickListener(element)) return true;
+    if (DRAG_INTERACTIVE_ROLES.has(element.getAttribute?.('role')?.toLowerCase())) return true;
     const name = element.localName;
     if (!DRAG_INTERACTIVE_CONTROLS.has(name)) {
       if (element.getAttribute?.('draggable')?.toLowerCase() === 'true') return true;

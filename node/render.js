@@ -1195,6 +1195,17 @@ function layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip) {
  * space; nothing is cached against the window and `options.scrollLayerState`
  * supplies the layers nested inside it.
  */
+const canvasBoxMemo = new WeakMap();
+// Whether any box is a <canvas>, remembered per assembled box list.
+function hasCanvasBox(boxes) {
+  let found = canvasBoxMemo.get(boxes);
+  if (found === undefined) {
+    found = boxes.some(box => box.element.localName === 'canvas');
+    canvasBoxMemo.set(boxes, found);
+  }
+  return found;
+}
+
 export function buildTransformedDisplayList(boxes, width, height, overlays = [], options = {}) {
   const layerPaint = !!options.layerPaint;
   resetReplayArena();
@@ -1206,7 +1217,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   // Video frames update the existing GPU texture in place. Keeping a <video>
   // in the tree must not disable the transformed-scene cache — that rebuilt
   // the whole carousel on every decoded frame.
-  const fullSceneCacheable = cacheable && !boxes.some(box => box.element.localName === 'canvas');
+  const fullSceneCacheable = cacheable && !hasCanvasBox(boxes);
   if (process.env.NASTY_BENCH_PROFILE) {
     paintSegmentDiagnostics.frames++;
     if (cacheable) paintSegmentDiagnostics.cacheable++;
@@ -1281,7 +1292,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       return true;
     })();
   if (scrollSceneQuietReusable) {
-    const boxesByElement = new Map(boxes.map((box) => [box.element, box]));
+    const boxesByElement = assembledMap(boxes);
     const projectPoint = createBoxProjector(boxes);
     const viewport = { x: 0, y: 0, width, height };
     const bodyBox = boxes.find(box => box.element.localName === "body");
@@ -1348,7 +1359,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       let overlayValues = [5, 0];
       let overlayCommands = 0;
       if (overlayList?.length) {
-        const overlayBoxes = new Map(boxes.map((box) => [box.element, box]));
+        const overlayBoxes = assembledMap(boxes);
         for (const overlay of overlayList) {
           const box = overlayBoxes.get(overlay.element);
           if (!box) continue;
@@ -1401,7 +1412,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   };
   projectPoint.matrixFor = projectPointReal.matrixFor;
   projectPoint.widthScaleAt = projectPointReal.widthScaleAt;
-  const boxesByElement = new Map(boxes.map((box) => [box.element, box]));
+  const boxesByElement = assembledMap(boxes);
   const transformedAncestors = new WeakMap();
   const hasTransform = element => {
     const cached = transformedAncestors.get(element);

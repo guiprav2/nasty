@@ -198,6 +198,8 @@ export class Window extends native.Window {
   #lastWheelY = NaN;
   #lastWheelSceneGeneration = -1;
   #pendingWheelScroll = null;
+  #animationFrames = new Map();
+  #nextAnimationFrame = 0;
   #dragHitTestDocument = null;
   #dragHitTestX = NaN;
   #dragHitTestY = NaN;
@@ -580,7 +582,7 @@ export class Window extends native.Window {
     Object.assign(fields, {
       key, text: nativeEvent.text ?? "", ctrlKey: /CTRL/i.test(modifiers),
       shiftKey: /SHIFT/i.test(modifiers), altKey: /ALT/i.test(modifiers), metaKey: /SUPER|META|LOGO/i.test(modifiers),
-      pointerId: 1, pointerType: "mouse",
+      pointerId: 1, pointerType: "mouse", isPrimary: true,
     });
     const event = makeHostEvent(nativeEvent.type, fields);
     this.#dispatchWindowEvent(event);
@@ -589,9 +591,12 @@ export class Window extends native.Window {
     if (!document || !["pointermove", "pointerdown", "pointerup", "pointercancel", "wheel", "keydown", "keyup"].includes(nativeEvent.type)) return;
     if (nativeEvent.type === "pointermove") {
       this.#lastWheelDocument = null;
-      const target = document.elementFromPoint(fields.clientX, fields.clientY);
-      const capture = documentState(document).pointerCapture?.get(1);
-      const blocked = this.#dragAnywhere !== false && blocksWindowDrag(target);
+      const capture = capturedPointerTarget(document);
+      // While captured, the pointer behaves as if it were over the capturing
+      // element: hit-tested only for window dragging, never for dispatch.
+      const hit = document.elementFromPoint(fields.clientX, fields.clientY);
+      const target = capture ?? hit;
+      const blocked = this.#dragAnywhere !== false && blocksWindowDrag(hit);
       const state = documentState(document);
       this.#dragHitTestDocument = document;
       this.#dragHitTestX = fields.clientX;
@@ -614,14 +619,15 @@ export class Window extends native.Window {
           dispatchDomEvent(target, "mouseenter", fields);
         }
       }
-      const pointerTarget = capture ?? target;
-      if (pointerTarget) dispatchDomEvent(pointerTarget, "pointermove", fields);
+      // Compatibility mouse events are retargeted to the capturing element too.
+      if (target) dispatchDomEvent(target, "pointermove", fields);
       if (target) dispatchDomEvent(target, "mousemove", fields);
       return;
     }
     if (nativeEvent.type === "pointerdown") {
       const target = document.elementFromPoint(fields.clientX, fields.clientY);
       this.#pressedElement = target;
+      documentState(document).pointerPressed = true;
       const control = nearestFormControl(target);
       if (control) control.focus();
       else document.activeElement?.blur();
@@ -630,26 +636,23 @@ export class Window extends native.Window {
       return;
     }
     if (nativeEvent.type === "pointerup") {
-      const capture = documentState(document).pointerCapture?.get(1);
+      const capture = capturedPointerTarget(document);
       const target = capture ?? document.elementFromPoint(fields.clientX, fields.clientY);
+      documentState(document).pointerPressed = false;
       if (target) dispatchDomEvent(target, "pointerup", fields);
       if (target) dispatchDomEvent(target, "mouseup", fields);
       if (target && target === this.#pressedElement) dispatchDomEvent(target, "click", fields);
-      if (capture) {
-        documentState(document).pointerCapture?.delete(1);
-        dispatchDomEvent(capture, "lostpointercapture", fields);
-      }
+      // Capture ends implicitly after pointerup.
+      if (capture) releaseCapturedPointer(document, 1);
       this.#pressedElement = null;
       return;
     }
     if (nativeEvent.type === "pointercancel") {
-      const capture = documentState(document).pointerCapture?.get(1);
+      const capture = capturedPointerTarget(document);
       const target = capture ?? this.#pressedElement ?? document.elementFromPoint(fields.clientX, fields.clientY);
+      documentState(document).pointerPressed = false;
       if (target) dispatchDomEvent(target, "pointercancel", fields);
-      if (capture) {
-        documentState(document).pointerCapture?.delete(1);
-        dispatchDomEvent(capture, "lostpointercapture", fields);
-      }
+      if (capture) releaseCapturedPointer(document, 1);
       this.#pressedElement = null;
       return;
     }
@@ -817,6 +820,7 @@ export class Window extends native.Window {
         || previousRenderCaretX !== elementStateValue.renderCaretX) {
         const doc = documentState(this.#document);
         doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
+        doc.textGeneration = (doc.textGeneration ?? 0) + 1;
         doc.paintDirtyElements ??= new Set();
         doc.paintDirtyElements.add(element);
       }
@@ -963,7 +967,35 @@ export class Window extends native.Window {
     }
     catch (error) { if (super.closed) this.#stopMedia(); throw error; }
   }
+  /** Runs `callback(timestamp)` once, at the start of the next presented frame. */
+  requestAnimationFrame(callback) {
+    if (typeof callback !== "function") throw new TypeError("requestAnimationFrame callback must be a function");
+    const id = ++this.#nextAnimationFrame;
+    this.#animationFrames.set(id, callback);
+    return id;
+  }
+
+  cancelAnimationFrame(id) {
+    this.#animationFrames.delete(id);
+  }
+
+  #runAnimationFrames(timestamp) {
+    if (!this.#animationFrames.size) return;
+    // Callbacks registered while these run belong to the next frame.
+    const callbacks = [...this.#animationFrames.values()];
+    this.#animationFrames.clear();
+    for (const callback of callbacks) {
+      try {
+        callback(timestamp);
+      } catch (error) {
+        console.error("Nasty animation frame callback failed:", error);
+      }
+    }
+  }
+
   presentDocument() {
+    const presentStarted = performance.now();
+    this.#runAnimationFrames(presentStarted);
     if (this.#document) {
       const doc = documentState(this.#document);
       doc.presentId = (doc.presentId ?? 0) + 1;
@@ -1058,6 +1090,14 @@ export class Window extends native.Window {
       if (!super.closed) console.error("Nasty window event polling failed:", error);
     }
     if (benchmarkStages) this._benchmarkStages = benchmarkStages;
+    if (this.#document) {
+      // Cost of a content-visibility batch: the frames that relaid out after it.
+      const content = documentState(this.#document);
+      if (content.cvBatchFrames > 0) {
+        content.cvBatchFrames--;
+        content.cvBatchCost = Math.max(content.cvBatchCost ?? 0, performance.now() - presentStarted);
+      }
+    }
     if (!this.#documentPresented) {
       this.#documentPresented = true;
       this.#startEventPolling();
@@ -1767,7 +1807,11 @@ export class Element extends EventTarget {
     // at layout time instead of converting it now and again after each change.
     state.handle = documentState(document).layoutTree.createNode(blankTaffyStyle ??= styleForTaffy({}, 16, documentState(document).viewport));
     (documentState(document).pendingStyleSync ??= new Set()).add(this);
-    if (this.localName === "img") (documentState(document).imageElements ??= new Set()).add(this);
+    if (this.localName === "img") {
+      const documentData = documentState(document);
+      (documentData.imageElements ??= new Set()).add(this);
+      documentData.imageActiveDirty = true;
+    }
   }
 
   addEventListener(type, callback, options) {
@@ -1942,6 +1986,12 @@ export class Element extends EventTarget {
   get ownerDocument() { return this.document; }
   get className() { return this.getAttribute("class") || ""; }
   set className(value) { this.setAttribute("class", value); }
+  // ARIA reflection: element.role is the role attribute.
+  get role() { return this.getAttribute("role"); }
+  set role(value) {
+    if (value == null) this.removeAttribute("role");
+    else this.setAttribute("role", String(value));
+  }
   get classList() {
     const state = elementState(this);
     if (state.classList) return state.classList;
@@ -2048,8 +2098,23 @@ export class Element extends EventTarget {
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
   append(...children) { for (const child of children) this.appendChild(child); }
   replaceChildren(...children) { for (const child of [...this.children]) this.removeChild(child); this.append(...children); }
-  setPointerCapture(id) { (documentState(this.document).pointerCapture ??= new Map()).set(id, this); }
-  releasePointerCapture(id) { documentState(this.document).pointerCapture?.delete(id); }
+  // The mouse is the only pointer, with id 1 (as on pointer events).
+  setPointerCapture(id) {
+    const state = documentState(this.document);
+    if (id !== 1) throw new DOMException("No active pointer with the given id is found.", "NotFoundError");
+    if (!this.isConnected) throw new DOMException("The element is not connected.", "InvalidStateError");
+    if (!state.pointerPressed) throw new DOMException("The pointer has no buttons pressed.", "InvalidStateError");
+    const captures = state.pointerCapture ??= new Map();
+    const previous = captures.get(id);
+    if (previous === this) return;
+    captures.set(id, this);
+    if (previous) dispatchPointerCaptureEvent(previous, "lostpointercapture", id);
+    dispatchPointerCaptureEvent(this, "gotpointercapture", id);
+  }
+  releasePointerCapture(id) {
+    if (id !== 1) throw new DOMException("No active pointer with the given id is found.", "NotFoundError");
+    if (documentState(this.document).pointerCapture?.get(id) === this) releaseCapturedPointer(this.document, id);
+  }
   hasPointerCapture(id) { return documentState(this.document).pointerCapture?.get(id) === this; }
   click() {
     if (this.disabled) return;
@@ -2880,7 +2945,7 @@ export class Element extends EventTarget {
     const configured = Number(elementState(this).imageMaxEdge);
     const maxEdge = Math.min(
       8192,
-      Math.max(64, Number.isFinite(configured) && configured > 0 ? configured : 512),
+      Math.max(64, Number.isFinite(configured) && configured > 0 ? configured : elementState(this).imageLoadSticky ? 8192 : 512),
     );
     loadImage(source, window, maxEdge).then((result) => {
       if (request !== elementState(this).imageRequest) {
@@ -2905,8 +2970,8 @@ export class Element extends EventTarget {
         if (sizedByImage) ds.dirty = true;
         ds.paintDirtyElements ??= new Set();
         ds.paintDirtyElements.add(this);
-        // Prefer paint-local dirty over full sceneGeneration bump per thumb.
-        ds.paintGeneration = (ds.paintGeneration ?? 0) + 1;
+        // Paint-local dirty only: bumping paintGeneration would rebuild every
+        // text run in the document for each thumbnail that finishes decoding.
       } catch { /* ignore */ }
       elementState(this).imageLoadState = "loaded";
       elementState(this).resolveImageLoad?.(result);
@@ -2975,6 +3040,7 @@ export class Element extends EventTarget {
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
     doc.paintDirtyElements ??= new Set();
     doc.paintDirtyElements.add(this);
+    (doc.textDirtyElements ??= new Set()).add(this);
     if (this === this.document.body) doc.defaultView?._syncBodyWindowAppearance();
     // Nerd Font icon classes are text content: a class change that swaps the
     // glyph must re-measure this element even when no layout property changed.
@@ -3216,6 +3282,7 @@ export class Element extends EventTarget {
     doc.hitTestGeneration = (doc.hitTestGeneration ?? 0) + 1;
     doc.paintOrderGeneration = (doc.paintOrderGeneration ?? 0) + 1;
     doc.paintGeneration = (doc.paintGeneration ?? 0) + 1;
+    doc.textGeneration = (doc.textGeneration ?? 0) + 1;
     (doc.paintDirtyElements ??= new Set()).add(this);
   }
 
@@ -3816,6 +3883,28 @@ function makeHostEvent(type, fields = {}) {
     Object.defineProperty(event, key, { configurable: true, enumerable: true, value });
   }
   return event;
+}
+
+/** gotpointercapture / lostpointercapture are dispatched on the element and do not bubble. */
+function dispatchPointerCaptureEvent(element, type, pointerId) {
+  element.dispatchEvent(makeHostEvent(type, { pointerId, pointerType: "mouse", isPrimary: true }));
+}
+
+function releaseCapturedPointer(document, pointerId) {
+  const captures = documentState(document).pointerCapture;
+  const element = captures?.get(pointerId);
+  if (!element) return;
+  captures.delete(pointerId);
+  dispatchPointerCaptureEvent(element, "lostpointercapture", pointerId);
+}
+
+/** The element capturing the mouse; capture ends when that element leaves the document. */
+function capturedPointerTarget(document) {
+  const element = documentState(document).pointerCapture?.get(1);
+  if (!element) return null;
+  if (element.isConnected) return element;
+  releaseCapturedPointer(document, 1);
+  return null;
 }
 
 function dispatchDomEvent(target, type, fields = {}) {

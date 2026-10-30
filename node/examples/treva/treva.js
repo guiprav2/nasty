@@ -41,7 +41,7 @@ const C = {
   teal400: "#2dd4bf",
 };
 
-const FIELD = `mt-1.5 w-full rounded-xl border border-stone-400/10 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`;
+const FIELD = `mt-1.5 w-full rounded-xl border border-stone-400/6 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`;
 const FIELD_H = `h-10 ${FIELD}`;
 
 const SHORTCUTS = [
@@ -66,6 +66,10 @@ const ICONS = {
   folder: "nf-md-folder",
   grid: "nf-md-view_grid",
   image: "nf-md-image",
+  chevronDown: "nf-md-chevron_down",
+  check: "nf-md-check",
+  imageSmaller: "nf-md-image_minus",
+  imageLarger: "nf-md-image_plus",
   play: "nf-md-play",
   pause: "nf-md-pause",
   help: "nf-md-help_circle_outline",
@@ -246,7 +250,7 @@ function kbd(label) {
   return d.el(
     "span",
     {
-      class: `inline-flex items-center rounded-[5px] border border-stone-400/14 border-b-2 bg-[${C.ink800}] px-1.5 py-px text-[11px] text-[${C.body}] font-sans`,
+      class: `inline-flex items-center rounded-[5px] border border-stone-400/9 border-b-2 bg-[${C.ink800}] px-1.5 py-px text-[11px] text-[${C.body}] font-sans`,
     },
     label,
   );
@@ -275,7 +279,7 @@ function placeAnchor(ev, preferredWidth, preferredHeight = 320) {
 function panelClass(anchor, extra = "") {
   const a = anchor || { left: 8, top: 56, width: 288 };
   return [
-    `fixed z-[70] max-h-[90vh] overflow-auto rounded-2xl border border-stone-400/10 bg-[${C.ink900}] p-4`,
+    `fixed z-[70] max-h-[90vh] overflow-auto rounded-2xl border border-stone-400/6 bg-[${C.ink900}] p-4`,
     `left-[${a.left}px] top-[${a.top}px] w-[${a.width}px]`,
     extra,
   ].filter(Boolean).join(" ");
@@ -449,7 +453,7 @@ function grokSettingsMenu() {
               spellcheck: "false",
               placeholder: "xai-…",
               "data-testid": "grok-key-input",
-              class: `mt-1.5 h-10 w-full rounded-xl border border-stone-400/10 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`,
+              class: `mt-1.5 h-10 w-full rounded-xl border border-stone-400/6 bg-[${C.ink950}] px-3 text-sm font-normal normal-case tracking-normal`,
               value: d.binding({
                 get: () => rx.keyDraft,
                 set: v => { rx.keyDraft = v; },
@@ -776,7 +780,7 @@ function strategyButton(testId, active, label, hint, onPick) {
         () =>
           active()
             ? `border-[${C.copper500}] bg-[${C.copper500}]/15`
-            : "border-stone-400/10 hover:bg-white/5",
+            : "border-stone-400/6 hover:bg-white/5",
       ],
       onclick: () => {
         onPick();
@@ -1020,7 +1024,7 @@ function reimagineTabs() {
           d.el(
             "div",
             {
-              class: `flex h-8 max-w-[12rem] shrink-0 items-center gap-1 rounded-full bg-white/5 px-2.5 text-xs text-stone-200 ring-1 ring-stone-400/10`,
+              class: `flex h-8 max-w-[12rem] shrink-0 items-center gap-1 rounded-full bg-white/5 px-2.5 text-xs text-stone-200 ring-1 ring-stone-400/6`,
               "data-testid": "reimagine-tab",
             },
             d.el("span", { class: "min-w-0 truncate" }, run.name || "Reimagine"),
@@ -1148,10 +1152,12 @@ function thumbButton(im) {
         // Explicit square size from virtualizer — more reliable than aspect-square alone
         // for giving <img> a non-zero content box to paint into.
         "aspect-square w-full",
+        // Loading hint is a class on the cell, so a load never adds or removes nodes.
+        () => (im.loaded || im.error ? "" : "animate-pulse"),
         () =>
           selected()
             ? `ring-2 ring-[${C.gold300}]`
-            : "ring-1 ring-stone-400/10",
+            : "ring-1 ring-stone-400/6",
       ],
       onclick: () => activateImage(im),
     },
@@ -1172,8 +1178,7 @@ function thumbButton(im) {
         try {
           ev.target?.classList?.remove?.("opacity-0");
           ev.target?.classList?.add?.("opacity-100");
-          const pulse = ev.target?.parentElement?.querySelector?.(".animate-pulse");
-          pulse?.remove?.();
+          ev.target?.parentElement?.classList?.remove?.("animate-pulse");
         } catch { /* ignore */ }
       },
       onerror: ev => {
@@ -1183,10 +1188,6 @@ function thumbButton(im) {
         } catch { /* ignore */ }
       },
     }),
-    d.if(
-      () => !im.loaded && !im.error,
-      d.el("div", { class: "pointer-events-none absolute inset-0 animate-pulse bg-white/5" }),
-    ),
     d.if(
       () => im.error,
       d.el(
@@ -1221,7 +1222,7 @@ function gallery() {
       d.el(
         "div",
         {
-          class: "grid w-full grid-cols-2 gap-2.5 p-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-7",
+          class: ["grid w-full gap-2.5 p-3", () => `grid-cols-[repeat(auto-fill,minmax(${state.thumb}px,1fr))]`],
           "data-testid": "grid-inner",
         },
         d.map(() => visible().map(im => im.id), (id) => {
@@ -1257,12 +1258,139 @@ function gallery() {
   );
 }
 
+// Directory of an image, relative to the opened folder and starting with its name.
+function directoryLabel(im) {
+  const root = state.folderName || "Folder";
+  return im.path.includes("/") ? `${root}/${im.path.slice(0, im.path.lastIndexOf("/"))}` : root;
+}
+
+const THUMB_MIN = 120;
+const THUMB_MAX = 320;
+const THUMB_STEP = 10;
+
+function setThumbSize(value) {
+  const next = Math.max(THUMB_MIN, Math.min(THUMB_MAX, Math.round(value / THUMB_STEP) * THUMB_STEP));
+  if (next === state.thumb) return;
+  state.thumb = next;
+  d.update();
+}
+
+// Slider built from divs: icons at both ends step the size, the track drags it
+// (the track captures the pointer, so a drag may leave it).
+function thumbSlider() {
+  const percent = () => Math.round(((state.thumb - THUMB_MIN) / (THUMB_MAX - THUMB_MIN)) * 100);
+  const fromPointer = ev => {
+    const rect = ev.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    setThumbSize(THUMB_MIN + ((ev.clientX - rect.left) / rect.width) * (THUMB_MAX - THUMB_MIN));
+  };
+  const step = (name, title, delta) => d.el(
+    "button",
+    {
+      type: "button",
+      title,
+      class: "flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-stone-400 hover:bg-white/10 hover:text-stone-200 cursor-pointer",
+      onclick: () => setThumbSize(state.thumb + delta),
+    },
+    icon(name, "h-4 w-4 text-base"),
+  );
+  return d.el(
+    "div",
+    { class: "flex items-center gap-1", "data-testid": "thumb-size" },
+    step("imageSmaller", "Smaller thumbnails", -THUMB_STEP),
+    d.el(
+      "div",
+      {
+        role: "slider",
+        title: "Thumbnail size",
+        class: "relative h-6 min-w-0 flex-1 cursor-pointer",
+        onpointerdown: ev => {
+          ev.currentTarget.setPointerCapture(ev.pointerId);
+          fromPointer(ev);
+        },
+        onpointermove: ev => {
+          if (ev.currentTarget.hasPointerCapture(ev.pointerId)) fromPointer(ev);
+        },
+      },
+      d.el("div", { class: "pointer-events-none absolute inset-x-0 top-[10px] h-1 rounded-full bg-white/10" }),
+      d.el("div", {
+        class: ["pointer-events-none absolute left-0 top-[10px] h-1 rounded-full", () => `w-[${percent()}%] bg-[${C.gold300}]/60`],
+      }),
+      d.el("div", {
+        class: ["pointer-events-none absolute top-[6px] h-3 w-3 -translate-x-1/2 rounded-full", () => `left-[${percent()}%] bg-[${C.gold300}]`],
+      }),
+    ),
+    step("imageLarger", "Larger thumbnails", THUMB_STEP),
+  );
+}
+
+const SORT_KEYS = ["name", "path", "size", "modified", "ext"];
+
+function chooseSort(key) {
+  state.sortKey = key;
+  state.sortMenu = false;
+  state.scroll.grid = 0;
+  state.scroll.list = 0;
+  d.update();
+}
+
+// Sort property picker built from divs: a trigger plus a menu below it.
+function sortDropdown() {
+  return d.el(
+    "div",
+    { class: "relative min-w-0 flex-1", "data-testid": "sort" },
+    d.el(
+      "button",
+      {
+        type: "button",
+        "aria-haspopup": "listbox",
+        class: `flex h-8 w-full items-center justify-between gap-2 rounded-md border border-stone-400/6 bg-[${C.ink950}] px-2 text-sm text-stone-100 cursor-pointer hover:bg-white/5`,
+        onclick: () => {
+          state.sortMenu = !state.sortMenu;
+          d.update();
+        },
+      },
+      d.el("div", { class: "truncate" }, d.text(() => SORT_LABEL[state.sortKey] ?? "Name")),
+      icon("chevronDown", "h-4 w-4 shrink-0 text-base text-stone-400"),
+    ),
+    d.if(
+      () => !!state.sortMenu,
+      backdrop(() => { state.sortMenu = false; d.update(); }, "Close sort menu"),
+    ),
+    d.if(
+      () => !!state.sortMenu,
+      d.el(
+        "div",
+        {
+          role: "listbox",
+          class: `absolute left-0 right-0 top-9 z-[70] flex flex-col gap-0.5 rounded-md border border-stone-400/9 bg-[${C.ink900}] p-1`,
+        },
+        ...SORT_KEYS.map(key => d.el(
+          "button",
+          {
+            type: "button",
+            role: "option",
+            "data-testid": "sort-option",
+            class: [
+              "flex h-8 w-full items-center justify-between gap-2 rounded px-2 text-left text-sm text-stone-200 cursor-pointer hover:bg-white/10",
+              () => (state.sortKey === key ? `bg-[${C.gold300}]/15` : ""),
+            ],
+            onclick: () => chooseSort(key),
+          },
+          d.el("div", {}, SORT_LABEL[key]),
+          d.if(() => state.sortKey === key, icon("check", `h-4 w-4 text-base text-[${C.gold300}]`)),
+        )),
+      ),
+    ),
+  );
+}
+
 function sidebar() {
   return d.el(
     "aside",
     {
       class: [
-        `z-30 w-72 shrink-0 flex-col border-r border-stone-400/10 bg-[${C.ink900}]`,
+        `z-30 w-72 shrink-0 flex-col border-r border-stone-400/6 bg-[${C.ink900}]`,
         () => {
           if (!state.sidebarOpen) return "hidden";
           if (state.narrow) return "absolute inset-y-0 left-0 flex";
@@ -1273,7 +1401,7 @@ function sidebar() {
     },
     d.el(
       "div",
-      { class: "shrink-0 space-y-3 border-b border-stone-400/10 p-3" },
+      { class: "relative z-20 flex shrink-0 flex-col gap-3 border-b border-stone-400/6 p-3" },
       d.el(
         "div",
         { class: "flex items-center justify-between gap-2" },
@@ -1286,7 +1414,7 @@ function sidebar() {
       ),
       d.el("input", {
         "data-testid": "filter",
-        class: `h-8 w-full rounded-md border border-stone-400/10 bg-[${C.ink950}] px-2 text-sm text-stone-100`,
+        class: `h-8 w-full rounded-md border border-stone-400/6 bg-[${C.ink950}] px-2 text-sm text-stone-100`,
         placeholder: "Filter name or path",
         value: d.binding({
           get: () => state.filter,
@@ -1299,33 +1427,14 @@ function sidebar() {
       }),
       d.el(
         "div",
-        { class: "flex gap-2" },
-        d.el(
-          "select",
-          {
-            "data-testid": "sort",
-            class: `h-8 min-w-0 flex-1 rounded-md border border-stone-400/10 bg-[${C.ink950}] px-2 text-sm text-stone-100`,
-            value: d.binding({
-              get: () => state.sortKey,
-              set: v => {
-                state.sortKey = v;
-                state.scroll.grid = 0;
-                state.scroll.list = 0;
-              },
-            }),
-          },
-          d.el("option", { value: "name" }, "Name"),
-          d.el("option", { value: "path" }, "Path"),
-          d.el("option", { value: "size" }, "Size"),
-          d.el("option", { value: "modified" }, "Modified"),
-          d.el("option", { value: "ext" }, "Type"),
-        ),
+        { class: "relative z-30 flex gap-2" },
+        sortDropdown(),
         d.el(
           "button",
           {
             type: "button",
             class:
-              "h-8 shrink-0 rounded-md px-2 text-xs text-stone-200 ring-1 ring-stone-400/10 hover:bg-white/10 cursor-pointer",
+              "h-8 shrink-0 rounded-md px-2 text-xs text-stone-200 ring-1 ring-stone-400/6 hover:bg-white/10 cursor-pointer",
             title: "Reverse sort",
             onclick: () => {
               state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
@@ -1337,43 +1446,7 @@ function sidebar() {
           d.text(() => (state.sortDir === "asc" ? "Asc" : "Desc")),
         ),
       ),
-      d.el(
-        "label",
-        { class: "flex items-center gap-2 text-sm text-stone-300" },
-        d.el("input", {
-          type: "checkbox",
-          "data-testid": "subfolders",
-          class: "h-4 w-4",
-          checked: d.binding({
-            get: () => state.recursive,
-            set: v => {
-              state.recursive = !!v;
-              state.scroll.grid = 0;
-              state.scroll.list = 0;
-            },
-          }),
-        }),
-        "Show images in subfolders",
-      ),
-      d.el(
-        "label",
-        { class: "block text-xs text-stone-500" },
-        "Thumbnail size",
-        d.el("input", {
-          type: "range",
-          min: "120",
-          max: "320",
-          step: "10",
-          "data-testid": "thumb-size",
-          class: "mt-1 w-full",
-          value: d.binding({
-            get: () => state.thumb,
-            set: v => {
-              state.thumb = Number(v) || 180;
-            },
-          }),
-        }),
-      ),
+      thumbSlider(),
     ),
     d.el(
       "div",
@@ -1390,7 +1463,7 @@ function sidebar() {
               type: "button",
               "data-testid": "file-row",
               class: [
-                `flex h-[${ROW_H}px] w-full items-center gap-3 border-b border-stone-400/6 px-3 text-left hover:bg-white/5 cursor-pointer content-auto`,
+                `flex h-[${ROW_H}px] w-full items-center gap-3 border-b border-stone-400/4 px-3 text-left hover:bg-white/5 cursor-pointer content-auto`,
                 () => (im.id === state.currentId ? `bg-[${C.gold300}]/15` : ""),
               ],
               onclick: () => activateImage(im),
@@ -1403,7 +1476,7 @@ function sidebar() {
                   () =>
                     im.id === state.currentId
                       ? `ring-2 ring-[${C.gold300}]`
-                      : "ring-1 ring-stone-400/10",
+                      : "ring-1 ring-stone-400/6",
                 ],
               },
               d.el("img", {
@@ -1419,11 +1492,7 @@ function sidebar() {
               d.el(
                 "div",
                 { class: "truncate text-xs text-stone-500" },
-                d.text(() =>
-                  im.path.includes("/")
-                    ? im.path.slice(0, im.path.lastIndexOf("/"))
-                    : "Top",
-                ),
+                d.text(() => directoryLabel(im)),
               ),
             ),
           ),
@@ -1512,7 +1581,7 @@ function welcome() {
     keys.push(
       d.el(
         "div",
-        { class: "flex items-center justify-between gap-6 border-b border-stone-400/6 py-1.5 text-sm" },
+        { class: "flex items-center justify-between gap-6 border-b border-stone-400/4 py-1.5 text-sm" },
         d.el("span", { class: "text-stone-400" }, pair[1]),
         kbd(pair[0]),
       ),
@@ -1582,7 +1651,7 @@ function helpModal() {
     rows.push(
       d.el(
         "div",
-        { class: "flex items-center justify-between gap-4 border-b border-stone-400/6 py-2 text-sm" },
+        { class: "flex items-center justify-between gap-4 border-b border-stone-400/4 py-2 text-sm" },
         d.el("span", { class: "text-stone-300" }, pair[1]),
         kbd(pair[0]),
       ),
@@ -1606,7 +1675,7 @@ function helpModal() {
           "aria-modal": "true",
           "aria-label": "Keyboard shortcuts",
           "data-testid": "help",
-          class: `max-h-full w-full max-w-lg overflow-auto rounded-xl border border-stone-400/10 bg-[${C.ink900}] p-6`,
+          class: `max-h-full w-full max-w-lg overflow-auto rounded-xl border border-stone-400/6 bg-[${C.ink900}] p-6`,
           onclick: ev => ev.stopPropagation?.(),
         },
         d.el(
@@ -1663,7 +1732,7 @@ function toast() {
           {
             role: "alert",
             "data-testid": "toast",
-            class: `pointer-events-auto flex items-start gap-3 rounded-lg border border-stone-400/10 bg-[${C.ink800}] px-4 py-3 text-sm`,
+            class: `pointer-events-auto flex items-start gap-3 rounded-lg border border-stone-400/6 bg-[${C.ink800}] px-4 py-3 text-sm`,
           },
           d.el("div", { class: "min-w-0 flex-1" }, item.text),
           d.el(
@@ -1719,7 +1788,7 @@ function windowControls() {
 
 function header() {
   const bar = {
-    class: `relative z-[60] flex h-14 shrink-0 items-center gap-2 overflow-x-auto border-b border-stone-400/10 bg-[${C.ink950}] px-3`,
+    class: `relative z-[60] flex h-14 shrink-0 items-center gap-2 overflow-x-auto border-b border-stone-400/6 bg-[${C.ink950}] px-3`,
   };
   return d.el(
     "header",
@@ -1863,7 +1932,7 @@ function shell() {
 function updateBodyFrame(maximized = state.windowMax) {
   state.windowMax = maximized;
   const open = process.env.SWEET_ANDROID_APK || maximized;
-  const frame = open ? "" : "rounded-2xl border border-stone-400/10 ";
+  const frame = open ? "" : "rounded-2xl border border-stone-400/6 ";
   doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[${C.ink950}] text-[${C.body}] font-sans`;
 }
 

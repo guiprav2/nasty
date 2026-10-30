@@ -492,11 +492,23 @@ export function prepareScrollLayers(window, document, boxes) {
       }
     }
     if (changedHere.size) {
-      for (const [painted, bounds] of layer.bounds) {
-        for (let current = painted; current?.nodeType === 1 && current !== host; current = current.parentElement ?? current.parent) {
-          if (!changedHere.has(current)) continue;
-          layer.dirty.push(bounds.transformed ? { x: 0, y: 0, width, height } : bounds.rect);
-          break;
+      const dirtyFor = (bounds) => layer.dirty.push(bounds.transformed ? { x: 0, y: 0, width, height } : bounds.rect);
+      if (changedHere.size * 4 < layer.bounds.size) {
+        // A few changed elements: visit their subtrees instead of every painted element.
+        const seen = new Set();
+        const visit = (node) => {
+          const bounds = layer.bounds.get(node);
+          if (bounds && !seen.has(node)) { seen.add(node); dirtyFor(bounds); }
+          for (const child of node.children) visit(child);
+        };
+        for (const element of changedHere) visit(element);
+      } else {
+        for (const [painted, bounds] of layer.bounds) {
+          for (let current = painted; current?.nodeType === 1 && current !== host; current = current.parentElement ?? current.parent) {
+            if (!changedHere.has(current)) continue;
+            dirtyFor(bounds);
+            break;
+          }
         }
       }
     }
@@ -545,16 +557,56 @@ export function scrollLayerQuads(layer, hostBox) {
   return quads;
 }
 
+// Painting a tile only needs the boxes that can reach it. Content boxes are
+// bucketed by the bands of layer height they overlap, once per assembled
+// content list, so a tile visits its own bands instead of the whole layer.
+const BAND_HEIGHT = 512;
+const contentIndexes = new WeakMap();
+
+function contentIndexFor(layer, content) {
+  let entry = contentIndexes.get(layer.bounds);
+  if (entry?.content === content) return entry;
+  const always = [];
+  const bands = new Map();
+  for (let i = 0; i < content.length; i++) {
+    const bounds = layer.bounds.get(content[i].element);
+    if (!bounds || bounds.transformed) { always.push(i); continue; }
+    const rect = bounds.rect;
+    if (!(rect.width > 0 && rect.height > 0)) continue;
+    const first = Math.floor(rect.y / BAND_HEIGHT), last = Math.floor((rect.y + rect.height) / BAND_HEIGHT);
+    for (let band = first; band <= last; band++) {
+      let list = bands.get(band);
+      if (!list) bands.set(band, list = []);
+      list.push(i);
+    }
+  }
+  entry = { content, always, bands };
+  contentIndexes.set(layer.bounds, entry);
+  return entry;
+}
+
 function paintRegion(window, document, layer, content, nested, rect) {
+  const index = contentIndexFor(layer, content);
   for (const tile of layer.tiles.values()) {
     const region = intersect(rect, { x: tile.x, y: tile.y, width: tile.width, height: tile.height });
     if (region.width <= 0 || region.height <= 0) continue;
+    const candidates = new Set(index.always);
+    for (let band = Math.floor(region.y / BAND_HEIGHT), last = Math.floor((region.y + region.height) / BAND_HEIGHT); band <= last; band++) {
+      const list = index.bands.get(band);
+      if (list) for (const i of list) candidates.add(i);
+    }
+    // Paint order is content order.
+    const order = [...candidates].sort((a, b) => a - b);
     const boxes = [];
-    for (const box of content) {
+    for (const i of order) {
+      const box = content[i];
       const bounds = layer.bounds.get(box.element);
-      if (!bounds || bounds.transformed || intersect(bounds.rect, region).width > 0 && intersect(bounds.rect, region).height > 0) {
-        boxes.push(shiftBox(box, -region.x, -region.y));
+      if (bounds && !bounds.transformed) {
+        const r = bounds.rect;
+        if (!(r.x < region.x + region.width && r.x + r.width > region.x
+          && r.y < region.y + region.height && r.y + r.height > region.y)) continue;
       }
+      boxes.push(shiftBox(box, -region.x, -region.y));
     }
     const nestedLayers = new Map();
     for (const box of boxes) {

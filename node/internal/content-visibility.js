@@ -22,6 +22,11 @@ const SKIP_TRIGGER = 10;
 // Skipping only gives memory back, so it waits until scrolling has settled;
 // a scroll then relays out only when it nears the released frontier.
 const SETTLE_MS = 300;
+// A release or skip batch relays out the whole document, however few cells it
+// changes. Batches may use only a share of the time: the next one waits for a
+// multiple of what the last one cost, shorter when cells in view are blank.
+const COOLDOWN_FACTOR = 4;
+const URGENT_FACTOR = 1.5;
 const CHECK_INTERVAL_MS = 100;
 const MOVE_FRACTION = 0.25;
 
@@ -77,6 +82,7 @@ function setSkipped(doc, element, skipped, markGeometryDirty) {
     if (box && box.height > 0) state.cvLastSize = { width: box.width, height: box.height };
   }
   state.cvSkipped = skipped;
+  doc.imageActiveDirty = true;
   (doc.pendingStyleSync ??= new Set()).add(element);
   (doc.pendingChildSync ??= new Set()).add(element);
   if (!skipped) releaseSubtree(doc, element);
@@ -128,17 +134,16 @@ export function reconcileContentVisibility(document, markGeometryDirty, { force 
   // Scrolling re-checks a few times a second; a layout always checks.
   if (!force && now - (doc.cvCheckedAt ?? -Infinity) < CHECK_INTERVAL_MS) return false;
   const viewport = doc.viewport;
-  // The trigger bands are a viewport or more from the release/skip targets, so
-  // a scroller that moved only a fraction of a viewport since the last check
-  // cannot have crossed one.
+  // No cell can cross a trigger band before the scrollers have moved at least
+  // as far as the nearest one is from it (recorded by the last scan).
   const checkedAt = doc.cvCheckedOffsets ??= new Map();
   if (!force) {
     let moved = 0;
     for (const host of doc.cvScrolledHosts ?? []) {
-      moved = Math.max(moved, Math.abs((host.scrollTop || 0) - (checkedAt.get(host)?.y ?? 0)),
-        Math.abs((host.scrollLeft || 0) - (checkedAt.get(host)?.x ?? 0)));
+      const was = checkedAt.get(host);
+      moved += Math.abs((host.scrollTop || 0) - (was?.y ?? 0)) + Math.abs((host.scrollLeft || 0) - (was?.x ?? 0));
     }
-    if (moved < Math.min(viewport.width, viewport.height) * MOVE_FRACTION) return false;
+    if (moved < Math.max(doc.cvSlack ?? 0, Math.min(viewport.width, viewport.height) * MOVE_FRACTION)) return false;
   }
   doc.cvCheckedAt = now;
   doc.cvScrollGeneration = doc.scrollGeneration ?? 0;
@@ -183,32 +188,78 @@ export function reconcileContentVisibility(document, markGeometryDirty, { force 
   };
   const within = (rect, region) => region.width >= 0 && overlaps(rect, region);
   const candidates = [];
+  // Siblings share their ancestors, so each ancestor is classified once.
+  const skippedMemo = new Map();
+  const insideSkipped = (node) => {
+    if (!node) return false;
+    let value = skippedMemo.get(node);
+    if (value === undefined) {
+      value = elementState(node).cvSkipped === true || insideSkipped(node.parent);
+      skippedMemo.set(node, value);
+    }
+    return value;
+  };
   for (const element of elements) {
-    if (!element.parent) continue;
+    const parent = element.parent;
+    if (!parent) continue;
     // A skipped ancestor has no layout of its own for this element.
-    if (insideSkippedContent(element)) continue;
-    const rect = screenRect(element);
-    if (rect) candidates.push({ element, rect, skipped: isContentSkipped(element) });
+    if (insideSkipped(parent)) continue;
+    const data = elementState(element);
+    const box = snapshot[data.handle];
+    if (!box) continue;
+    const outer = offsetOf(parent);
+    candidates.push({ element, skipped: data.cvSkipped === true,
+      rect: { x: box.x - outer.x, y: box.y - outer.y, width: box.width, height: box.height } });
   }
   const scrolling = now - (doc.cvScrollAt ?? -Infinity) < SETTLE_MS;
-  if (scrolling && !doc.cvSettleTimer) {
+  const recheck = (delay) => {
+    if (doc.cvSettleTimer) return;
     doc.cvSettleTimer = setTimeout(() => {
       doc.cvSettleTimer = null;
       if (!doc.closed && reconcileContentVisibility(document, markGeometryDirty, { force: true })) doc.dirty = true;
-    }, SETTLE_MS + 20);
+    }, Math.ceil(delay));
     doc.cvSettleTimer.unref?.();
-  }
+  };
+  if (scrolling) recheck(SETTLE_MS + 20);
   const releaseTrigger = regions(RELEASE_TRIGGER);
   const skipTrigger = regions(SKIP_TRIGGER);
+  // Scrolling moves a rect relative to its region by at most the scroll distance,
+  // and a skipped cell cannot reach the release band before covering its gap.
+  let slack = Infinity;
+  for (const { element, rect, skipped } of candidates) {
+    if (!skipped) continue;
+    const region = releaseTrigger(element.parent);
+    if (region.width < 0) { slack = 0; break; }
+    const gapX = Math.max(0, region.x - (rect.x + rect.width), rect.x - (region.x + region.width));
+    const gapY = Math.max(0, region.y - (rect.y + rect.height), rect.y - (region.y + region.height));
+    slack = Math.min(slack, Math.max(gapX, gapY));
+    if (slack === 0) break;
+  }
+  doc.cvSlack = slack;
   const triggered = candidates.some(({ element, rect, skipped }) => skipped
     ? within(rect, releaseTrigger(element.parent)) : !scrolling && !within(rect, skipTrigger(element.parent)));
   if (!triggered) return false;
+  const inView = regions(0);
+  const urgent = candidates.some(({ element, rect, skipped }) => skipped && within(rect, inView(element.parent)));
+  const wait = (urgent ? URGENT_FACTOR : COOLDOWN_FACTOR) * (doc.cvBatchCost ?? 0) - (now - (doc.cvBatchAt ?? -Infinity));
+  if (wait > 0) {
+    // The retry timer owns the next scan; scrolling alone should not trigger more.
+    doc.cvSlack = Math.min(viewport.width, viewport.height);
+    recheck(wait);
+    return false;
+  }
   const releaseTarget = regions(RELEASE_TARGET);
   const skipTarget = regions(SKIP_TARGET);
   let changed = false;
   for (const { element, rect, skipped } of candidates) {
     if (skipped && within(rect, releaseTarget(element.parent))) changed = setSkipped(doc, element, false, markGeometryDirty) || changed;
     else if (!scrolling && !skipped && !within(rect, skipTarget(element.parent))) changed = setSkipped(doc, element, true, markGeometryDirty) || changed;
+  }
+  if (changed) {
+    doc.cvBatchAt = now;
+    // The next frames pay for the relayout; presentDocument records what they cost.
+    doc.cvBatchFrames = 2;
+    doc.cvBatchCost = 0;
   }
   return changed;
 }

@@ -320,16 +320,49 @@ export function syncDocumentText(window, document, textLayers = null) {
   // A scroll that only moves scroll-layer samples changes none of them.
   const doc = document ? documentState(document) : null;
   const key = doc ? { boxes: doc.boxesSnapshot, geometry: doc.geometryGeneration, paint: doc.paintGeneration,
-    scene: doc.sceneGeneration, transition: doc.transitionFrameGeneration, dirty: doc.geometryDirty } : null;
+    scene: doc.sceneGeneration, transition: doc.transitionFrameGeneration, text: doc.textGeneration ?? 0,
+    dirty: doc.geometryDirty } : null;
   const known = windows.get(window)?.key;
   if (key && known && !key.dirty && key.boxes && known.boxes === key.boxes && known.geometry === key.geometry
-    && known.paint === key.paint && known.scene === key.scene && known.transition === key.transition) {
-    lastSyncDetails.set(window, { mode: "unchanged", runs: 0, changedRuns: 0, reshaped: false });
-    return;
+    && known.text === key.text) {
+    if (known.paint === key.paint && known.scene === key.scene && known.transition === key.transition) {
+      lastSyncDetails.set(window, { mode: "unchanged", runs: 0, changedRuns: 0, reshaped: false });
+      return;
+    }
+    // Style, class and animation changes only matter to text when they touch
+    // an element that has text in its subtree; a thumbnail's class flip does not.
+    if (!textMayHaveChanged(window, doc)) {
+      doc.textDirtyElements?.clear();
+      windows.get(window).key = { ...key, boxes: doc.boxesSnapshot, geometry: doc.geometryGeneration, dirty: doc.geometryDirty };
+      lastSyncDetails.set(window, { mode: "unchanged", runs: 0, changedRuns: 0, reshaped: false });
+      return;
+    }
   }
+  doc?.textDirtyElements?.clear();
   syncTextRuns(window, document, textLayers);
   const state = windows.get(window);
   if (state) state.key = doc ? { ...key, boxes: doc.boxesSnapshot, geometry: doc.geometryGeneration, dirty: doc.geometryDirty } : null;
+}
+
+// A subtree larger than this is assumed to contain text.
+const SUBTREE_TEXT_PROBE = 2000;
+
+function subtreeHasText(window, element) {
+  const owners = windows.get(window)?.slotOf;
+  let budget = SUBTREE_TEXT_PROBE;
+  const visit = (node) => {
+    if (--budget < 0) return true;
+    if (renderedText(node) || owners?.has(node)) return true;
+    for (const child of node.children) if (visit(child)) return true;
+    return false;
+  };
+  return visit(element);
+}
+
+function textMayHaveChanged(window, doc) {
+  for (const element of doc.textDirtyElements ?? []) if (subtreeHasText(window, element)) return true;
+  for (const element of doc.activeTransitionElements ?? []) if (subtreeHasText(window, element)) return true;
+  return false;
 }
 
 function syncTextRuns(window, document, textLayers) {

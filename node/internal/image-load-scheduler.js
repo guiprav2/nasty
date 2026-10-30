@@ -10,10 +10,12 @@
 // After one continuous minute fully outside that region, the texture is
 // unloaded and the img returns to pending (sticky / detached Image() exempt).
 import { documentLiveLookup, documentState, elementState } from "./dom-state.js";
+import { insideSkippedContent } from "./content-visibility.js";
 
 const DEFAULT_POOL = 48;
 const DEFAULT_KEEP_FOLD = 2;
 const DEFAULT_EVICT_MS = 60_000;
+const TREE_CHECK_MS = 5000;
 const pendingDocs = new Set();
 let flushScheduled = false;
 let flushing = false;
@@ -130,28 +132,61 @@ function inTree(element, body) {
   return false;
 }
 
+// Images inside skipped content have no boxes, so they can neither be visible
+// nor nearby: passes only walk the others. The split is rebuilt when contents
+// are skipped or released or images are created; loaded images that fell into
+// skipped content are kept apart so they can still be evicted.
+function activeImageSet(document, state) {
+  if (!state.imageActive || state.imageActiveDirty) {
+    const active = new Set();
+    const away = [];
+    for (const element of state.imageElements) {
+      if (!insideSkippedContent(element)) { active.add(element); continue; }
+      const data = elementState(element);
+      if (data.imageLoadState === "loaded" || data.imageLoadState === "loading") away.push(element);
+    }
+    state.imageActive = active;
+    state.imageAway = away;
+    state.imageActiveDirty = false;
+  }
+  return state.imageActive;
+}
+
+// Each image's element state is looked up once per pass and carried along;
+// the lookup dominates a pass over a document with thousands of images.
 function documentImages(document) {
   const images = [];
   const state = documentState(document);
   const body = document.body;
-  const registry = state.imageElements;
-  if (!registry) return images;
+  if (!state.imageElements) return images;
+  const registry = activeImageSet(document, state);
+  // Whether an image is still in the tree only changes when something removes
+  // it, so connected images are re-verified a couple of times a second.
+  const now = performance.now();
+  const verify = now - (state.imageTreeCheckedAt ?? -Infinity) >= TREE_CHECK_MS;
+  if (verify) state.imageTreeCheckedAt = now;
   for (const element of registry) {
     const elementData = elementState(element);
+    if (!verify && elementData.imageConnected) {
+      const loadState = elementData.imageLoadState;
+      if (loadState && loadState !== "empty") images.push({ element, state: elementData, box: null });
+      continue;
+    }
+    const src = element.getAttribute?.("src");
+    const hasSource = src != null && src !== "";
     if (inTree(element, body)) {
       elementData.imageConnected = true;
-      const src = element.getAttribute?.("src");
-      if (src != null && src !== "") images.push(element);
+      if (hasSource) images.push({ element, state: elementData, box: null });
       continue;
     }
     // Removed from the tree for good: forget it unless it still has to load.
     if (elementData.imageConnected && !elementData.imageLoadSticky) {
       registry.delete(element);
+      state.imageElements.delete(element);
       continue;
     }
     if (!isDetachedImage(element) && !elementData.imageLoadSticky) continue;
-    const src = element.getAttribute?.("src");
-    if (src != null && src !== "") images.push(element);
+    if (hasSource) images.push({ element, state: elementData, box: null });
   }
   return images;
 }
@@ -204,14 +239,6 @@ function unloadAwayImage(element, window) {
   return true;
 }
 
-function inFlightCount(images) {
-  let n = 0;
-  for (const element of images) {
-    if (elementState(element).imageLoadState === "loading") n++;
-  }
-  return n;
-}
-
 function armEvictionTimer(document, delayMs) {
   if (!(delayMs >= 0) || !Number.isFinite(delayMs)) return;
   const existing = evictionTimers.get(document);
@@ -229,21 +256,20 @@ function armEvictionTimer(document, delayMs) {
  * Soft-evict loaded images that have been outside the 2× viewport keep region
  * for at least imageEvictMs(). Returns the soonest future deadline (ms), or null.
  */
-function evictAwayImages(document, window, images, byElement, viewport, now) {
+function evictAwayImages(window, entries, viewport, now) {
   const evictAfter = imageEvictMs();
   let soonest = null;
-  for (const element of images) {
-    const state = elementState(element);
-    if (state.imageLoadSticky || isDetachedImage(element)) {
-      state.imageAwaySince = null;
-      continue;
-    }
+  for (const entry of entries) {
+    const { element, state } = entry;
     if (state.imageLoadState !== "loaded" && state.imageLoadState !== "loading") {
       state.imageAwaySince = null;
       continue;
     }
-    const box = byElement.get(element);
-    const kept = box ? withinKeepFold(box, viewport) : false;
+    if (state.imageLoadSticky || entry.detached) {
+      state.imageAwaySince = null;
+      continue;
+    }
+    const kept = entry.box ? withinKeepFold(entry.box, viewport) : false;
     if (kept) {
       state.imageAwaySince = null;
       continue;
@@ -260,6 +286,28 @@ function evictAwayImages(document, window, images, byElement, viewport, now) {
   return soonest;
 }
 
+/** Eviction for loaded images that sit inside skipped content (they have no box). */
+function evictSkippedImages(window, state, now) {
+  const evictAfter = imageEvictMs();
+  let soonest = null;
+  const away = state.imageAway;
+  if (!away?.length) return soonest;
+  state.imageAway = away.filter((element) => {
+    const data = elementState(element);
+    if (data.imageLoadState !== "loaded" && data.imageLoadState !== "loading") return false;
+    if (data.imageLoadSticky) return false;
+    if (data.imageAwaySince == null) data.imageAwaySince = now;
+    const remaining = evictAfter - (now - data.imageAwaySince);
+    if (remaining <= 0) {
+      unloadAwayImage(element, window);
+      return false;
+    }
+    if (soonest == null || remaining < soonest) soonest = remaining;
+    return true;
+  });
+  return soonest;
+}
+
 /**
  * Admit the working set. Always start detached + visible. Fill free pool slots
  * with pending images: local before network, DOM order within each tier.
@@ -271,22 +319,20 @@ export function scheduleDocumentImageLoads(document, boxes = null) {
   if (!window || window.closed) return;
   const viewport = docState.viewport;
   const hasViewport = viewport?.width > 0 && viewport?.height > 0;
-  const images = documentImages(document).filter((element) => {
-    const state = elementState(element);
-    return state.imageLoadState === "pending"
-      || state.imageLoadState === "loading"
-      || state.imageLoadState === "loaded"
-      || state.imageLoadSticky
-      || isDetachedImage(element);
-  });
-  if (!images.length) return;
+  const entries = [];
+  for (const entry of documentImages(document)) {
+    const { element, state } = entry;
+    // Only `new Image()` can be detached; skip the tree walk for everything else.
+    entry.detached = !state.imageConnected && !!state.imageConstructor && isDetachedImage(element);
+    if (state.imageLoadState === "pending" || state.imageLoadState === "loading"
+        || state.imageLoadState === "loaded" || state.imageLoadSticky || entry.detached) entries.push(entry);
+  }
+  if (!entries.length) return;
 
   // In-tree loads wait for first layout; detached Image() may already be loading.
   if (!hasViewport || !docState.layoutSnapshot) {
-    for (const element of images) {
-      if (isDetachedImage(element) || elementState(element).imageLoadSticky) {
-        admitImage(element, window, null);
-      }
+    for (const { element, state, detached } of entries) {
+      if (detached || state.imageLoadSticky) admitImage(element, window, null);
     }
     return;
   }
@@ -294,43 +340,46 @@ export function scheduleDocumentImageLoads(document, boxes = null) {
   const byElement = boxes
     ? new Map(boxes.map(box => [box.element, box]))
     : { get: documentLiveLookup(document) };
+  for (const entry of entries) entry.box = byElement.get(entry.element) ?? null;
 
   const now = performance.now();
-  const soonestEvict = evictAwayImages(document, window, images, byElement, viewport, now);
-  if (soonestEvict != null) armEvictionTimer(document, soonestEvict);
+  const soonestEvict = evictAwayImages(window, entries, viewport, now);
+  const soonestSkipped = evictSkippedImages(window, docState, now);
+  const nextEvict = soonestEvict == null ? soonestSkipped : soonestSkipped == null ? soonestEvict : Math.min(soonestEvict, soonestSkipped);
+  if (nextEvict != null) armEvictionTimer(document, nextEvict);
 
   const must = [];
   const localFill = [];
   const networkFill = [];
-  for (const element of images) {
-    const state = elementState(element);
+  let inFlight = 0;
+  let nearbyPending = false;
+  for (const entry of entries) {
+    const { element, state, box } = entry;
+    if (state.imageLoadState === "loading") inFlight++;
     if (state.imageLoadState === "error") continue;
-    const local = isLocalImageSource(resolvedSrc(element));
-    const box = byElement.get(element);
     const visible = !!(box && visibleThroughClip(box, viewport));
-    const nearby = !!(box && withinKeepFold(box, viewport));
-    if (state.imageLoadSticky || isDetachedImage(element) || visible) {
-      must.push(element);
+    const nearby = visible || !!(box && withinKeepFold(box, viewport));
+    if (state.imageLoadState === "pending" && (state.imageLoadSticky || entry.detached || nearby)) nearbyPending = true;
+    if (state.imageLoadSticky || entry.detached || visible) {
+      must.push(entry);
       continue;
     }
     // Prefetch only inside the keep fold so soft-evicted far images are not
     // immediately restarted. They wait until they enter the 2× viewport band.
     if (state.imageLoadState !== "pending" || !nearby) continue;
-    if (local) localFill.push(element);
-    else networkFill.push(element);
+    if (isLocalImageSource(resolvedSrc(element))) localFill.push(entry);
+    else networkFill.push(entry);
   }
 
   const pool = imageLoadPoolSize();
   // Sticky + detached Image() always admit (decode() / constructor path).
   // In-tree visible images are paced by the pool so a dense gallery cannot
   // open unbounded work in one flush; leftovers stay pending for later turns.
-  const inFlight = inFlightCount(images);
   let started = 0;
   let startBudget = Math.max(0, pool - inFlight);
-  for (const element of must) {
-    if (elementState(element).imageLoadState === "loading" || elementState(element).imageLoadState === "loaded") continue;
-    const box = byElement.get(element) ?? null;
-    if (isDetachedImage(element) || elementState(element).imageLoadSticky) {
+  for (const { element, state, box, detached } of must) {
+    if (state.imageLoadState === "loading" || state.imageLoadState === "loaded") continue;
+    if (detached || state.imageLoadSticky) {
       admitImage(element, window, box);
       started++;
       continue;
@@ -343,36 +392,22 @@ export function scheduleDocumentImageLoads(document, boxes = null) {
 
   // Prefetch into remaining in-flight capacity: local first, then network.
   let slots = Math.max(0, pool - inFlight - started);
-  for (const element of localFill) {
-    if (slots <= 0) break;
-    if (elementState(element).imageLoadState !== "pending") continue;
-    admitImage(element, window, byElement.get(element) ?? null);
-    started++;
-    slots--;
-  }
-  for (const element of networkFill) {
-    if (slots <= 0) break;
-    if (elementState(element).imageLoadState !== "pending") continue;
-    admitImage(element, window, byElement.get(element) ?? null);
-    started++;
-    slots--;
+  for (const fill of [localFill, networkFill]) {
+    for (const { element, state, box } of fill) {
+      if (slots <= 0) break;
+      if (state.imageLoadState !== "pending") continue;
+      admitImage(element, window, box);
+      started++;
+      slots--;
+    }
   }
 
   // Keep draining the queue across turns while work remains, without spinning
-  // the current event-loop callback.
-  // Far-off images stay pending with src set until they enter the 2× keep band.
-  // Re-arm only when capacity frees or geometry may have changed (caller also
-  // schedules on scroll/reflow).
-  // Always continue while nearby work remains OR in-flight jobs will free slots.
+  // the current event-loop callback. Far-off images stay pending with src set
+  // until they enter the 2× keep band. Re-arm only when capacity frees or
+  // geometry may have changed (caller also schedules on scroll/reflow).
   const inflight = inFlight + started;
-  const stillNearbyPending = images.some((element) => {
-    const st = elementState(element);
-    if (st.imageLoadState !== "pending") return false;
-    if (st.imageLoadSticky || isDetachedImage(element)) return true;
-    const box = byElement.get(element);
-    return !!(box && (visibleThroughClip(box, viewport) || withinKeepFold(box, viewport)));
-  });
-  if (stillNearbyPending || inflight > 0) {
+  if (nearbyPending || inflight > 0) {
     // Pace follow-up flushes so we drain the native pool without spinning.
     const kick = typeof setTimeout === "function" ? setTimeout : null;
     if (kick) {
@@ -389,7 +424,7 @@ export function scheduleDocumentImageLoads(document, boxes = null) {
 const MIN_SCHEDULE_INTERVAL_MS = 60;
 const lastScheduleAt = new WeakMap();
 // A pass costs time proportional to the number of images, so passes also leave
-// at least eight times their own duration before the next one.
+// at least three times their own duration before the next one.
 const lastScheduleCost = new WeakMap();
 
 function flushImageLoadSchedules() {
@@ -404,7 +439,7 @@ function flushImageLoadSchedules() {
         const state = documentState(doc);
         if (!state?.defaultView || state.closed) continue;
         const now = performance.now();
-        const interval = Math.max(MIN_SCHEDULE_INTERVAL_MS, 8 * (lastScheduleCost.get(doc) ?? 0));
+        const interval = Math.max(MIN_SCHEDULE_INTERVAL_MS, 3 * (lastScheduleCost.get(doc) ?? 0));
         const wait = interval - (now - (lastScheduleAt.get(doc) ?? -Infinity));
         if (wait > 0) {
           pendingDocs.add(doc);
