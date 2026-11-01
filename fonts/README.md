@@ -9,3 +9,4 @@ emoji fallback; it is registered automatically for text runs that contain emoji.
 
 Names use lowercase ASCII with whitespace replaced by underscores. Optional weight
 variants use suffixes such as `_medium` and `_bold`. Select them through `style.fontFamily`.
+Pacifico (Google Fonts, OFL) is the Webfoundry wordmark face, used by the tour example.

@@ -628,16 +628,29 @@ static int open_input(const char *path, AVFormatContext **fmt, char *err, size_t
     return 0;
 }
 
+static void fill_probe(AVFormatContext *fmt, int video, SweetProbe *out) {
+    int width = 0;
+    int height = 0;
+    int pre_w = 0;
+    int pre_h = 0;
+    AVRational sar = fmt->streams[video]->codecpar->sample_aspect_ratio;
+    AVRational frame_rate = fmt->streams[video]->avg_frame_rate;
+    if (fmt->duration > 0) {
+        out->duration = (double)fmt->duration / (double)AV_TIME_BASE;
+    }
+    if (frame_rate.num <= 0 || frame_rate.den <= 0) frame_rate = fmt->streams[video]->r_frame_rate;
+    out->frame_rate = frame_rate.num > 0 && frame_rate.den > 0 ? av_q2d(frame_rate) : 30.0;
+    upright_size(fmt->streams[video]->codecpar->width, fmt->streams[video]->codecpar->height, sar,
+                 stream_rotation(fmt->streams[video]), 0, &width, &height, &pre_w, &pre_h);
+    out->width = width;
+    out->height = height;
+}
+
 int sweet_ffmpeg_probe(const char *path, SweetProbe *out, char *err, size_t err_len) {
     AVFormatContext *fmt = NULL;
     AVCodec *codec = NULL;
     int video;
     int audio;
-    int width = 0;
-    int height = 0;
-    int pre_w = 0;
-    int pre_h = 0;
-    AVRational sar = {0, 1};
     if (!out) {
         set_err(err, err_len, "missing probe output");
         return -1;
@@ -649,9 +662,6 @@ int sweet_ffmpeg_probe(const char *path, SweetProbe *out, char *err, size_t err_
         avformat_close_input(&fmt);
         return -1;
     }
-    if (fmt->duration > 0) {
-        out->duration = (double)fmt->duration / (double)AV_TIME_BASE;
-    }
     video = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
     audio = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     out->has_audio = audio >= 0;
@@ -660,15 +670,20 @@ int sweet_ffmpeg_probe(const char *path, SweetProbe *out, char *err, size_t err_
         set_err(err, err_len, "no video stream");
         return -1;
     }
-    sar = fmt->streams[video]->codecpar->sample_aspect_ratio;
-    AVRational frame_rate = fmt->streams[video]->avg_frame_rate;
-    if (frame_rate.num <= 0 || frame_rate.den <= 0) frame_rate = fmt->streams[video]->r_frame_rate;
-    out->frame_rate = frame_rate.num > 0 && frame_rate.den > 0 ? av_q2d(frame_rate) : 30.0;
-    upright_size(fmt->streams[video]->codecpar->width, fmt->streams[video]->codecpar->height, sar,
-                 stream_rotation(fmt->streams[video]), 0, &width, &height, &pre_w, &pre_h);
-    out->width = width;
-    out->height = height;
+    fill_probe(fmt, video, out);
     avformat_close_input(&fmt);
+    return 0;
+}
+
+/* Probe facts for an already opened video, so a remote source is not opened twice. */
+int sweet_ffmpeg_video_info(const SweetMedia *media, SweetProbe *out) {
+    if (!media || !media->fmt || media->video_index < 0 || !out) {
+        return -1;
+    }
+    memset(out, 0, sizeof *out);
+    out->duration = -1;
+    out->has_audio = av_find_best_stream(media->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0) >= 0;
+    fill_probe(media->fmt, media->video_index, out);
     return 0;
 }
 

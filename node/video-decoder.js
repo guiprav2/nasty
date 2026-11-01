@@ -49,7 +49,15 @@ function ensureAudioWorker() {
   audioWorker.on("message", message => {
     if (message.type === "audio-clock") {
       if (audioGenerations.get(message.audioId) === message.generation) {
-        audioClocks.set(message.audioId, { time: message.time, receivedAt: performance.now() });
+        // The audio server takes output in bursts (~0.8s on PipeWire), so the
+        // played position holds, then jumps. Timing a held value from when it
+        // last moved lets readers extrapolate at 1x instead of seeing a clock
+        // that stops between bursts. Before it first moves (priming), keep the
+        // sample fresh so the clock does not run ahead of silent audio.
+        const previous = audioClocks.get(message.audioId);
+        const now = performance.now();
+        if (previous && previous.time === message.time && previous.moved) return;
+        audioClocks.set(message.audioId, { time: message.time, receivedAt: now, moved: !!previous && previous.time !== message.time });
       }
       return;
     }
@@ -78,7 +86,7 @@ export function startVideoAudio(audioId, source, time = 0, volume = 1, deviceId 
   return generation;
 }
 
-export function waitForVideoAudioReady(audioId) {
+export function waitForVideoAudioReady(audioId, timeoutMs = 2000) {
   if (audioReady.has(audioId)) return Promise.resolve(true);
   return new Promise(resolve => {
     const waiters = audioReadyWaiters.get(audioId) ?? [];
@@ -89,7 +97,7 @@ export function waitForVideoAudioReady(audioId) {
       if (!remaining) return;
       audioReadyWaiters.delete(audioId);
       for (const waiter of remaining) waiter(false);
-    }, 2000);
+    }, timeoutMs);
     timer.unref?.();
   });
 }

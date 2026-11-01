@@ -11,6 +11,8 @@ import native from "./native.js";
 import { FIRE_AND_FORGET, PRESENTS, SIGNAL, STATE } from "./remote-window-protocol.js";
 
 const CALL_TIMEOUT_MS = 60_000;
+// Dialogs wait on the user, who may browse for as long as they like.
+const DIALOGS = new Set(["pickFolder", "pickFiles"]);
 // Decode job ids handed out before the native pool has assigned its own.
 const PROVISIONAL_JOB_BASE = 1e12;
 
@@ -69,11 +71,11 @@ export class RemoteWindow {
     if (reply.error) throw this.#error(reply.error);
   }
 
-  #await() {
+  #await(timeout = CALL_TIMEOUT_MS) {
     // The host sets the flag after posting its reply (the caller cleared it before asking).
     const message = this.#poll();
     if (message) return message.message;
-    const result = Atomics.wait(this.#signal, SIGNAL.REPLY, 0, CALL_TIMEOUT_MS);
+    const result = Atomics.wait(this.#signal, SIGNAL.REPLY, 0, timeout);
     if (result === "timed-out") throw new Error("native window thread did not respond");
     return this.#poll()?.message ?? { error: { message: "native window thread sent no reply" } };
   }
@@ -92,9 +94,10 @@ export class RemoteWindow {
   call(method, args) {
     Atomics.store(this.#signal, SIGNAL.REPLY, 0);
     this.#worker.postMessage({ method, args: args.map(compact) });
-    const reply = this.#await();
+    const reply = this.#await(DIALOGS.has(method) ? Infinity : CALL_TIMEOUT_MS);
     // Something posted without waiting failed since the last call.
-    if (reply.deferredError) console.error("Nasty window call failed:", this.#error(reply.deferredError));
+    // Calls already posted when the window closed fail; that is expected, not news.
+    if (reply.deferredError && !this.closed) console.error("Nasty window call failed:", this.#error(reply.deferredError));
     if (reply.error) throw this.#error(reply.error);
     return reply.result;
   }

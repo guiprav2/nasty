@@ -1,6 +1,6 @@
 //! Compressed-AU video stream player. JS demuxes (mp4-stream); this queues
 //! packets, decodes on a worker with FFmpeg (VAAPI then software), and keeps
-//! the latest RGBA frame for take_latest_frame.
+//! a few converted RGBA frames ahead so JS can present each one when it is due.
 
 use crate::ffmpeg_decode::{PacketVideo, RgbaFrame};
 use napi::bindgen_prelude::Buffer;
@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 
 const STREAM_QUEUE_CAPACITY: usize = 48;
 const STREAM_QUEUE_MAX_BYTES: usize = 24 * 1024 * 1024;
+/// Converted frames kept ahead of presentation. Converting a frame only once it
+/// was due put the whole sws pass (and the JS poll) inside every frame period.
+const READY_FRAMES: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 enum StreamCodec {
@@ -171,7 +174,7 @@ struct Shared {
     queue: Arc<StreamQueue>,
     clock: Mutex<Clock>,
     media_clock: Mutex<MediaClockAnchor>,
-    latest: Mutex<Option<LatestFrame>>,
+    ready: Mutex<VecDeque<LatestFrame>>,
     generation: AtomicU64,
     frame_generation: AtomicU64,
     stop: Mutex<Option<Arc<AtomicBool>>>,
@@ -184,7 +187,7 @@ impl Shared {
             queue: Arc::new(StreamQueue::new()),
             clock: Mutex::new(Clock::new()),
             media_clock: Mutex::new(MediaClockAnchor::new()),
-            latest: Mutex::new(None),
+            ready: Mutex::new(VecDeque::with_capacity(READY_FRAMES)),
             generation: AtomicU64::new(0),
             frame_generation: AtomicU64::new(0),
             stop: Mutex::new(None),
@@ -286,8 +289,8 @@ fn decode_stream_loop(shared: Arc<Shared>, start: f64, stop: Arc<AtomicBool>, ge
             active_epoch = packet.epoch;
             target_time = target;
             playback_origin = Instant::now();
-            if let Ok(mut latest) = shared.latest.lock() {
-                *latest = None;
+            if let Ok(mut ready) = shared.ready.lock() {
+                ready.clear();
             }
         }
 
@@ -335,8 +338,8 @@ fn decode_stream_loop(shared: Arc<Shared>, start: f64, stop: Arc<AtomicBool>, ge
             // Prefer the audio-master media clock from JS. Falling back to the
             // epoch wall clock races ahead of the audible buffer and forced the
             // present loop to hold every frame for hundreds of ms (low FPS with
-            // good skew). Skip-to-want / wait-if-early keeps export near lipsync
-            // without the old forever-drop bug.
+            // good skew). Late frames are skipped before the costly export;
+            // early ones wait converted in `ready` for the present loop.
             let want_pts = shared
                 .media_clock
                 .lock()
@@ -347,30 +350,15 @@ fn decode_stream_loop(shared: Arc<Shared>, start: f64, stop: Arc<AtomicBool>, ge
                 dec.discard();
                 continue;
             }
-            while {
-                let now_want = shared
-                    .media_clock
-                    .lock()
-                    .ok()
-                    .and_then(|clock| clock.want_pts())
-                    .unwrap_or_else(|| target_time + playback_origin.elapsed().as_secs_f64());
-                held.pts > now_want + 0.008
-            } {
+            // Convert ahead of time, but no further than READY_FRAMES.
+            while shared.ready.lock().map(|ready| ready.len() >= READY_FRAMES).unwrap_or(false) {
                 if stop.load(Ordering::Acquire)
                     || shared.generation.load(Ordering::Acquire) != generation
                     || queue.state.lock().expect("video stream queue").epoch != active_epoch
                 {
-                    dec.discard();
                     break;
                 }
-                let now_want = shared
-                    .media_clock
-                    .lock()
-                    .ok()
-                    .and_then(|clock| clock.want_pts())
-                    .unwrap_or_else(|| target_time + playback_origin.elapsed().as_secs_f64());
-                let early = held.pts - now_want;
-                thread::sleep(Duration::from_secs_f64(early.clamp(0.001, 0.020)));
+                thread::sleep(Duration::from_millis(2));
             }
             if stop.load(Ordering::Acquire)
                 || shared.generation.load(Ordering::Acquire) != generation
@@ -389,13 +377,13 @@ fn decode_stream_loop(shared: Arc<Shared>, start: f64, stop: Arc<AtomicBool>, ge
             };
             let pts = frame.pts;
             let (width, height, rgba) = pack_rgba(frame);
-            let _ = shared.frame_generation.fetch_add(1, Ordering::AcqRel);
-            *shared.latest.lock().expect("latest") = Some(LatestFrame {
+            shared.ready.lock().expect("ready").push_back(LatestFrame {
                 pts,
                 width,
                 height,
                 rgba,
             });
+            let _ = shared.frame_generation.fetch_add(1, Ordering::AcqRel);
             {
                 let mut clock = shared.clock.lock().expect("clock");
                 clock.width = width;
@@ -417,13 +405,19 @@ fn decode_stream_loop(shared: Arc<Shared>, start: f64, stop: Arc<AtomicBool>, ge
                     }
                     let pts = frame.pts;
                     let (width, height, rgba) = pack_rgba(frame);
-                    let _ = shared.frame_generation.fetch_add(1, Ordering::AcqRel);
-                    *shared.latest.lock().expect("latest") = Some(LatestFrame {
+                    while shared.ready.lock().map(|ready| ready.len() >= READY_FRAMES).unwrap_or(false)
+                        && !stop.load(Ordering::Acquire)
+                        && shared.generation.load(Ordering::Acquire) == generation
+                    {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    shared.ready.lock().expect("ready").push_back(LatestFrame {
                         pts,
                         width,
                         height,
                         rgba,
                     });
+                    let _ = shared.frame_generation.fetch_add(1, Ordering::AcqRel);
                 }
                 Ok(None) => break,
                 Err(_) => break,
@@ -468,7 +462,7 @@ impl VideoStreamPlayer {
             stream.ended = false;
         }
         self.shared.queue.ready.notify_all();
-        *self.shared.latest.lock().expect("latest") = None;
+        self.shared.ready.lock().expect("ready").clear();
         {
             let mut clock = self.shared.clock.lock().expect("clock");
             clock.duration = duration;
@@ -589,6 +583,7 @@ impl VideoStreamPlayer {
             media.active = false;
             media.media_time = time.max(0.0);
         }
+        self.shared.ready.lock().expect("ready").clear();
         let mut clock = self.shared.clock.lock().expect("clock");
         clock.playing = false;
         clock.started_at = None;
@@ -614,6 +609,7 @@ impl VideoStreamPlayer {
             media.anchored_at = Instant::now();
             // Keep active state; JS will refresh from the audio clock after seek.
         }
+        self.shared.ready.lock().expect("ready").clear();
         let mut clock = self.shared.clock.lock().expect("clock");
         let was_playing = clock.playing;
         clock.start_time = seconds;
@@ -639,13 +635,37 @@ impl VideoStreamPlayer {
 
     #[napi(js_name = "takeLatestFrame")]
     pub fn take_latest_frame(&self) -> Option<crate::DecodedVideoFrame> {
-        // Take under the latest lock only — do not hold clock while copying ~MB RGBA.
-        let frame = self.shared.latest.lock().expect("latest").take()?;
+        let frame = self.shared.ready.lock().expect("ready").drain(..).last()?;
+        Some(self.decoded(frame))
+    }
+
+    /// The newest converted frame with pts <= `max_pts`; older due frames are
+    /// dropped, frames still in the future stay queued.
+    #[napi(js_name = "takeFrame")]
+    pub fn take_frame(&self, max_pts: f64) -> Option<crate::DecodedVideoFrame> {
+        let frame = {
+            let mut ready = self.shared.ready.lock().expect("ready");
+            let mut due = None;
+            while ready.front().is_some_and(|frame| frame.pts <= max_pts) {
+                due = ready.pop_front();
+            }
+            due
+        }?;
+        Some(self.decoded(frame))
+    }
+
+    /// Pts of the next converted frame, if one is ready.
+    #[napi(getter, js_name = "nextFramePts")]
+    pub fn next_frame_pts(&self) -> Option<f64> {
+        self.shared.ready.lock().expect("ready").front().map(|frame| frame.pts)
+    }
+
+    fn decoded(&self, frame: LatestFrame) -> crate::DecodedVideoFrame {
         let (source_width, source_height) = {
             let clock = self.shared.clock.lock().expect("clock");
             (clock.width.max(frame.width), clock.height.max(frame.height))
         };
-        Some(crate::DecodedVideoFrame {
+        crate::DecodedVideoFrame {
             width: frame.width,
             height: frame.height,
             source_width,
@@ -653,7 +673,7 @@ impl VideoStreamPlayer {
             pts: frame.pts,
             frame_duration: 0.0,
             pixels: Buffer::from(frame.rgba),
-        })
+        }
     }
 
     #[napi(getter, js_name = "frameGeneration")]
@@ -705,7 +725,7 @@ impl VideoStreamPlayer {
         stream.packets.clear();
         stream.queued_bytes = 0;
         stream.ended = true;
-        *self.shared.latest.lock().expect("latest") = None;
+        self.shared.ready.lock().expect("ready").clear();
     }
 }
 

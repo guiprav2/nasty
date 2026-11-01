@@ -28,6 +28,18 @@ export function rotatesText(matrix) {
     || Math.abs(matrix[3][0]) > EPSILON || Math.abs(matrix[3][1]) > EPSILON || Math.abs(matrix[3][3] - 1) > EPSILON;
 }
 
+/**
+ * The scale of a world matrix that only translates and scales both axes equally,
+ * else 0. Text under such a matrix is shaped at the scaled size instead.
+ */
+export function uniformTextScale(matrix) {
+  const scale = matrix[0][0];
+  if (!(scale > EPSILON) || Math.abs(matrix[1][1] - scale) > EPSILON) return 0;
+  if (Math.abs(matrix[0][1]) > EPSILON || Math.abs(matrix[1][0]) > EPSILON) return 0;
+  if (Math.abs(matrix[3][0]) > EPSILON || Math.abs(matrix[3][1]) > EPSILON || Math.abs(matrix[3][3] - 1) > EPSILON) return 0;
+  return scale;
+}
+
 /** Start collecting the elements whose text is transformed in this text pass. */
 export function beginTransformedTextPass() {
   noted = new Set();

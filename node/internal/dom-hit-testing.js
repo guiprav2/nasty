@@ -140,7 +140,16 @@ function comparePaintOrder(left, right) {
     if (a.level !== b.level) return a.level - b.level;
     if (a.order !== b.order) return a.order - b.order;
   }
-  if (left.path.length !== right.path.length) return left.path.length - right.path.length;
+  // A stacking context that only one side is inside paints by its z-index
+  // and, at the same level, in tree order with the other side, so a faded
+  // (opacity < 1) layer does not cover controls that come after it.
+  if (left.path.length !== right.path.length) {
+    const sign = left.path.length > right.path.length ? 1 : -1;
+    const step = (sign > 0 ? left : right).path[length];
+    const other = sign > 0 ? right : left;
+    if (step.level !== 0) return sign * step.level;
+    return sign * (step.order - other.order || 1);
+  }
   return left.order - right.order;
 }
 
@@ -251,7 +260,8 @@ export function elementsFromPoint(document, x, y, stopAtFirst = false) {
       }
       if (!point || !insideRoundedBox(box, point, radii)) continue;
       let clipped = false;
-      for (let parent = element.parent; parent; parent = parent.parent) {
+      // Ancestors above a fixed subtree's root (the top layer included) do not clip it.
+      for (let child = element, parent = element.parent; parent && child !== box.fixedRoot; child = parent, parent = parent.parent) {
         const clipX = clipsOverflow(parent, 'x'), clipY = clipsOverflow(parent, 'y');
         if (!clipX && !clipY) continue;
         const parentBox = byElement.get(parent);

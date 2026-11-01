@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { Document } from "../index.js";
+import { AnimationEvent, Document } from "../index.js";
 import { resolveTailwind } from "../tailwind.js";
 import { computedStyleValue, hasActiveStyleTransition } from "../internal/css-transitions.js";
-import { getRegisteredKeyframes } from "../internal/css-animations.js";
+import { getRegisteredKeyframes, registerKeyframes } from "../internal/css-animations.js";
 
 const spin = resolveTailwind("animate-spin [animation-duration:16s]");
 assert.equal(spin.animationName, "spin");
@@ -15,11 +15,22 @@ assert.equal(sheenUtility.animationName, "sheen");
 assert.equal(sheenUtility.animationTimingFunction, "linear");
 assert.equal(sheenUtility.animationDuration, "5.5s");
 
+// tailwindcss-animated longhands override the shorthand in either class order.
+const longhands = resolveTailwind("animate-duration-[16s] animate-spin animate-delay-200 animate-ease-in-out animate-once animate-alternate animate-fill-both animate-stop");
+assert.equal(longhands.animationName, "spin");
+assert.equal(longhands.animationDuration, "16s");
+assert.equal(longhands.animationDelay, "200ms");
+assert.equal(longhands.animationTimingFunction, "ease-in-out");
+assert.equal(longhands.animationIterationCount, "1");
+assert.equal(longhands.animationDirection, "alternate");
+assert.equal(longhands.animationFillMode, "both");
+assert.equal(longhands.animationPlayState, "paused");
+
 const glowUtility = resolveTailwind("animate-glow");
 assert.equal(glowUtility.animationName, "glow");
 assert.equal(glowUtility.animationDuration, "5.5s");
 
-for (const name of ["spin", "float", "glow", "sheen"]) {
+for (const name of ["spin", "float", "glow", "sheen", "pulse", "ping"]) {
   assert.ok(getRegisteredKeyframes(name)?.length >= 2, `missing keyframes for ${name}`);
 }
 
@@ -114,15 +125,18 @@ assert.match(String(sheenA ?? ""), /skewX\(-18deg\)/);
   await nest.close();
 }
 
-const programmed = doc.createElement("div");
-doc.body.appendChild(programmed);
-const animation = doc.createElementAnimation(programmed, [
+// A finite named animation holds its last frame and reports animationend.
+registerKeyframes("check-fade", [
   ["opacity-40"],
   ["opacity-95", () => false && "rounded-full"],
-], { duration: 50, easing: "linear", iterations: 1, fill: "forwards" });
-await animation.finished;
+]);
+const programmed = doc.createElement("div");
+programmed.className = "animate-[check-fade] animate-duration-50 animate-ease-linear animate-fill-forwards";
+doc.body.appendChild(programmed);
+const ended = await new Promise((resolve) => programmed.addEventListener("animationend", resolve, { once: true }));
+assert.ok(ended instanceof AnimationEvent);
+assert.equal(ended.animationName, "check-fade");
 assert.equal(computedStyleValue(programmed.style, "opacity"), 0.95);
-assert.equal(animation.playState, "finished");
 
 console.log("css animations ok");
 process.exit(0);

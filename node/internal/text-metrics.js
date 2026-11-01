@@ -2,6 +2,7 @@ import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { EMOJI_FAMILY, findFontFiles, fontFamilies, systemFontFamily } from '../font-registry.js';
 import { elementState } from './dom-state.js';
 import { nerdIcon, renderedText } from './nerd-icon.js';
+import { isInlineRoot } from './inline-text.js';
 const loaded = new Set();
 function loadFamilies(stack) {
   for (const family of fontFamilies(stack)) {
@@ -64,25 +65,91 @@ export function textStyle(element) {
     wrap: element.localName !== 'input' && !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')),
     breakWords: element.localName === 'textarea' || overflowWrap === 'anywhere' || overflowWrap === 'break-word' };
 }
+/** Ascent and descent of an element's font, as the shaper places its baseline. */
+export function fontExtents(element) {
+  const { font } = textStyle(element);
+  let bounds = fontBounds.get(font);
+  if (!bounds) { context.font = font; bounds = context.measureText('Mg'); fontBounds.set(font, bounds); }
+  return { ascent: bounds.fontBoundingBoxAscent, descent: bounds.fontBoundingBoxDescent };
+}
+// Inline formatting context (inline-text.js): the block's words, each made of
+// pieces from one or more children, measured with those children's fonts.
+function inlineTextMetrics(element, style) {
+  const segments = element.children.map((child) => ({ element: child, style: textStyle(child),
+    text: transformedText(child, renderedText(child)) }));
+  const whiteSpace = inherited(element, 'whiteSpace', 'normal');
+  const key = JSON.stringify([style.size, style.line, style.font, style.wrap, whiteSpace,
+    segments.map(({ text, style: each }) => [text, each.font, each.spacing])]);
+  const state = elementState(element);
+  if (state.textMetrics?.key === key) return state.textMetrics;
+  // Collapse white space across children: a run of spaces becomes one, kept by
+  // the child it starts in, and the block's edges are trimmed.
+  const characters = [];
+  segments.forEach(({ text }, index) => {
+    for (const character of text) {
+      if (/\s/.test(character)) {
+        if (characters.length && characters[characters.length - 1].character !== ' ') characters.push({ character: ' ', index });
+      } else characters.push({ character, index });
+    }
+  });
+  while (characters.length && characters[characters.length - 1].character === ' ') characters.pop();
+  const tokens = [], pieces = [];
+  let word = [];
+  const flush = () => {
+    if (!word.length) return;
+    const parts = [];
+    for (const { character, index } of word) {
+      const last = parts[parts.length - 1];
+      if (last?.index === index) last.text += character; else parts.push({ index, text: character });
+    }
+    pieces.push(parts);
+    tokens.push(parts.map((part) => part.text).join(''));
+    word = [];
+  };
+  const spaceOwners = [];
+  for (const entry of characters) {
+    if (entry.character === ' ') { flush(); spaceOwners[pieces.length] = entry.index; } else word.push(entry);
+  }
+  flush();
+  const measure = (index, text) => {
+    const each = segments[index].style;
+    context.font = each.font; context.letterSpacing = `${each.spacing}px`;
+    return context.measureText(text).width;
+  };
+  const words = pieces.map((parts) => parts.reduce((sum, part) => sum + measure(part.index, part.text), 0));
+  context.font = style.font; context.letterSpacing = `${style.spacing}px`;
+  const space = context.measureText(' ').width;
+  // spaceOwners[i]: the child whose space precedes word i.
+  state.textMetrics = { key, style, tokens, words, space, joiner: ' ', breakWords: null,
+    inline: { segments: segments.map(({ element: child }) => child), pieces, spaceOwners, measure } };
+  return state.textMetrics;
+}
 export function textMetrics(element) {
   const style = textStyle(element);
+  if (isInlineRoot(element)) return inlineTextMetrics(element, style);
   let text = renderedText(element);
   text = transformedText(element, text);
   // Color affects paint only. Keeping it out of the measurement key prevents
   // animated text colors from invalidating Taffy's layout tree.
-  const key = JSON.stringify([text, style.size, style.spacing, style.line, style.font, style.wrap, style.breakWords]);
+  const key = JSON.stringify([text, style.size, style.spacing, style.line, style.font, style.wrap, style.breakWords, inherited(element, 'whiteSpace', 'normal')]);
   const state = elementState(element);
   if (state.textMetrics?.key === key) {
     state.textMetrics.style.color = style.color;
     return state.textMetrics;
   }
   context.font = style.font; context.letterSpacing = `${style.spacing}px`;
-  const preserve = ['pre', 'pre-wrap', 'pre-line'].includes(inherited(element, 'whiteSpace', 'normal'));
+  const whiteSpace = inherited(element, 'whiteSpace', 'normal');
+  const preserve = ['pre', 'pre-wrap', 'pre-line'].includes(whiteSpace);
   text = preserve ? text : text.replace(/\s+/g, ' ').trim();
-  const tokens = text.split(/(\n| +)/).filter(Boolean).filter(word => !/^ +$/.test(word));
+  // pre and pre-wrap keep every space: each word carries the spaces after it (a
+  // leading run starts the first word), so words join with nothing in between.
+  const keepSpaces = whiteSpace === 'pre' || whiteSpace === 'pre-wrap';
+  const tokens = keepSpaces
+    ? text.split(/(\n)|(?<= )(?=[^ \n])/).filter(Boolean)
+    : text.split(/(\n| +)/).filter(Boolean).filter(word => !/^ +$/.test(word));
   const words = tokens.map(word => word === '\n' ? -1 : context.measureText(word).width);
-  const space = context.measureText(' ').width;
-  state.textMetrics = { key, style, tokens, words, space,
+  const space = keepSpaces ? 0 : context.measureText(' ').width;
+  state.textMetrics = { key, style, tokens, words, space, joiner: keepSpaces ? '' : ' ',
     breakWords: style.breakWords ? tokens.map(word => word === '\n' ? null : [...word].map(character => context.measureText(character).width)) : null };
   return state.textMetrics;
 }
@@ -91,11 +158,29 @@ export function textMetrics(element) {
  * content box `width` (same greedy algorithm as workers/layout.js), so native
  * shaping draws exactly the laid-out lines instead of re-wrapping them.
  */
+/**
+ * Lines of an inline formatting context at content width `width`, with the same
+ * greedy breaks as the layout measure: each line lists its words' indices.
+ */
+export function inlineTextLines(element, width) {
+  const metrics = elementState(element).textMetrics ?? textMetrics(element);
+  if (!metrics.inline) return null;
+  const lines = [];
+  let line = [], lineWidth = 0;
+  metrics.words.forEach((word, index) => {
+    const next = lineWidth ? lineWidth + metrics.space + word : word;
+    if (metrics.style.wrap && next > width + .01 && line.length) { lines.push(line); line = []; lineWidth = 0; }
+    lineWidth = line.length ? lineWidth + metrics.space + word : word;
+    line.push(index);
+  });
+  if (line.length) lines.push(line);
+  return { metrics, lines };
+}
 export function layoutTextLines(element, width) {
   // Layout keeps these metrics current (Document#prepareText runs before any
   // box is read), so paint can reuse them without re-keying.
   const metrics = elementState(element).textMetrics ?? textMetrics(element);
-  const { tokens, words, space, breakWords, style } = metrics;
+  const { tokens, words, space, breakWords, style, joiner } = metrics;
   if (!style.wrap) return null;
   const state = elementState(element);
   if (state.textLines?.metrics === metrics && state.textLines.width === width) return state.textLines.lines;
@@ -112,7 +197,7 @@ export function layoutTextLines(element, width) {
     if (characters && word > limit + .01) {
       const glyphs = [...token];
       let fragment = '', fragmentWidth = 0;
-      if (lineWidth) { line += ' '; lineWidth += space; }
+      if (lineWidth) { line += joiner; lineWidth += space; }
       glyphs.forEach((glyph, glyphIndex) => {
         const glyphWidth = characters[glyphIndex] ?? 0;
         if (fragmentWidth > 0 && lineWidth + fragmentWidth + glyphWidth > limit + .01) {
@@ -122,7 +207,7 @@ export function layoutTextLines(element, width) {
       });
       line += fragment; lineWidth += fragmentWidth;
     } else {
-      line += (lineWidth ? ' ' : '') + token;
+      line += (lineWidth ? joiner : '') + token;
       lineWidth += (lineWidth ? space : 0) + word;
     }
   }
@@ -203,7 +288,7 @@ export function textLines(metrics, width) {
         size += characterWidth;
       }
     } else {
-      line += (line ? ' ' : '') + word;
+      line += (line ? metrics.joiner : '') + word;
       size += (line === word ? 0 : metrics.space) + advance;
     }
   });

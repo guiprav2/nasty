@@ -37,7 +37,6 @@ struct SweetAudioChunk {
 enum SweetMedia {}
 
 extern "C" {
-    fn sweet_ffmpeg_probe(path: *const c_char, out: *mut SweetProbe, err: *mut c_char, err_len: usize) -> c_int;
     fn sweet_ffmpeg_open(
         path: *const c_char,
         want_video: c_int,
@@ -47,6 +46,7 @@ extern "C" {
     ) -> *mut SweetMedia;
     fn sweet_ffmpeg_close(media: *mut SweetMedia);
     fn sweet_ffmpeg_duration(media: *const SweetMedia) -> f64;
+    fn sweet_ffmpeg_video_info(media: *const SweetMedia, out: *mut SweetProbe) -> c_int;
     fn sweet_ffmpeg_seek(media: *mut SweetMedia, seconds: f64, err: *mut c_char, err_len: usize) -> c_int;
     fn sweet_ffmpeg_pull_video(
         media: *mut SweetMedia,
@@ -99,22 +99,13 @@ pub struct Probe {
     pub frame_rate: f64,
 }
 
-pub fn probe(path: &Path) -> Result<Probe, String> {
-    let path = path_cstr(path)?;
-    let mut info = SweetProbe { duration: -1.0, width: 0, height: 0, has_audio: 0, frame_rate: 0.0 };
-    let mut err = [0u8; 512];
-    let ret = unsafe {
-        sweet_ffmpeg_probe(path.as_ptr(), &mut info, err.as_mut_ptr().cast(), err.len())
-    };
-    if ret < 0 {
-        return Err(error_text(&err));
-    }
-    Ok(Probe {
+fn probe_from(info: &SweetProbe) -> Probe {
+    Probe {
         duration: (info.duration >= 0.0).then_some(info.duration),
         width: info.width.max(0) as u32,
         height: info.height.max(0) as u32,
         frame_rate: if info.frame_rate.is_finite() && info.frame_rate > 0.0 { info.frame_rate } else { 30.0 },
-    })
+    }
 }
 
 pub struct RgbaFrame {
@@ -146,6 +137,15 @@ impl Video {
             return Err(error_text(&err));
         }
         Ok(Self { raw })
+    }
+
+    /// Probe facts from this open input; avoids a second open of remote sources.
+    pub fn probe(&self) -> Result<Probe, String> {
+        let mut info = SweetProbe { duration: -1.0, width: 0, height: 0, has_audio: 0, frame_rate: 0.0 };
+        if unsafe { sweet_ffmpeg_video_info(self.raw, &mut info) } < 0 {
+            return Err("no video stream".into());
+        }
+        Ok(probe_from(&info))
     }
 
     pub fn duration(&self) -> Option<f64> {

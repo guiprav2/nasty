@@ -12,8 +12,9 @@ export const systemFontFamily = (() => {
   } catch { return 'DejaVu Sans'; }
 })();
 
-export const fontDirectory = process.env.NASTY_FONT_DIR || fileURLToPath(new URL('../fonts/', import.meta.url));
 const sharedFontDirectory = fileURLToPath(new URL('../fonts/', import.meta.url));
+// Read on every lookup: apps set NASTY_FONT_DIR after their static imports have run.
+export function fontDirectory() { return process.env.NASTY_FONT_DIR || sharedFontDirectory; }
 export function fontFileStem(family) {
   return family.normalize('NFKD').replace(/[^\x20-\x7e]/g, '').toLowerCase().trim()
     .replace(/\s+/g, '_').replace(/[^a-z0-9_-]/g, '');
@@ -29,7 +30,7 @@ export function findFontFiles(family) {
       const lower = file.toLowerCase().replace(/\.[^.]+$/, '');
       return lower === stem || lower.startsWith(`${stem}_`) || lower.startsWith(`${stem}-`);
     });
-    return hasFamily(fontDirectory) ? fontDirectory : sharedFontDirectory;
+    return hasFamily(fontDirectory()) ? fontDirectory() : sharedFontDirectory;
   })();
   return readdirSync(directory).filter(file => {
     const lower = file.toLowerCase();
@@ -62,7 +63,7 @@ export class FontRegistry {
     if (this.#cache.has(family)) return Promise.resolve({ data: this.#cache.get(family), cached: true, loadMs: 0 });
     if (this.#inflight.has(family)) return this.#inflight.get(family);
     const source = this.#sources.get(family) ?? findFontFiles(family)[0];
-    if (!source) return Promise.reject(new Error(`No font file for "${family}" in ${fontDirectory}`));
+    if (!source) return Promise.reject(new Error(`No font file for "${family}" in ${fontDirectory()}`));
     const started = performance.now();
     const promise = (async () => {
       const value = typeof source === 'function' ? await source()

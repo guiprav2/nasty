@@ -68,7 +68,7 @@ function parseIterations(value) {
 
 function normalizeKeyframes(keyframes) {
   if (!Array.isArray(keyframes) || keyframes.length === 0) {
-    throw new TypeError("createElementAnimation keyframes must be a non-empty array");
+    throw new TypeError("keyframes must be a non-empty array");
   }
   const last = Math.max(1, keyframes.length - 1);
   const normalized = keyframes.map((frame, index) => {
@@ -213,6 +213,20 @@ function markAnimationFrame(element, property = "transform") {
   element?._scheduleTransitionFrame?.(property);
 }
 
+// Standard AnimationEvent for CSS animations: animationend / animationcancel.
+export class AnimationEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, {
+      bubbles: init.bubbles ?? true,
+      cancelable: init.cancelable ?? false,
+      composed: init.composed ?? false,
+    });
+    this.animationName = String(init.animationName ?? "");
+    this.elapsedTime = Number(init.elapsedTime ?? 0);
+    this.pseudoElement = String(init.pseudoElement ?? "");
+  }
+}
+
 export class ElementAnimation {
   constructor(element, keyframes, options = {}, { cssManaged = false } = {}) {
     this.element = element;
@@ -268,21 +282,32 @@ export class ElementAnimation {
   }
 
   cancel() {
+    const wasActive = this.playState === "running" || this.playState === "paused";
     this.playState = "idle";
     this.#clearFinishedTimer();
     detachAnimation(this);
     markAnimationFrame(this.element);
     this.#settleFinished();
+    if (wasActive) this.#dispatch("animationcancel");
     return this;
   }
 
   finish() {
+    if (this.playState === "finished") return this;
     this.playState = "finished";
     this.#clearFinishedTimer();
     if (!(this.fill === "forwards" || this.fill === "both")) detachAnimation(this);
     markAnimationFrame(this.element);
     this.#settleFinished();
+    this.#dispatch("animationend");
     return this;
+  }
+
+  // CSS animations (animation-name on an element) report their end like a browser.
+  #dispatch(type) {
+    if (!this.cssManaged || !this.name || typeof this.element?.dispatchEvent !== "function") return;
+    const elapsedTime = (type === "animationend" ? this.duration * this.iterations : Math.max(0, performance.now() - this.startTime)) / 1000;
+    queueMicrotask(() => this.element.dispatchEvent(new AnimationEvent(type, { animationName: this.name, elapsedTime })));
   }
 
   #clearFinishedTimer() {
@@ -295,11 +320,14 @@ export class ElementAnimation {
   #armFinishedTimer() {
     this.#clearFinishedTimer();
     if (this.iterations === Infinity) return;
-    const total = this.delay + this.duration * this.iterations;
-    const wait = Math.max(0, this.startTime + total - performance.now()) + 1;
+    // startTime already includes the delay.
+    const wait = Math.max(0, this.startTime + this.duration * this.iterations - performance.now()) + 1;
     this._finishTimer = setTimeout(() => {
       this._finishTimer = null;
-      if (this.playState === "running") this.sample();
+      if (this.playState !== "running") return;
+      this.sample();
+      // Timers can fire a little before performance.now() reaches the end.
+      if (this.playState === "running") this.#armFinishedTimer();
     }, wait);
     // A finite animation keeps the process alive until it finishes, like any
     // pending timer, so `await animation.finished` settles.
@@ -406,11 +434,6 @@ function detachAnimation(animation) {
   if (animationState.cssManaged === animation) animationState.cssManaged = null;
 }
 
-export function createElementAnimation(element, keyframes, options = {}) {
-  if (!element?.style) throw new TypeError("createElementAnimation requires an Element");
-  const animation = new ElementAnimation(element, keyframes, options, { cssManaged: false });
-  return animation.play();
-}
 
 function animationOptionsFromStyle(values) {
   return {
@@ -508,6 +531,19 @@ registerKeyframes("float", [
   { offset: 0, class: ["translate-y-0"] },
   { offset: 0.5, class: ["-translate-y-3"] },
   { offset: 1, class: ["translate-y-0"] },
+]);
+
+// Tailwind animate-pulse / animate-ping.
+registerKeyframes("pulse", [
+  { offset: 0, class: ["opacity-100"] },
+  { offset: 0.5, class: ["opacity-50"] },
+  { offset: 1, class: ["opacity-100"] },
+]);
+
+registerKeyframes("ping", [
+  { offset: 0, class: ["opacity-100", "[transform:scale(1)]"] },
+  { offset: 0.75, class: ["opacity-0", "[transform:scale(2)]"] },
+  { offset: 1, class: ["opacity-0", "[transform:scale(2)]"] },
 ]);
 
 // Centering translates stay in every glow frame so animate-glow can replace

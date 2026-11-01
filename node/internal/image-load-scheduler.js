@@ -11,6 +11,8 @@
 // unloaded and the img returns to pending (sticky / detached Image() exempt).
 import { documentLiveLookup, documentState, elementState } from "./dom-state.js";
 import { insideSkippedContent } from "./content-visibility.js";
+import { clipsOverflow } from "./overflow.js";
+import { createBoxProjector } from "../render.js";
 
 const DEFAULT_POOL = 48;
 const DEFAULT_KEEP_FOLD = 2;
@@ -367,6 +369,39 @@ export function scheduleDocumentImageLoads(document, boxes = null) {
     ? new Map(boxes.map(box => [box.element, box]))
     : { get: documentLiveLookup(document) };
   for (const entry of entries) entry.box = byElement.get(entry.element) ?? null;
+  // Admission is about where an image is drawn: map boxes (and the clips of
+  // their overflow ancestors) through CSS transforms, such as a scaled stage or
+  // a grid sliding by translate.
+  const allBoxes = docState.boxesSnapshot;
+  if (allBoxes?.length) {
+    const project = createBoxProjector(allBoxes);
+    const boxOf = new Map(allBoxes.map((box) => [box.element, box]));
+    const drawn = (box, rect) => {
+      const a = project(box, rect.x, rect.y), b = project(box, rect.x + rect.width, rect.y + rect.height);
+      if (![a.x, a.y, b.x, b.y].every(Number.isFinite)) return null;
+      return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) };
+    };
+    for (const entry of entries) {
+      const box = entry.box && boxOf.get(entry.element);
+      if (!box) continue;
+      const bounds = drawn(box, box.borderBox ?? box);
+      if (!bounds) continue;
+      let clip = null;
+      for (let ancestor = box.element.parent; ancestor?.nodeType === 1; ancestor = ancestor.parent) {
+        if (!clipsOverflow(ancestor, "x") && !clipsOverflow(ancestor, "y")) continue;
+        const ancestorBox = boxOf.get(ancestor);
+        const rect = ancestorBox && drawn(ancestorBox, ancestorBox.paddingBox ?? ancestorBox.borderBox);
+        if (!rect) continue;
+        if (!clip) clip = rect;
+        else {
+          const x = Math.max(clip.x, rect.x), y = Math.max(clip.y, rect.y);
+          clip = { x, y, width: Math.max(0, Math.min(clip.x + clip.width, rect.x + rect.width) - x),
+            height: Math.max(0, Math.min(clip.y + clip.height, rect.y + rect.height) - y) };
+        }
+      }
+      entry.box = { ...entry.box, element: box.element, width: bounds.width, height: bounds.height, borderBox: bounds, clip };
+    }
+  }
 
   const now = performance.now();
   const soonestEvict = evictAwayImages(window, entries, viewport, now);

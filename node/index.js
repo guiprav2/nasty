@@ -1,5 +1,6 @@
 import native from "./internal/native.js";
-import { join, resolve, sep } from "node:path";
+import { extname, join, resolve, sep } from "node:path";
+import { readFile, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { LayoutWorker } from "./internal/layout-worker.js";
 import "./internal/locale-compare.js";
@@ -48,10 +49,11 @@ function enqueueImageCompletion(job) {
 
 import { documentBoxes, documentLiveLookup, documentPaintBoxes, documentState, elementRect, elementState, registerDocument, registerDocumentState, registerElementState } from "./internal/dom-state.js";
 import { syncDocumentTextForPresent } from "./internal/dom-text.js";
+import { isInlineRoot } from "./internal/inline-text.js";
 import { DOMRect } from "./dom-rect.js";
 import { computedStyleValue, isPaintColorProperty, registerStyleTransitionState, startColorTransition, startInterpolableTransition, startNumberTransition, TransitionEvent } from "./internal/css-transitions.js";
 import { computeTransform } from "./internal/css-transform.js";
-import { createElementAnimation, isAnimationControlProperty, registerKeyframes, syncCssAnimations } from "./internal/css-animations.js";
+import { AnimationEvent, isAnimationControlProperty, registerKeyframes, syncCssAnimations } from "./internal/css-animations.js";
 import { buildTransformedDisplayList, clearPaintSegments, displayListCanvas, displayListScrollScene, displayListTextLayers, parseColor } from "./render.js";
 import { scrollHostElement } from "./internal/scroll-quads.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
@@ -119,6 +121,7 @@ export function bindVideoStream(element, binding = {}) {
 
 export { DOMRect };
 export { TransitionEvent };
+export { AnimationEvent };
 export { MutationObserver };
 export { ResizeObserver };
 export {
@@ -166,6 +169,61 @@ export class FileSystemDirectoryHandle {
   async isSameEntry(other) {
     return other instanceof FileSystemDirectoryHandle && other.path === this.#path;
   }
+}
+
+// Types File.type reports for picked files, by extension.
+const FILE_TYPES = {
+  ".avif": "image/avif", ".bmp": "image/bmp", ".gif": "image/gif", ".jpeg": "image/jpeg", ".jpg": "image/jpeg",
+  ".png": "image/png", ".svg": "image/svg+xml", ".webp": "image/webp", ".m4v": "video/mp4", ".mkv": "video/x-matroska",
+  ".mov": "video/quicktime", ".mp4": "video/mp4", ".webm": "video/webm", ".mp3": "audio/mpeg", ".ogg": "audio/ogg",
+  ".wav": "audio/wav", ".json": "application/json", ".pdf": "application/pdf", ".txt": "text/plain", ".zip": "application/zip",
+};
+const ACCEPT_ALL_TYPES = Object.groupBy(Object.entries(FILE_TYPES), ([, type]) => type);
+
+/** File System Access file handle. Like the directory handle, Nasty adds `.path`. */
+export class FileSystemFileHandle {
+  #path;
+  constructor(path) {
+    if (typeof path !== "string" || !path.trim()) {
+      throw new TypeError("FileSystemFileHandle requires an absolute path");
+    }
+    this.#path = resolve(path);
+  }
+  get kind() { return "file"; }
+  get name() { return this.#path.split(sep).filter(Boolean).pop() || this.#path; }
+  /** Absolute filesystem path (Nasty extension, as on FileSystemDirectoryHandle). */
+  get path() { return this.#path; }
+  async getFile() {
+    const [bytes, info] = await Promise.all([readFile(this.#path), stat(this.#path)]);
+    return new File([bytes], this.name, { type: FILE_TYPES[extname(this.#path).toLowerCase()] ?? "", lastModified: info.mtimeMs });
+  }
+  async queryPermission() { return "granted"; }
+  async requestPermission() { return "granted"; }
+  async isSameEntry(other) {
+    return other instanceof FileSystemFileHandle && other.path === this.#path;
+  }
+}
+
+// showOpenFilePicker `types` as native dialog filters. A MIME type listed without
+// extensions ("image/*": []) stands for the extensions known for it.
+function filePickerFilters(types, excludeAcceptAllOption) {
+  const filters = [];
+  for (const { description, accept } of types ?? []) {
+    const extensions = new Set();
+    for (const [type, listed] of Object.entries(accept ?? {})) {
+      const named = [listed].flat().filter(Boolean);
+      if (!/^[a-z]+\/(\*|[\w.+-]+)$/i.test(type)) throw new TypeError(`Invalid type '${type}' in showOpenFilePicker accept`);
+      if (named.length) for (const extension of named) extensions.add(String(extension).replace(/^\./, "").toLowerCase());
+      else for (const [known, matches] of Object.entries(ACCEPT_ALL_TYPES)) {
+        if (known === type || (type.endsWith("/*") && known.startsWith(type.slice(0, -1)))) {
+          for (const [extension] of matches) extensions.add(extension.slice(1));
+        }
+      }
+    }
+    if (extensions.size) filters.push({ name: description || [...extensions].map(extension => `.${extension}`).join(", "), extensions: [...extensions] });
+  }
+  if (filters.length && !excludeAcceptAllOption) filters.push({ name: "All files", extensions: ["*"] });
+  return filters;
 }
 let nextVideoAudioId = 1;
 let cachedAudioOutputs = null;
@@ -289,6 +347,7 @@ export class Window extends NativeWindow {
     this.#vsync = initialVsync;
     this.DOMRect = DOMRect;
     this.FileSystemDirectoryHandle = FileSystemDirectoryHandle;
+    this.FileSystemFileHandle = FileSystemFileHandle;
     this.#applyWindowDimensions();
     if (showAfterSizing) {
       super.show();
@@ -320,6 +379,25 @@ export class Window extends NativeWindow {
     if (!path) throw new DOMException("The user aborted a request.", "AbortError");
     if (typeof opts.id === "string" && opts.id) directoryPickerStarts.set(opts.id, path);
     return new FileSystemDirectoryHandle(path);
+  }
+
+  /**
+   * Standard file picker. Cancellation rejects with AbortError. Handles carry a
+   * Nasty-only `.path`; `getFile()` reads the file into a standard File.
+   */
+  async showOpenFilePicker(options = {}) {
+    const opts = options && typeof options === "object" ? options : {};
+    let startIn = null;
+    if (opts.startIn instanceof FileSystemDirectoryHandle) startIn = opts.startIn.path;
+    else if (opts.startIn instanceof FileSystemFileHandle) startIn = resolve(opts.startIn.path, "..");
+    else if (typeof opts.startIn === "string" && opts.startIn && !WELL_KNOWN_DIRECTORY_STARTS.has(opts.startIn)) startIn = resolve(opts.startIn);
+    if (!startIn && typeof opts.id === "string" && opts.id) startIn = directoryPickerStarts.get(opts.id) || null;
+    const filters = filePickerFilters(opts.types, !!opts.excludeAcceptAllOption);
+    const multiple = !!opts.multiple;
+    const paths = this.pickFiles(multiple ? "Open files" : "Open a file", startIn ?? undefined, multiple, filters);
+    if (!paths?.length) throw new DOMException("The user aborted a request.", "AbortError");
+    if (typeof opts.id === "string" && opts.id) directoryPickerStarts.set(opts.id, resolve(paths[0], ".."));
+    return paths.map(path => new FileSystemFileHandle(path));
   }
 
   get width() { return this.#width; }
@@ -406,7 +484,7 @@ export class Window extends NativeWindow {
     }
     this.#dragHitTestAt = performance.now();
     const target = document?.elementFromPoint(position.x, position.y) ?? null;
-    const blocked = this.#dragAnywhere !== false && blocksWindowDrag(target);
+    const blocked = this.#dragAnywhere !== false && this.#blocksDrag(target);
     this.#dragHitTestDocument = document;
     this.#dragHitTestX = position.x;
     this.#dragHitTestY = position.y;
@@ -416,6 +494,11 @@ export class Window extends NativeWindow {
     if (blocked === this.#dragBlocked) return;
     this.#dragBlocked = blocked;
     super.setDragBlocked(blocked);
+  }
+
+  // A fullscreen window does not move: every target blocks dragging it.
+  #blocksDrag(target) {
+    return !!this.#document?.fullscreenElement || blocksWindowDrag(target);
   }
 
   drainEvents() {
@@ -435,7 +518,7 @@ export class Window extends NativeWindow {
         continue;
       }
       const target = this.#document?.elementFromPoint(event.x, event.y) ?? null;
-      const blocked = blocksWindowDrag(target);
+      const blocked = this.#blocksDrag(target);
       this.#dragBlocked = blocked;
       super.setDragBlocked(blocked);
       routedEvents.push(event);
@@ -659,6 +742,11 @@ export class Window extends NativeWindow {
       shiftKey: /SHIFT/i.test(modifiers), altKey: /ALT/i.test(modifiers), metaKey: /SUPER|META|LOGO/i.test(modifiers),
       pointerId: 1, pointerType: "mouse", isPrimary: true,
     });
+    // Like a browser, Escape leaves fullscreen and is not delivered to the page.
+    if (nativeEvent.type === "keydown" && key === "Escape" && this.#document?.fullscreenElement) {
+      this.#document.exitFullscreen().catch(() => {});
+      return;
+    }
     const event = makeHostEvent(nativeEvent.type, fields);
     this.#dispatchWindowEvent(event);
 
@@ -671,7 +759,7 @@ export class Window extends NativeWindow {
       // element: hit-tested only for window dragging, never for dispatch.
       const hit = document.elementFromPoint(fields.clientX, fields.clientY);
       const target = capture ?? hit;
-      const blocked = this.#dragAnywhere !== false && blocksWindowDrag(hit);
+      const blocked = this.#dragAnywhere !== false && this.#blocksDrag(hit);
       const state = documentState(document);
       this.#dragHitTestDocument = document;
       this.#dragHitTestX = fields.clientX;
@@ -1086,6 +1174,8 @@ export class Window extends NativeWindow {
         if (doc.needsTransformFrame) {
           doc.needsTransformFrame = false;
           doc.hitTestTransformGeneration = (doc.hitTestTransformGeneration ?? 0) + 1;
+          // Transforms move images in and out of view without a reflow (throttled).
+          requestImageLoadSchedule(this.#document);
         }
         if (doc.needsHitStructureFrame) {
           doc.needsHitStructureFrame = false;
@@ -1455,6 +1545,14 @@ function fixedInset(value, basis, fontSize, viewport) {
   return resolveCssLength(value, fontSize, viewport);
 }
 
+// How long a playing video waits for its audio to prime before running without it.
+const LOCAL_AUDIO_READY_MS = 2000;
+const REMOTE_AUDIO_READY_MS = 20000;
+// Stream presents re-anchor to the audio clock past this much drift.
+const AUDIO_CLOCK_DRIFT_SECONDS = 0.08;
+// A stream frame this close to due is presented on the current tick.
+const STREAM_PRESENT_SLACK_SECONDS = 0.008;
+
 function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 }) {
   const result = { ...style };
   delete result.boxSizing;
@@ -1733,7 +1831,7 @@ const ANIMATION_CONTROLS = new Set([
 ]);
 
 function refreshStyleValues(state) {
-  const next = { ...state.baseValues, ...state.hostValues, ...state.classValues };
+  const next = { ...state.baseValues, ...state.hostValues, ...state.classValues, ...state.importantValues };
   const transitionControls = TRANSITION_CONTROLS;
   const animationControls = ANIMATION_CONTROLS;
   const keys = [...new Set([...Object.keys(state.values), ...Object.keys(next)])]
@@ -1812,9 +1910,26 @@ function setHostStyle(element, values) {
   if (changed.size) element._styleChanged();
 }
 
+// User-agent `!important` declarations (the :fullscreen rules) win over classes.
+function setUserAgentImportantStyle(element, values) {
+  const state = styleData.get(element.style);
+  state.importantValues = { ...values };
+  const changed = refreshStyleValues(state);
+  if (changed.size) element._styleChanged();
+}
+
+// The UA stylesheet's `*:not(:root):fullscreen` rules, all `!important`, and
+// the black `::backdrop` drawn under the fullscreen element.
+const FULLSCREEN_STYLE = {
+  position: "fixed", top: 0, right: 0, bottom: 0, left: 0,
+  margin: 0, marginTop: 0, marginRight: 0, marginBottom: 0, marginLeft: 0, boxSizing: "border-box",
+  minWidth: 0, maxWidth: "none", minHeight: 0, maxHeight: "none", width: "100%", height: "100%", transform: "none",
+};
+const BACKDROP_STYLE = { position: "fixed", top: 0, right: 0, bottom: 0, left: 0, backgroundColor: "#000000", pointerEvents: "none" };
+
 class CSSStyleDeclaration {
   constructor(element, initial) {
-    const state = { element, values: { ...initial }, baseValues: initial, hostValues: {}, classValues: {}, selectionValues: {}, transitions: new Map() };
+    const state = { element, values: { ...initial }, baseValues: initial, hostValues: {}, classValues: {}, importantValues: {}, selectionValues: {}, transitions: new Map() };
     styleData.set(this, state);
     const proxy = new Proxy(this, {
       get: (target, property, receiver) => {
@@ -2219,6 +2334,15 @@ export class Element extends EventTarget {
     if (this.disabled) return;
     this.dispatchEvent(new Event("click", { bubbles: true, cancelable: true }));
   }
+  requestFullscreen() {
+    const view = documentState(this.document).defaultView;
+    if (!this.isConnected || !view) {
+      dispatchDomEvent(this, "fullscreenerror", { bubbles: true });
+      return Promise.reject(new TypeError("Fullscreen request denied: the element is not in a displayed document."));
+    }
+    setFullscreenElement(this.document, this);
+    return Promise.resolve();
+  }
   dispatchEvent(event) {
     const result = super.dispatchEvent(event);
     this[`on${event.type}`]?.call(this, event);
@@ -2425,6 +2549,8 @@ export class Element extends EventTarget {
     this._startVideoAudio(video.currentTime);
     this._startVideo();
     this.dispatchEvent(new Event("play"));
+    // Resuming with a frame already shown plays at once; a first play waits for it.
+    if (video.dataLoaded) this.dispatchEvent(new Event("playing"));
     return video.frameRequest;
   }
 
@@ -2473,6 +2599,14 @@ export class Element extends EventTarget {
 
   // Live MediaStream playback: show each new picture of the first live video
   // track, polled at the display refresh rate.
+  // A new frame is in the video's texture. The window samples that texture on
+  // every present, but a scroll layer keeps a copy of the pixels, so the layer
+  // repaints the video's rect.
+  _videoFrameUploaded() {
+    if (noteScrollLayerPaintChange(this) !== "content") return;
+    (documentState(this.document).paintDirtyElements ??= new Set()).add(this);
+  }
+
   _startMediaStream() {
     const video = elementState(this).video, token = ++video.token;
     const startedAt = performance.now();
@@ -2492,6 +2626,7 @@ export class Element extends EventTarget {
         }
         if (video.textureId === null) video.textureId = view.createImageTexture(frame.width, frame.height, frame.data);
         else view.updateImageTexture(video.textureId, frame.data);
+        this._videoFrameUploaded();
         // Pixels stay available for canvas drawImage(video) readback.
         video.image = { textureId: video.textureId, width: frame.width, height: frame.height, pixels: frame.data };
         video.width = frame.width;
@@ -2530,7 +2665,16 @@ export class Element extends EventTarget {
       video.audioStartPending = true;
       video.playbackClockStartedAt = null;
       video._audioClockAnchored = false;
-      video.audioStartPromise = waitForVideoAudioReady(video.audioId).then(ready => {
+      // Audio starts paused and plays only once primed, so give a remote source
+      // time to connect and buffer: a slow CDN can take seconds, and audio that
+      // misses this wait would stay silent.
+      const remote = /^https?:\/\//i.test(audioSource);
+      const audioReady = waitForVideoAudioReady(video.audioId, remote ? REMOTE_AUDIO_READY_MS : LOCAL_AUDIO_READY_MS);
+      // Decoded sources start sound and picture together, like a browser
+      // leaving HAVE_CURRENT_DATA: audio waits for the first frame at `time`,
+      // or it plays under a still poster and the picture must chase it.
+      const framePrimed = video.streamMode ? null : new Promise(resolve => { video.resolveFramePrimed = resolve; });
+      video.audioStartPromise = Promise.all([audioReady, framePrimed]).then(([ready]) => {
         if (video.audioGeneration !== generation || video.paused) return;
         if (ready) pauseVideoAudio(video.audioId, false);
         video.audioStartPending = false;
@@ -2538,12 +2682,20 @@ export class Element extends EventTarget {
         video.playbackClockStartedAt = performance.now();
         video._audioClockAnchored = false;
         // Start (or restart) decode on the audio timeline once priming finishes.
+        // A decoded source's pending frame request presents its primed frame
+        // itself; restarting it would throw that frame away.
         this._startStreamDecode(video, time);
-        if (!video.paused) this._startVideo();
+        if (!video.paused && video.streamMode) this._startVideo();
       });
     } else if (video.streamMode) {
       this._startStreamDecode(video, time);
     }
+  }
+
+  _videoFramePrimed() {
+    const video = elementState(this).video, resolve = video.resolveFramePrimed;
+    video.resolveFramePrimed = null;
+    resolve?.();
   }
 
   _setVideoSource(source) {
@@ -2610,20 +2762,22 @@ export class Element extends EventTarget {
           this._startStreamDecode(video, video.currentTime || 0);
         }
 
-        // Master clock: wall time anchored when audio becomes ready (see
-        // _startVideoAudio). Re-anchor once to the first audio-clock sample so
-        // lipsync matches the audible timeline, then free-run at 1x wall — the
-        // continuous audio playback clock lags by the output buffer and caused
-        // multi-hundred-ms present holds when used as a hard master every frame.
+        // Master clock: the audible timeline. The wall anchor set when audio
+        // became ready (see _startVideoAudio) free-runs between audio-clock
+        // samples, which advance in output-period steps, and re-anchors only
+        // on real drift: an audio stall (remote m4a buffering) otherwise left
+        // the picture running a second or more ahead of the sound.
         const now = performance.now();
         let audioExpected = null;
         if (!this.muted && video.volume > 0) {
           const audioClock = getVideoAudioClock(video.audioId);
           if (audioClock) {
             audioExpected = audioClock.time + (now - audioClock.receivedAt) / 1000;
-            if (!video._audioClockAnchored) {
-              video.playbackClockTime = audioClock.time;
-              video.playbackClockStartedAt = audioClock.receivedAt;
+            const anchored = video.playbackClockStartedAt == null ? null
+              : video.playbackClockTime + (now - video.playbackClockStartedAt) / 1000;
+            if (!video._audioClockAnchored || anchored == null || Math.abs(anchored - audioExpected) > AUDIO_CLOCK_DRIFT_SECONDS) {
+              video.playbackClockTime = audioExpected;
+              video.playbackClockStartedAt = now;
               video._audioClockAnchored = true;
             }
           }
@@ -2632,64 +2786,35 @@ export class Element extends EventTarget {
           video.playbackClockTime = Math.max(0, video.currentTime || 0);
           video.playbackClockStartedAt = now;
         }
-        // Present slightly behind the wall anchor so frames line up with the
+        // Present slightly behind the anchor so frames line up with the
         // audible position (ALSA/Pulse keeps ~250ms queued after audio-ready).
         const outputLatency = 0.18;
-        const expected = Math.max(0, video.playbackClockTime + (now - video.playbackClockStartedAt) / 1000 - outputLatency);
+        const clockAt = time => Math.max(0, video.playbackClockTime + (time - video.playbackClockStartedAt) / 1000 - outputLatency);
+        const expected = clockAt(now);
         try { player.setMediaClock(expected); } catch { /* older native */ }
 
         const failure = player.error;
         if (failure) throw new Error(failure);
 
-        // Hold the taken frame so a slightly-early picture can wait without
-        // losing it (takeLatestFrame clears the slot).
-        if (!video._heldStreamFrame) {
-          let spins = 0;
-          while (!player.ended && spins < 30) {
-            if (token !== video.token || video.paused) return;
-            const gen = player.frameGeneration;
-            if (gen !== video.streamFrameGeneration) {
-              const next = player.takeLatestFrame();
-              if (next) {
-                video.streamFrameGeneration = gen;
-                video._heldStreamFrame = next;
-                break;
-              }
-            }
-            await new Promise(resolve => setTimeout(resolve, 4));
-            spins += 1;
-          }
-        }
-        if (token !== video.token || video.paused) return;
-        const frame = video._heldStreamFrame;
+        // The native player converts a few frames ahead; take the newest one
+        // that is due (older due frames are dropped) and wait for the next.
+        const frame = player.takeFrame(expected + STREAM_PRESENT_SLACK_SECONDS);
         if (!frame) {
-          if (player.ended) {
+          const nextPts = player.nextFramePts;
+          if (player.ended && nextPts == null) {
             video.paused = true;
             video.ended = true;
             stopVideoAudio(video.audioId);
             this.dispatchEvent(new Event("ended"));
             return;
           }
-          video.timer = setTimeout(() => this._startVideo(), 8);
+          const refreshMs = 1000 / (view.refreshRate?.() || 60);
+          const wait = nextPts == null ? 4 : Math.min(refreshMs, Math.max(1, (nextPts - STREAM_PRESENT_SLACK_SECONDS - expected) * 1000));
+          video.timer = setTimeout(() => this._startVideo(), wait);
           return;
         }
 
         const pts = frame.time ?? frame.pts ?? player.currentTime;
-        const frameDuration = (frame.frameDuration > 0 ? frame.frameDuration : 0) || 1 / 30;
-        if (pts > expected + 0.04) {
-          const wait = Math.min(40, Math.max(4, (pts - expected) * 1000));
-          video.timer = setTimeout(() => this._startVideo(), wait);
-          return;
-        }
-        if (pts < expected - 0.12) {
-          video._heldStreamFrame = null;
-          if (player.frameGeneration !== video.streamFrameGeneration) {
-            video.timer = setTimeout(() => this._startVideo(), 0);
-            return;
-          }
-        }
-
-        video._heldStreamFrame = null;
         video.duration = player.duration;
         const sourceWidth = frame.sourceWidth || frame.width || player.width;
         const sourceHeight = frame.sourceHeight || frame.height || player.height;
@@ -2709,6 +2834,7 @@ export class Element extends EventTarget {
         }
         if (video.textureId === null) video.textureId = view.createImageTexture(frame.width, frame.height, pixels);
         else view.updateImageTexture(video.textureId, pixels);
+        this._videoFrameUploaded();
         // Live GPU texture only — keep ~3.6MiB RGBA off the JS heap after upload.
         video.image = { textureId: video.textureId, width: frame.width, height: frame.height };
         video.currentTime = pts;
@@ -2718,6 +2844,8 @@ export class Element extends EventTarget {
           video.dataLoaded = true;
           this.dispatchEvent(new Event("loadeddata"));
           this.dispatchEvent(new Event("canplay"));
+          // Playback has started: its first frame is on screen.
+          if (!video.paused) this.dispatchEvent(new Event("playing"));
         }
         this.dispatchEvent(new Event("timeupdate"));
 
@@ -2732,11 +2860,12 @@ export class Element extends EventTarget {
           }
         }
 
-        let delayMs = (pts + frameDuration - expected) * 1000;
-        if (!Number.isFinite(delayMs)) delayMs = frameDuration * 1000;
+        const nextPts = player.nextFramePts;
+        let delayMs = nextPts == null ? 4 : (nextPts - STREAM_PRESENT_SLACK_SECONDS - clockAt(performance.now())) * 1000;
+        if (!Number.isFinite(delayMs)) delayMs = 4;
         delayMs = Math.max(0, Math.min(delayMs, 48));
         video.timer = setTimeout(() => {
-          if (player.ended || (Number.isFinite(video.duration) && video.currentTime >= video.duration)) {
+          if ((player.ended && player.nextFramePts == null) || (Number.isFinite(video.duration) && video.currentTime >= video.duration)) {
             if (this.loop) {
               video.currentTime = 0;
               video.seekPending = true;
@@ -2804,6 +2933,7 @@ export class Element extends EventTarget {
         } else {
           frame = await decodeVideoFrame(video.source, video.currentTime, video.maxEdge, seek);
         }
+        this._videoFramePrimed();
         if (token !== video.token || video.paused) return;
         const view = this.document.defaultView;
         if (!view || view.closed) return;
@@ -2902,6 +3032,7 @@ export class Element extends EventTarget {
         }
         if (video.textureId === null) video.textureId = view.createImageTexture(frame.width, frame.height, pixels);
         else view.updateImageTexture(video.textureId, pixels);
+        this._videoFrameUploaded();
         video.image = { textureId: video.textureId, width: frame.width, height: frame.height, pixels };
         video.currentTime = frame.time;
         if (video.playbackClockStartedAt == null) {
@@ -2913,6 +3044,8 @@ export class Element extends EventTarget {
           video.dataLoaded = true;
           this.dispatchEvent(new Event("loadeddata"));
           this.dispatchEvent(new Event("canplay"));
+          // Playback has started: its first frame is on screen.
+          if (!video.paused) this.dispatchEvent(new Event("playing"));
         }
         this.dispatchEvent(new Event("timeupdate"));
         const nextMediaTime = frame.time + frameDuration;
@@ -2939,6 +3072,7 @@ export class Element extends EventTarget {
           this._startVideo();
         }, Math.max(0, nextDue - performance.now()));
       } catch (error) {
+        this._videoFramePrimed();
         if (token === video.token && !video.paused && this.document.defaultView && !this.document.defaultView.closed) {
           video.paused = true;
           this.dispatchEvent(Object.assign(new Event("error"), { error }));
@@ -3202,12 +3336,16 @@ export class Element extends EventTarget {
     const presentId = doc.presentId ?? 0;
     const scheduled = presentId !== 0 && elementState(this).transitionScheduleId === presentId;
     elementState(this).transitionScheduleId = presentId;
-    if (scheduled || !LAYOUT_STYLE_PROPERTIES.has(property)) return;
-    if (LAYOUT_STYLE_PROPERTIES.has(property)) {
-      doc.dirty = true;
-      doc.transitionLayoutDirty = true;
-      doc.transitionLayoutDirtyElements ??= new Set();
-      doc.transitionLayoutDirtyElements.add(this);
+    if (!LAYOUT_STYLE_PROPERTIES.has(property)) return;
+    // Always re-mark layout: the layout pass clears these flags and then samples
+    // this property again within the same present. Skipping that re-mark froze
+    // width/height/padding transitions after their first frame.
+    doc.dirty = true;
+    doc.transitionLayoutDirty = true;
+    doc.transitionLayoutDirtyElements ??= new Set();
+    doc.transitionLayoutDirtyElements.add(this);
+    if (scheduled) return;
+    {
       if (["fontSize", "lineHeight", "fontFamily", "fontWeight", "whiteSpace", "wordBreak", "overflowWrap"].includes(property)) {
         const addDescendants = element => {
           for (const child of element.children) {
@@ -3240,6 +3378,8 @@ export class Element extends EventTarget {
 
   _taffyStyle() {
     const style = { ...styleData.get(this.style).values, ...(this.hidden && { display: "none" }) };
+    // Inline children are measured and painted by their block (inline-text.js).
+    if (this.parent?.nodeType === 1 && elementState(this.parent).inlineRoot) return styleForTaffy({ display: "none" }, 16, documentState(this.document).viewport);
     for (const property of Object.keys(style)) style[property] = computedStyleValue(this.style, property);
     applyIntrinsicSize(this, style);
     const fontSize = Number.parseFloat(inheritedStyle(this, "fontSize", 16)) || 16;
@@ -3280,8 +3420,10 @@ export class Element extends EventTarget {
 
   get scrollLeft() { return elementState(this).scrollLeft; }
   set scrollLeft(value) {
-    const next = Math.max(0, Number(value) || 0);
     const state = elementState(this);
+    // Like a browser, never past the end (as of the last layout, which clamps again).
+    const max = state.scrollViewport ? Math.max(0, (Number(this.scrollWidth) || 0) - state.scrollViewport.width) : Infinity;
+    const next = Math.min(max, Math.max(0, Number(value) || 0));
     if (next === state.scrollLeft) return;
     state.scrollLeft = next;
     markScrolled(this);
@@ -3291,8 +3433,10 @@ export class Element extends EventTarget {
 
   get scrollTop() { return elementState(this).scrollTop; }
   set scrollTop(value) {
-    const next = Math.max(0, Number(value) || 0);
     const state = elementState(this);
+    // Like a browser, never past the end (as of the last layout, which clamps again).
+    const max = state.scrollViewport ? Math.max(0, (Number(this.scrollHeight) || 0) - state.scrollViewport.height) : Infinity;
+    const next = Math.min(max, Math.max(0, Number(value) || 0));
     if (next === state.scrollTop) return;
     state.scrollTop = next;
     markScrolled(this);
@@ -3345,6 +3489,32 @@ export class Element extends EventTarget {
   }
 
   remove() { this.parent?.removeChild(this); }
+
+  // ChildNode before/after/replaceWith. Nodes go in order ahead of the first
+  // sibling that is not itself being moved (the standard's "viable" sibling).
+  #viableNextSibling(nodes) {
+    const siblings = this.parent.children;
+    let index = siblings.indexOf(this) + 1;
+    while (siblings[index] && nodes.includes(siblings[index])) index++;
+    return siblings[index] ?? null;
+  }
+  before(...nodes) {
+    if (!this.parent) return;
+    // With itself among the nodes, the result is the same as replacing itself with them.
+    if (nodes.includes(this)) return this.replaceWith(...nodes);
+    for (const node of nodes) this.parent.insertBefore(node, this);
+  }
+  after(...nodes) {
+    if (!this.parent) return;
+    const parent = this.parent, next = this.#viableNextSibling(nodes);
+    for (const node of nodes) parent.insertBefore(node, next);
+  }
+  replaceWith(...nodes) {
+    if (!this.parent) return;
+    const parent = this.parent, next = this.#viableNextSibling(nodes);
+    if (!nodes.includes(this)) parent.removeChild(this);
+    for (const node of nodes) parent.insertBefore(node, next);
+  }
 
   removeChild(child) {
     const index = this.children.indexOf(child);
@@ -3416,6 +3586,8 @@ const VIEWPORT_UNIT = /(?:\d|\))\s*(?:vw|vh|vmin|vmax|dvw|dvh|svw|svh|lvw|lvh)\b
 function usesViewportUnits(element) {
   const values = styleData.get(element.style)?.values;
   if (!values) return true;
+  // Fixed boxes resolve their insets and percentages against the viewport.
+  if (values.position === "fixed") return true;
   for (const key in values) {
     const value = values[key];
     if (typeof value === "string" && VIEWPORT_UNIT.test(value)) return true;
@@ -3456,8 +3628,17 @@ function flushChildSync(doc) {
   doc.pendingChildSync = new Set();
   for (const parent of pending) {
     if (insideSkippedContent(parent)) continue;
-    const children = isContentSkipped(parent) ? [] : parent.children.map((child) => elementState(child).handle);
-    doc.layoutTree.setChildren(elementState(parent).handle, children);
+    // An inline formatting context measures its children as its own text.
+    const inline = isInlineRoot(parent);
+    const parentState = elementState(parent);
+    if (!!parentState.inlineRoot !== inline) {
+      parentState.inlineRoot = inline;
+      for (const child of parent.children) doc.layoutTree.setStyle(elementState(child).handle, child._taffyStyle());
+      (doc.textMetricsDirtyElements ??= new Set()).add(parent);
+      doc.textMetricsDirty = true;
+    }
+    const children = isContentSkipped(parent) || inline ? [] : parent.children.map((child) => elementState(child).handle);
+    doc.layoutTree.setChildren(parentState.handle, children);
   }
 }
 
@@ -3542,6 +3723,13 @@ export class Document extends EventTarget {
   get baseURI() { return documentState(this).baseURI; }
   get defaultView() { return documentState(this).defaultView; }
   get activeElement() { return documentState(this).activeElement ?? this.body; }
+  get fullscreenElement() { return documentState(this).fullscreenElement ?? null; }
+  get fullscreenEnabled() { return !!documentState(this).defaultView; }
+  exitFullscreen() {
+    if (!documentState(this).fullscreenElement) return Promise.reject(new TypeError("Not in fullscreen mode."));
+    setFullscreenElement(this, null);
+    return Promise.resolve();
+  }
   get ownerDocument() { return null; }
   contains(node) { return node === this || this.body.contains(node); }
   elementFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y, true)[0] ?? null; }
@@ -3557,13 +3745,6 @@ export class Document extends EventTarget {
     return new Element(this, name);
   }
 
-  createElementAnimation(element, keyframes, options) {
-    if (!(element instanceof Element) || element.document !== this) {
-      throw new TypeError("createElementAnimation requires an Element from this document");
-    }
-    return createElementAnimation(element, keyframes, options);
-  }
-
   querySelector(selector) { return this.body.matches(selector) ? this.body : this.body.querySelector(selector); }
   querySelectorAll(selector) { return [...(this.body.matches(selector) ? [this.body] : []), ...this.body.querySelectorAll(selector)]; }
   getElementById(id) { return [...documentState(this).elements].find(element => element.id === String(id)) ?? null; }
@@ -3574,12 +3755,16 @@ export class Document extends EventTarget {
     doc.textMetricsDirty = false;
     // Only elements whose own style, text, or inherited text properties changed
     // (or that were just created/inserted) can have new metrics.
-    const dirty = doc.textMetricsDirtyElements ?? doc.elements;
+    const dirty = new Set();
+    // A child of an inline formatting context is measured as part of its block.
+    for (const element of doc.textMetricsDirtyElements ?? doc.elements) {
+      dirty.add(element.parent?.nodeType === 1 && elementState(element.parent).inlineRoot ? element.parent : element);
+    }
     doc.textMetricsDirtyElements = new Set();
     for (const element of dirty) {
       const state = elementState(element);
       const isTextControl = element.localName === "input" || element.localName === "textarea";
-      if (!renderedText(element) && !isTextControl) continue;
+      if (!renderedText(element) && !isTextControl && !state.inlineRoot) continue;
       // Skipped contents are measured when they are released.
       if (isContentSkipped(element) || insideSkippedContent(element)) continue;
       const metrics = textMetrics(element);
@@ -3840,8 +4025,11 @@ export class Document extends EventTarget {
         const childBox = byElement.get(child);
         if (!childBox || childBox.fixedRoot === child) continue;
         const childExtent = extents.get(child) ?? { width: childBox.width, height: childBox.height };
-        width = Math.max(width, childBox.x - box.paddingBox.x + childExtent.width + childBox.margin.right + box.padding.right);
-        height = Math.max(height, childBox.y - box.paddingBox.y + childExtent.height + childBox.margin.bottom + box.padding.bottom);
+        // A child that clips an axis (a nested scroller) keeps its overflow to itself.
+        const childWidth = clipsOverflow(child, 'x') ? childBox.width : childExtent.width;
+        const childHeight = clipsOverflow(child, 'y') ? childBox.height : childExtent.height;
+        width = Math.max(width, childBox.x - box.paddingBox.x + childWidth + childBox.margin.right + box.padding.right);
+        height = Math.max(height, childBox.y - box.paddingBox.y + childHeight + childBox.margin.bottom + box.padding.bottom);
       }
       extents.set(box.element, { width, height });
     }
@@ -3936,6 +4124,8 @@ export class Document extends EventTarget {
       const oldScrollTop = Number(box.element.scrollTop) || 0;
       box.element.scrollWidth = extent.width;
       box.element.scrollHeight = extent.height;
+      // The scroll setters clamp against this layout's extents without laying out again.
+      elementState(box.element).scrollViewport = { width: clientWidth, height: clientHeight };
       const newMaxLeft = Math.max(0, extent.width - clientWidth);
       const newMaxTop = Math.max(0, extent.height - clientHeight);
       // csswg-drafts#14598: pin to the active anchor edge while within the margin.
@@ -3989,6 +4179,21 @@ export class Document extends EventTarget {
       return box;
     });
     return boxes;
+  }
+
+  /** The fullscreen ::backdrop: a viewport-sized box in the shape `#assemble` makes. */
+  #backdropBox(template) {
+    const element = documentState(this).fullscreenBackdrop;
+    const { width, height } = documentState(this).viewport;
+    const rect = () => ({ x: 0, y: 0, width, height });
+    const edges = () => ({ top: 0, right: 0, bottom: 0, left: 0 });
+    const fixed = { x: 0, y: 0, root: element };
+    return { ...template, element, x: 0, y: 0, width, height,
+      margin: edges(), border: edges(), padding: edges(), marginBox: rect(), borderBox: rect(), paddingBox: rect(), contentBox: rect(),
+      fixedRoot: element, fixed, clip: null, scrollWidth: width, scrollHeight: height,
+      scope: { scrollX: 0, scrollY: 0, clip: null, layerHost: null, layerOriginX: 0, layerOriginY: 0, innerClip: null },
+      layerHost: null, layerOriginX: 0, layerOriginY: 0, innerClip: null,
+      isLayerHost: false, assembledScrollLeft: 0, assembledScrollTop: 0, sticky: null };
   }
 
   /**
@@ -4062,14 +4267,22 @@ export class Document extends EventTarget {
       return state.boxesSnapshot;
     }
     const assemblyStart = timings && performance.now();
-    const patched = !selectedElements && this.#patchBoxes();
+    let topLayer = documentState(this).fullscreenElement;
+    // A fullscreen element removed from the document leaves fullscreen.
+    if (topLayer && !topLayer.isConnected) {
+      queueMicrotask(() => { if (documentState(this).fullscreenElement === topLayer) setFullscreenElement(this, null); });
+      topLayer = null;
+    }
+    const patched = !selectedElements && !topLayer && this.#patchBoxes();
     let boxes = patched;
     if (!boxes) {
       documentState(this).boxPatch = null;
       const elements = [];
       if (selectedElements) elements.push(...selectedElements);
-      else collectBoxElements(this.body, elements);
+      // The fullscreen element covers everything: only it and its backdrop draw.
+      else collectBoxElements(topLayer ?? this.body, elements);
       boxes = this.#assemble(elements);
+      if (topLayer && !selectedElements) boxes.unshift(this.#backdropBox(boxes[0]));
     }
     boxes.forEach((box, index) => { box.index = index; });
     if (timings) timings.assembly = performance.now() - assemblyStart;
@@ -4240,6 +4453,37 @@ function dispatchDomEvent(target, type, fields = {}) {
     current.dispatchEvent(event);
     if (stopped) break;
   }
+}
+
+// Fullscreen API: the fullscreen element is the document's top layer. It gets
+// the UA :fullscreen declarations and is drawn and hit-tested alone over its
+// black ::backdrop, while the window itself goes borderless fullscreen.
+function setFullscreenElement(document, element) {
+  const state = documentState(document);
+  const previous = state.fullscreenElement ?? null;
+  if (previous === element) return;
+  if (previous) setUserAgentImportantStyle(previous, {});
+  state.fullscreenElement = element;
+  if (element) {
+    if (!state.fullscreenBackdrop) {
+      state.fullscreenBackdrop = new Element(document, "div");
+      setHostStyle(state.fullscreenBackdrop, BACKDROP_STYLE);
+    }
+    setUserAgentImportantStyle(element, FULLSCREEN_STYLE);
+  }
+  // What is painted and hit-tested changes, not only geometry.
+  clearPaintSegmentSubtree(document.body);
+  for (const name of ["sceneGeneration", "staticPaintGeneration", "hitTestGeneration", "hitTestOrderGeneration", "paintOrderGeneration", "paintGeneration"]) {
+    state[name] = (state[name] ?? 0) + 1;
+  }
+  state.pendingScrollSceneInvalidation = true;
+  state.dirty = true;
+  markGeometryDirty(state);
+  invalidateTransformedContentCache(state);
+  const view = state.defaultView;
+  if (view && view.isFullscreen() !== !!element) view.setFullscreen(!!element);
+  if (previous) dispatchDomEvent(previous.isConnected ? previous : document, "fullscreenchange", { bubbles: true });
+  if (element) dispatchDomEvent(element, "fullscreenchange", { bubbles: true });
 }
 
 function nearestFormControl(element) {

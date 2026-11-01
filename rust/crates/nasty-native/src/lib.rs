@@ -30,6 +30,7 @@ mod audio_output;
 mod video_stream;
 mod image_decode_pool;
 mod webrtc_bridge;
+mod frame_recorder;
 #[cfg(target_os = "android")]
 mod android_camera;
 use image_decode_pool::{ImageDecodePool, ImageJobOutcome};
@@ -40,6 +41,40 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use winit::window::{CursorIcon, ResizeDirection, Window as OsWindow, WindowId};
+
+#[napi(object)]
+pub struct RecordingInfo {
+    pub frames: u32,
+    pub duration_ms: f64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// CSS font matching within one family: the requested weight when the family has
+/// it, else its nearest face (heavier first above 500, lighter first below 400).
+/// cosmic-text only takes exact weights from a named family and otherwise falls
+/// through to unrelated fonts, which then disagree with layout's measurements.
+fn nearest_weight(db: &glyphon::fontdb::Database, family: Family<'_>, requested: u16) -> Weight {
+    let Family::Name(name) = family else { return Weight(requested) };
+    let weights: Vec<u16> = db.faces()
+        .filter(|face| face.style == glyphon::fontdb::Style::Normal && face.families.iter().any(|(each, _)| each.eq_ignore_ascii_case(name)))
+        .map(|face| face.weight.0)
+        .collect();
+    if weights.is_empty() || weights.contains(&requested) { return Weight(requested); }
+    let pick = |candidates: &mut dyn Iterator<Item = u16>, heavier: bool| {
+        if heavier { candidates.min() } else { candidates.max() }
+    };
+    let above = |weights: &[u16]| pick(&mut weights.iter().copied().filter(|weight| *weight > requested), true);
+    let below = |weights: &[u16]| pick(&mut weights.iter().copied().filter(|weight| *weight < requested), false);
+    let chosen = if requested > 500 { above(&weights).or_else(|| below(&weights)) }
+        else if requested < 400 { below(&weights).or_else(|| above(&weights)) }
+        else {
+            // 400 tries 500 first and 500 tries 400 first, then lighter, then heavier.
+            let partner = if requested == 400 { 500 } else { 400 };
+            weights.contains(&partner).then_some(partner).or_else(|| below(&weights)).or_else(|| above(&weights))
+        };
+    Weight(chosen.unwrap_or(requested))
+}
 
 #[napi(object)]
 #[derive(Default)]
@@ -106,6 +141,13 @@ pub struct LayoutStyle {
     pub grid_row: Option<String>,
     pub row_gap: Option<f64>,
     pub column_gap: Option<f64>,
+}
+
+/// One file-type choice in the file picker, e.g. "Images" with ["png", "jpg"].
+#[napi(object)]
+pub struct FilePickerFilter {
+    pub name: String,
+    pub extensions: Vec<String>,
 }
 
 #[napi(object)]
@@ -999,7 +1041,9 @@ enum DrawOrder {
         clip_height: f64,
     },
     Image(usize),
-    BackdropBlur { x: f32, y: f32, width: f32, height: f32, radius: f32 },
+    // `masks`: two rounded rects (x, y, width, height, corner radius) in surface
+    // pixels that the blurred result is limited to; a zero width disables one.
+    BackdropBlur { x: f32, y: f32, width: f32, height: f32, radius: f32, masks: [f32; 10] },
     /// GPU boxes: SDF rounded rects with fill/gradient, border, and up to two
     /// rounded clips, BOX_FLOATS floats per instance in `display_boxes`.
     Boxes(std::ops::Range<u32>),
@@ -1038,6 +1082,7 @@ struct BackdropResources {
     composite_bind: wgpu::BindGroup,
     horizontal_params: wgpu::Buffer,
     vertical_params: wgpu::Buffer,
+    composite_params: wgpu::Buffer,
     downsample_pipeline: wgpu::RenderPipeline,
     blur_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
@@ -1096,6 +1141,10 @@ impl BackdropResources {
         });
         let horizontal_params = make_params(1.0, 0.0);
         let vertical_params = make_params(0.0, 1.0);
+        let composite_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nasty backdrop composite masks"), size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
         let make_bind = |view: &wgpu::TextureView, params: Option<&wgpu::Buffer>| {
             let mut entries = vec![
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
@@ -1126,7 +1175,7 @@ impl BackdropResources {
                 var o: Out; o.position = vec4(p[i],0.0,1.0); o.uv = vec2((p[i].x+1.0)*0.5, (1.0-p[i].y)*0.5); return o;
             }
         "#;
-        let make_pipeline = |label: &'static str, fragment: String, bind_layout: &wgpu::BindGroupLayout| {
+        let make_pipeline = |label: &'static str, fragment: String, bind_layout: &wgpu::BindGroupLayout, blend: Option<wgpu::BlendState>| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(fragment.into()) });
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bind_layout], push_constant_ranges: &[] });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1134,11 +1183,10 @@ impl BackdropResources {
                 vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
                 primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })] }),
                 multiview: None, cache: None,
             })
         };
-        let simple_shader = format!("{shader_source}\n@group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler; @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{ return textureSample(tex,samp,i.uv); }}");
         // One axis of a Gaussian with standard deviation params.z (in texels of the
         // downsampled copy), sampled densely out to 3σ. Each tap pair of adjacent
         // texels is read with one bilinear fetch at their weighted midpoint.
@@ -1174,14 +1222,40 @@ impl BackdropResources {
                     + textureSampleLevel(tex, samp, i.uv + t * vec2(-1.0, 1.0), 0.0)
                     + textureSampleLevel(tex, samp, i.uv + t * vec2(1.0, 1.0), 0.0));
             }}");
-        let downsample_pipeline = make_pipeline("Nasty backdrop downsample pipeline", downsample_shader, &simple_layout);
-        let composite_pipeline = make_pipeline("Nasty backdrop composite pipeline", simple_shader, &simple_layout);
-        let blur_pipeline = make_pipeline("Nasty backdrop blur pipeline", blur_shader, &layout);
+        // The blurred backdrop, limited to the rounded-rect masks with antialiased
+        // edges. Samples are premultiplied, so dividing by alpha leaves only real
+        // content: transparent pixels beyond the window's own corners are not
+        // averaged in as dark, see-through haze. The result is opaque where the
+        // masks cover it and blends in by their coverage at the edges.
+        let composite_shader = format!("{shader_source}
+            @group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler;
+            struct Masks {{ a: vec4<f32>, a_radius: vec4<f32>, b: vec4<f32>, b_radius: vec4<f32> }};
+            @group(0) @binding(2) var<uniform> masks: Masks;
+            fn coverage(p: vec2<f32>, rect: vec4<f32>, radius: f32) -> f32 {{
+                if (rect.z <= 0.0) {{ return 1.0; }}
+                let half = rect.zw * 0.5;
+                let r = min(radius, min(half.x, half.y));
+                let q = abs(p - (rect.xy + half)) - (half - vec2(r));
+                let d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+                return clamp(0.5 - d, 0.0, 1.0);
+            }}
+            @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{
+                let c = textureSample(tex, samp, i.uv);
+                let cover = coverage(i.position.xy, masks.a, masks.a_radius.x) * coverage(i.position.xy, masks.b, masks.b_radius.x);
+                return vec4(c.rgb / max(c.a, 0.0001), cover);
+            }}");
+        let composite_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+        };
+        let downsample_pipeline = make_pipeline("Nasty backdrop downsample pipeline", downsample_shader, &simple_layout, None);
+        let composite_pipeline = make_pipeline("Nasty backdrop composite pipeline", composite_shader, &layout, Some(composite_blend));
+        let blur_pipeline = make_pipeline("Nasty backdrop blur pipeline", blur_shader, &layout, None);
         Self { source, small, horizontal, blurred,
             downsample_bind: make_simple_bind(&source_view),
             horizontal_bind: make_bind(&small_view, Some(&horizontal_params)),
             vertical_bind: make_bind(&horizontal_view, Some(&vertical_params)),
-            composite_bind: make_simple_bind(&blurred_view), horizontal_params, vertical_params,
+            composite_bind: make_bind(&blurred_view, Some(&composite_params)), horizontal_params, vertical_params, composite_params,
             downsample_pipeline, blur_pipeline, composite_pipeline, small_width, small_height }
     }
 }
@@ -1669,10 +1743,9 @@ impl NativeAudioDecoder {
 impl NativeVideoDecoder {
     #[napi(constructor)]
     pub fn new(source: String) -> Result<Self> {
-        let path = std::path::Path::new(&source);
-        let probe = ffmpeg_decode::probe(path)
-            .map_err(|error| Error::new(Status::GenericFailure, error))?;
         let decoder = ffmpeg_decode::Video::open(std::path::Path::new(&source))
+            .map_err(|error| Error::new(Status::GenericFailure, error))?;
+        let probe = decoder.probe()
             .map_err(|error| Error::new(Status::GenericFailure, error))?;
         let duration = probe.duration.unwrap_or(f64::NAN);
         let frame_duration = 1.0 / probe.frame_rate;
@@ -1987,6 +2060,10 @@ struct Renderer {
     supported_present_modes: Vec<wgpu::PresentMode>,
     backdrop: HashMap<(u32, u32), BackdropResources>,
     surface_copy_src: bool,
+    /// PNG path for the next presented window frame (see `captureFrame`).
+    pending_capture: Option<String>,
+    /// MP4 recording of presented frames (see `startRecording`).
+    recorder: Option<frame_recorder::FrameRecorder>,
 }
 
 struct PositionedText {
@@ -2834,7 +2911,8 @@ fn create_text_runtime(
     let mut viewport = Viewport::new(device, &cache);
     viewport.update(queue, Resolution { width, height });
     let layer_viewport = Viewport::new(device, &cache);
-    let atlas = TextAtlas::new(device, queue, &cache, format);
+    let atlas = if format.is_srgb() { TextAtlas::new(device, queue, &cache, format) }
+        else { TextAtlas::with_color_mode(device, queue, &cache, format, glyphon::ColorMode::Web) };
     TextRuntime {
         font_system: None,
         system_font_init_ms: 0.0,
@@ -2906,7 +2984,9 @@ impl Renderer {
             .formats
             .iter()
             .copied()
-            .find(wgpu::TextureFormat::is_srgb)
+            // Blend in sRGB-encoded space, as browsers do: translucent fills, borders,
+            // and text coverage then match the web instead of looking lighter.
+            .find(|format| !format.is_srgb() && matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
             .or_else(|| capabilities.formats.first().copied())
             .ok_or_else(|| "GPU surface has no supported formats".to_string())?;
         let format_name = format!("{format:?}");
@@ -3769,6 +3849,8 @@ impl Renderer {
             supported_present_modes,
             backdrop: HashMap::new(),
             surface_copy_src,
+            pending_capture: None,
+            recorder: None,
         })
     }
 
@@ -3805,7 +3887,8 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            // Sampled as stored when the surface blends in sRGB space.
+            format: if self.config.format.is_srgb() { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm },
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -4363,7 +4446,7 @@ impl Renderer {
             }
             let mut segment_start = 0;
             while segment_start < draw_order.len() {
-                if let DrawOrder::BackdropBlur { x, y, width, height, radius } = &draw_order[segment_start] {
+                if let DrawOrder::BackdropBlur { x, y, width, height, radius, masks } = &draw_order[segment_start] {
                     if !self.surface_copy_src {
                         // Draw the rest of the frame unblurred rather than failing it.
                         static WARNED: std::sync::Once = std::sync::Once::new();
@@ -4371,7 +4454,7 @@ impl Renderer {
                         segment_start += 1;
                         continue;
                     }
-                    self.encode_backdrop_blur(&mut encoder, &frame.as_ref().expect("window frame").texture, *x, *y, *width, *height, *radius)?;
+                    self.encode_backdrop_blur(&mut encoder, &frame.as_ref().expect("window frame").texture, *x, *y, *width, *height, *radius, masks)?;
                     segment_start += 1;
                     continue;
                 }
@@ -4612,9 +4695,39 @@ impl Renderer {
                 }
             }
         }
+        let readback = match (&frame, self.pending_capture.is_some() && self.surface_copy_src) {
+            (Some(frame), true) => Some(self.encode_readback(&mut encoder, &frame.texture)),
+            _ => None,
+        };
+        if let (Some(frame), Some(recorder)) = (&frame, self.recorder.as_mut()) {
+            recorder.capture(&self.device, &mut encoder, &frame.texture);
+        }
         let submit_started = Instant::now();
         self.queue.submit(Some(encoder.finish()));
         let submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        if frame.is_some() {
+            if let Some(recorder) = self.recorder.as_mut() { recorder.after_submit(&self.device); }
+        }
+        if let Some(readback) = readback {
+            let path = self.pending_capture.take().expect("capture path");
+            let pixels = self.finish_readback(readback)?;
+            let (width, height) = (self.config.width, self.config.height);
+            // Encode off the window thread; write beside the target, then rename, so a
+            // reader never sees a partial file.
+            std::thread::spawn(move || {
+                let partial = format!("{path}.part");
+                let result = image::RgbaImage::from_raw(width, height, pixels)
+                    .ok_or_else(|| "frame size mismatch".to_string())
+                    .and_then(|frame| frame.save_with_format(&partial, image::ImageFormat::Png).map_err(|error| error.to_string()))
+                    .and_then(|_| std::fs::rename(&partial, &path).map_err(|error| error.to_string()));
+                if let Err(error) = result { eprintln!("Nasty: frame capture to {path} failed: {error}"); }
+            });
+        }
+        // Glyphs prepared for this frame are pinned until trimmed; without this the
+        // atlas keeps every glyph ever drawn and eventually reports itself full.
+        if layer_target.is_none() {
+            if let Some(runtime) = self.text_runtime.as_mut() { runtime.text_atlas.trim(); }
+        }
         let present_started = Instant::now();
         if let Some(frame) = frame { frame.present(); }
         let present_ms = present_started.elapsed().as_secs_f64() * 1000.0;
@@ -4627,6 +4740,46 @@ impl Renderer {
         })
     }
 
+    /// Copies the composited surface texture into a mappable buffer (rows padded
+    /// to wgpu's copy alignment). Recorded in the frame's own encoder, before present.
+    fn encode_readback(&self, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) -> (wgpu::Buffer, u32) {
+        let (width, height) = (self.config.width, self.config.height);
+        let padded = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Nasty frame readback"), size: padded as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(height) } },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        (buffer, padded)
+    }
+
+    /// Waits for a readback and returns tightly packed RGBA with opaque alpha.
+    fn finish_readback(&self, (buffer, padded): (wgpu::Buffer, u32)) -> std::result::Result<Vec<u8>, String> {
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| { let _ = sender.send(result); });
+        let _ = self.device.poll(wgpu::Maintain::Wait);
+        receiver.recv().map_err(|error| error.to_string())?.map_err(|error| format!("map frame readback: {error}"))?;
+        let (width, height) = (self.config.width as usize, self.config.height as usize);
+        let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        {
+            let data = slice.get_mapped_range();
+            for row in data.chunks(padded as usize).take(height) {
+                for pixel in row[..width * 4].chunks_exact(4) {
+                    if bgra { pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]); }
+                    else { pixels.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]); }
+                }
+            }
+        }
+        buffer.unmap();
+        Ok(pixels)
+    }
+
     fn encode_backdrop_blur(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -4636,6 +4789,7 @@ impl Renderer {
         width: f32,
         height: f32,
         radius: f32,
+        masks: &[f32; 10],
     ) -> std::result::Result<(), String> {
         if width <= 0.0 || height <= 0.0 { return Ok(()); }
         let left = x.floor().clamp(0.0, self.config.width as f32) as u32;
@@ -4665,6 +4819,10 @@ impl Renderer {
         let sigma = (radius.max(0.0) / 4.0).max(0.5);
         self.queue.write_buffer(&resources.horizontal_params, 0, bytemuck::cast_slice(&[1.0_f32, 0.0, sigma, 0.0]));
         self.queue.write_buffer(&resources.vertical_params, 0, bytemuck::cast_slice(&[0.0_f32, 1.0, sigma, 0.0]));
+        self.queue.write_buffer(&resources.composite_params, 0, bytemuck::cast_slice(&[
+            masks[0], masks[1], masks[2], masks[3], masks[4], 0.0, 0.0, 0.0,
+            masks[5], masks[6], masks[7], masks[8], masks[9], 0.0, 0.0, 0.0,
+        ]));
         for (label, texture, pipeline, bind_group, w, h) in [
             ("Nasty backdrop downsample", &resources.small, &resources.downsample_pipeline, &resources.downsample_bind, resources.small_width, resources.small_height),
             ("Nasty backdrop horizontal", &resources.horizontal, &resources.blur_pipeline, &resources.horizontal_bind, resources.small_width, resources.small_height),
@@ -5142,9 +5300,10 @@ impl TextRuntime {
             buffer.set_text(
                 font_system,
                 &run.text,
-                Attrs::new()
-                    .family(text_family(run.font_family.as_deref(), font_system.db()))
-                    .weight(Weight(run.font_weight.unwrap_or(400))),
+                {
+                    let family = text_family(run.font_family.as_deref(), font_system.db());
+                    Attrs::new().family(family).weight(nearest_weight(font_system.db(), family, run.font_weight.unwrap_or(400)))
+                },
                 Shaping::Advanced,
             );
             if let Some(align) = text_run_align(run.text_align.as_deref()) {
@@ -5253,9 +5412,10 @@ impl TextRuntime {
             buffer.set_text(
                 font_system,
                 &run.text,
-                Attrs::new()
-                    .family(text_family(run.font_family.as_deref(), font_system.db()))
-                    .weight(Weight(run.font_weight.unwrap_or(400))),
+                {
+                    let family = text_family(run.font_family.as_deref(), font_system.db());
+                    Attrs::new().family(family).weight(nearest_weight(font_system.db(), family, run.font_weight.unwrap_or(400)))
+                },
                 Shaping::Advanced,
             );
             if let Some(align) = text_run_align(run.text_align.as_deref()) {
@@ -6314,6 +6474,20 @@ impl Window {
         self.app.maximized
     }
 
+    /// Borderless fullscreen on the window's current monitor, or back to windowed.
+    #[napi(js_name = "setFullscreen")]
+    pub fn set_fullscreen(&mut self, value: bool) -> Result<()> {
+        let window = self.app.window.as_ref().ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+        window.set_fullscreen(value.then_some(winit::window::Fullscreen::Borderless(None)));
+        self.app.render_pending = true;
+        Ok(())
+    }
+
+    #[napi(js_name = "isFullscreen")]
+    pub fn is_fullscreen(&self) -> bool {
+        self.app.window.as_ref().is_some_and(|window| window.fullscreen().is_some())
+    }
+
     #[napi]
     pub fn start_dragging(&self) -> Result<()> {
         if self.app.drag_anywhere.is_none() { return Ok(()); }
@@ -6370,6 +6544,49 @@ impl Window {
             Ok(dialog
                 .pick_folder()
                 .map(|path| path.to_string_lossy().into_owned()))
+        }
+    }
+
+    /// Host bridge for Window.showOpenFilePicker. Returns absolute paths, or null when cancelled.
+    #[napi(js_name = "pickFiles")]
+    pub fn pick_files(
+        &self,
+        title: Option<String>,
+        start_in: Option<String>,
+        multiple: bool,
+        filters: Option<Vec<FilePickerFilter>>,
+    ) -> Result<Option<Vec<String>>> {
+        #[cfg(target_os = "android")]
+        {
+            let _ = (title, start_in, multiple, filters);
+            return Err(Error::new(
+                Status::GenericFailure,
+                "file picker is unavailable on Android",
+            ));
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = self
+                .app
+                .window
+                .as_ref()
+                .ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+                dialog = dialog.set_title(title);
+            }
+            if let Some(start_in) = start_in.filter(|value| !value.trim().is_empty()) {
+                dialog = dialog.set_directory(start_in);
+            }
+            for filter in filters.unwrap_or_default() {
+                dialog = dialog.add_filter(filter.name, &filter.extensions);
+            }
+            let paths = if multiple {
+                dialog.pick_files()
+            } else {
+                dialog.pick_file().map(|path| vec![path])
+            };
+            Ok(paths.map(|paths| paths.into_iter().map(|path| path.to_string_lossy().into_owned()).collect()))
         }
     }
 
@@ -6725,6 +6942,45 @@ impl Window {
             .as_ref()
             .map(Renderer::system_font_init_ms)
             .unwrap_or(0.0)
+    }
+
+    /// Starts recording every presented frame, as composited on the GPU, to an
+    /// H.264 MP4 at `path`. `fps` is the nominal rate (the display's by default).
+    #[napi(js_name = "startRecording")]
+    pub fn start_recording(&mut self, path: String, fps: Option<f64>) -> Result<()> {
+        let rate = fps.filter(|rate| *rate > 0.0).unwrap_or_else(|| { let rate = self.refresh_rate(); if rate > 0.0 { rate } else { 60.0 } });
+        let renderer = self.app.renderer.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        if !renderer.surface_copy_src {
+            return Err(Error::new(Status::GenericFailure, "this GPU surface cannot be read back"));
+        }
+        if renderer.recorder.is_some() { return Err(Error::new(Status::GenericFailure, "already recording")); }
+        let bgra = matches!(renderer.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+        renderer.recorder = Some(frame_recorder::FrameRecorder::start(path, renderer.config.width, renderer.config.height, rate as f32, bgra)
+            .map_err(|error| Error::new(Status::GenericFailure, error))?);
+        Ok(())
+    }
+
+    /// Finishes the recording started by `startRecording` and reports it.
+    #[napi(js_name = "stopRecording")]
+    pub fn stop_recording(&mut self) -> Result<RecordingInfo> {
+        let renderer = self.app.renderer.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        let recorder = renderer.recorder.take().ok_or_else(|| Error::new(Status::GenericFailure, "not recording"))?;
+        let summary = recorder.stop(&renderer.device).map_err(|error| Error::new(Status::GenericFailure, error))?;
+        Ok(RecordingInfo { frames: summary.frames, duration_ms: summary.duration_ms, width: summary.width, height: summary.height })
+    }
+
+    /// Writes the next presented frame, as composited on the GPU, to a PNG file.
+    #[napi(js_name = "captureFrame")]
+    pub fn capture_frame(&mut self, path: String) -> Result<()> {
+        let renderer = self.app.renderer.as_mut()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
+        if !renderer.surface_copy_src {
+            return Err(Error::new(Status::GenericFailure, "this GPU surface cannot be read back"));
+        }
+        renderer.pending_capture = Some(path);
+        Ok(())
     }
 
     #[napi]
@@ -7425,7 +7681,7 @@ fn parse_ordered_display_list(bytes: &[u8], canvas_vertex_count: u32, canvas_cir
                     return Err(Error::new(Status::InvalidArg, "backdrop blur has invalid bounds or radius"));
                 }
                 order.push(DrawOrder::BackdropBlur {
-                    x: record[1], y: record[2], width: record[3], height: record[4], radius: record[5],
+                    x: record[1], y: record[2], width: record[3], height: record[4], radius: record[5], masks: [0.0; 10],
                 });
             }
             3.0 => {
@@ -7828,16 +8084,19 @@ fn parse_transformed_display_list(
         } else if tag == 11.0 {
             // [x, y, width, height, radius]: blur what is already drawn under the rect
             // (CSS backdrop-filter: blur()), before the element itself paints.
+            // x, y, width, height, radius, then two rounded-rect masks of five floats.
             let record = values
-                .get(cursor..cursor + 5)
+                .get(cursor..cursor + 15)
                 .ok_or_else(|| Error::new(Status::InvalidArg, "truncated backdrop blur"))?;
             if record.iter().any(|value| !value.is_finite()) || record[2] < 0.0 || record[3] < 0.0 || record[4] < 0.0 {
                 return Err(Error::new(Status::InvalidArg, "backdrop blur has invalid bounds or radius"));
             }
+            let mut masks = [0.0_f32; 10];
+            masks.copy_from_slice(&record[5..15]);
             order.push(DrawOrder::BackdropBlur {
-                x: record[0], y: record[1], width: record[2], height: record[3], radius: record[4],
+                x: record[0], y: record[1], width: record[2], height: record[3], radius: record[4], masks,
             });
-            cursor += 5;
+            cursor += 15;
         } else if tag == 9.0 {
             let layer = *values
                 .get(cursor)

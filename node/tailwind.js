@@ -94,6 +94,12 @@ function arbitraryValue(raw) {
 }
 
 function spacing(value) { return parseLength(value); }
+// Tailwind preflight gives every element a solid border style; width utilities
+// apply it only where no border-style utility is present.
+function defaultBorderStyle(edge) {
+  const edges = edge ? [edge] : ["Top", "Right", "Bottom", "Left"];
+  return [["__default:borderStyle", "solid"], ...edges.map(side => [`__default:border${side}Style`, "solid"])];
+}
 function colorValue(value) {
   const [name, alphaText] = value.split("/");
   let color = name === "white" ? "#ffffff" : name === "black" ? "#000000" : name === "transparent" ? "transparent" : null;
@@ -147,10 +153,77 @@ function utilityStyle(utility) {
     const signed = negative ? (typeof amount === "number" ? -amount : `-${amount}`) : amount;
     return [[`__translate${axis.toUpperCase()}`, signed]];
   }
+  // rotate-* and scale-* compose with translate-* in Tailwind's order:
+  // translate, rotate, scale (see the merge in resolveTailwind).
+  const rotate = /^(-)?rotate-(.+)$/.exec(utility);
+  if (rotate) {
+    const [, negative, raw] = rotate;
+    const amount = raw.startsWith("[") && raw.endsWith("]") ? raw.slice(1, -1)
+      : /^\d+$/.test(raw) ? `${raw}deg` : null;
+    if (!amount || !/^-?(?:\d+\.?\d*|\.\d+)(?:deg|rad|turn|grad)$/.test(amount)) return null;
+    return [["__rotate", negative ? (amount.startsWith("-") ? amount.slice(1) : `-${amount}`) : amount]];
+  }
+  const scale = /^(-)?scale-(?:([xy])-)?(.+)$/.exec(utility);
+  if (scale) {
+    const [, negative, axis, raw] = scale;
+    const amount = raw.startsWith("[") && raw.endsWith("]") ? Number(raw.slice(1, -1))
+      : /^\d+$/.test(raw) ? Number(raw) / 100 : NaN;
+    if (!Number.isFinite(amount)) return null;
+    const signed = negative ? -amount : amount;
+    return axis ? [[`__scale${axis.toUpperCase()}`, signed]] : [["__scaleX", signed], ["__scaleY", signed]];
+  }
+  // transition-* sets the property list; its 150ms / cubic-bezier defaults only
+  // apply when no duration-* / ease-* utility is present, as in Tailwind's CSS order.
+  const transitionList = /^transition-(.+)$/.exec(utility);
+  if (transitionList && transitionList[1] !== "none") {
+    const lists = {
+      all: "all",
+      colors: "color, background-color, border-color, text-decoration-color, fill, stroke",
+      opacity: "opacity",
+      shadow: "box-shadow",
+      transform: "transform",
+    };
+    const raw = transitionList[1];
+    const value = lists[raw] ?? (raw.startsWith("[") && raw.endsWith("]") ? raw.slice(1, -1).replaceAll("_", " ").split(",").map(name => name.trim()).filter(Boolean).join(", ") : null);
+    if (!value) return null;
+    return [["transitionProperty", value], ["__default:transitionDuration", "150ms"], ["__default:transitionTimingFunction", "cubic-bezier(0.4, 0, 0.2, 1)"]];
+  }
+  const size = /^size-(.+)$/.exec(utility);
+  if (size) {
+    const amount = spacing(size[1]);
+    if (amount === undefined) return null;
+    return [["width", amount], ["height", amount]];
+  }
+  // tailwindcss-animated longhand utilities. Like that plugin's stylesheet, they
+  // win over the matching part of an animate-* shorthand in any class order.
+  const animatedTime = /^animate-(duration|delay)-(.+)$/.exec(utility);
+  if (animatedTime) {
+    const raw = animatedTime[2];
+    const value = /^\d+$/.test(raw) ? `${raw}ms` : raw.startsWith("[") && raw.endsWith("]") ? raw.slice(1, -1) : null;
+    if (!value || !/^-?\d*\.?\d+(?:ms|s)$/.test(value)) return null;
+    return [[`__override:animation${animatedTime[1] === "duration" ? "Duration" : "Delay"}`, value]];
+  }
+  const animatedEase = /^animate-ease-(.+)$/.exec(utility);
+  if (animatedEase) {
+    const raw = animatedEase[1];
+    const value = ({ linear: "linear", in: "ease-in", out: "ease-out", "in-out": "ease-in-out" })[raw]
+      ?? (raw.startsWith("[") && raw.endsWith("]") ? raw.slice(1, -1).replaceAll("_", " ") : null);
+    return value ? [["__override:animationTimingFunction", value]] : null;
+  }
+  const animatedIterations = ({ "animate-infinite": "infinite", "animate-once": "1", "animate-twice": "2", "animate-thrice": "3" })[utility]
+    ?? /^animate-iteration-\[(\d*\.?\d+|infinite)\]$/.exec(utility)?.[1];
+  if (animatedIterations) return [["__override:animationIterationCount", animatedIterations]];
+  const animatedDirection = /^animate-(normal|reverse|alternate|alternate-reverse)$/.exec(utility);
+  if (animatedDirection) return [["__override:animationDirection", animatedDirection[1]]];
+  const animatedFill = /^animate-fill-(none|forwards|backwards|both)$/.exec(utility);
+  if (animatedFill) return [["__override:animationFillMode", animatedFill[1]]];
+  if (utility === "animate-play" || utility === "animate-stop") return [["__override:animationPlayState", utility === "animate-play" ? "running" : "paused"]];
   // animate-[name_duration_easing_delay_iterations_direction_fill] runs keyframes
   // registered with registerKeyframes, like Tailwind's arbitrary animation value.
   const animation = /^animate-\[(.+)\]$/.exec(utility);
   if (animation) return animationLonghands(animation[1]);
+  const negativeZ = /^-z-(\d+)$/.exec(utility);
+  if (negativeZ) return ["zIndex", -Number(negativeZ[1])];
   const perspective = /^perspective-\[(.+)\]$/.exec(utility);
   if (perspective) return ["perspective", perspective[1]];
   const ringWidth = /^ring(?:-(\d+))?$/.exec(utility);
@@ -174,10 +247,25 @@ function utilityStyle(utility) {
     "font-display": ["fontFamily", "Fraunces, ui-serif, Georgia, serif"],
     "font-sans": ["fontFamily", "Outfit, ui-sans-serif, system-ui, sans-serif"],
     "font-serif": ["fontFamily", "ui-serif, Georgia, serif"],
+    "font-mono": ["fontFamily", "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, Courier New, monospace"],
+    "animate-pulse": [
+      ["animationName", "pulse"],
+      ["animationDuration", "2s"],
+      ["animationTimingFunction", "cubic-bezier(0.4, 0, 0.6, 1)"],
+      ["animationIterationCount", "infinite"],
+    ],
+    "animate-ping": [
+      ["animationName", "ping"],
+      ["animationDuration", "1s"],
+      ["animationTimingFunction", "cubic-bezier(0, 0, 0.2, 1)"],
+      ["animationIterationCount", "infinite"],
+    ],
     "origin-center": ["transformOrigin", "50% 50%"], "origin-top": ["transformOrigin", "50% 0%"], "origin-top-right": ["transformOrigin", "100% 0%"],
     "origin-right": ["transformOrigin", "100% 50%"], "origin-bottom-right": ["transformOrigin", "100% 100%"], "origin-bottom": ["transformOrigin", "50% 100%"],
     "origin-bottom-left": ["transformOrigin", "0% 100%"], "origin-left": ["transformOrigin", "0% 50%"], "origin-top-left": ["transformOrigin", "0% 0%"],
     "content-center": ["alignContent", "center"], "whitespace-nowrap": ["whiteSpace", "nowrap"],
+    "whitespace-normal": ["whiteSpace", "normal"], "whitespace-pre": ["whiteSpace", "pre"],
+    "whitespace-pre-line": ["whiteSpace", "pre-line"], "whitespace-pre-wrap": ["whiteSpace", "pre-wrap"],
     truncate: [["overflow", "hidden"], ["overflowX", "hidden"], ["overflowY", "hidden"], ["textOverflow", "ellipsis"], ["whiteSpace", "nowrap"]],
     "text-left": ["textAlign", "left"], "text-center": ["textAlign", "center"], "text-right": ["textAlign", "right"],
     uppercase: ["textTransform", "uppercase"], lowercase: ["textTransform", "lowercase"], capitalize: ["textTransform", "capitalize"], "normal-case": ["textTransform", "none"],
@@ -289,8 +377,26 @@ function utilityStyle(utility) {
   }
   const duration = /^duration-(\d+)$/.exec(utility);
   if (duration) return ["transitionDuration", `${duration[1]}ms`];
+  const delay = /^delay-(\d+)$/.exec(utility);
+  if (delay) return ["transitionDelay", `${delay[1]}ms`];
+  // Arbitrary transition timing: duration-[1800ms], delay-[.2s], ease-[cubic-bezier(…)].
+  const transitionTime = /^(duration|delay)-\[(-?\d*\.?\d+(?:ms|s))\]$/.exec(utility);
+  if (transitionTime) return [transitionTime[1] === "duration" ? "transitionDuration" : "transitionDelay", transitionTime[2]];
+  const transitionEase = /^ease-\[(.+)\]$/.exec(utility);
+  if (transitionEase) return ["transitionTimingFunction", transitionEase[1].replaceAll("_", " ")];
   const caret = /^caret-(.+)$/.exec(utility);
   if (caret && colorValue(caret[1])) return ["caretColor", colorValue(caret[1])];
+  const roundedNamed = /^rounded-(t|r|b|l|tl|tr|br|bl)(?:-(none|sm|md|lg|xl|2xl|3xl|full))?$/.exec(utility);
+  if (roundedNamed) {
+    const radius = ({ none: 0, sm: 2, md: 6, lg: 8, xl: 12, "2xl": 16, "3xl": 24, full: 9999 })[roundedNamed[2]] ?? 4;
+    const corners = ({ t: ["TopLeft", "TopRight"], r: ["TopRight", "BottomRight"], b: ["BottomRight", "BottomLeft"], l: ["TopLeft", "BottomLeft"],
+      tl: ["TopLeft"], tr: ["TopRight"], br: ["BottomRight"], bl: ["BottomLeft"] })[roundedNamed[1]];
+    return corners.map(corner => [`border${corner}Radius`, radius]);
+  }
+  if (utility === "rounded-none" || utility === "rounded-3xl") {
+    const radius = utility === "rounded-none" ? 0 : 24;
+    return [["borderRadius", radius], ["borderTopLeftRadius", radius], ["borderTopRightRadius", radius], ["borderBottomRightRadius", radius], ["borderBottomLeftRadius", radius]];
+  }
   const roundedArb = /^rounded(?:-([trbl]{1,2}|[tl][lr]))?-\[(.+)\]$/.exec(utility);
   if (roundedArb) {
     let raw = roundedArb[2];
@@ -384,15 +490,17 @@ function utilityStyle(utility) {
     }
     return null;
   }
-  const inset = /^(inset(?:-[xy])?|top|right|bottom|left)-(.+)$/.exec(utility);
+  const inset = /^(-)?(inset(?:-[xy])?|top|right|bottom|left)-(.+)$/.exec(utility);
   if (inset) {
-    const amount = parseLength(inset[2]);
+    const [, negative, name, raw] = inset;
+    let amount = parseLength(raw);
     if (amount === undefined) return null;
+    if (negative) amount = typeof amount === "number" ? -amount : `-${amount}`;
     const sides = {
       inset: ["top", "right", "bottom", "left"],
       "inset-x": ["right", "left"],
       "inset-y": ["top", "bottom"],
-    }[inset[1]] || [inset[1]];
+    }[name] || [name];
     return sides.map(side => [side, amount]);
   }
   // Border shorthands expand to edge longhands so read-only CSSOM / paint see
@@ -400,18 +508,14 @@ function utilityStyle(utility) {
   if (utility === "border") {
     return [
       ["borderWidth", 1], ["borderTopWidth", 1], ["borderRightWidth", 1], ["borderBottomWidth", 1], ["borderLeftWidth", 1],
-      ["borderStyle", "solid"], ["borderTopStyle", "solid"], ["borderRightStyle", "solid"], ["borderBottomStyle", "solid"], ["borderLeftStyle", "solid"],
+      ...defaultBorderStyle(),
     ];
   }
   // Side-only width utilities (border-t / border-r / …) match Tailwind: 1px solid on that edge.
   const borderSideOnly = /^border-([trbl])$/.exec(utility);
   if (borderSideOnly) {
     const edge = ({ t: "Top", r: "Right", b: "Bottom", l: "Left" })[borderSideOnly[1]];
-    return [
-      [`border${edge}Width`, 1],
-      [`border${edge}Style`, "solid"],
-      ["borderStyle", "solid"],
-    ];
+    return [[`border${edge}Width`, 1], ...defaultBorderStyle(edge)];
   }
   const autoMargin = /^m([xytrbl]?)-auto$/.exec(utility);
   if (autoMargin) {
@@ -437,20 +541,12 @@ function utilityStyle(utility) {
     }
     const width = /^\d+$/.test(value) ? Number(value) : parseLength(value);
     if (width !== undefined && typeof width === "number") {
-      // Width utilities also force solid style (Tailwind preflight assumes solid).
-      if (edge) {
-        return [
-          [`border${edge}Width`, width],
-          [`border${edge}Style`, "solid"],
-          ["borderStyle", "solid"],
-        ];
-      }
+      if (edge) return [[`border${edge}Width`, width], ...defaultBorderStyle(edge)];
       return [
         ["borderWidth", width],
         ["borderTopWidth", width], ["borderRightWidth", width],
         ["borderBottomWidth", width], ["borderLeftWidth", width],
-        ["borderStyle", "solid"], ["borderTopStyle", "solid"], ["borderRightStyle", "solid"],
-        ["borderBottomStyle", "solid"], ["borderLeftStyle", "solid"],
+        ...defaultBorderStyle(),
       ];
     }
   }
@@ -513,7 +609,10 @@ function utilityStyle(utility) {
         ["borderBottomColor", color], ["borderLeftColor", color],
       ];
     }
-    if (prefix === "opacity") return ["opacity", Number(value) / 100];
+    if (prefix === "opacity") {
+      const amount = value.startsWith("[") && value.endsWith("]") ? Number(value.slice(1, -1)) : Number(value) / 100;
+      return Number.isFinite(amount) ? ["opacity", amount] : null;
+    }
     if (prefix === "z") {
       const raw = value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
       return ["zIndex", raw === "auto" ? "auto" : Number(raw)];
@@ -566,6 +665,9 @@ export function resolveTailwind(className, width = 0, interaction) {
     || a.variants.length - b.variants.length || a.index - b.index);
   const values = {};
   let translateX, translateY;
+  let rotation, scaleX, scaleY;
+  const defaults = {};
+  const overrides = {};
   let ringWidth, ringColor;
   let gradientDirection;
   let gradientFrom;
@@ -575,6 +677,11 @@ export function resolveTailwind(className, width = 0, interaction) {
     if (pairs) for (const [property, value] of Array.isArray(pairs[0]) ? pairs : [pairs]) {
       if (property === "__translateX") translateX = value;
       else if (property === "__translateY") translateY = value;
+      else if (property === "__rotate") rotation = value;
+      else if (property === "__scaleX") scaleX = value;
+      else if (property === "__scaleY") scaleY = value;
+      else if (property.startsWith("__default:")) defaults[property.slice(10)] = value;
+      else if (property.startsWith("__override:")) overrides[property.slice(11)] = value;
       else if (property === "__ringWidth") ringWidth = value;
       else if (property === "__ringColor") ringColor = value;
       else if (property === "__gradientDirection") gradientDirection = value;
@@ -587,8 +694,14 @@ export function resolveTailwind(className, width = 0, interaction) {
   const translation = [
     translateX !== undefined && `translateX(${typeof translateX === "number" ? `${translateX}px` : translateX})`,
     translateY !== undefined && `translateY(${typeof translateY === "number" ? `${translateY}px` : translateY})`,
+    rotation !== undefined && `rotate(${rotation})`,
+    (scaleX !== undefined || scaleY !== undefined) && `scale(${scaleX ?? 1}, ${scaleY ?? 1})`,
   ].filter(Boolean).join(" ");
   if (translation) values.transform = [translation, values.transform].filter(Boolean).join(" ");
+  // Defaults stand in for Tailwind's stylesheet order and preflight: border widths
+  // assume solid and transition-* assumes 150ms unless a style utility says otherwise.
+  for (const [property, value] of Object.entries(defaults)) if (values[property] === undefined) values[property] = value;
+  Object.assign(values, overrides);
   if (ringWidth !== undefined || ringColor !== undefined) {
     values.boxShadow = `0 0 0 ${ringWidth ?? 3}px ${ringColor ?? "rgba(59, 130, 246, 0.5)"}`;
   }

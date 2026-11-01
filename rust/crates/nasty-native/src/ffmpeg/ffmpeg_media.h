@@ -34,6 +34,9 @@ typedef struct SweetAudioChunk {
 
 int sweet_ffmpeg_probe(const char *path, SweetProbe *out, char *err, size_t err_len);
 
+/* Probe facts for a media opened with want_video. Returns -1 without a video stream. */
+int sweet_ffmpeg_video_info(const SweetMedia *media, SweetProbe *out);
+
 /* want_video and want_audio are 0 or 1. Returns NULL and writes err on failure.
  * Audio-only open writes "no audio stream" when the file has none. */
 SweetMedia *sweet_ffmpeg_open(const char *path, int want_video, int want_audio, char *err, size_t err_len);

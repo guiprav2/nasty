@@ -511,6 +511,15 @@ function normalizeGradientStops(parts) {
       stops[current].position = left + (right - left) * (current - first + 1) / (index - first + 1);
     }
   }
+  // CSS interpolates stops premultiplied, so a fully transparent stop has no hue
+  // of its own. Give it its neighbor's color; otherwise `transparent` (black at
+  // zero alpha) drags every fade toward gray.
+  stops.forEach((stop, index) => {
+    if (stop.color[3] > 0) return;
+    const neighbor = stops.slice(index + 1).find((each) => each.color[3] > 0)
+      ?? stops.slice(0, index).reverse().find((each) => each.color[3] > 0);
+    if (neighbor) stop.color = [neighbor.color[0], neighbor.color[1], neighbor.color[2], 0];
+  });
   return stops;
 }
 
@@ -543,7 +552,12 @@ function gradientColor(stops, at) {
   if (right === 0) return stops[0].color;
   const leftStop = stops[right - 1], rightStop = stops[right];
   const t = Math.max(0, Math.min(1, (at - leftStop.position) / Math.max(1e-9, rightStop.position - leftStop.position)));
-  return leftStop.color.map((channel, index) => channel + (rightStop.color[index] - channel) * t);
+  // Premultiplied, as CSS gradients interpolate.
+  const a0 = leftStop.color[3], a1 = rightStop.color[3];
+  const alpha = a0 + (a1 - a0) * t;
+  if (alpha <= 0) return [leftStop.color[0], leftStop.color[1], leftStop.color[2], 0];
+  const channel = (index) => (leftStop.color[index] * a0 + (rightStop.color[index] * a1 - leftStop.color[index] * a0) * t) / alpha;
+  return [channel(0), channel(1), channel(2), alpha];
 }
 
 function rectsOverlap(a, b) {
@@ -683,6 +697,8 @@ const identity4 = () => [
   [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1],
 ];
 const IDENTITY_MATRIX = identity4();
+// The similarity (translate + uniform scale) of an untransformed box.
+const IDENTITY_SIMILARITY = Object.freeze({ scale: 1, x: 0, y: 0 });
 
 function multiply4(a, b) {
   const out = Array.from({ length: 4 }, () => [0, 0, 0, 0]);
@@ -1551,6 +1567,14 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   let layerTextBounds = null;
   let pendingText = null;
   const textLayers = new Map();
+  // A layout-space rect of `box` as drawn: the bounds of its projected corners.
+  const windowRectOf = (box, rect) => {
+    if (!hasTransform(box.element)) return rect;
+    const corners = [[rect.x, rect.y], [rect.x + rect.width, rect.y], [rect.x + rect.width, rect.y + rect.height], [rect.x, rect.y + rect.height]]
+      .map(([x, y]) => projectPoint(box, x, y));
+    if (!corners.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))) return { x: 0, y: 0, width: 0, height: 0 };
+    return screenSpaceBounds(corners);
+  };
   // Rotated, scaled or skewed text was drawn upright into a texture; map it
   // through the element's transform right after the element's own paint.
   const emitTransformedText = (element, texture) => {
@@ -1586,10 +1610,34 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       [border.x + border.width, border.y + border.height], [border.x, border.y + border.height]]
       .map(([x, y]) => projectPoint(box, x, y));
     if (!corners.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y))) return;
-    let rect = screenSpaceBounds(corners, viewport);
+    const bounds = screenSpaceBounds(corners, viewport);
+    let rect = bounds;
     if (box.clip) rect = intersection(rect, box.clip);
     if (!(rect.width > 0 && rect.height > 0)) return;
-    pushScenePart(Float32Array.of(11, rect.x, rect.y, rect.width, rect.height, radius), element);
+    // The blur keeps to its own rounded border box (when drawn untransformed)
+    // and to its nearest rounded clipping ancestor, such as a rounded window body.
+    const cornerRadius = (style, target) => {
+      const text = String(style.borderRadius ?? "");
+      const raw = Number.parseFloat(text) || 0;
+      const value = text.trim().endsWith("%") ? Math.min(target.width, target.height) * raw / 100 : raw;
+      return Math.max(0, Math.min(value, target.width / 2, target.height / 2));
+    };
+    const untransformed = Math.abs(bounds.width - border.width) < 0.5 && Math.abs(bounds.height - border.height) < 0.5;
+    const ownRadius = untransformed ? cornerRadius(element.style, border) : 0;
+    const own = ownRadius > 0 ? [bounds.x, bounds.y, bounds.width, bounds.height, ownRadius] : [0, 0, 0, 0, 0];
+    let outer = [0, 0, 0, 0, 0];
+    for (let ancestor = element.parentElement ?? element.parent; ancestor; ancestor = ancestor.parentElement ?? ancestor.parent) {
+      const style = ancestor.style;
+      const clips = [style.overflow, style.overflowX, style.overflowY].some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll");
+      if (!clips) continue;
+      const ancestorBox = boxesByElement.get(ancestor);
+      const outerRadius = ancestorBox ? cornerRadius(style, ancestorBox.borderBox) : 0;
+      if (!(outerRadius > 0)) continue;
+      const inner = ancestorBox.paddingBox;
+      outer = [inner.x, inner.y, inner.width, inner.height, Math.max(0, outerRadius - Math.max(ancestorBox.border.top, ancestorBox.border.left))];
+      break;
+    }
+    pushScenePart(Float32Array.of(11, rect.x, rect.y, rect.width, rect.height, radius, ...own, ...outer), element);
     commandCount++;
   };
   const commitPendingText = () => {
@@ -1623,8 +1671,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     const shadow = String(paintStyleValue(owner.style, "boxShadow") ?? "");
     const ring = /^0 0 0 (\d+(?:\.\d+)?)px/.exec(shadow);
     const spread = !shadow || shadow === "none" ? 0 : ring ? Number(ring[1]) : 48;
-    const rect = { x: box.borderBox.x - spread, y: box.borderBox.y - spread,
-      width: box.borderBox.width + spread * 2, height: box.borderBox.height + spread * 2 };
+    const rect = windowRectOf(box, { x: box.borderBox.x - spread, y: box.borderBox.y - spread,
+      width: box.borderBox.width + spread * 2, height: box.borderBox.height + spread * 2 });
     if (!rectsOverlap(rect, layerTextBounds)) return false;
     return layerText.some((text) => rectsOverlap(rect, text));
   };
@@ -1805,7 +1853,31 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   // is transformed; such elements keep the tessellated path.
   // Overflow clips above an element, nearest last, memoized through the parent
   // for this frame. `transformed` marks a chain the GPU box path cannot use.
+  // A world matrix that only translates and scales both axes equally maps boxes,
+  // radii, borders, and clips to window space exactly, so GPU boxes can draw them
+  // (a fitted stage, a zoomed lockup, a rising card). Anything else is null.
+  const similarities = new Map();
+  const similarityOf = (box) => {
+    if (!box) return null;
+    const matrix = projectPointReal.matrixFor(box);
+    if (matrix === IDENTITY_MATRIX) return IDENTITY_SIMILARITY;
+    let similarity = similarities.get(matrix);
+    if (similarity !== undefined) return similarity;
+    const scale = matrix[0][0];
+    const near = (value, target) => Math.abs(value - target) <= 1e-6;
+    similarity = scale > 1e-6 && near(matrix[1][1], scale) && near(matrix[0][1], 0) && near(matrix[1][0], 0)
+      && near(matrix[3][0], 0) && near(matrix[3][1], 0) && near(matrix[3][3], 1)
+      ? { scale, x: matrix[0][3], y: matrix[1][3] } : null;
+    similarities.set(matrix, similarity);
+    return similarity;
+  };
+  const mapRect = (similarity, rect) => similarity === IDENTITY_SIMILARITY ? rect : {
+    x: rect.x * similarity.scale + similarity.x, y: rect.y * similarity.scale + similarity.y,
+    width: rect.width * similarity.scale, height: rect.height * similarity.scale,
+  };
   const clipChains = new Map();
+  // Overflow clips above an element, in window space. `transformed` means some
+  // ancestor's transform is not a similarity, so window-space rects cannot hold them.
   const clipChain = (element) => {
     const parent = element.parentElement ?? element.parent;
     if (!parent || parent.nodeType !== 1) return { clips: [], transformed: false };
@@ -1814,21 +1886,32 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     const above = clipChain(parent);
     let chain = above;
     const style = parent.style;
+    const parentBox = boxesByElement.get(parent);
+    const similarity = hasTransform(parent) ? similarityOf(parentBox) : IDENTITY_SIMILARITY;
     if ([style.overflow, style.overflowX, style.overflowY]
       .some((value) => value === "hidden" || value === "clip" || value === "auto" || value === "scroll")) {
-      const parentBox = boxesByElement.get(parent);
       if (parentBox) {
         const padding = parentBox.paddingBox ?? parentBox.borderBox;
-        chain = { clips: [...above.clips, { ...padding, radius: clipRadius(style, padding) }],
-          transformed: above.transformed || hasTransform(parent) };
+        const radius = clipRadius(style, padding);
+        chain = { clips: [...above.clips, similarity ? { ...mapRect(similarity, padding), radius: radius * similarity.scale } : padding],
+          transformed: above.transformed || !similarity };
       }
-    } else if (hasTransform(parent)) chain = { clips: above.clips, transformed: true };
+    } else if (!similarity) chain = { clips: above.clips, transformed: true };
     clipChains.set(parent, chain);
     return chain;
   };
+  // Clips for one element's GPU boxes, given its paint bounds in layout space, or
+  // null when it needs the tessellated path. The element's similarity rides along
+  // on the result so pushGpuBox/pushImageBox map their geometry with it.
   const gpuBoxClips = (element, left, top, right, bottom) => {
     const chain = clipChain(element);
     if (chain.transformed) return null;
+    const similarity = hasTransform(element) ? similarityOf(boxesByElement.get(element)) : IDENTITY_SIMILARITY;
+    if (!similarity) return null;
+    if (similarity !== IDENTITY_SIMILARITY) {
+      left = left * similarity.scale + similarity.x; right = right * similarity.scale + similarity.x;
+      top = top * similarity.scale + similarity.y; bottom = bottom * similarity.scale + similarity.y;
+    }
     const rounded = [];
     let rect = null;
     // The window corners are already a clip when the body itself clips overflow.
@@ -1844,11 +1927,21 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     }
     if (rect && (rect.width <= 0 || rect.height <= 0)) rect = { x: 0, y: 0, width: -1, height: -1 };
     const clips = rect ? [...rounded, { ...rect, radius: 0 }] : rounded;
-    return clips.length > 2 ? null : clips;
+    if (clips.length > 2) return null;
+    clips.similarity = similarity;
+    return clips;
   };
   // One GPU box instance (display-list tag 7). `fill` is a solid color or a
   // linear gradient { stops: [{ color, position }], line: [x0, y0, x1, y1] }.
   const pushGpuBox = (rect, corners, fill, border, borderColor, clips) => {
+    const similarity = clips.similarity ?? IDENTITY_SIMILARITY;
+    if (similarity !== IDENTITY_SIMILARITY) {
+      const { scale, x, y } = similarity;
+      rect = mapRect(similarity, rect);
+      corners = { tl: corners.tl * scale, tr: corners.tr * scale, br: corners.br * scale, bl: corners.bl * scale };
+      border = border.map((width) => width * scale);
+      if (fill?.line) fill = { ...fill, line: [fill.line[0] * scale + x, fill.line[1] * scale + y, fill.line[2] * scale + x, fill.line[3] * scale + y] };
+    }
     const stops = fill?.stops ?? [{ color: fill ?? [0, 0, 0, 0], position: 0 }];
     values.push(7, rect.x, rect.y, rect.width, rect.height, corners.tl, corners.tr, corners.br, corners.bl);
     for (let index = 0; index < 4; index++) values.push(...(stops[Math.min(index, stops.length - 1)].color));
@@ -1864,6 +1957,11 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   };
   // One textured GPU instance (display-list tag 8) for an image texture.
   const pushImageBox = (textureId, rect, uv, corners, clips, imageOpacity) => {
+    const similarity = clips.similarity ?? IDENTITY_SIMILARITY;
+    if (similarity !== IDENTITY_SIMILARITY) {
+      rect = mapRect(similarity, rect);
+      corners = { tl: corners.tl * similarity.scale, tr: corners.tr * similarity.scale, br: corners.br * similarity.scale, bl: corners.bl * similarity.scale };
+    }
     values.push(8, textureId, rect.x, rect.y, rect.width, rect.height, uv[0], uv[1], uv[2], uv[3],
       corners.tl, corners.tr, corners.br, corners.bl);
     for (let index = 0; index < 2; index++) {
@@ -1985,7 +2083,10 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       && left >= safeInset && top >= safeInset && right <= width - safeInset && bottom <= height - safeInset
       ? "inside" : "partial";
   };
-  const saveSegment = (element, box, after, start, beforeCommands, visible, segmentValues = values) => {
+  // `commands` defaults to what this element added since `beforeCommands`; a
+  // reused segment passes its own count, since pushing it may also have closed a
+  // text layer, whose marker is a separate part.
+  const saveSegment = (element, box, after, start, beforeCommands, visible, segmentValues = values, commands = commandCount - beforeCommands) => {
     if (!cacheable || element.localName === "canvas" || element.localName === "video"
       || hasTransitionInPaintAncestry(element)) return;
     const entries = paintSegments.get(element) ?? {};
@@ -2005,7 +2106,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       status: clipStatus(box, hasTransform(element)),
       clipKey: hasTransform(element) ? null : clipSignature(box),
       visible,
-      commands: commandCount - beforeCommands,
+      commands,
       values: Float32Array.from(segmentValues.slice(start)),
     };
     paintSegments.set(element, entries);
@@ -2151,11 +2252,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
           || box.x >= clip.x + clip.width || box.y >= clip.y + clip.height) continue;
     }
     paintingAfter = after;
-    if (!after && renderedText(element)) {
-      const textRect = intersection(box.contentBox, box.clip ? intersection(box.clip, viewport) : viewport);
+    if (!after && (renderedText(element) || elementState(element).inlineRoot)) {
+      // Text layers are decided in window space, where text and covering paint meet.
+      const textRect = intersection(windowRectOf(box, box.contentBox), transformed ? viewport : box.clip ? intersection(box.clip, viewport) : viewport);
       if (textRect.width > 0 && textRect.height > 0) pendingText = { element, rect: textRect };
     }
-    if (!transformed && !paintMode.capture) {
+    if (!paintMode.capture) {
       const recipe = fastPaintRecipe(element);
       if (recipe) {
         values = [];
@@ -2195,7 +2297,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
           if (process.env.NASTY_BENCH_PROFILE) paintSegmentDiagnostics.translated++;
           commandCount += previousSegment.commands;
           if (previousSegment.visible) addVisibleAncestors(element);
-          saveSegment(element, box, after, 0, beforeCommands, previousSegment.visible, translated);
+          saveSegment(element, box, after, 0, beforeCommands, previousSegment.visible, translated, previousSegment.commands);
           continue;
         }
       }
@@ -2206,7 +2308,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
           if (process.env.NASTY_BENCH_PROFILE) paintSegmentDiagnostics.translated++;
           commandCount += previousSegment.commands;
           addVisibleAncestors(element);
-          saveSegment(element, box, false, 0, beforeCommands, true, translated);
+          saveSegment(element, box, false, 0, beforeCommands, true, translated, previousSegment.commands);
           continue;
         }
       }
@@ -2277,7 +2379,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       const { x, y, width: ringWidth, height } = box.borderBox;
       const corners = cornerRadiiFor(box.element.style, ringWidth, height);
       const ringRect = { x: x - spread, y: y - spread, width: ringWidth + spread * 2, height: height + spread * 2 };
-      const ringClips = !transformed && !paintMode.capture
+      const ringClips = !paintMode.capture
         ? gpuBoxClips(element, ringRect.x, ringRect.y, ringRect.x + ringRect.width, ringRect.y + ringRect.height) : null;
       if (ringClips && color) {
         const grow = (radius) => radius > 0 ? radius + spread : 0;
@@ -2379,7 +2481,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     const gradient = gradientStops(computedStyleValue(style, "backgroundImage"));
     // GPU boxes draw backgrounds, linear gradients, borders, and rounded clips
     // in the fragment shader. Transformed or blurred paint keeps tessellation.
-    const gpuClips = !transformed && !paintMode.capture && !(filterBlur > 0)
+    const gpuClips = !paintMode.capture && !(filterBlur > 0)
       && (!gradient || (gradient.kind === "linear" && gradient.stops.length <= 4))
       ? gpuBoxClips(element, box.borderBox.x, box.borderBox.y,
         box.borderBox.x + box.borderBox.width, box.borderBox.y + box.borderBox.height)

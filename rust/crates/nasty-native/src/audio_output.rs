@@ -10,6 +10,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[path = "audio_pulse.rs"]
+mod pulse;
+
 static DEVICE_OPENING: AtomicBool = AtomicBool::new(false);
 
 struct QueueState {
@@ -35,8 +38,41 @@ struct OpenedPcm {
     kind: SampleKind,
 }
 
+/// Where PCM goes: the sound server's own protocol when one is running, or an
+/// ALSA device (hardware, or a server reached through its ALSA plugin).
+enum Output {
+    Pulse(pulse::Stream),
+    Alsa(OpenedPcm),
+}
+
+impl Output {
+    fn rate(&self) -> u32 {
+        match self { Output::Pulse(stream) => stream.rate, Output::Alsa(pcm) => pcm.rate }
+    }
+    fn channels(&self) -> u16 {
+        match self { Output::Pulse(stream) => stream.channels, Output::Alsa(pcm) => pcm.channels }
+    }
+}
+
+/// Devices routed to the sound server open as a native Pulse stream; the ALSA
+/// writer remains for hardware devices, machines without a server or libpulse,
+/// and NASTY_AUDIO_BACKEND=alsa.
+fn open_output(id: &str) -> std::result::Result<Output, String> {
+    let forced_alsa = std::env::var("NASTY_AUDIO_BACKEND").is_ok_and(|backend| backend.eq_ignore_ascii_case("alsa"));
+    if pulse_routed(id) && !forced_alsa {
+        let sink = id.strip_prefix("pulse:").or_else(|| id.strip_prefix("pipewire:")).filter(|name| !name.is_empty());
+        let info = pulse_sink_info(id);
+        let rate = info.as_ref().map(|sink| sink.rate).unwrap_or(48_000);
+        if let Ok(mut stream) = pulse::Stream::open(sink, rate) {
+            stream.unreported_latency_frames = info.map_or(0, |sink| sink.unreported_latency_us * u64::from(rate) / 1_000_000);
+            return Ok(Output::Pulse(stream));
+        }
+    }
+    open_pcm(id).map(Output::Alsa)
+}
+
 enum OutputCommand {
-    Switch(OpenedPcm, mpsc::Sender<()>),
+    Switch(Output, mpsc::Sender<()>),
     Stop,
 }
 
@@ -86,6 +122,10 @@ fn spec_rate_hz(spec: &str) -> Option<u32> {
 
 struct PulseSink {
     rate: u32,
+    /// Device latency the server leaves out of stream timing. PipeWire reports
+    /// a sink's latency as 0 while its configured buffer can be most of a
+    /// second; servers that report a real latency already include it.
+    unreported_latency_us: u64,
 }
 
 /// Pulse/PipeWire sink behind this ALSA device. Hardware PCM devices return
@@ -111,6 +151,7 @@ fn pulse_sink_info(device: &str) -> Option<PulseSink> {
     let list = pactl_stdout(&["list", "sinks"])?;
     let mut current = String::new();
     let mut rate = None;
+    let mut unreported_latency_us = 0;
     for line in list.lines() {
         let line = line.trim();
         if let Some(name) = line.strip_prefix("Name:") {
@@ -123,8 +164,13 @@ fn pulse_sink_info(device: &str) -> Option<PulseSink> {
         if let Some(spec) = line.strip_prefix("Sample Specification:") {
             rate = spec_rate_hz(spec);
         }
+        // "Latency: 0 usec, configured 906000 usec"
+        if let Some(latency) = line.strip_prefix("Latency:") {
+            let numbers: Vec<u64> = latency.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse().ok()).collect();
+            if let [0, configured] = numbers[..] { unreported_latency_us = configured; }
+        }
     }
-    Some(PulseSink { rate: rate? })
+    Some(PulseSink { rate: rate?, unreported_latency_us })
 }
 
 fn open_pcm(name: &str) -> std::result::Result<OpenedPcm, String> {
@@ -231,10 +277,99 @@ fn restore_unwritten(state: &Mutex<QueueState>, epoch: u64, samples: &[f32]) {
 }
 
 fn output_loop(
-    mut output: OpenedPcm,
+    mut output: Output,
     state: Arc<Mutex<QueueState>>,
     commands: mpsc::Receiver<OutputCommand>,
 ) {
+    loop {
+        let next = match output {
+            Output::Pulse(stream) => pulse_loop(stream, &state, &commands),
+            Output::Alsa(pcm) => alsa_loop(pcm, &state, &commands),
+        };
+        let Some(next) = next else { break };
+        output = next;
+    }
+}
+
+/// Switches to `next`: the clock restarts with the new device.
+fn switch_output(state: &Mutex<QueueState>, next: Output, ready: mpsc::Sender<()>) -> Option<Output> {
+    state.lock().ok().map(|state| state.playback_frames.store(0, Ordering::Release));
+    let _ = ready.send(());
+    Some(next)
+}
+
+/// Native Pulse writer. Each write blocks until the server wants more, so the
+/// device paces it; the clock is what was written minus what the server
+/// reports still buffered.
+fn pulse_loop(
+    stream: pulse::Stream,
+    state: &Mutex<QueueState>,
+    commands: &mpsc::Receiver<OutputCommand>,
+) -> Option<Output> {
+    let channels = stream.channels as usize;
+    // ~20ms per write, the stream's minimum request.
+    let chunk_samples = (stream.rate as usize / 50).max(1) * channels;
+    let mut scaled = Vec::<f32>::new();
+    let mut written_frames = 0u64;
+    let mut heard_frames = 0u64;
+    let mut seen_epoch = None;
+    // Nothing is heard faster than realtime: the clock never passes the wall
+    // time since writing (re)started after a pause or seek.
+    let mut started: Option<(Instant, u64)> = None;
+    loop {
+        match commands.try_recv() {
+            Ok(OutputCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => return None,
+            Ok(OutputCommand::Switch(next, ready)) => return switch_output(state, next, ready),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let Ok(mut guard) = state.lock() else { return None };
+        if guard.paused {
+            drop(guard);
+            started = None;
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        // A cleared queue (a seek) also drops what the server still holds.
+        if seen_epoch.replace(guard.epoch).is_some_and(|epoch| epoch != guard.epoch) {
+            stream.flush();
+            written_frames = heard_frames;
+            started = None;
+        }
+        let available = guard.samples.len() / channels * channels;
+        if available == 0 {
+            drop(guard);
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let count = available.min(chunk_samples);
+        let volume = guard.volume;
+        scaled.clear();
+        scaled.extend(guard.samples.drain(..count).map(|sample| sample * volume));
+        drop(guard);
+        if let Err(error) = stream.write(&scaled) {
+            // The server went away: say so once and stop this stream; the
+            // queue keeps filling until the page reopens playback.
+            eprintln!("audio output: {error}");
+            return None;
+        }
+        let (since, base) = *started.get_or_insert((Instant::now(), heard_frames));
+        written_frames += (count / channels) as u64;
+        if let Some(latency) = stream.latency_frames() {
+            let reported = written_frames.saturating_sub(latency + stream.unreported_latency_frames);
+            let wall = base + (since.elapsed().as_secs_f64() * f64::from(stream.rate)) as u64;
+            heard_frames = heard_frames.max(reported.min(wall));
+            if let Ok(guard) = state.lock() {
+                guard.playback_frames.store(heard_frames, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn alsa_loop(
+    output: OpenedPcm,
+    state: &Arc<Mutex<QueueState>>,
+    commands: &mpsc::Receiver<OutputCommand>,
+) -> Option<Output> {
     let mut taken = Vec::<f32>::new();
     let mut scaled = Vec::<f32>::new();
     let mut i16_samples = Vec::<i16>::new();
@@ -246,13 +381,8 @@ fn output_loop(
         match commands.try_recv() {
             Ok(OutputCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => break,
             Ok(OutputCommand::Switch(next, ready)) => {
-                output = next;
-                written_frames = 0;
-                pace_origin = None;
-                pace_origin_frames = 0;
-                short_idle = 0;
-                state.lock().ok().map(|state| state.playback_frames.store(0, Ordering::Release));
-                let _ = ready.send(());
+                let _ = output.pcm.drop();
+                return switch_output(state, next, ready);
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -322,7 +452,7 @@ fn output_loop(
         let write_error = match write_result {
             Ok(frames) => {
                 let written_samples = frames.saturating_mul(channels).min(taken.len());
-                restore_unwritten(&state, epoch, &taken[written_samples..]);
+                restore_unwritten(state, epoch, &taken[written_samples..]);
                 if pace_origin.is_none() && frames > 0 {
                     pace_origin = Some(Instant::now());
                     pace_origin_frames = written_frames;
@@ -337,7 +467,7 @@ fn output_loop(
                 None
             }
             Err(error) => {
-                restore_unwritten(&state, epoch, &taken);
+                restore_unwritten(state, epoch, &taken);
                 Some(error)
             }
         };
@@ -360,6 +490,7 @@ fn output_loop(
         // path previously starved Pulse and clicked on speakers.
     }
     let _ = output.pcm.drop();
+    None
 }
 
 #[napi(object)]
@@ -405,9 +536,9 @@ impl NativeAudioPlayer {
     #[napi(constructor)]
     pub fn new(device_id: Option<String>) -> Result<Self> {
         let id = device_id.unwrap_or_else(|| "default".into());
-        let output = open_pcm(&id).map_err(audio_error)?;
-        let output_rate = output.rate as usize;
-        let output_channels = output.channels as usize;
+        let output = open_output(&id).map_err(audio_error)?;
+        let output_rate = output.rate() as usize;
+        let output_channels = output.channels() as usize;
         let state = Arc::new(Mutex::new(QueueState {
             samples: VecDeque::new(),
             paused: false,
@@ -513,15 +644,15 @@ impl NativeAudioPlayer {
         let (opened_sender, opened_receiver) = mpsc::sync_channel(1);
         let open_id = id.clone();
         thread::spawn(move || {
-            let opened = open_pcm(&open_id);
+            let opened = open_output(&open_id);
             DEVICE_OPENING.store(false, Ordering::Release);
             let _ = opened_sender.send(opened);
         });
         let output = opened_receiver.recv_timeout(Duration::from_secs(2))
             .map_err(|error| audio_error(format!("opening output device timed out: {error}")))?
             .map_err(audio_error)?;
-        let rate = output.rate as usize;
-        let channels = output.channels as usize;
+        let rate = output.rate() as usize;
+        let channels = output.channels() as usize;
         let (ready_sender, ready_receiver) = mpsc::channel();
         self.commands.send(OutputCommand::Switch(output, ready_sender)).map_err(audio_error)?;
         ready_receiver.recv_timeout(Duration::from_secs(1)).map_err(audio_error)?;
