@@ -45,7 +45,7 @@ process.on('message', message => {
   if (message.type === 'append-log') scroller.append(d.el('div', { class: 'shrink-0 h-8 text-sm' }, 'New chat message'));
   if (message.type === 'widen') dynamic.classList.replace('w-[110px]', 'w-[300px]');
   if (message.type === 'report') process.send({ id: message.id, bubbles: bubbles.map(bubble => ({
-    rect: rect(bubble), text: rect(bubble.children[0]), value: bubble.textContent,
+    rect: rect(bubble), text: rect(bubble), value: bubble.textContent,
   })), dynamic: rect(dynamic), textarea: rect(textarea), input: rect(input), composer: rect(composer),
     scroller: rect(scroller), scrollTop: scroller.scrollTop, scrollHeight: scroller.scrollHeight,
     firstLog: rect(logs[0]), scrollEvents, labels: labels.map(rect), tallReference: rect(tallReference) });

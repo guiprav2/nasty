@@ -16,7 +16,14 @@ function classes(value) {
 }
 
 function connected(document, node) {
-  return node === document.body || document.body.contains(node);
+  if (node === document.body) return true;
+  if (node?.nodeType === 3) {
+    for (let current = node.parent; current; current = current.parent) {
+      if (current === document.body) return true;
+    }
+    return false;
+  }
+  return document.body.contains(node);
 }
 
 function setBoundValue(element, key, value, previous) {
@@ -45,14 +52,14 @@ function addBinding(element, binding) {
 }
 
 function bindText(document, getter) {
-  const element = document.createElement("span");
+  const node = document.createTextNode("");
   const binding = { update: () => {
     const next = getter();
     const value = next == null || typeof next === "boolean" ? "" : String(next);
-    if (element.textContent !== value) element.textContent = value;
+    if (node.data !== value) node.data = value;
   } };
-  addBinding(element, binding);
-  return element;
+  addBinding(node, binding);
+  return node;
 }
 
 function normalizeChildren(document, children) {
@@ -60,6 +67,19 @@ function normalizeChildren(document, children) {
     if (typeof child === "string" || typeof child === "number") return bindText(document, () => String(child));
     return child;
   });
+}
+
+
+/** Element and Text descendants that may carry bindings/lifecycle. */
+function boundDescendants(node) {
+  const out = [];
+  const walk = (current) => {
+    out.push(current);
+    if (current.nodeType !== 1) return;
+    for (const child of current.children || []) walk(child);
+  };
+  walk(node);
+  return out;
 }
 
 function scanNode(document, current, attached) {
@@ -73,8 +93,7 @@ function scanNode(document, current, attached) {
 
 function scan(document, nodes, attached) {
   for (const node of nodes) {
-    scanNode(document, node, attached);
-    for (const current of node.querySelectorAll("*")) scanNode(document, current, attached);
+    for (const current of boundDescendants(node)) scanNode(document, current, attached);
   }
 }
 
@@ -102,13 +121,12 @@ export function dominant(document) {
       for (const node of record.removedNodes || []) {
         if (!connected(document, node)) {
           scan(document, [node], false);
-          for (const current of [node, ...node.querySelectorAll("*")]) state.bound.delete(current);
+          for (const current of boundDescendants(node)) state.bound.delete(current);
         }
       }
       for (const node of record.addedNodes || []) {
         scan(document, [node], true);
-        const descendants = [node, ...node.querySelectorAll("*")];
-        for (const child of descendants) {
+        for (const child of boundDescendants(node)) {
           if (!(nodeBindings.has(child) || lifecycle.has(child)) || state.bound.has(child)) continue;
           state.bound.add(child);
           added.add(child);

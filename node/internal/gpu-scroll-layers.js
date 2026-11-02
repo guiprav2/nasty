@@ -595,7 +595,7 @@ export function prepareScrollLayers(window, document, boxes) {
         const visit = (node) => {
           const bounds = layer.bounds.get(node);
           if (bounds && !seen.has(node)) { seen.add(node); dirtyFor(bounds); }
-          for (const child of node.children) visit(child);
+          for (const child of node.children) if (child.nodeType === 1) visit(child);
         };
         for (const element of changedHere) visit(element);
       } else {
@@ -724,6 +724,13 @@ function paintRegion(window, document, layer, byElement, nested, rect) {
   }
 }
 
+function hiddenInTree(element) {
+  for (let current = element; current?.nodeType === 1; current = current.parentElement ?? current.parent) {
+    if (current.hidden || current.style.display === 'none' || current.style.visibility === 'hidden') return true;
+  }
+  return false;
+}
+
 /** Repaint the changed regions of every layer prepared this frame, inner layers first. */
 export function paintScrollLayers(window, document) {
   const doc = documentState(document);
@@ -736,7 +743,9 @@ export function paintScrollLayers(window, document) {
     const layer = layers.get(hostBox.element);
     if (!layer) continue;
     nested.set(hostBox.element, layer);
-    if (layer.dirty.length) pending.push({ hostBox, layer });
+    // A hidden host's content paints nothing: keep its dirty regions until it
+    // shows again, rather than repainting them blank.
+    if (layer.dirty.length && !hiddenInTree(hostBox.element)) pending.push({ hostBox, layer });
   }
   pending.sort((a, b) => b.layer.depth - a.layer.depth);
   for (const { hostBox, layer } of pending) {

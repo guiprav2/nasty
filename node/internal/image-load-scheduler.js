@@ -168,11 +168,11 @@ function activeImageSet(document, state) {
       }
       // A nested skipped cell keeps its own contents skipped.
       const childSkipped = skipped || elementState(node).cvSkipped === true;
-      for (const child of node.children) visit(child, childSkipped);
+      for (const child of node.children) { if (child.nodeType !== 1) continue; visit(child, childSkipped); }
     };
     for (const cell of new Set(toggles)) {
       const skipped = elementState(cell).cvSkipped === true;
-      for (const child of cell.children) visit(child, skipped || insideSkippedContent(cell));
+      for (const child of cell.children) { if (child.nodeType !== 1) continue; visit(child, skipped || insideSkippedContent(cell)); }
     }
   }
   return state.imageActive;

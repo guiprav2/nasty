@@ -78,7 +78,7 @@ function inlineTextMetrics(element, style) {
   const segments = element.children.map((child) => ({ element: child, style: textStyle(child),
     text: transformedText(child, renderedText(child)) }));
   const whiteSpace = inherited(element, 'whiteSpace', 'normal');
-  const key = JSON.stringify([style.size, style.line, style.font, style.wrap, whiteSpace,
+  const key = JSON.stringify([style.size, style.line, style.font, style.wrap, style.breakWords, whiteSpace,
     segments.map(({ text, style: each }) => [text, each.font, each.spacing])]);
   const state = elementState(element);
   if (state.textMetrics?.key === key) return state.textMetrics;
@@ -119,8 +119,18 @@ function inlineTextMetrics(element, style) {
   const words = pieces.map((parts) => parts.reduce((sum, part) => sum + measure(part.index, part.text), 0));
   context.font = style.font; context.letterSpacing = `${style.spacing}px`;
   const space = context.measureText(' ').width;
+  // Per-glyph advances so overflow-wrap:anywhere / break-word can split a long
+  // token that spans one or more inline children (Vitrola chat bubbles use a
+  // dominant text span inside the bubble).
+  const breakWords = style.breakWords
+    ? pieces.map((parts) => {
+        const widths = [];
+        for (const part of parts) for (const character of part.text) widths.push(measure(part.index, character));
+        return widths;
+      })
+    : null;
   // spaceOwners[i]: the child whose space precedes word i.
-  state.textMetrics = { key, style, tokens, words, space, joiner: ' ', breakWords: null,
+  state.textMetrics = { key, style, tokens, words, space, joiner: ' ', breakWords,
     inline: { segments: segments.map(({ element: child }) => child), pieces, spaceOwners, measure } };
   return state.textMetrics;
 }
@@ -165,13 +175,44 @@ export function textMetrics(element) {
 export function inlineTextLines(element, width) {
   const metrics = elementState(element).textMetrics ?? textMetrics(element);
   if (!metrics.inline) return null;
+  // Each line is a list of { word, text } fragments so a single long word can
+  // split across lines under overflow-wrap, matching layout-engine measure.
   const lines = [];
   let line = [], lineWidth = 0;
+  const flush = () => { lines.push(line); line = []; lineWidth = 0; };
+  const { pieces } = metrics.inline;
+  const fullWord = (index) => pieces[index].map((part) => part.text).join('');
   metrics.words.forEach((word, index) => {
     const next = lineWidth ? lineWidth + metrics.space + word : word;
-    if (metrics.style.wrap && next > width + .01 && line.length) { lines.push(line); line = []; lineWidth = 0; }
-    lineWidth = line.length ? lineWidth + metrics.space + word : word;
-    line.push(index);
+    if (metrics.style.wrap && next > width + .01 && line.length) flush();
+    const characters = metrics.breakWords?.[index];
+    if (metrics.style.wrap && characters && word > width + .01) {
+      const glyphs = [...fullWord(index)];
+      let fragment = '', fragmentWidth = 0;
+      if (lineWidth) { /* leading space only between whole words; broken words start fresh after flush */ }
+      // If the line already has content, a space precedes this word — but the
+      // word itself does not fit, so we already flushed above when lineWidth>0.
+      // When the word alone exceeds the limit, break by glyph.
+      glyphs.forEach((glyph, glyphIndex) => {
+        const glyphWidth = characters[glyphIndex] ?? 0;
+        if (fragmentWidth > 0 && lineWidth + fragmentWidth + glyphWidth > width + .01) {
+          line.push({ word: index, text: fragment });
+          flush();
+          fragment = '';
+          fragmentWidth = 0;
+        }
+        fragment += glyph;
+        fragmentWidth += glyphWidth;
+      });
+      if (fragment) {
+        line.push({ word: index, text: fragment });
+        lineWidth += fragmentWidth;
+      }
+    } else {
+      if (lineWidth) lineWidth += metrics.space;
+      line.push({ word: index, text: fullWord(index) });
+      lineWidth += word;
+    }
   });
   if (line.length) lines.push(line);
   return { metrics, lines };

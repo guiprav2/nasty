@@ -2,7 +2,7 @@
 //! Workers only produce owned RGBA (`Vec<u8>` moved into the result queue).
 //! The window/GPU thread drains results and uploads — JS only sees texture ids.
 
-use crate::{decode_image_rgba, IMAGE_TEXTURE_MAX_EDGE};
+use crate::{decode_image_rgba_natural, IMAGE_TEXTURE_MAX_EDGE};
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -35,6 +35,8 @@ pub enum ImageJobOutcome {
         max_edge: u32,
         width: u32,
         height: u32,
+        /// Intrinsic size of the source before any max-edge downscale.
+        natural: (u32, u32),
         pixels: Vec<u8>,
     },
     Failed {
@@ -58,7 +60,7 @@ pub struct ImageDecodePool {
     /// Jobs currently held by worker threads (not in pending queue).
     in_flight: AtomicU64,
     /// Completed jobs keyed by source+max_edge so identical thumbs share GPU work.
-    cache: Mutex<HashMap<(String, u32), (u32, u32, Arc<Vec<u8>>)>>,
+    cache: Mutex<HashMap<(String, u32), (u32, u32, (u32, u32), Arc<Vec<u8>>)>>,
 }
 
 impl Default for ImageDecodePool {
@@ -186,9 +188,9 @@ impl ImageDecodePool {
 
             // Cache hit: skip decode entirely (common when tests/UI reuse a URL).
             if let Ok(cache) = self.cache.lock() {
-                if let Some((width, height, pixels)) = cache.get(&(job.source.clone(), job.max_edge)) {
+                if let Some((width, height, natural, pixels)) = cache.get(&(job.source.clone(), job.max_edge)) {
                     let pixels = Vec::clone(pixels); // last hop into upload queue owns a buffer
-                    self.push_result(ImageJobOutcome::Ready { id: job.id, source: job.source.clone(), max_edge: job.max_edge, width: *width, height: *height, pixels, });
+                    self.push_result(ImageJobOutcome::Ready { id: job.id, source: job.source.clone(), max_edge: job.max_edge, width: *width, height: *height, natural: *natural, pixels, });
                     self.cvar.notify_one();
                     continue;
                 }
@@ -198,7 +200,7 @@ impl ImageDecodePool {
             let outcome = match catch_unwind(AssertUnwindSafe(|| {
                 load_and_decode(&job.source, job.max_edge)
             })) {
-                Ok(Ok((width, height, pixels))) => {
+                Ok(Ok((width, height, pixels, natural))) => {
                     if let Ok(mut cache) = self.cache.lock() {
                         // Keep a modest cache; identical paths win most.
                         if cache.len() > 256 {
@@ -206,10 +208,10 @@ impl ImageDecodePool {
                         }
                         cache.insert(
                             (job.source.clone(), job.max_edge),
-                            (width, height, Arc::new(pixels.clone())),
+                            (width, height, natural, Arc::new(pixels.clone())),
                         );
                     }
-                    ImageJobOutcome::Ready { id: job.id, source: job.source.clone(), max_edge: job.max_edge, width, height, pixels, }
+                    ImageJobOutcome::Ready { id: job.id, source: job.source.clone(), max_edge: job.max_edge, width, height, natural, pixels, }
                 }
                 Ok(Err(error)) => ImageJobOutcome::Failed {
                     id: job.id,
@@ -239,7 +241,7 @@ fn max_parallel_decodes() -> usize {
         })
 }
 
-fn load_and_decode(source: &str, max_edge: u32) -> Result<(u32, u32, Vec<u8>), String> {
+fn load_and_decode(source: &str, max_edge: u32) -> Result<(u32, u32, Vec<u8>, (u32, u32)), String> {
     let encoded = fetch_encoded_bytes(source)?;
     let max_edge = if max_edge == 0 {
         IMAGE_TEXTURE_MAX_EDGE
@@ -268,7 +270,7 @@ fn load_and_decode(source: &str, max_edge: u32) -> Result<(u32, u32, Vec<u8>), S
             break;
         }
     }
-    let result = decode_image_rgba(&encoded, max_edge);
+    let result = decode_image_rgba_natural(&encoded, max_edge);
     IN_DECODE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     result
 }

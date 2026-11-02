@@ -22,7 +22,9 @@ export function trackClickListener(element, callback, capture, added) {
 }
 
 function hasClickListener(element) {
-  return typeof element.onclick === 'function' || (clickListeners.get(element)?.size ?? 0) > 0;
+  return typeof element.onclick === 'function' || typeof element.ondblclick === 'function'
+    || typeof element.onpointerdown === 'function' || typeof element.onmousedown === 'function'
+    || (clickListeners.get(element)?.size ?? 0) > 0;
 }
 
 function valueFor(element, property, inherited = false) {

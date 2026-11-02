@@ -1,6 +1,6 @@
 # Treva
 
-Local image viewer port of Treva’s title screen, header (with Index / Wallpaper / Grok menus), and **responsive CSS Grid gallery**.
+Local image viewer port of Treva’s title screen, header (Index menu; Wallpaper / Grok are hidden until their backends are ported), **responsive CSS Grid gallery**, and **full-size viewer**.
 
 ```sh
 # from node/
@@ -19,6 +19,12 @@ This example depends on CSS Grid in the layout bridge:
 - Tailwind: `grid`, `grid-cols-*`, `grid-cols-[…]`, `gap-*`, `col-span-*`, …
 - Native Taffy: `display: grid` + `gridTemplateColumns` track lists (`repeat()`, `minmax()`, `fr`)
 
+## Viewer
+
+As in Treva: click selects, a second click (or double-click in the list, or Enter) opens the viewer. Fit / fit width / actual size / fill, wheel zoom at the cursor, drag to pan, double-click for actual size, rotation, details panel with Copy path, slideshow (speed, loop), filmstrip, fullscreen, and the keyboard shortcuts in the help dialog. The last opened folder is remembered in `data/folder.json` and reopened at startup, as Treva desktop does.
+
+Not yet like Treva: the stage has a flat `#141210` background instead of the checkerboard (Nasty draws no tiled multi-layer gradients yet).
+
 ## Not ported yet
 
-Full-size viewer, filmstrip, reimagine runs, catalog indexing backend, wallpaper API.
+Reimagine runs, catalog indexing backend, wallpaper API.

@@ -34,6 +34,10 @@ function ensureWindowHook(window) {
     const textureId = Number(event.x);
     const width = Number(event.y);
     const height = Number(event.deltaY ?? 0);
+    // Intrinsic size before any max-edge downscale, as "WxH" in `text`.
+    const natural = /^(\d+)x(\d+)$/.exec(String(event.text ?? ""));
+    const naturalWidth = natural ? Number(natural[1]) : width;
+    const naturalHeight = natural ? Number(natural[2]) : height;
     const id = Number(event.deltaX);
     const map = pendingMap(window);
     const request = map.get(id);
@@ -47,6 +51,8 @@ function ensureWindowHook(window) {
       textureId,
       width,
       height,
+      naturalWidth,
+      naturalHeight,
       pixels: null,
       readMs: 0,
       decodeMs: 0,
@@ -86,7 +92,11 @@ export async function loadImage(path, window, maxEdge = DEFAULT_MAX_EDGE) {
   });
   // Temporary holder keyed after we know the id; use a side channel if needed.
   const started = performance.now();
-  const job = window.submitImageDecode(String(path), edge);
+  // A file: URL names a file by its path alone; as in a browser, its query
+  // and fragment (cache-busting "?v=2", say) do not reach the filesystem.
+  let source = String(path);
+  if (/^file:/i.test(source)) source = source.replace(/[?#].*$/s, "");
+  const job = window.submitImageDecode(source, edge);
   const id = Number(job?.id ?? job);
   if (!Number.isFinite(id)) {
     rejectFn(new Error("submitImageDecode returned no job id"));

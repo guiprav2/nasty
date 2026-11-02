@@ -29,7 +29,7 @@ const CSS_PROPERTIES = new Set([
   "transition", "transitionProperty", "transitionDuration", "transitionDelay", "transitionTimingFunction",
   "animation", "animationName", "animationDuration", "animationTimingFunction", "animationDelay",
   "animationIterationCount", "animationDirection", "animationFillMode", "animationPlayState",
-  "boxShadow", "filter", "backdropFilter", "objectFit", "objectPosition", "visibility",
+  "boxShadow", "filter", "backdropFilter", "objectFit", "objectPosition", "imageRendering", "visibility",
   "cursor", "pointerEvents", "userSelect", "touchAction",
   "caretColor",
   // csswg-drafts#14598: separate edge + margin (threshold) longhands.
@@ -94,6 +94,13 @@ function arbitraryValue(raw) {
 }
 
 function spacing(value) { return parseLength(value); }
+// `[calc(-50%+12px)]` → "calc(-50% + 12px)": underscores are spaces, and, as
+// Tailwind does, binary + and - inside calc() get the spaces CSS requires.
+function arbitraryCalc(value) {
+  if (!/^\[calc\(.+\)\]$/i.test(value)) return undefined;
+  return value.slice(1, -1).replaceAll("_", " ")
+    .replace(/(?<=[\d.%a-z)])\s*([+-])\s*(?=[\d.(a-z-])/gi, " $1 ");
+}
 // Tailwind preflight gives every element a solid border style; width utilities
 // apply it only where no border-style utility is present.
 function defaultBorderStyle(edge) {
@@ -148,7 +155,7 @@ function utilityStyle(utility) {
   const translate = /^(-)?translate-([xy])-(.+)$/.exec(utility);
   if (translate) {
     const [, negative, axis, raw] = translate;
-    const amount = raw === "full" ? "100%" : spacing(raw);
+    const amount = raw === "full" ? "100%" : arbitraryCalc(raw) ?? spacing(raw);
     if (amount === undefined) return null;
     const signed = negative ? (typeof amount === "number" ? -amount : `-${amount}`) : amount;
     return [[`__translate${axis.toUpperCase()}`, signed]];
@@ -597,7 +604,14 @@ function utilityStyle(utility) {
       return colorValue(value) ? ["backgroundColor", colorValue(value)] : null;
     }
     if (prefix === "text") {
-      if (/^(xs|sm|base|lg|xl|[2-9]xl)$/.test(value)) return ["fontSize", ({ xs: 12, sm: 14, base: 16, lg: 18, xl: 20 })[value] ?? 24 + (Number.parseInt(value, 10) - 2) * 8];
+      if (/^(xs|sm|base|lg|xl|[2-9]xl)$/.test(value)) {
+        // Each Tailwind font size carries its line height; a leading-* utility
+        // overrides it whatever the class order, as Tailwind's stylesheet order does.
+        const size = ({ xs: 12, sm: 14, base: 16, lg: 18, xl: 20 })[value] ?? 24 + (Number.parseInt(value, 10) - 2) * 8;
+        const pxLeading = ({ xs: 16, sm: 20, base: 24, lg: 28, xl: 28, "2xl": 32, "3xl": 36, "4xl": 40 })[value];
+        const leading = pxLeading ? `${pxLeading}px` : "1";
+        return [["fontSize", size], ["__default:lineHeight", leading]];
+      }
       if (/^\[(?:\d+(?:\.\d+)?(?:px|rem|em))\]$/.test(value)) return ["fontSize", parseLength(value.slice(1, -1))];
       if (colorValue(value)) return ["color", colorValue(value)];
     }
@@ -624,9 +638,11 @@ function utilityStyle(utility) {
         if (/^-?(?:\d+\.?\d*|\.\d+)px$/.test(raw)) return ["lineHeight", raw];
         if (/^-?(?:\d+\.?\d*|\.\d+)(?:em|rem|%)$/.test(raw)) return ["lineHeight", raw];
         const parsed = parseLength(raw);
-        return parsed === undefined ? null : ["lineHeight", parsed];
+        return parsed === undefined ? null : ["lineHeight", typeof parsed === "number" ? `${parsed}px` : parsed];
       }
-      return ["lineHeight", spacing(value)];
+      // A bare number is a CSS line-height multiplier: spacing values are lengths.
+      const length = spacing(value);
+      return length === undefined ? null : ["lineHeight", typeof length === "number" ? `${length}px` : length];
     }
     if (prefix === "font" && /^\d+$/.test(value)) return ["fontWeight", Number(value)];
     if (prefix === "font") {

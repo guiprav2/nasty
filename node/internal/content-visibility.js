@@ -69,7 +69,7 @@ function releaseSubtree(doc, element) {
     (doc.textMetricsDirtyElements ??= new Set()).add(node);
     // A nested skipped element keeps its own contents skipped.
     if (elementState(node).cvSkipped === true) return;
-    for (const child of node.children) visit(child);
+    for (const child of node.children) if (child.nodeType === 1) visit(child);
   };
   visit(element);
   doc.textMetricsDirty = true;

@@ -132,7 +132,24 @@ export {
 } from "./webrtc.js";
 
 /** The `window.navigator` object: media capture plus the basic platform fields. */
+// Open windows, newest last: the system clipboard is reached through one.
+const openWindows = new Set();
+function clipboardWindow() {
+  const windows = [...openWindows];
+  const window = windows.at(-1);
+  if (!window) throw new DOMException("No window is open to reach the clipboard.", "NotAllowedError");
+  return window;
+}
+
+/** Async Clipboard API, text only. */
+export class Clipboard extends EventTarget {
+  async writeText(text) { clipboardWindow().setClipboardText(String(text)); }
+  async readText() { return clipboardWindow().clipboardText() ?? ""; }
+}
+const sharedClipboard = new Clipboard();
+
 export class Navigator {
+  get clipboard() { return sharedClipboard; }
   get mediaDevices() { return mediaDevices; }
   get userAgent() { return `Mozilla/5.0 (${process.platform}) Nasty/0.1`; }
   get platform() { return process.platform; }
@@ -285,6 +302,7 @@ export class Window extends NativeWindow {
   #eventTimer = null;
   #closeNotified = false;
   #pressedElement = null;
+  #lastClick = null;
   #hoveredElement = null;
   #textControlIds = new WeakMap();
   #managedTextControls = new WeakSet();
@@ -334,6 +352,7 @@ export class Window extends NativeWindow {
       visible: showAfterSizing ? false : options.visible,
       resizable: initialResizable, orientation: initialOrientation, borderless: initialBorderless,
       dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized, vsync: initialVsync });
+    openWindows.add(this);
     this.#appId = appId;
     this.#userDataPath = userDataPath;
     this.#cachePath = cachePath;
@@ -636,6 +655,7 @@ export class Window extends NativeWindow {
   #notifyClosed() {
     if (this.#closeNotified) return;
     this.#closeNotified = true;
+    openWindows.delete(this);
     clearTimeout(this.#presentationTimer);
     this.#presentationTimer = null;
     clearTimeout(this.#eventTimer);
@@ -738,7 +758,8 @@ export class Window extends NativeWindow {
     const key = normalizeWindowKey(nativeEvent.key, nativeEvent.text);
     const modifiers = String(nativeEvent.modifiers || "");
     Object.assign(fields, {
-      key, text: nativeEvent.text ?? "", ctrlKey: /CTRL/i.test(modifiers),
+      // winit formats its ModifiersState as "ModifiersState(SHIFT | CONTROL)".
+      key, text: nativeEvent.text ?? "", ctrlKey: /CTRL|CONTROL/i.test(modifiers),
       shiftKey: /SHIFT/i.test(modifiers), altKey: /ALT/i.test(modifiers), metaKey: /SUPER|META|LOGO/i.test(modifiers),
       pointerId: 1, pointerType: "mouse", isPrimary: true,
     });
@@ -806,7 +827,22 @@ export class Window extends NativeWindow {
       documentState(document).pointerPressed = false;
       if (target) dispatchDomEvent(target, "pointerup", fields);
       if (target) dispatchDomEvent(target, "mouseup", fields);
-      if (target && target === this.#pressedElement) dispatchDomEvent(target, "click", fields);
+      // As in browsers (Pointer Events), click goes to the nearest common
+      // ancestor of the pointerdown and pointerup targets, so a press that
+      // ends on a capturing ancestor still clicks it.
+      const clickTarget = target && this.#pressedElement ? commonInclusiveAncestor(target, this.#pressedElement) : null;
+      if (clickTarget) {
+        // Consecutive clicks on one target, close in time and place, count up
+        // in `detail`; the second dispatches dblclick, as in a browser.
+        const now = performance.now();
+        const last = this.#lastClick;
+        const repeat = last && last.target === clickTarget && now - last.time < 500
+          && Math.abs(last.x - fields.clientX) <= 4 && Math.abs(last.y - fields.clientY) <= 4;
+        const detail = repeat ? last.detail + 1 : 1;
+        this.#lastClick = { target: clickTarget, time: now, x: fields.clientX, y: fields.clientY, detail };
+        dispatchDomEvent(clickTarget, "click", { ...fields, detail });
+        if (detail === 2) dispatchDomEvent(clickTarget, "dblclick", { ...fields, detail });
+      }
       // Capture ends implicitly after pointerup.
       if (capture) releaseCapturedPointer(document, 1);
       this.#pressedElement = null;
@@ -834,7 +870,8 @@ export class Window extends NativeWindow {
         this.#lastWheelTarget = document.elementFromPoint(fields.clientX, fields.clientY);
       }
       const target = this.#lastWheelTarget;
-      if (target) dispatchDomEvent(target, "wheel", fields);
+      // A wheel listener that calls preventDefault() cancels the scroll.
+      if (target && dispatchDomEvent(target, "wheel", fields)) return;
       const next = this.#pendingWheelScroll ??= { x: fields.clientX, y: fields.clientY, deltaX: 0, deltaY: 0 };
       next.deltaX += fields.deltaX;
       next.deltaY += fields.deltaY;
@@ -1727,7 +1764,9 @@ function invalidateTransformedContentCache(document) {
 
 function clearPaintSegmentSubtree(element) {
   clearPaintSegments(element);
-  for (const child of element.children) clearPaintSegmentSubtree(child);
+  for (const child of element.children) {
+    if (child.nodeType === 1) clearPaintSegmentSubtree(child);
+  }
 }
 
 function documentHasTransformedContent(document) {
@@ -1744,7 +1783,7 @@ function documentHasTransformedContent(document) {
     const transform = computedStyleValue(element.style, "transform");
     const perspective = computedStyleValue(element.style, "perspective");
     if ((transform && transform !== "none") || (perspective && perspective !== "none")) return true;
-    for (const child of element.children) if (inspect(child)) return true;
+    for (const child of element.children) if (child.nodeType === 1 && inspect(child)) return true;
     return false;
   };
   const value = document.body ? inspect(document.body) : false;
@@ -1993,6 +2032,78 @@ function cssStyleValue(values, property) {
   return values[specific] ?? values[shorthand];
 }
 
+// Listeners for these make an element interactive: it takes the pointer, so
+// a drag-anywhere window does not start moving from it.
+/** The nearest element that contains (or is) both a and b, or null. */
+function commonInclusiveAncestor(a, b) {
+  const chain = new Set();
+  for (let node = a; node; node = node.parentNode) chain.add(node);
+  for (let node = b; node; node = node.parentNode) if (chain.has(node) && node.nodeType === 1) return node;
+  return null;
+}
+
+const POINTER_ACTIVATION_EVENTS = new Set(["click", "dblclick", "pointerdown", "mousedown"]);
+
+
+/** DOM Text node. Measured and painted through its parent Element. */
+export class Text extends EventTarget {
+  constructor(document, data = "") {
+    super();
+    this.document = document;
+    this.nodeType = 3;
+    this.nodeName = "#text";
+    this.parent = null;
+    this._data = data == null ? "" : String(data);
+  }
+  get parentNode() { return this.parent; }
+  get parentElement() { return this.parent?.nodeType === 1 ? this.parent : null; }
+  get ownerDocument() { return this.document; }
+  get textContent() { return this._data; }
+  set textContent(value) { this.data = value; }
+  get nodeValue() { return this._data; }
+  set nodeValue(value) { this.data = value; }
+  get data() { return this._data; }
+  set data(value) {
+    const next = value == null ? "" : String(value);
+    if (this._data === next) return;
+    this._data = next;
+    const parent = this.parent;
+    if (!parent || parent.nodeType !== 1) return;
+    const doc = documentState(parent.document);
+    doc.textMetricsDirty = true;
+    (doc.textMetricsDirtyElements ??= new Set()).add(parent);
+    if (!parent.children.some((child) => child.nodeType === 1)) {
+      elementState(parent).text = parent.children.map((child) => (child.nodeType === 3 ? child.data : "")).join("");
+    }
+    parent._styleChanged();
+  }
+  remove() { this.parent?.removeChild(this); }
+  before(...nodes) {
+    if (!this.parent) return;
+    if (nodes.includes(this)) return this.replaceWith(...nodes);
+    for (const node of nodes) this.parent.insertBefore(node, this);
+  }
+  after(...nodes) {
+    if (!this.parent) return;
+    const parent = this.parent;
+    const siblings = parent.children;
+    let index = siblings.indexOf(this) + 1;
+    while (siblings[index] && nodes.includes(siblings[index])) index++;
+    const next = siblings[index] ?? null;
+    for (const node of nodes) parent.insertBefore(node, next);
+  }
+  replaceWith(...nodes) {
+    if (!this.parent) return;
+    const parent = this.parent;
+    const siblings = parent.children;
+    let index = siblings.indexOf(this) + 1;
+    while (siblings[index] && nodes.includes(siblings[index])) index++;
+    const next = siblings[index] ?? null;
+    if (!nodes.includes(this)) parent.removeChild(this);
+    for (const node of nodes) parent.insertBefore(node, next);
+  }
+}
+
 export class Element extends EventTarget {
   constructor(document, name) {
     super();
@@ -2031,7 +2142,7 @@ export class Element extends EventTarget {
   addEventListener(type, callback, options) {
     if (callback == null) return;
     const eventType = String(type);
-    if (eventType !== "click") {
+    if (!POINTER_ACTIVATION_EVENTS.has(eventType)) {
       super.addEventListener(eventType, callback, options);
       return;
     }
@@ -2047,20 +2158,20 @@ export class Element extends EventTarget {
       if (once) {
         byCallback.delete(callback);
         if (byCallback.size === 0) records.delete(key);
-        trackClickListener(this, callback, capture, false);
+        trackClickListener(this, callback, `${eventType}\0${capture}`, false);
       }
       if (typeof callback === "function") callback.call(this, event);
       else callback.handleEvent?.call(callback, event);
     };
     byCallback.set(callback, wrapped);
-    trackClickListener(this, callback, capture, true);
+    trackClickListener(this, callback, `${eventType}\0${capture}`, true);
     super.addEventListener(eventType, wrapped, options);
     if (typeof options === "object" && options?.signal) {
       const signal = options.signal;
       const forget = () => {
         byCallback.delete(callback);
         if (byCallback.size === 0) records.delete(key);
-        trackClickListener(this, callback, capture, false);
+        trackClickListener(this, callback, `${eventType}\0${capture}`, false);
       };
       if (signal.aborted) forget();
       else signal.addEventListener("abort", forget, { once: true });
@@ -2069,7 +2180,7 @@ export class Element extends EventTarget {
 
   removeEventListener(type, callback, options) {
     const eventType = String(type);
-    if (eventType !== "click") {
+    if (!POINTER_ACTIVATION_EVENTS.has(eventType)) {
       super.removeEventListener(eventType, callback, options);
       return;
     }
@@ -2083,12 +2194,14 @@ export class Element extends EventTarget {
       super.removeEventListener(eventType, wrapped, options);
       byCallback.delete(callback);
       if (byCallback.size === 0) records.delete(key);
-      trackClickListener(this, callback, capture, false);
+      trackClickListener(this, callback, `${eventType}\0${capture}`, false);
     }
   }
 
   get textContent() {
-    return (elementState(this).text ?? "") + this.children.map((child) => child.textContent).join("");
+    const own = elementState(this).text ?? "";
+    if (!this.children.length) return own;
+    return this.children.map((child) => child.textContent).join("");
   }
 
   get value() { return this.localName === "input" || this.localName === "textarea" ? elementState(this).inputValue : undefined; }
@@ -2191,9 +2304,10 @@ export class Element extends EventTarget {
   }
 
   set textContent(value) {
-    if (this.children.length === 0 && elementState(this).text === String(value ?? "")) return;
+    const next = value == null ? "" : String(value);
+    if (this.children.length === 0 && elementState(this).text === next) return;
     for (const child of [...this.children]) this.removeChild(child);
-    elementState(this).text = value == null ? "" : String(value);
+    elementState(this).text = next;
     this._styleChanged();
   }
 
@@ -2306,7 +2420,13 @@ export class Element extends EventTarget {
   }
   querySelectorAll(selector) {
     const found = [];
-    const visit = parent => { for (const child of parent.children) { if (child.matches(selector)) found.push(child); visit(child); } };
+    const visit = parent => {
+      for (const child of parent.children) {
+        if (child.nodeType !== 1) continue;
+        if (child.matches(selector)) found.push(child);
+        visit(child);
+      }
+    };
     visit(this); return found;
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
@@ -2388,6 +2508,13 @@ export class Element extends EventTarget {
       // or layout — same short-circuit as setHostStyle when nothing changed.
       if (changed.size) {
         this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
+        // Showing or hiding a subtree changes what the scene holds (its scroll
+        // layers and baked content), not just this element's paint: the cached
+        // scroll-scene base must not be reused.
+        if (changed.has("visibility")) {
+          const doc = documentState(this.document);
+          doc.pendingScrollSceneInvalidation = true;
+        }
       } else if ((nerdIcon(this)?.glyph ?? null) !== (elementState(this).nerdGlyph ?? null)) {
         // Nerd Font icon tokens resolve to no CSS but change the element's text.
         this._styleChanged("class");
@@ -3096,11 +3223,15 @@ export class Element extends EventTarget {
   }
 
   get naturalWidth() {
-    return this.localName === "video" ? elementState(this).video.width : elementState(this).image?.width ?? 0;
+    if (this.localName === "video") return elementState(this).video.width;
+    const image = elementState(this).image;
+    return image?.naturalWidth ?? image?.width ?? 0;
   }
 
   get naturalHeight() {
-    return this.localName === "video" ? elementState(this).video.height : elementState(this).image?.height ?? 0;
+    if (this.localName === "video") return elementState(this).video.height;
+    const image = elementState(this).image;
+    return image?.naturalHeight ?? image?.height ?? 0;
   }
 
   get width() {
@@ -3121,6 +3252,12 @@ export class Element extends EventTarget {
   set height(value) {
     if (this.localName === "canvas") { this.setAttribute("height", value); return; }
     this.setAttribute("height", value);
+  }
+
+  // A raster canvas's pixels changed (canvas-2d.js): repaint it, as a decoded image is.
+  _canvasContentChanged() {
+    clearPaintSegments(this);
+    this._styleChanged("image");
   }
 
   getContext(contextId, options = undefined) {
@@ -3178,9 +3315,11 @@ export class Element extends EventTarget {
     // cannot enqueue dozens of multi-megapixel full-res decodes on first paint.
     // Full-res still available via decode()/sticky or explicit imageMaxEdge.
     const configured = Number(elementState(this).imageMaxEdge);
+    // decode() asks for the image itself (as a browser decodes it: full
+    // size), so it wins over the layout box's thumbnail-sized edge.
     const maxEdge = Math.min(
       8192,
-      Math.max(64, Number.isFinite(configured) && configured > 0 ? configured : elementState(this).imageLoadSticky ? 8192 : 512),
+      Math.max(64, elementState(this).imageLoadSticky ? 8192 : Number.isFinite(configured) && configured > 0 ? configured : 512),
     );
     cachedImageSource(source, window.cachePath && join(window.cachePath, "images")).then((path) => {
       if (request !== elementState(this).imageRequest) return null;
@@ -3199,6 +3338,8 @@ export class Element extends EventTarget {
         textureId: result.textureId,
         width: result.width,
         height: result.height,
+        naturalWidth: result.naturalWidth ?? result.width,
+        naturalHeight: result.naturalHeight ?? result.height,
         pixels: null,
       };
       clearPaintSegments(this);
@@ -3209,7 +3350,12 @@ export class Element extends EventTarget {
         // size from it; a thumbnail with a definite width and height repaints.
         const sizedByImage = this.style.width === undefined || this.style.height === undefined
           || this.style.width === "auto" || this.style.height === "auto";
-        if (sizedByImage) ds.dirty = true;
+        if (sizedByImage) {
+          // Its intrinsic size is part of its layout style: resend it.
+          (ds.pendingStyleSync ??= new Set()).add(this);
+          ds.dirty = true;
+          markGeometryDirty(ds);
+        }
         ds.paintDirtyElements ??= new Set();
         ds.paintDirtyElements.add(this);
         // Paint-local dirty only: bumping paintGeneration would rebuild every
@@ -3304,6 +3450,7 @@ export class Element extends EventTarget {
     if (inheritedFontChanged) {
       const refreshDescendants = element => {
         for (const child of element.children) {
+          if (child.nodeType !== 1) continue;
           doc.textMetricsDirtyElements.add(child);
           doc.pendingStyleSync.add(child);
           refreshDescendants(child);
@@ -3349,6 +3496,7 @@ export class Element extends EventTarget {
       if (["fontSize", "lineHeight", "fontFamily", "fontWeight", "whiteSpace", "wordBreak", "overflowWrap"].includes(property)) {
         const addDescendants = element => {
           for (const child of element.children) {
+            if (child.nodeType !== 1) continue;
             doc.transitionLayoutDirtyElements.add(child);
             addDescendants(child);
           }
@@ -3385,8 +3533,9 @@ export class Element extends EventTarget {
     const fontSize = Number.parseFloat(inheritedStyle(this, "fontSize", 16)) || 16;
     if (this.localName === "img") {
       const imageStyle = { ...style };
-      if (imageStyle.width === undefined) imageStyle.width = parseDimension(this.getAttribute("width")) ?? elementState(this).image?.width;
-      if (imageStyle.height === undefined) imageStyle.height = parseDimension(this.getAttribute("height")) ?? elementState(this).image?.height;
+      // An unsized img lays out at its intrinsic size, not the (possibly downscaled) texture's.
+      if (imageStyle.width === undefined) imageStyle.width = parseDimension(this.getAttribute("width")) ?? (elementState(this).image ? this.naturalWidth : undefined);
+      if (imageStyle.height === undefined) imageStyle.height = parseDimension(this.getAttribute("height")) ?? (elementState(this).image ? this.naturalHeight : undefined);
     return styleForTaffy(imageStyle, fontSize, documentState(this.document).viewport);
     }
     if (this.localName === "video") {
@@ -3456,10 +3605,10 @@ export class Element extends EventTarget {
   }
 
   appendChild(child) {
-    if (!(child instanceof Element) || child.document !== this.document) {
+    if (!((child instanceof Element) || (child instanceof Text)) || child.document !== this.document) {
       throw new TypeError("child must belong to the same document");
     }
-    if (child === this || this.isDescendantOf(child)) throw new Error("layout tree cycle");
+    if (child instanceof Element && (child === this || this.isDescendantOf(child))) throw new Error("layout tree cycle");
     const moved = child.parent === this;
     if (child.parent) child.parent.removeChild(child);
     this.children.push(child);
@@ -3474,8 +3623,8 @@ export class Element extends EventTarget {
     if (referenceChild == null) return this.appendChild(child);
     const index = this.children.indexOf(referenceChild);
     if (index < 0) throw new Error("reference child not found");
-    if (!(child instanceof Element) || child.document !== this.document) throw new TypeError("child must belong to the same document");
-    if (child === this || this.isDescendantOf(child)) throw new Error("layout tree cycle");
+    if (!((child instanceof Element) || (child instanceof Text)) || child.document !== this.document) throw new TypeError("child must belong to the same document");
+    if (child instanceof Element && (child === this || this.isDescendantOf(child))) throw new Error("layout tree cycle");
     if (child === referenceChild) return child;
     const moved = child.parent === this;
     if (child.parent) child.parent.removeChild(child);
@@ -3524,7 +3673,15 @@ export class Element extends EventTarget {
     this.children.splice(index, 1);
     child.parent = null;
     recordMutation({ type: "childList", target: this, addedNodes: [], removedNodes: [child], previousSibling, nextSibling });
-    if (child.localName === "video") child.pause();
+    if (child instanceof Element && child.localName === "video") child.pause();
+    if (child instanceof Text) {
+      if (!this.children.some((c) => c.nodeType === 1)) {
+        elementState(this).text = this.children.map((c) => (c.nodeType === 3 ? c.data : "")).join("");
+      }
+      const doc = documentState(this.document);
+      doc.textMetricsDirty = true;
+      (doc.textMetricsDirtyElements ??= new Set()).add(this);
+    }
     // A detached subtree is neither laid out nor painted; only this element's
     // structure changed.
     this.#structureChanged();
@@ -3543,6 +3700,20 @@ export class Element extends EventTarget {
     // Inherited styles (em lengths, fonts) resolve against the new ancestry.
     // Subtrees assembled while detached are refreshed once, when they connect;
     // reordering within the same parent keeps the same ancestry.
+    if (child instanceof Text) {
+      // Mirror pure-text children onto elementState.text for the leaf measure path.
+      if (!this.children.some((c) => c.nodeType === 1)) {
+        elementState(this).text = this.children.map((c) => (c.nodeType === 3 ? c.data : "")).join("");
+      } else {
+        elementState(this).text = "";
+      }
+      const doc = documentState(this.document);
+      doc.textMetricsDirty = true;
+      (doc.textMetricsDirtyElements ??= new Set()).add(this);
+      this.#structureChanged();
+      this._styleChanged();
+      return;
+    }
     if (!moved && this.#connected()) child._styleChanged(undefined, true);
     else this.#structureChanged();
   }
@@ -3599,7 +3770,9 @@ function usesViewportUnits(element) {
 function collectBoxElements(element, into) {
   into.push(element);
   if (isContentSkipped(element)) return;
-  for (const child of element.children) collectBoxElements(child, into);
+  for (const child of element.children) {
+    if (child.nodeType === 1) collectBoxElements(child, into);
+  }
 }
 
 function flushChildSync(doc) {
@@ -3633,11 +3806,14 @@ function flushChildSync(doc) {
     const parentState = elementState(parent);
     if (!!parentState.inlineRoot !== inline) {
       parentState.inlineRoot = inline;
-      for (const child of parent.children) doc.layoutTree.setStyle(elementState(child).handle, child._taffyStyle());
+      for (const child of parent.children) {
+        if (child.nodeType !== 1) continue;
+        doc.layoutTree.setStyle(elementState(child).handle, child._taffyStyle());
+      }
       (doc.textMetricsDirtyElements ??= new Set()).add(parent);
       doc.textMetricsDirty = true;
     }
-    const children = isContentSkipped(parent) || inline ? [] : parent.children.map((child) => elementState(child).handle);
+    const children = isContentSkipped(parent) || inline ? [] : parent.children.filter((child) => child.nodeType === 1).map((child) => elementState(child).handle);
     doc.layoutTree.setChildren(parentState.handle, children);
   }
 }
@@ -3743,6 +3919,10 @@ export class Document extends EventTarget {
 
   createElement(name) {
     return new Element(this, name);
+  }
+
+  createTextNode(data) {
+    return new Text(this, data);
   }
 
   querySelector(selector) { return this.body.matches(selector) ? this.body : this.body.querySelector(selector); }
@@ -4367,7 +4547,8 @@ export class Document extends EventTarget {
 
 function normalizeWindowKey(key, text = "") {
   const named = /^Named\((.*)\)$/.exec(String(key || ""));
-  if (named) return named[1];
+  // KeyboardEvent.key for the space bar is " " (winit names it Space).
+  if (named) return named[1] === "Space" ? " " : named[1];
   if (text) return text;
   const character = /^Character\('(.*)'\)$/.exec(String(key || ""));
   return character ? character[1] : String(key || "");
@@ -4430,6 +4611,7 @@ function updateHoverChain(previous, next) {
   const refresh = new Set();
   const collectGroupDescendants = element => {
     for (const child of element.children ?? []) {
+      if (child.nodeType !== 1) continue;
       if (styleData.get(child.style)?.hasGroupHoverUtilities) refresh.add(child);
       collectGroupDescendants(child);
     }
@@ -4441,8 +4623,10 @@ function updateHoverChain(previous, next) {
   for (const element of refresh) element._refreshTailwind(documentState(element.document).viewport.width);
 }
 
+/** Dispatches a bubbling host event; returns true when a listener called preventDefault(). */
 function dispatchDomEvent(target, type, fields = {}) {
   let stopped = false;
+  let prevented = false;
   const path = [];
   for (let current = target; current; current = current.parentNode) path.push(current);
   for (const current of path) {
@@ -4450,9 +4634,12 @@ function dispatchDomEvent(target, type, fields = {}) {
     Object.defineProperty(event, "target", { configurable: true, value: target });
     Object.defineProperty(event, "currentTarget", { configurable: true, value: current });
     event.stopPropagation = () => { stopped = true; };
+    if (prevented) event.preventDefault();
     current.dispatchEvent(event);
+    if (event.defaultPrevented) prevented = true;
     if (stopped) break;
   }
+  return prevented;
 }
 
 // Fullscreen API: the fullscreen element is the document's top layer. It gets

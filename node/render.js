@@ -3,10 +3,19 @@ import { assembledMap, prepareScrollLayers, scrollLayerQuads } from "./internal/
 import { transformedTextTexture } from "./internal/transformed-text.js";
 import { clipTexturedPolygon, quadCommands, scrollHostId } from "./internal/scroll-quads.js";
 import { computedStyleValue, getStyleTransitionState, hasActiveStyleTransition, styleHasAnimations, styleMeshRevision } from "./internal/css-transitions.js";
-import { canvasCommands, canvasSurface, canvasTriangleBuffer } from "./canvas-2d.js";
+import { canvasCommands, canvasSurface, canvasTriangleBuffer, canvasVersion } from "./canvas-2d.js";
 import { objectFitLayout, objectPositionFractions } from "./internal/object-fit.js";
 import { renderedText } from "./internal/nerd-icon.js";
 import { transformMatrix as parseCssTransform } from "./internal/css-transform.js";
+import { inherited as inheritedStyle } from "./internal/text-metrics.js";
+
+// Texture ids with this bit set sample nearest-neighbour in the native
+// renderer (CSS image-rendering: pixelated / crisp-edges). Native ids stay below it.
+const NEAREST_TEXTURE_BIT = 1 << 23;
+function sampledTextureId(element, textureId) {
+  const rendering = inheritedStyle(element, "imageRendering", "auto");
+  return rendering === "pixelated" || rendering === "crisp-edges" ? textureId + NEAREST_TEXTURE_BIT : textureId;
+}
 
 const SIDES = ["Top", "Right", "Bottom", "Left"];
 const transformedListTextLayers = new WeakMap();
@@ -1184,6 +1193,15 @@ function layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip) {
   return result;
 }
 
+const EMPTY_PART = new Float32Array(0);
+/** Whether an element or any ancestor is not rendered (hidden, display: none, visibility: hidden). */
+function hiddenInTree(element) {
+  for (let current = element; current?.nodeType === 1; current = current.parentElement ?? current.parent) {
+    if (current.hidden || current.style.display === "none" || current.style.visibility === "hidden") return true;
+  }
+  return false;
+}
+
 /** Where each scroll layer's quads sit in a finished scene (offsets in floats). */
 function layerSegments(sceneParts) {
   const segments = [];
@@ -1358,10 +1376,15 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       return regions;
     };
     for (const [hostElement, layer] of scrollLayers) {
+      const slot = scrollSceneCache.layerSlots.get(hostElement);
+      // A hidden host (or one under a hidden ancestor) draws nothing.
+      if (hiddenInTree(hostElement)) {
+        if (slot !== undefined) sceneParts[slot] = EMPTY_PART;
+        continue;
+      }
       const hostBox = boxesByElement.get(hostElement) ?? layer.hostBox;
       const quads = layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip);
       if (!quads) continue;
-      const slot = scrollSceneCache.layerSlots.get(hostElement);
       if (slot !== undefined) sceneParts[slot] = quads.values;
       else sceneParts.push(quads.values);
       commandCount += quads.commands;
@@ -1705,10 +1728,14 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     for (const [element, layer] of scrollSceneCache.textLayers ?? []) textLayers.set(element, layer);
     // Refresh scroll-layer quads in their cached slots (same as the quiet hit path).
     for (const [hostElement, layer] of scrollLayers) {
+      const slot = scrollSceneCache.layerSlots.get(hostElement);
+      if (hiddenInTree(hostElement)) {
+        if (slot !== undefined) sceneParts[slot] = EMPTY_PART;
+        continue;
+      }
       const hostBox = boxesByElement.get(hostElement) ?? layer.hostBox;
       const quads = layerQuadCommands(hostBox, layer, projectPoint, viewport, windowClip);
       if (!quads) continue;
-      const slot = scrollSceneCache.layerSlots.get(hostElement);
       if (slot !== undefined) sceneParts[slot] = quads.values;
       else pushScenePart(quads.values, null, quads.commands);
       commandCount += quads.commands;
@@ -2020,7 +2047,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       if (shown.width > 0 && shown.height > 0 && dest.width > 0 && dest.height > 0) {
         const u = (x) => layout.u0 + (x - dest.x) / dest.width * (layout.u1 - layout.u0);
         const v = (y) => layout.v0 + (y - dest.y) / dest.height * (layout.v1 - layout.v0);
-        pushImageBox(image.textureId, shown, [u(shown.x), v(shown.y), u(shown.x + shown.width), v(shown.y + shown.height)],
+        pushImageBox(sampledTextureId(element, image.textureId), shown, [u(shown.x), v(shown.y), u(shown.x + shown.width), v(shown.y + shown.height)],
           cornersOf(), clips, opacity);
       }
     }
@@ -2669,11 +2696,17 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       const surface = canvasSurface(state.canvasContext);
       const window = box.element.ownerDocument?.defaultView;
       if (surface && window) {
+        // Upload only pixels the canvas has changed since the last upload.
+        const version = canvasVersion(state.canvasContext);
         if (!state.image || state.image.width !== surface.width || state.image.height !== surface.height) {
           if (state.image) window.deleteImageTexture(state.image.textureId);
           state.image = { textureId: window.createImageTexture(surface.width, surface.height, surface.data()),
             width: surface.width, height: surface.height };
-        } else window.updateImageTexture(state.image.textureId, surface.data());
+          state.canvasUploadVersion = version;
+        } else if (state.canvasUploadVersion !== version) {
+          window.updateImageTexture(state.image.textureId, surface.data());
+          state.canvasUploadVersion = version;
+        }
       }
       const commands = canvasCommands(elementState(box.element).canvasContext);
       const scaleX = box.element.width ? box.width / box.element.width : 1;
@@ -2751,7 +2784,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
           for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
           const scissor = screenSpaceBounds(clipped, viewport);
           if (scissor.width > 0 && scissor.height > 0) {
-            values.push(1, image.textureId, scissor.x, scissor.y, scissor.width, scissor.height, triangles.length);
+            values.push(1, sampledTextureId(box.element, image.textureId), scissor.x, scissor.y, scissor.width, scissor.height, triangles.length);
             for (const point of triangles) values.push(point.x, point.y, point.u, point.v, point.reciprocalW);
             commandCount++;
           }

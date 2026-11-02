@@ -13,13 +13,20 @@ export function nerdIcon(element) {
 
 export function renderedText(element) {
   const state = elementState(element);
-  const text = element.localName === 'input' || element.localName === 'textarea'
-    ? (state.inputValue
+  if (element.localName === 'input' || element.localName === 'textarea') {
+    const text = state.inputValue
       ? (element.localName === 'input' && element.type === 'password'
         ? '•'.repeat(Array.from(state.inputValue).length)
         : state.inputValue)
-      : element.placeholder) : state.text;
-  if (text) return text;
+      : element.placeholder;
+    if (text) return text;
+    return nerdIcon(element)?.glyph ?? '';
+  }
+  if (state.text) return state.text;
+  // Text-node children (d.text / createTextNode) when no element children.
+  if (element.children?.length && element.children.every((child) => child.nodeType === 3)) {
+    return element.children.map((child) => child.data).join('');
+  }
   return nerdIcon(element)?.glyph ?? '';
 }
 

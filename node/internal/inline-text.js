@@ -22,6 +22,11 @@ export function isInlineRoot(element) {
   const display = element.style.display;
   // Flex and grid containers blockify their children instead.
   if (display && display !== 'block' && display !== 'flow-root' && display !== 'inline-block') return false;
+  // Pure Text children are leaf text on this element, not an inline formatting context.
+  if (element.children.every((child) => child.nodeType === 3)) return false;
   if (renderedText(element)) return false;
-  return element.children.every(isInlineLevel);
+  // Only element children participate; ignore inter-element Text.
+  const kids = element.children.filter((child) => child.nodeType === 1);
+  if (!kids.length) return false;
+  return kids.every(isInlineLevel);
 }

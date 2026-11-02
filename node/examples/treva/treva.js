@@ -1,20 +1,25 @@
 /**
- * Treva header + title screen ported to Nasty.
- * Header includes Index / Wallpaper / Grok dropdowns (UI + local state).
- * Gallery body is not ported yet.
+ * Treva ported to Nasty: title screen, header (Index / Wallpaper / Grok
+ * dropdowns), sidebar, gallery grid and the full-size viewer.
  * Run from node/: node examples/treva/treva.js
  */
 import { dirname, join, relative, sep, basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import fg from "fast-glob";
 import {
   IMAGE_EXT,
   extOf,
+  mimeFromExt,
   visibleImages,
   plural,
   gridWindow,
   listWindow,
+  formatBytes,
+  formatDate,
+  formatDims,
+  fitScale,
+  zoomAt,
 } from "./model.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -78,6 +83,19 @@ const ICONS = {
   pause: "nf-md-pause",
   help: "nf-md-help_circle_outline",
   close: "nf-md-close",
+  left: "nf-md-chevron_left",
+  right: "nf-md-chevron_right",
+  plus: "nf-md-plus",
+  minus: "nf-md-minus",
+  fit: "nf-md-fit_to_screen_outline",
+  width: "nf-md-arrow_expand_horizontal",
+  actual: "nf-md-crop_square",
+  rotate: "nf-md-rotate_right",
+  rotateCcw: "nf-md-rotate_left",
+  info: "nf-md-information_outline",
+  full: "nf-md-fullscreen",
+  checkOn: "nf-md-checkbox_marked",
+  checkOff: "nf-md-checkbox_blank_outline",
   minimize: "nf-md-window_minimize",
   maximize: "nf-md-window_maximize",
   restore: "nf-md-window_restore",
@@ -129,7 +147,24 @@ const state = {
   thumb: 180,
   currentId: null,
   screen: "gallery",
+  // Viewer, as in Treva's app.js.
+  mode: "fit",
+  scale: 1,
+  tx: 0,
+  ty: 0,
+  rotation: 0,
+  dragging: false,
   slideshow: false,
+  slideshowMs: 3000,
+  loop: true,
+  info: false,
+  osd: false,
+  copied: false,
+  fullscreen: false,
+  chrome: true,
+  overBar: false,
+  stageW: 0,
+  stageH: 0,
   help: false,
   // While a folder opens: { phase: "scanning" | "rendering", count, total }.
   opening: null,
@@ -535,7 +570,8 @@ function grokSettingsMenu() {
 function grokSettings() {
   return d.el(
     "div",
-    { class: "relative shrink-0" },
+    // Hidden until the Grok backend is ported.
+    { class: "hidden relative shrink-0" },
     d.el(
       "button",
       {
@@ -734,7 +770,8 @@ function wallpaperMenu() {
 function wallpaperControl() {
   return d.el(
     "div",
-    { class: "relative shrink-0" },
+    // Hidden until the wallpaper backend is ported.
+    { class: "hidden relative shrink-0" },
     d.el(
       "button",
       {
@@ -1080,6 +1117,7 @@ function visible() {
     sortKey: state.sortKey,
     sortDir: state.sortDir,
   });
+  frame.visibleSet = new Set(frame.visible);
   return frame.visible;
 }
 
@@ -1172,15 +1210,337 @@ function imageById(id) {
   return _byId.get(id);
 }
 
+// --- Selection, navigation and the viewer (Treva app.js) ---
+
+let slideTimer = 0;
+let osdTimer = 0;
+let copiedTimer = 0;
+let pointer = null;
+
 function currentImage() {
-  if (!state.currentId) return visible()[0] || null;
-  return state.images.find(im => im.id === state.currentId) || visible()[0] || null;
+  const list = visible();
+  if (!list.length) return null;
+  const im = state.currentId ? imageById(state.currentId) : null;
+  return im && frame.visibleSet.has(im) ? im : null;
+}
+
+// A folder opens with nothing selected; actions that need an image (open,
+// slideshow, fullscreen) start from the first one.
+function targetImage() {
+  return currentImage() ?? visible()[0] ?? null;
+}
+
+function currentIndex() {
+  const list = visible();
+  if (!list.length) return -1;
+  return state.currentId ? list.findIndex(im => im.id === state.currentId) : -1;
+}
+
+function displayScale(im) {
+  if (!im) return 1;
+  const scale = fitScale(
+    Math.max(0, state.stageW - 48),
+    Math.max(0, state.stageH - 48),
+    im.width || 0,
+    im.height || 0,
+    state.rotation,
+    state.mode,
+    state.scale,
+  );
+  if (!isFinite(scale) || scale <= 0) return 1;
+  return scale;
+}
+
+// translate(calc(-50% + tx), calc(-50% + ty)) rotate() scale(), as Treva's
+// inline transform, written as the equivalent Tailwind utilities.
+function transformClasses(im) {
+  const scale = displayScale(im);
+  const px = n => `${Math.round(n * 100) / 100}px`;
+  return `translate-x-[calc(-50%+${px(state.tx)})] translate-y-[calc(-50%+${px(state.ty)})] rotate-[${state.rotation}deg] scale-[${Math.round(scale * 1e5) / 1e5}]`;
+}
+
+function resetViewTransform() {
+  if (state.mode === "manual") state.mode = "fit";
+  state.tx = 0;
+  state.ty = 0;
+  state.rotation = 0;
+}
+
+function flashOsd() {
+  state.osd = true;
+  clearTimeout(osdTimer);
+  osdTimer = setTimeout(() => {
+    state.osd = false;
+    d.update();
+  }, 900);
+}
+
+function bumpSlideshow() {
+  if (!state.slideshow) return;
+  if (slideTimer) clearInterval(slideTimer);
+  slideTimer = setInterval(() => advance(1, false), state.slideshowMs);
+}
+
+function setSlideshow(on) {
+  if (on && !visible().length) on = false;
+  state.slideshow = !!on;
+  if (slideTimer) clearInterval(slideTimer);
+  slideTimer = 0;
+  if (state.slideshow) {
+    if (!state.currentId && visible()[0]) state.currentId = visible()[0].id;
+    state.screen = "viewer";
+    slideTimer = setInterval(() => advance(1, false), state.slideshowMs);
+  }
+  d.update();
+}
+
+function selectImage(im, opts) {
+  if (!im) return;
+  const open = opts && opts.open;
+  const changed = im.id !== state.currentId;
+  if (open) {
+    state.screen = "viewer";
+    if (state.narrow) state.sidebarOpen = false;
+  }
+  if (changed && state.screen === "viewer") {
+    resetViewTransform();
+    flashOsd();
+  }
+  state.currentId = im.id;
+  const index = visible().findIndex(item => item.id === im.id);
+  if (state.screen === "gallery") revealInGrid(index);
+  revealInList(index);
+  if (opts && opts.user && changed) bumpSlideshow();
+  d.update();
+}
+
+function openViewer(im) {
+  selectImage(im || targetImage(), { open: true, user: true });
 }
 
 function activateImage(im) {
   if (!im) return;
-  state.currentId = im.id;
+  if (state.screen === "viewer" || im.id === state.currentId) openViewer(im);
+  else selectImage(im, { user: true });
+}
+
+function showGallery() {
+  state.screen = "gallery";
+  if (state.slideshow) setSlideshow(false);
+  else d.update();
+}
+
+function advance(delta, user) {
+  const list = visible();
+  if (!list.length) return;
+  const i = currentIndex();
+  let n = i < 0 ? (delta < 0 ? list.length - 1 : 0) : i + delta;
+  if (n < 0 || n >= list.length) {
+    if (state.loop) n = (n + list.length) % list.length;
+    else {
+      if (state.slideshow) setSlideshow(false);
+      n = Math.max(0, Math.min(list.length - 1, n));
+    }
+  }
+  selectImage(list[n], { open: state.screen === "viewer", user: !!user });
+}
+
+function moveGrid(dx, dy) {
+  const list = visible();
+  if (!list.length) return;
+  const i = currentIndex();
+  // The first arrow press only selects the first image.
+  let n = i < 0 ? 0 : dx ? i + dx : i + dy * gridWin().cols;
+  n = Math.max(0, Math.min(list.length - 1, n));
+  selectImage(list[n], { user: true });
+}
+
+function jump(index) {
+  const list = visible();
+  if (!list.length) return;
+  const n = index < 0 ? list.length - 1 : index;
+  selectImage(list[n], { open: state.screen === "viewer", user: true });
+}
+
+function revealInGrid(index) {
+  const scroller = gridScroller;
+  if (!scroller || index < 0) return;
+  const layout = gridWin();
+  const row = Math.floor(index / layout.cols);
+  const top = layout.pad + row * layout.rowStride;
+  const bottom = top + layout.cell;
+  const view = scroller.clientHeight;
+  if (!view) return;
+  if (top < scroller.scrollTop) scroller.scrollTop = Math.max(0, top - layout.pad);
+  else if (bottom > scroller.scrollTop + view) scroller.scrollTop = bottom - view + layout.pad;
+}
+
+function revealInList(index) {
+  const scroller = listScroller;
+  if (!scroller || index < 0 || !scroller.clientHeight) return;
+  const top = index * ROW_H;
+  const bottom = top + ROW_H;
+  const view = scroller.clientHeight;
+  if (top < scroller.scrollTop) scroller.scrollTop = top;
+  else if (bottom > scroller.scrollTop + view) scroller.scrollTop = bottom - view;
+}
+
+function setMode(mode) {
+  state.mode = mode;
+  state.tx = 0;
+  state.ty = 0;
+  if (mode === "actual") state.scale = 1;
   d.update();
+}
+
+function zoomBy(factor) {
+  const im = currentImage();
+  if (!im) return;
+  const tx = state.mode === "manual" ? state.tx : 0;
+  const ty = state.mode === "manual" ? state.ty : 0;
+  const next = zoomAt(0, 0, tx, ty, displayScale(im), factor, 0.05, 32);
+  state.mode = "manual";
+  state.scale = next.scale;
+  state.tx = next.tx;
+  state.ty = next.ty;
+  d.update();
+}
+
+function rotateBy(delta) {
+  state.rotation = (state.rotation + delta + 360) % 360;
+  d.update();
+}
+
+// Fullscreen shows only the viewer: the image and its bottom bar, which fades
+// out after two idle seconds and comes back whenever the mouse moves.
+function toggleFullscreen() {
+  if (doc.fullscreenElement) {
+    doc.exitFullscreen().catch(() => {});
+    return;
+  }
+  if (state.screen !== "viewer") {
+    if (!targetImage()) return;
+    openViewer(targetImage());
+  }
+  nodes.viewer?.requestFullscreen().catch(() => {});
+}
+
+const CHROME_IDLE_MS = 2000;
+let chromeTimer = null;
+
+function wakeChrome() {
+  if (!state.fullscreen) return;
+  if (!state.chrome) {
+    state.chrome = true;
+    d.update();
+  }
+  clearTimeout(chromeTimer);
+  chromeTimer = setTimeout(fadeChrome, CHROME_IDLE_MS);
+}
+
+function fadeChrome() {
+  chromeTimer = null;
+  if (!state.fullscreen) return;
+  // Keep the bar while the pointer rests on it or its speed menu is open.
+  if (state.overBar || state.speedMenu) {
+    chromeTimer = setTimeout(fadeChrome, CHROME_IDLE_MS);
+    return;
+  }
+  state.chrome = false;
+  d.update();
+}
+
+function onViewerPointerMove(ev) {
+  state.overBar = !!ev.target?.closest?.("[data-viewer-bar]");
+  wakeChrome();
+}
+
+function zoomLabel() {
+  const im = currentImage();
+  if (!im) return "—";
+  return Math.round(displayScale(im) * 100) + "%";
+}
+
+function positionLabel() {
+  const list = visible();
+  if (!list.length) return "";
+  const i = currentIndex();
+  return (i < 0 ? "–" : i + 1) + " / " + list.length;
+}
+
+function onStageWheel(ev) {
+  if (state.screen !== "viewer") return;
+  if (ev.target.closest && ev.target.closest("[data-no-pan]")) return;
+  const im = currentImage();
+  const stage = nodes.stage;
+  if (!im || !stage) return;
+  ev.preventDefault();
+  const rect = stage.getBoundingClientRect();
+  const cx = ev.clientX - rect.left - rect.width / 2;
+  const cy = ev.clientY - rect.top - rect.height / 2;
+  const tx = state.mode === "manual" ? state.tx : 0;
+  const ty = state.mode === "manual" ? state.ty : 0;
+  // Zoom in proportion to the wheel distance: a mouse notch (40px) is about
+  // 6%, and touchpad pixel deltas zoom smoothly instead of in fixed steps.
+  const delta = Math.max(-200, Math.min(200, ev.deltaY));
+  const factor = Math.exp(-delta * 0.0015);
+  const next = zoomAt(cx, cy, tx, ty, displayScale(im), factor, 0.05, 32);
+  state.mode = "manual";
+  state.scale = next.scale;
+  state.tx = next.tx;
+  state.ty = next.ty;
+  d.update();
+}
+
+function onStagePointerDown(ev) {
+  if (ev.button !== 0) return;
+  if (ev.target.closest && ev.target.closest("[data-no-pan]")) return;
+  const im = currentImage();
+  if (!im) return;
+  if (state.mode !== "manual") {
+    state.scale = displayScale(im);
+    state.mode = "manual";
+  }
+  state.dragging = true;
+  pointer = { x: ev.clientX, y: ev.clientY, moved: false };
+  ev.currentTarget.setPointerCapture(ev.pointerId);
+}
+
+function onStagePointerMove(ev) {
+  if (!state.dragging || !pointer) return;
+  const dx = ev.clientX - pointer.x;
+  const dy = ev.clientY - pointer.y;
+  if (!pointer.moved && Math.abs(dx) + Math.abs(dy) < 3) return;
+  pointer.moved = true;
+  state.tx += dx;
+  state.ty += dy;
+  pointer.x = ev.clientX;
+  pointer.y = ev.clientY;
+  d.update();
+}
+
+function onStagePointerUp() {
+  if (!state.dragging) return;
+  state.dragging = false;
+  pointer = null;
+  d.update();
+}
+
+async function copyPath() {
+  const im = currentImage();
+  if (!im) return;
+  try {
+    await win.navigator.clipboard.writeText(im.path);
+    state.copied = true;
+    clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => {
+      state.copied = false;
+      d.update();
+    }, 1200);
+    d.update();
+  } catch {
+    showToast("Could not copy the path");
+  }
 }
 
 function fileUrlFor(im) {
@@ -1239,6 +1599,7 @@ async function listImages(rootPath, onProgress = null) {
       path,
       absPath,
       ext: extOf(name),
+      type: mimeFromExt(extOf(name)),
       size: null,
       lastModified: 0,
       loaded: false,
@@ -1470,6 +1831,7 @@ const SORT_KEYS = ["name", "path", "size", "modified", "ext"];
 function chooseSort(key) {
   state.sortKey = key;
   state.sortMenu = false;
+  rememberSort();
   state.scroll.grid = 0;
   state.scroll.list = 0;
   d.update();
@@ -1537,6 +1899,7 @@ function fileRow(im) {
                 () => (im.id === state.currentId ? `bg-[${C.gold300}]/15` : ""),
               ],
               onclick: () => activateImage(im),
+              ondblclick: () => openViewer(im),
             },
             d.el(
               "div",
@@ -1640,6 +2003,7 @@ function sidebar() {
             title: "Reverse sort",
             onclick: () => {
               state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+              rememberSort();
               state.scroll.grid = 0;
               state.scroll.list = 0;
               d.update();
@@ -1662,6 +2026,342 @@ function sidebar() {
   );
 }
 
+// --- Viewer (Treva app.js viewer(), infoPanel()) ---
+
+const SPEEDS = [1000, 2000, 3000, 5000, 8000];
+
+// Checkbox built from a button (Nasty draws no native checkbox).
+function toggle(testId, label, get, set) {
+  return d.el(
+    "button",
+    {
+      type: "button",
+      role: "checkbox",
+      "data-testid": testId,
+      "data-no-pan": "1",
+      "aria-checked": () => (get() ? "true" : "false"),
+      class: "flex h-8 items-center gap-1 px-1 text-xs text-stone-400 cursor-pointer hover:text-stone-200",
+      onclick: () => {
+        set(!get());
+        d.update();
+      },
+    },
+    d.if(get, icon("checkOn", `h-4 w-4 text-base text-[${C.copper500}]`), icon("checkOff", "h-4 w-4 text-base")),
+    label,
+  );
+}
+
+// Slideshow speed picker: a trigger with a menu that opens upward.
+function speedDropdown() {
+  return d.el(
+    "div",
+    { class: "relative shrink-0", "data-testid": "speed", "data-no-pan": "1" },
+    d.el(
+      "button",
+      {
+        type: "button",
+        title: "Slideshow speed",
+        "aria-haspopup": "listbox",
+        class: `flex h-8 items-center gap-1 rounded-md border border-stone-400/6 bg-[${C.ink950}] px-1.5 text-xs text-stone-200 cursor-pointer hover:bg-white/5`,
+        onclick: () => {
+          state.speedMenu = !state.speedMenu;
+          d.update();
+        },
+      },
+      d.text(() => `${state.slideshowMs / 1000}s`),
+      icon("chevronDown", "h-3 w-3 shrink-0 text-xs text-stone-400"),
+    ),
+    d.if(() => !!state.speedMenu, backdrop(() => { state.speedMenu = false; d.update(); }, "Close speed menu")),
+    d.if(
+      () => !!state.speedMenu,
+      d.el(
+        "div",
+        {
+          role: "listbox",
+          class: `absolute bottom-9 left-0 z-[70] flex w-16 flex-col gap-0.5 rounded-md border border-stone-400/9 bg-[${C.ink900}] p-1`,
+        },
+        ...SPEEDS.map(ms => d.el(
+          "button",
+          {
+            type: "button",
+            role: "option",
+            class: [
+              "flex h-7 w-full items-center rounded px-2 text-left text-xs text-stone-200 cursor-pointer hover:bg-white/10",
+              () => (state.slideshowMs === ms ? `bg-[${C.gold300}]/15` : ""),
+            ],
+            onclick: () => {
+              state.slideshowMs = ms;
+              state.speedMenu = false;
+              if (state.slideshow) bumpSlideshow();
+              d.update();
+            },
+          },
+          `${ms / 1000}s`,
+        )),
+      ),
+    ),
+  );
+}
+
+function infoRow(label, get, testid) {
+  return d.el(
+    "div",
+    { class: "min-w-0 border-b border-stone-400/4 py-2" },
+    d.el("div", { class: "truncate text-[11px] uppercase tracking-wide text-stone-500" }, label),
+    d.el("div", { class: "mt-0.5 truncate text-sm text-stone-100", title: get, "data-testid": testid || null }, d.text(get)),
+  );
+}
+
+function infoPanel() {
+  const cur = fn => () => {
+    const im = currentImage();
+    return im ? fn(im) : "—";
+  };
+  return d.el(
+    "aside",
+    {
+      "data-no-pan": "1",
+      "data-testid": "info",
+      class: () => {
+        if (!state.info) return "hidden";
+        if (state.narrow) return `absolute inset-x-0 bottom-0 z-20 h-[46%] overflow-auto border-t border-stone-400/6 bg-[${C.ink950}]/95 p-4`;
+        return `absolute bottom-0 right-0 top-0 z-20 w-72 overflow-auto border-l border-stone-400/6 bg-[${C.ink950}]/95 p-4`;
+      },
+    },
+    d.el(
+      "div",
+      { class: "mb-3 flex items-center justify-between" },
+      d.el("div", { class: "text-xs uppercase tracking-[0.16em] text-stone-500" }, "Details"),
+      d.el("button", {
+        type: "button",
+        class: "text-sm text-stone-400 hover:text-white cursor-pointer",
+        onclick: () => { state.info = false; d.update(); },
+      }, "Close"),
+    ),
+    infoRow("Name", cur(im => im.name)),
+    infoRow("Path", cur(im => im.path), "info-path"),
+    infoRow("Type", cur(im => im.type || im.ext)),
+    infoRow("Dimensions", cur(im => formatDims(im.width, im.height)), "info-dims"),
+    infoRow("Size", cur(im => formatBytes(im.size)), "info-size"),
+    infoRow("Modified", cur(im => formatDate(im.lastModified))),
+    infoRow("Shown at", cur(() => zoomLabel() + (state.rotation ? " · " + state.rotation + "°" : ""))),
+    d.el("button", {
+      type: "button",
+      "data-action": "copy-path",
+      class: `mt-3 rounded-md px-2 py-1 text-sm text-[${C.copper300}] ring-1 ring-[${C.copper500}]/40 hover:bg-white/5 cursor-pointer`,
+      onclick: () => copyPath(),
+    }, d.text(() => (state.copied ? "Copied" : "Copy path"))),
+  );
+}
+
+// The stage image's source is set here, after bindings, so a new source can
+// ask for a full-size decode (decode()), as a browser shows the image itself.
+function syncStageImage() {
+  const img = nodes.stageImage;
+  if (!img) return;
+  const im = currentImage();
+  const want = state.screen === "viewer" && im && !im.error ? fileUrlFor(im) : "";
+  if ((img.getAttribute("src") || "") === want) return;
+  if (want) {
+    img.src = want;
+    img.decode().catch(() => {});
+  } else img.removeAttribute("src");
+}
+
+function stage() {
+  return d.el(
+    "div",
+    {
+      class: () => `relative min-h-0 flex-1 overflow-hidden bg-[#141210] ${state.dragging ? "cursor-grabbing" : "cursor-grab"}`,
+      "data-stage": "1",
+      "data-testid": "stage",
+      onpointerdown: onStagePointerDown,
+      onpointermove: onStagePointerMove,
+      onpointerup: onStagePointerUp,
+      onlostpointercapture: onStagePointerUp,
+      ondblclick: ev => {
+        if (ev.target.closest && ev.target.closest("[data-no-pan]")) return;
+        setMode(state.mode === "actual" ? "fit" : "actual");
+      },
+      onwheel: onStageWheel,
+    },
+    nodes.stageImage = d.el("img", {
+      "data-testid": "stage-image",
+      draggable: false,
+      alt: () => currentImage()?.name ?? "",
+      class: ["pointer-events-none absolute left-1/2 top-1/2 origin-center", () => transformClasses(currentImage())],
+      onload: ev => {
+        const im = currentImage();
+        const el = ev.target;
+        if (!im || el.getAttribute("src") !== fileUrlFor(im) || !el.naturalWidth) return;
+        if (im.width === el.naturalWidth && im.height === el.naturalHeight && !im.error) return;
+        im.width = el.naturalWidth;
+        im.height = el.naturalHeight;
+        im.error = false;
+        d.update();
+      },
+      onerror: ev => {
+        const im = currentImage();
+        if (!im || ev.target.getAttribute("src") !== fileUrlFor(im)) return;
+        im.error = "Cannot preview";
+        d.update();
+      },
+    }),
+    d.el(
+      "div",
+      {
+        class: () => `pointer-events-none absolute ${state.fullscreen ? "bottom-16" : "bottom-4"} left-1/2 z-10 -translate-x-1/2 rounded-full bg-black/70 px-4 py-1.5 text-sm text-white transition-opacity duration-300 ease-in-out ${state.osd ? "opacity-100" : "opacity-0"}`,
+        "data-testid": "osd",
+      },
+      d.text(() => currentImage()?.name ?? ""),
+    ),
+    d.if(
+      () => !!currentImage()?.error,
+      d.el(
+        "div",
+        { class: "pointer-events-none absolute inset-0 z-10 flex items-center justify-center p-6 text-center" },
+        d.el(
+          "div",
+          {},
+          d.el("div", { class: "font-display text-4xl text-stone-200" }, d.text(() => (currentImage()?.ext ?? "").toUpperCase())),
+          d.el("p", { class: "mt-2 text-sm text-stone-400" }, "This file cannot be previewed in the browser."),
+        ),
+      ),
+    ),
+    d.el("button", {
+      type: "button",
+      "data-action": "prev",
+      "data-no-pan": "1",
+      "aria-label": "Previous image",
+      class: () => `absolute left-3 top-1/2 z-30 -translate-y-1/2 rounded-full bg-black/45 p-3 text-white hover:bg-black/70 cursor-pointer ${state.fullscreen ? "hidden" : ""}`,
+      onclick: () => advance(-1, true),
+    }, icon("left", "h-5 w-5 text-xl")),
+    d.el("button", {
+      type: "button",
+      "data-action": "next",
+      "data-no-pan": "1",
+      "aria-label": "Next image",
+      class: () => `absolute top-1/2 z-30 -translate-y-1/2 rounded-full bg-black/45 p-3 text-white hover:bg-black/70 cursor-pointer ${!state.narrow && state.info ? "right-[19.5rem]" : "right-3"} ${state.fullscreen ? "hidden" : ""}`,
+      onclick: () => advance(1, true),
+    }, icon("right", "h-5 w-5 text-xl")),
+    infoPanel(),
+  );
+}
+
+function viewerToolbar() {
+  return d.el(
+    "div",
+    {
+      "data-no-pan": "1",
+      "data-viewer-bar": "1",
+      class: () => state.fullscreen
+        ? `absolute inset-x-0 bottom-0 z-40 flex flex-wrap items-center gap-1 border-t border-stone-400/6 bg-[${C.ink900}]/90 px-2 py-1.5 transition-opacity duration-300 ease-in-out ${state.chrome ? "opacity-100" : "opacity-0"}`
+        : `relative z-40 flex shrink-0 flex-wrap items-center gap-1 border-t border-stone-400/6 bg-[${C.ink900}] px-2 py-1.5`,
+    },
+    tool({ action: "grid", title: "Grid (G)", label: "Show grid", onClick: () => { state.screen = "gallery"; d.update(); } }, icon("grid")),
+    tool({ action: "prev-bar", title: "Previous", label: "Previous image", onClick: () => advance(-1, true) }, icon("left")),
+    tool({ action: "next-bar", title: "Next", label: "Next image", onClick: () => advance(1, true) }, icon("right")),
+    tool({
+      action: "slideshow",
+      title: "Slideshow (Space)",
+      label: "Slideshow",
+      active: () => state.slideshow,
+      onClick: () => setSlideshow(!state.slideshow),
+    }, d.if(() => state.slideshow, icon("pause"), icon("play"))),
+    speedDropdown(),
+    toggle("loop", "Loop", () => state.loop, v => { state.loop = v; }),
+    d.el("div", { class: "mx-1 hidden h-5 w-px bg-white/10 sm:block" }),
+    tool({ action: "zoom-out", title: "Zoom out", label: "Zoom out", onClick: () => zoomBy(1 / 1.25) }, icon("minus")),
+    d.el("div", { class: "w-12 text-center text-xs text-stone-300", "data-testid": "zoom" }, d.text(zoomLabel)),
+    tool({ action: "zoom-in", title: "Zoom in", label: "Zoom in", onClick: () => zoomBy(1.25) }, icon("plus")),
+    tool({ action: "fit", title: "Fit (0)", label: "Fit on screen", active: () => state.mode === "fit", onClick: () => setMode("fit") }, icon("fit")),
+    tool({ action: "width", title: "Fit width (2)", label: "Fit width", active: () => state.mode === "width", onClick: () => setMode("width") }, icon("width")),
+    tool({ action: "actual", title: "Actual size (1)", label: "Actual size", active: () => state.mode === "actual", onClick: () => setMode("actual") }, icon("actual")),
+    tool({ action: "rotate-ccw", title: "Rotate counter-clockwise", label: "Rotate counter-clockwise", onClick: () => rotateBy(-90) }, icon("rotateCcw")),
+    tool({ action: "rotate", title: "Rotate clockwise (R)", label: "Rotate clockwise", onClick: () => rotateBy(90) }, icon("rotate")),
+    tool({ action: "info", title: "Details (I)", label: "Image details", active: () => state.info, onClick: () => { state.info = !state.info; d.update(); } }, icon("info")),
+    tool({ action: "fullscreen", title: "Fullscreen (F)", label: "Fullscreen", onClick: () => toggleFullscreen() }, icon("full")),
+    d.el(
+      "div",
+      { class: "min-w-0 flex-1 px-2" },
+      d.el("div", { class: "truncate text-sm text-stone-100", "data-testid": "current-name" }, d.text(() => currentImage()?.name ?? "")),
+      d.el("div", { class: "truncate text-xs text-stone-500", "data-testid": "position" }, d.text(positionLabel)),
+    ),
+  );
+}
+
+function filmThumb(im) {
+  const selected = () => im.id === state.currentId;
+  return d.el(
+    "button",
+    {
+      type: "button",
+      "data-testid": "film-thumb",
+      "data-path": im.path,
+      "data-current": () => (selected() ? "1" : "0"),
+      title: im.path,
+      class: [
+        `h-16 w-16 shrink-0 overflow-hidden rounded-md border bg-[${C.ink800}] cursor-pointer`,
+        () => (selected() ? `border-[${C.gold300}]` : "border-stone-400/6"),
+      ],
+      onclick: () => activateImage(im),
+    },
+    d.el("img", {
+      alt: "",
+      draggable: false,
+      class: ["h-full w-full object-cover", () => (im.error ? "opacity-0" : "opacity-100")],
+      src: fileUrlFor(im),
+      onerror: () => { im.error = "Cannot preview"; d.update(); },
+    }),
+  );
+}
+
+function filmSlice() {
+  const list = visible();
+  const i = currentIndex();
+  const start = Math.max(0, i - 20);
+  const end = Math.min(list.length, (i < 0 ? 0 : i) + 21);
+  return list.slice(start, end).map(im => im.id);
+}
+
+function centerFilm() {
+  const root = nodes.film;
+  if (!root || state.screen !== "viewer" || !state.currentId) return;
+  const el = root.querySelector('[data-current="1"]');
+  if (!el) return;
+  const box = el.getBoundingClientRect();
+  const left = box.left - root.getBoundingClientRect().left + root.scrollLeft;
+  root.scrollLeft = Math.max(0, left - root.clientWidth / 2 + box.width / 2);
+}
+
+function viewer() {
+  return nodes.viewer = d.el(
+    "div",
+    {
+      onpointermove: onViewerPointerMove,
+      class: [
+        "absolute inset-0 flex flex-col",
+        () => (state.screen === "viewer" ? "z-10" : "invisible pointer-events-none z-0"),
+      ],
+      "data-testid": "viewer",
+    },
+    stage(),
+    viewerToolbar(),
+    nodes.film = d.el(
+      "div",
+      {
+        class: () => `${state.fullscreen ? "hidden" : "flex"} h-20 shrink-0 items-center gap-1 overflow-x-auto border-t border-stone-400/6 bg-[${C.ink950}] px-2`,
+        "data-scrollroot": "film",
+        "data-testid": "film",
+      },
+      d.map(filmSlice, id => {
+        const im = imageById(id);
+        return im ? filmThumb(im) : null;
+      }),
+    ),
+  );
+}
+
 function workspace() {
   return d.el(
     "div",
@@ -1671,6 +2371,7 @@ function workspace() {
       "div",
       { class: "relative flex min-h-0 min-w-0 flex-1 flex-col" },
       gallery(),
+      viewer(),
     ),
   );
 }
@@ -1680,16 +2381,95 @@ async function chooseFolder() {
     showToast("Directory picker is not available.");
     return;
   }
+  let handle;
   try {
-    const handle = await win.showDirectoryPicker({ mode: "read" });
-    const rootPath = handle.path;
-    state.folderName = handle.name || "Folder";
-    state.resumeName = state.folderName;
+    handle = await win.showDirectoryPicker({ mode: "read" });
+  } catch (err) {
+    if (err && (err.name === "AbortError" || /abort/i.test(String(err.message || err)))) return;
+    showToast(err && err.message ? err.message : String(err));
+    return;
+  }
+  await openFolder(handle.path, handle.name);
+}
+
+// Treva desktop remembers the last folder (localStorage there, a file here)
+// and reopens it at startup.
+const folderMemoryFile = join(dataDir, "folder.json");
+
+async function readFolderMemory() {
+  try {
+    const saved = JSON.parse(await readFile(folderMemoryFile, "utf8"));
+    return saved && saved.root ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+async function rememberFolder(root, name) {
+  state.resumeName = name || state.resumeName || "Last folder";
+  try {
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(folderMemoryFile, JSON.stringify({ root, name: state.resumeName }, null, 2));
+  } catch { /* the folder still opened */ }
+}
+
+// Sort choices are remembered per folder; a folder without one sorts by name.
+const sortMemoryFile = join(dataDir, "sort.json");
+let sortMemory = null;
+
+async function readSortMemory() {
+  if (sortMemory) return sortMemory;
+  try {
+    const saved = JSON.parse(await readFile(sortMemoryFile, "utf8"));
+    sortMemory = saved && typeof saved === "object" ? saved : {};
+  } catch {
+    sortMemory = {};
+  }
+  return sortMemory;
+}
+
+async function applySortMemory(rootPath) {
+  const saved = (await readSortMemory())[rootPath];
+  state.sortKey = saved && SORT_KEYS.includes(saved.key) ? saved.key : "name";
+  state.sortDir = saved && saved.dir === "desc" ? "desc" : "asc";
+}
+
+let sortWrite = Promise.resolve();
+function rememberSort() {
+  const root = state.folderPath;
+  if (!root || !sortMemory) return;
+  sortMemory[root] = { key: state.sortKey, dir: state.sortDir };
+  const body = JSON.stringify(sortMemory, null, 2);
+  // Chain writes so a quick key then direction change land in order.
+  sortWrite = sortWrite.then(async () => {
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(sortMemoryFile, body);
+  }).catch(() => {});
+}
+
+async function restore() {
+  const saved = await readFolderMemory();
+  if (!saved) return;
+  state.resumeName = saved.name || "Last folder";
+  d.update();
+  await openFolder(saved.root, saved.name);
+}
+
+async function openFolder(rootPath, name) {
+  try {
+    await stat(rootPath);
+    state.folderName = name || basename(rootPath) || "Folder";
     state.folderPath = rootPath;
+    await applySortMemory(rootPath);
     state.scroll.grid = 0;
     state.scroll.list = 0;
     state.currentId = null;
     state.scan = { errors: 0 };
+    state.screen = "gallery";
+    if (state.slideshow) setSlideshow(false);
+    state.mode = "fit";
+    state.scale = 1;
+    resetViewTransform();
 
     // Glob off the critical path already; yield once so the picker dialog can
     // dismiss and a frame can paint before we build the gallery DOM.
@@ -1713,7 +2493,7 @@ async function chooseFolder() {
     state.images = images;
     invalidate();
     state.status = "ready";
-    if (images[0]) state.currentId = images[0].id;
+    state.currentId = null;
     state.scroll.grid = 0;
     state.scroll.list = 0;
     showToast(
@@ -1728,6 +2508,8 @@ async function chooseFolder() {
     queueMicrotask(() => {
       try { d.update(); } catch { /* ignore */ }
     });
+    void statAll(images);
+    void rememberFolder(rootPath, state.folderName);
   } catch (err) {
     state.opening = null;
     d.update();
@@ -1736,13 +2518,39 @@ async function chooseFolder() {
   }
 }
 
+// Sizes and dates, read after the scan as Treva's statAll does, eight at a time.
+let statGeneration = 0;
+async function statAll(images) {
+  const gen = ++statGeneration;
+  let cursor = 0;
+  async function worker() {
+    while (cursor < images.length) {
+      if (gen !== statGeneration) return;
+      const im = images[cursor++];
+      try {
+        const info = await stat(im.absPath);
+        im.size = info.size;
+        im.lastModified = info.mtimeMs;
+      } catch {
+        im.error = "Unreadable";
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(8, images.length) }, worker));
+  if (gen !== statGeneration) return;
+  // Size and date sorting depend on these.
+  if (state.sortKey === "size" || state.sortKey === "modified") invalidate();
+  d.update();
+}
+
 function nextFrame() {
   return new Promise((resolve) => win.requestAnimationFrame(() => resolve()));
 }
 
-function reopen() {
-  if (!state.resumeName) return;
-  showToast(`Reopen “${state.resumeName}” needs the gallery port.`);
+async function reopen() {
+  const saved = await readFolderMemory();
+  if (!saved) return chooseFolder();
+  await openFolder(saved.root, saved.name);
 }
 
 function closeFolder() {
@@ -1755,7 +2563,20 @@ function closeFolder() {
   invalidate();
   state.currentId = null;
   state.screen = "gallery";
+  if (slideTimer) clearInterval(slideTimer);
+  slideTimer = 0;
   state.slideshow = false;
+  state.mode = "fit";
+  state.scale = 1;
+  state.tx = 0;
+  state.ty = 0;
+  state.rotation = 0;
+  state.dragging = false;
+  state.osd = false;
+  state.copied = false;
+  state.info = false;
+  state.filter = "";
+  statGeneration++;
   d.update();
 }
 
@@ -2044,11 +2865,7 @@ function header() {
         label: "Show grid",
         active: () => state.screen === "gallery" && state.status !== "idle",
         disabled: () => !state.images.length,
-        onClick: () => {
-          state.screen = "gallery";
-          if (state.slideshow) state.slideshow = false;
-          d.update();
-        },
+        onClick: () => showGallery(),
       },
       icon("grid"),
     ),
@@ -2059,10 +2876,7 @@ function header() {
         label: "View selected image",
         active: () => state.screen === "viewer",
         disabled: () => !state.images.length,
-        onClick: () => {
-          state.screen = "viewer";
-          d.update();
-        },
+        onClick: () => openViewer(targetImage()),
       },
       icon("image"),
     ),
@@ -2073,10 +2887,7 @@ function header() {
         label: "Slideshow",
         active: () => state.slideshow,
         disabled: () => !state.images.length,
-        onClick: () => {
-          state.slideshow = !state.slideshow;
-          d.update();
-        },
+        onClick: () => setSlideshow(!state.slideshow),
       },
       d.if(() => state.slideshow, icon("pause"), icon("play")),
     ),
@@ -2158,6 +2969,141 @@ function updateBodyFrame(maximized = state.windowMax) {
   doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[${C.ink950}] text-[${C.body}] font-sans`;
 }
 
+// Header menus close on Escape first; then Treva's own shortcuts (app.js onKey).
+function closeOpenMenu() {
+  if (rx.settings) { closeGrokSettings(); return true; }
+  if (wp.open) { closeWallpaper(); return true; }
+  if (ix.open) { ix.open = false; d.update(); return true; }
+  if (state.sortMenu || state.speedMenu) { state.sortMenu = state.speedMenu = false; d.update(); return true; }
+  return false;
+}
+
+function onKey(ev) {
+  const active = doc.activeElement;
+  const tag = active?.localName;
+  const typing = tag === "input" || tag === "textarea" || tag === "select";
+  if (typing && ev.key === "Escape") {
+    if (active.getAttribute("data-testid") === "filter" && state.filter) {
+      state.filter = "";
+      state.scroll.grid = 0;
+      state.scroll.list = 0;
+      d.update();
+    } else active.blur();
+    return;
+  }
+  if (typing) return;
+  if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  if (ev.key === "Escape" && closeOpenMenu()) return;
+  if (ev.key === "?") {
+    state.help = !state.help;
+    d.update();
+    return;
+  }
+  if (state.help) {
+    if (ev.key === "Escape") {
+      state.help = false;
+      d.update();
+    }
+    return;
+  }
+  if (state.status === "idle") return;
+  if (ev.key === "/") {
+    state.sidebarOpen = true;
+    d.updateSync();
+    doc.querySelector('[data-testid="filter"]')?.focus();
+    return;
+  }
+  if (ev.key === "Escape") {
+    if (state.info) {
+      state.info = false;
+      d.update();
+      return;
+    }
+    if (doc.fullscreenElement) {
+      doc.exitFullscreen().catch(() => {});
+      return;
+    }
+    if (state.screen === "viewer") {
+      state.screen = "gallery";
+      if (state.slideshow) setSlideshow(false);
+      else d.update();
+    }
+    return;
+  }
+  if (ev.key === "ArrowRight") return state.screen === "gallery" ? moveGrid(1, 0) : advance(1, true);
+  if (ev.key === "ArrowLeft") return state.screen === "gallery" ? moveGrid(-1, 0) : advance(-1, true);
+  if (ev.key === "ArrowDown") return state.screen === "gallery" ? moveGrid(0, 1) : advance(1, true);
+  if (ev.key === "ArrowUp") return state.screen === "gallery" ? moveGrid(0, -1) : advance(-1, true);
+  if (ev.key === "Enter") return openViewer(targetImage());
+  if (ev.key === " ") return setSlideshow(!state.slideshow);
+  if (ev.key === "+" || ev.key === "=") return zoomBy(1.25);
+  if (ev.key === "-" || ev.key === "_") return zoomBy(1 / 1.25);
+  if (ev.key === "0") return setMode("fit");
+  if (ev.key === "1") return setMode("actual");
+  if (ev.key === "2") return setMode("width");
+  if (ev.key === "3") return setMode("fill");
+  if (ev.key === "f" || ev.key === "F") return toggleFullscreen();
+  if (ev.key === "g" || ev.key === "G") {
+    state.screen = "gallery";
+    d.update();
+    return;
+  }
+  if (ev.key === "i" || ev.key === "I") {
+    state.info = !state.info;
+    d.update();
+    return;
+  }
+  if (ev.key === "r" || ev.key === "R") return rotateBy(ev.shiftKey ? -90 : 90);
+  if (ev.key === "Home") return jump(0);
+  if (ev.key === "End") return jump(-1);
+}
+
+// Treva's registerEffects: keep the selection inside the visible list, and
+// follow screen/selection changes (stage image, filmstrip centering).
+let lastViewKey = "";
+d.on("beforeUpdate", () => {
+  if (state.status === "idle") return;
+  const list = visible();
+  if (!list.length) {
+    state.currentId = null;
+    return;
+  }
+  // A selection filtered out of view is dropped, not moved to another image.
+  const selected = state.currentId ? imageById(state.currentId) : null;
+  if (!selected || !frame.visibleSet.has(selected)) {
+    // The viewer always shows an image; the gallery may have none selected.
+    state.currentId = state.screen === "viewer" ? list[0].id : null;
+  }
+});
+d.on("update", () => {
+  // Leaving the viewer (grid button, G) leaves its fullscreen too.
+  if (state.screen !== "viewer" && doc.fullscreenElement && doc.fullscreenElement === nodes.viewer) {
+    doc.exitFullscreen().catch(() => {});
+  }
+  syncStageImage();
+  const key = `${state.screen}:${state.currentId || ""}`;
+  if (key === lastViewKey) return;
+  lastViewKey = key;
+  win?.requestAnimationFrame(() => centerFilm());
+});
+
+// The stage's size drives Fit / Fit width / Fill (Treva measures it the same way).
+function observeStage() {
+  if (nodes.stage?.isConnected) return;
+  const el = doc.querySelector('[data-stage="1"]');
+  if (!el || nodes.stage === el) return;
+  nodes.stage = el;
+  const measure = () => {
+    if (el.clientWidth === state.stageW && el.clientHeight === state.stageH) return;
+    state.stageW = el.clientWidth;
+    state.stageH = el.clientHeight;
+    d.update();
+  };
+  new ResizeObserver(measure).observe(el);
+  measure();
+}
+d.on("update", observeStage);
+
 await loadGrokPrefs();
 updateBodyFrame(false);
 doc.body.appendChild(shell());
@@ -2188,35 +3134,21 @@ win.addEventListener("maximize", event => {
   updateBodyFrame(event.x > 0);
   d.updateSync();
 });
-win.addEventListener("keydown", event => {
-  if (event.key === "Escape") {
-    if (rx.settings) {
-      closeGrokSettings();
-      return;
-    }
-    if (wp.open) {
-      closeWallpaper();
-      return;
-    }
-    if (ix.open) {
-      ix.open = false;
-      d.update();
-      return;
-    }
-    if (state.help) {
-      state.help = false;
-      d.update();
-    }
-    return;
-  }
-  if (event.key === "?" || (event.shiftKey && event.key === "/")) {
-    state.help = !state.help;
-    d.update();
-  }
+win.addEventListener("keydown", onKey);
+doc.addEventListener("fullscreenchange", () => {
+  state.fullscreen = !!doc.fullscreenElement;
+  state.chrome = true;
+  clearTimeout(chromeTimer);
+  chromeTimer = state.fullscreen ? setTimeout(fadeChrome, CHROME_IDLE_MS) : null;
+  d.update();
 });
 win.addEventListener("close", () => {
   if (indexTimer) clearInterval(indexTimer);
+  if (slideTimer) clearInterval(slideTimer);
+  clearTimeout(chromeTimer);
 });
+
+restore().catch(err => console.warn(err));
 
 await closed;
 console.log("window closed");

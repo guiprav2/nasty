@@ -8,11 +8,13 @@
     "build:release": "cargo build --release --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js --release",
     "build:android-arm64": "bash scripts/build-android-arm64.sh",
     "build:tour-apk": "bash scripts/build-tour-apk.sh",
-    "build:dyndyn-apk": "bash scripts/build-dyndyn-apk.sh"
+    "build:dyndyn-apk": "bash scripts/build-dyndyn-apk.sh",
+    "build:treva-appimage": "bash scripts/build-treva-appimage.sh"
   },
   "dependencies": {
     "@napi-rs/canvas": "1.0.11",
     "acorn": "^8.7.0",
+    "chokidar": "^4.0.3",
     "commander": "^15.0.0",
     "fast-glob": "^3.3.3",
     "jpeg-js": "^0.4.4",

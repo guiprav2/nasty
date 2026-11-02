@@ -995,9 +995,15 @@ pub struct ImageDraw {
     pub vertices: Option<Vec<f64>>,
 }
 
+/// A texture id with this bit set draws its image with nearest-neighbour
+/// sampling (CSS `image-rendering: pixelated` / `crisp-edges`). Image ids are
+/// allocated below it, so the flag never collides with a real id.
+const NEAREST_TEXTURE_BIT: u32 = 1 << 23;
+
 struct GpuImage {
     _texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    nearest_bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
     /// Scroll-layer render targets hold premultiplied color (ALPHA_BLENDING
@@ -1319,6 +1325,15 @@ fn decode_image_rgba(
     encoded: &[u8],
     max_edge: u32,
 ) -> std::result::Result<(u32, u32, Vec<u8>), String> {
+    decode_image_rgba_natural(encoded, max_edge).map(|(width, height, pixels, _)| (width, height, pixels))
+}
+
+/// Like `decode_image_rgba`, plus the source's intrinsic (pre-downscale) size,
+/// which `HTMLImageElement.naturalWidth/naturalHeight` report.
+pub(crate) fn decode_image_rgba_natural(
+    encoded: &[u8],
+    max_edge: u32,
+) -> std::result::Result<(u32, u32, Vec<u8>, (u32, u32)), String> {
     let max_edge = max_edge.max(1);
     // Never call imageops::resize (rayon) from pool workers — nested deadlock.
     if let Ok(img) = try_decode_jpeg_scaled(encoded, max_edge) {
@@ -1333,19 +1348,19 @@ fn decode_image_rgba(
     }
     let longest = width.max(height);
     if longest <= max_edge {
-        return Ok((width, height, image.into_raw()));
+        return Ok((width, height, image.into_raw(), (width, height)));
     }
     let scale = f64::from(max_edge) / f64::from(longest);
     let next_width = ((f64::from(width) * scale).round() as u32).max(1);
     let next_height = ((f64::from(height) * scale).round() as u32).max(1);
     let resized = resize_rgba_nearest(&image, next_width, next_height);
-    Ok((next_width, next_height, resized))
+    Ok((next_width, next_height, resized, (width, height)))
 }
 
 fn try_decode_jpeg_scaled(
     encoded: &[u8],
     max_edge: u32,
-) -> std::result::Result<(u32, u32, Vec<u8>), String> {
+) -> std::result::Result<(u32, u32, Vec<u8>, (u32, u32)), String> {
     if encoded.len() < 3 || encoded[0] != 0xFF || encoded[1] != 0xD8 {
         return Err("not jpeg".into());
     }
@@ -1390,14 +1405,14 @@ fn try_decode_jpeg_scaled(
     let rgba = jpeg_pixels_to_rgba(&pixels, info.pixel_format, width, height)?;
     let longest = width.max(height);
     if longest <= max_edge {
-        return Ok((width, height, rgba));
+        return Ok((width, height, rgba, (full_w, full_h)));
     }
     let img = image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| "rgba buffer size mismatch".to_string())?;
     let s = f64::from(max_edge) / f64::from(longest);
     let nw = ((f64::from(width) * s).round() as u32).max(1);
     let nh = ((f64::from(height) * s).round() as u32).max(1);
-    Ok((nw, nh, resize_rgba_nearest(&img, nw, nh)))
+    Ok((nw, nh, resize_rgba_nearest(&img, nw, nh), (full_w, full_h)))
 }
 
 fn jpeg_pixels_to_rgba(
@@ -2928,9 +2943,46 @@ fn create_text_runtime(
     }
 }
 
+impl GpuImage {
+    /// The bindings for a draw of this image through `id`, which may carry
+    /// NEAREST_TEXTURE_BIT.
+    fn binding(&self, id: u32) -> &wgpu::BindGroup {
+        if id & NEAREST_TEXTURE_BIT != 0 { &self.nearest_bind_group } else { &self.bind_group }
+    }
+}
+
+fn next_texture_id(id: u32) -> u32 {
+    let next = id.wrapping_add(1);
+    if next == 0 || next >= NEAREST_TEXTURE_BIT { 1 } else { next }
+}
+
 impl Renderer {
     fn image(&self, id: &u32) -> Option<&GpuImage> {
-        self.images.get(id).or_else(|| self.retired_images.get(id))
+        let id = id & !NEAREST_TEXTURE_BIT;
+        self.images.get(&id).or_else(|| self.retired_images.get(&id))
+    }
+
+    /// Image bind groups for a linear and a nearest-neighbour sampler.
+    fn image_bind_groups(&self, label: &str, view: &wgpu::TextureView) -> (wgpu::BindGroup, wgpu::BindGroup) {
+        let make = |filter: wgpu::FilterMode| {
+            let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some(label),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                mag_filter: filter,
+                min_filter: filter,
+                ..Default::default()
+            });
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.image_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                ],
+            })
+        };
+        (make(wgpu::FilterMode::Linear), make(wgpu::FilterMode::Nearest))
     }
 
     fn select_present_mode(
@@ -3925,35 +3977,15 @@ impl Renderer {
             },
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Nasty image sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Nasty image bind group"),
-            layout: &self.image_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let (bind_group, nearest_bind_group) = self.image_bind_groups("Nasty image bind group", &view);
         let id = self.next_image_id;
-        self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        self.next_image_id = next_texture_id(self.next_image_id);
         self.images.insert(
             id,
             GpuImage {
                 _texture: texture,
                 bind_group,
+                nearest_bind_group,
                 width,
                 height,
                 premultiplied: false,
@@ -3988,23 +4020,8 @@ impl Renderer {
 
     fn layer_image(&self, texture: wgpu::Texture, width: u32, height: u32) -> GpuImage {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Nasty scroll layer sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Nasty scroll layer bind group"),
-            layout: &self.image_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-        });
-        GpuImage { _texture: texture, bind_group, width, height, premultiplied: true }
+        let (bind_group, nearest_bind_group) = self.image_bind_groups("Nasty scroll layer bind group", &view);
+        GpuImage { _texture: texture, bind_group, nearest_bind_group, width, height, premultiplied: true }
     }
 
     fn check_layer_size(&self, width: u32, height: u32) -> std::result::Result<(), String> {
@@ -4020,7 +4037,7 @@ impl Renderer {
         let texture = self.new_layer_texture(width, height);
         let image = self.layer_image(texture, width, height);
         let id = self.next_image_id;
-        self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        self.next_image_id = next_texture_id(self.next_image_id);
         self.images.insert(id, image);
         Ok(id)
     }
@@ -4543,7 +4560,7 @@ impl Renderer {
                         let image = self.image(texture_id).expect("prepared image texture");
                         pass.set_pipeline(if image.premultiplied { &self.image_premultiplied_pipeline } else { &self.image_pipeline }); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
                         pass.set_scissor_rect(*x, *y, *w, *h);
-                        pass.set_bind_group(0, &image.bind_group, &[]); pass.draw(range.clone(), 0..1);
+                        pass.set_bind_group(0, image.binding(*texture_id), &[]); pass.draw(range.clone(), 0..1);
                         pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                     },
                     DrawOrder::Boxes(range) => if !range.is_empty() {
@@ -4554,7 +4571,7 @@ impl Renderer {
                     },
                     DrawOrder::ImageBoxes { texture_id, range } => if let Some(image) = self.image(texture_id) {
                         pass.set_pipeline(&self.image_box_pipeline);
-                        pass.set_bind_group(0, &image.bind_group, &[]);
+                        pass.set_bind_group(0, image.binding(*texture_id), &[]);
                         pass.set_bind_group(1, &self.canvas_viewport_bind_group, &[]);
                         pass.set_vertex_buffer(0, self.image_box_instance_buffer.slice(..));
                         pass.draw(0..6, range.clone());
@@ -4605,7 +4622,7 @@ impl Renderer {
                     let (texture_id, range, x, y, w, h) = batch;
                     let image = self.image(texture_id).expect("prepared image texture");
                     pass.set_pipeline(if image.premultiplied { &self.image_premultiplied_pipeline } else { &self.image_pipeline }); pass.set_vertex_buffer(0, self.image_vertex_buffer.slice(..));
-                    pass.set_scissor_rect(ox + *x, oy + *y, *w, *h); pass.set_bind_group(0, &image.bind_group, &[]); pass.draw(range.clone(), 0..1);
+                    pass.set_scissor_rect(ox + *x, oy + *y, *w, *h); pass.set_bind_group(0, image.binding(*texture_id), &[]); pass.draw(range.clone(), 0..1);
                     pass.set_scissor_rect(ox, oy, target_width, target_height);
                 }
             } else {
@@ -4651,7 +4668,7 @@ impl Renderer {
                             pass.set_pipeline(if image.premultiplied { &self.image_premultiplied_pipeline } else { &self.image_pipeline });
                             pass.set_vertex_buffer(0,self.image_vertex_buffer.slice(..));
                             pass.set_scissor_rect(ox + *x,oy + *y,*w,*h);
-                            pass.set_bind_group(0,&image.bind_group,&[]);
+                            pass.set_bind_group(0,image.binding(*texture_id),&[]);
                             pass.draw(range.clone(),0..1);
                             // Match the BackdropBlur path: restore full-frame scissor so
                             // later Solids/Triangles (title form fills under a spinning logo)
@@ -4666,7 +4683,7 @@ impl Renderer {
                         },
                         DrawOrder::ImageBoxes { texture_id, range } => if let Some(image) = self.image(texture_id) {
                             pass.set_pipeline(&self.image_box_pipeline);
-                            pass.set_bind_group(0, &image.bind_group, &[]);
+                            pass.set_bind_group(0, image.binding(*texture_id), &[]);
                             pass.set_bind_group(1, viewport_bind_group, &[]);
                             pass.set_vertex_buffer(0, self.image_box_instance_buffer.slice(..));
                             pass.draw(0..6, range.clone());
@@ -5666,7 +5683,10 @@ struct WindowApp {
     last_render_count: u64,
     image_decode_pool: Option<std::sync::Arc<ImageDecodePool>>,
     /// Reuse GPU texture ids for identical (source, max_edge) submissions.
-    gpu_image_cache: std::collections::HashMap<(String, u32), (u32, u32, u32)>,
+    /// Value: (texture id, width, height, natural size, live references).
+    gpu_image_cache: std::collections::HashMap<(String, u32), (u32, u32, u32, (u32, u32), u32)>,
+    /// Texture id -> its cache key, so deleting a shared texture only drops a reference.
+    gpu_image_cache_keys: std::collections::HashMap<u32, (String, u32)>,
 }
 
 
@@ -5686,9 +5706,9 @@ impl WindowApp {
             .unwrap_or(image_decode_pool::POOL_MAX_EDGE)
             .clamp(1, image_decode_pool::POOL_MAX_EDGE);
         // Instant GPU-cache hit: emit image-ready on next drain without re-decode/upload.
-        if let Some(&(texture_id, width, height)) =
-            self.gpu_image_cache.get(&(source.clone(), max_edge))
-        {
+        if let Some(entry) = self.gpu_image_cache.get_mut(&(source.clone(), max_edge)) {
+            entry.4 += 1;
+            let (texture_id, width, height, natural, _) = *entry;
             let pool = self.ensure_image_pool();
             let id = pool.alloc_id();
             self.events.push(NativeEvent {
@@ -5697,7 +5717,7 @@ impl WindowApp {
                 y: f64::from(width),
                 key: None,
                 button: None,
-                text: None,
+                text: Some(format!("{}x{}", natural.0, natural.1)),
                 modifiers: None,
                 drag_requested: None,
                 delta_x: Some(id as f64),
@@ -5728,21 +5748,22 @@ impl WindowApp {
                     max_edge,
                     width,
                     height,
+                    natural,
                     pixels,
                 } => match renderer.upload_image(width, height, &pixels) {
                     Ok(texture_id) => {
-                        if self.gpu_image_cache.len() > 512 {
-                            self.gpu_image_cache.clear();
-                        }
+                        // Entries leave the cache when their last reference is
+                        // deleted, so the cache holds only live textures.
+                        self.gpu_image_cache_keys.insert(texture_id, (source.clone(), max_edge));
                         self.gpu_image_cache
-                            .insert((source, max_edge), (texture_id, width, height));
+                            .insert((source, max_edge), (texture_id, width, height, natural, 1));
                         self.events.push(NativeEvent {
                             kind: "image-ready".into(),
                             x: f64::from(texture_id),
                             y: f64::from(width),
                             key: None,
                             button: None,
-                            text: None,
+                            text: Some(format!("{}x{}", natural.0, natural.1)),
                             modifiers: None,
                             drag_requested: None,
                             delta_x: Some(id as f64),
@@ -6512,6 +6533,21 @@ impl Window {
         Ok(())
     }
 
+    /// Host bridge for navigator.clipboard.writeText (the window's system clipboard).
+    #[napi(js_name = "setClipboardText")]
+    pub fn set_clipboard_text(&mut self, text: String) -> Result<()> {
+        let editor = self.app.text_editor.as_mut().ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+        editor.winit.set_clipboard_text(text);
+        Ok(())
+    }
+
+    /// Host bridge for navigator.clipboard.readText.
+    #[napi(js_name = "clipboardText")]
+    pub fn clipboard_text(&mut self) -> Result<Option<String>> {
+        let editor = self.app.text_editor.as_mut().ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+        Ok(editor.winit.clipboard_text())
+    }
+
     /// Host bridge for Window.showDirectoryPicker. Returns an absolute path, or null when cancelled.
     #[napi(js_name = "pickFolder")]
     pub fn pick_folder(
@@ -7277,7 +7313,19 @@ impl Window {
 
     #[napi(js_name = "deleteImageTexture")]
     pub fn delete_image_texture(&mut self, texture_id: u32) -> bool {
-        let referenced = self.app.image_draws.iter().any(|image| image.texture_id == texture_id);
+        // A cached texture can back several imgs (same source and edge): keep
+        // it until the last one lets go, and never hand out a deleted id.
+        if let Some(key) = self.app.gpu_image_cache_keys.get(&texture_id).cloned() {
+            if let Some(entry) = self.app.gpu_image_cache.get_mut(&key) {
+                if entry.4 > 1 {
+                    entry.4 -= 1;
+                    return true;
+                }
+                self.app.gpu_image_cache.remove(&key);
+            }
+            self.app.gpu_image_cache_keys.remove(&texture_id);
+        }
+        let referenced = self.app.image_draws.iter().any(|image| image.texture_id & !NEAREST_TEXTURE_BIT == texture_id);
         self.app.renderer.as_mut().is_some_and(|renderer| {
             let Some(image) = renderer.images.remove(&texture_id) else { return false; };
             if referenced { renderer.retired_images.insert(texture_id, image); }
@@ -7488,7 +7536,7 @@ impl Window {
         order: Vec<DrawOrder>,
     ) -> Result<PresentStats> {
         if let Some(renderer) = self.app.renderer.as_mut() {
-            let live_ids: std::collections::HashSet<u32> = images.iter().map(|image| image.texture_id).collect();
+            let live_ids: std::collections::HashSet<u32> = images.iter().map(|image| image.texture_id & !NEAREST_TEXTURE_BIT).collect();
             let no_images = images.is_empty();
             let retired_ids: Vec<u32> = renderer.retired_images.keys().copied().collect();
             for id in retired_ids {

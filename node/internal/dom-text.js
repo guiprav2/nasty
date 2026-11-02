@@ -287,16 +287,42 @@ function textEntriesFor(entries, boxes, target, textLayers, styleFrame, hiddenMe
     const visibleClip = textClip(box, outerClip, rootStyle.clipX, rootStyle.clipY, projectPoint);
     const align = rootStyle.textAlign;
     let part = 0;
-    lines.forEach((indices, lineIndex) => {
+    lines.forEach((fragments, lineIndex) => {
       // Stretches of this line by child, spaces going to the child they began in.
+      // Fragments are { word, text } so overflow-wrap can split one word across lines.
       const runs = [];
       const add = (index, text) => {
         const last = runs[runs.length - 1];
         if (last?.index === index) last.text += text; else runs.push({ index, text });
       };
-      indices.forEach((word, position) => {
-        if (position) add(spaceOwners[word] ?? pieces[word][0].index, ' ');
-        for (const piece of pieces[word]) add(piece.index, piece.text);
+      fragments.forEach((fragment, position) => {
+        const word = fragment.word;
+        const full = pieces[word].map((part) => part.text).join('');
+        // Space only between consecutive full words on the same line (not after a break).
+        if (position) {
+          const prev = fragments[position - 1];
+          const prevFull = pieces[prev.word].map((part) => part.text).join('');
+          if (prev.word !== word && prev.text === prevFull && fragment.text === full) {
+            add(spaceOwners[word] ?? pieces[word][0].index, ' ');
+          } else if (prev.word !== word) {
+            add(spaceOwners[word] ?? pieces[word][0].index, ' ');
+          }
+        }
+        // Map fragment text onto the word's pieces (may be a partial after a break).
+        let remaining = fragment.text;
+        let offset = full.indexOf(remaining);
+        if (offset < 0) offset = 0;
+        let cursor = 0;
+        for (const piece of pieces[word]) {
+          const start = cursor;
+          const end = cursor + piece.text.length;
+          cursor = end;
+          if (end <= offset) continue;
+          if (start >= offset + remaining.length) break;
+          const sliceStart = Math.max(0, offset - start);
+          const sliceEnd = Math.min(piece.text.length, offset + remaining.length - start);
+          if (sliceEnd > sliceStart) add(piece.index, piece.text.slice(sliceStart, sliceEnd));
+        }
       });
       let lineWidth = 0;
       for (const run of runs) { run.width = measure(run.index, run.text); run.x = lineWidth; lineWidth += run.width; }
@@ -516,7 +542,7 @@ function subtreeHasText(window, element) {
   const visit = (node) => {
     if (--budget < 0) return true;
     if (renderedText(node) || owners?.has(node)) return true;
-    for (const child of node.children) if (visit(child)) return true;
+    for (const child of node.children) if (child.nodeType === 1 && visit(child)) return true;
     return false;
   };
   return visit(element);

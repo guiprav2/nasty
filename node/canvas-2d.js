@@ -5,6 +5,16 @@ import { elementState } from './internal/dom-state.js';
 const contexts = new WeakMap();
 const gradients = new WeakMap();
 const parsedColors = new Map();
+// Methods that change a canvas's pixels. A raster (non-GPU) canvas changed by
+// one bumps its version, so the renderer uploads its texture only after a
+// change, and its element is marked for repaint even outside animation frames.
+const PIXEL_WRITERS = new Set(['putImageData', 'drawImage', 'fillRect', 'strokeRect', 'clearRect', 'fill', 'stroke', 'fillText', 'strokeText']);
+function touched(state) {
+  state.version = (state.version ?? 0) + 1;
+  if (state.notifyQueued) return;
+  state.notifyQueued = true;
+  queueMicrotask(() => { state.notifyQueued = false; state.canvas._canvasContentChanged?.(); });
+}
 
 class CanvasMesh {
   constructor() { this.data = new Float32Array(4096); this.cursor = 0; }
@@ -50,6 +60,7 @@ function supportsRadial(gradient) {
 }
 function canvasCall(state, name, args = []) {
   if (state.deferred) { recordOperation(state, name, args); return undefined; }
+  if (PIXEL_WRITERS.has(name)) touched(state);
   return state.ctx[name](...args);
 }
 function recordOperation(state, name, args = []) {
@@ -93,6 +104,7 @@ function addGradientStop(stops, stop) {
 }
 function materialize(state) {
   if (!state.deferred) return;
+  touched(state);
   flushPendingCirclePath(state);
   for (let index = 0; index < state.operationCursor; index++) {
     const operation = state.operations[index];
@@ -358,6 +370,7 @@ export function canvasSurface(context, shouldMaterialize = true) {
   return state?.surface;
 }
 export function canvasCommands() { return []; }
+export function canvasVersion(context) { return contexts.get(context)?.version ?? 0; }
 export function materializeCanvas(context) { const state = contexts.get(context); if (state) materialize(state); }
 export function canvasTriangleBuffer(context, width = context?.canvas?.width, height = context?.canvas?.height) {
   const state = contexts.get(context);
@@ -402,6 +415,7 @@ export function resetCanvasContext(context) {
   state.path.length = 0; state.circle = null; state.gpu.path = state.path;
   state.deferred = false; state.operations = []; state.operationCursor = 0;
   state.gpu = createCanvasGpu();
+  touched(state);
 }
 export function imageSurface(element) {
   const state = elementState(element);
@@ -427,7 +441,7 @@ export class CanvasRenderingContext2D {
       get(target, key) {
         if (key === 'canvas') return canvas;
         if (['fillStyle', 'strokeStyle', 'lineWidth'].includes(key)) return state[key];
-        if (key === 'drawImage') return (source, ...args) => { materialize(state); state.gpu.valid = false; return state.ctx.drawImage(source?.localName ? imageSurface(source) : source, ...args); };
+        if (key === 'drawImage') return (source, ...args) => { materialize(state); state.gpu.valid = false; touched(state); return state.ctx.drawImage(source?.localName ? imageSurface(source) : source, ...args); };
         if (key === 'createRadialGradient') return (...args) => {
           const gradient = { native: null, args, x0: args[0], y0: args[1], r0: args[2], x1: args[3], y1: args[4], r1: args[5], stops: [], addColorStop(offset, value) {
             offset = Number(offset); value = String(value);
@@ -500,7 +514,11 @@ export class CanvasRenderingContext2D {
         if (key === 'setTransform') return (...args) => { if(args.length===1 && typeof args[0]==='object') {const m=args[0];state.transform=[m.a,m.b,m.c,m.d,m.e,m.f];} else state.transform=args.slice(0,6); return canvasCall(state, 'setTransform', args); };
         if (key === 'resetTransform') return () => { state.transform=[1,0,0,1,0,0]; return canvasCall(state, 'resetTransform'); };
         const value = state.ctx[key];
-        if (typeof value === 'function') return (...args) => { materialize(state); state.gpu.valid = false; state.gpu.canMirror = false; return value.apply(state.ctx, args); };
+        if (typeof value === 'function') return (...args) => {
+          materialize(state); state.gpu.valid = false; state.gpu.canMirror = false;
+          if (PIXEL_WRITERS.has(key)) touched(state);
+          return value.apply(state.ctx, args);
+        };
         materialize(state); return value;
       },
       set(target, key, value) {
