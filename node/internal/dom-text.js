@@ -1,13 +1,41 @@
 import { fontsForRuns } from '../font-registry.js';
 import { documentPaintBoxes, documentState, elementState } from './dom-state.js';
 import { layerContentBoxes, paintsInLayer, scrollLayerTarget } from './gpu-scroll-layers.js';
-import { computedStyleValue, hasActiveStyleTransition, styleMeshRevision } from './css-transitions.js';
+import { computedStyleValue, getStyleTransitionState, hasActiveStyleTransition, styleHasAnimations, styleMeshRevision } from './css-transitions.js';
+import { sampleAnimationProperty } from './css-animations.js';
 import { createBoxProjector, parseColor } from '../render.js';
 import { fontFamilyForElement, isPlaceholderText, renderedText } from './nerd-icon.js';
 import { fontExtents, inlineTextLines, layoutTextLines, measureText, textStyle as measuredTextStyle, transformedText } from './text-metrics.js';
 import { isInlineRoot } from './inline-text.js';
 import { beginTransformedTextPass, endTransformedTextPass, noteTransformedText, rotatesText, TRANSFORMED_TEXT_TARGET, uniformTextScale } from './transformed-text.js';
 import { clipsOverflow } from './overflow.js';
+
+// Color-emoji (CBDT/COLR) ignore glyph-color alpha, so opacity on text must be
+// applied when compositing a texture. Stay on that path for the whole opacity
+// animation — including peaks at 1 — so pulse does not flicker between direct
+// glyphs and a textured quad.
+function opacityTextureDrive(element) {
+  let opacity = 1;
+  let texture = false;
+  for (let current = element; current; current = current.parent) {
+    const style = current.style;
+    if (!style) continue;
+    const state = getStyleTransitionState(style);
+    const opacityTransition = state?.transitions?.get("opacity");
+    const transitioning = !!opacityTransition && performance.now() < opacityTransition.started + opacityTransition.duration;
+    const animatedOpacity = state ? sampleAnimationProperty(state, "opacity") : undefined;
+    const hasStatic = style.opacity !== undefined && style.opacity !== "";
+    if (animatedOpacity !== undefined || transitioning) texture = true;
+    if (animatedOpacity === undefined && !transitioning && !hasStatic) continue;
+    const raw = Number(animatedOpacity !== undefined || transitioning
+      ? computedStyleValue(style, "opacity")
+      : style.opacity);
+    if (!Number.isFinite(raw)) continue;
+    opacity *= Math.max(0, Math.min(1, raw));
+    if (opacity < 0.999) texture = true;
+  }
+  return { opacity, texture };
+}
 
 const windows = new WeakMap();
 const lastSyncTimes = new WeakMap();
@@ -86,8 +114,18 @@ function textStyle(element, frame) {
   }
   const rgba = parseColor(inherited(element, 'color', '#000000')) ?? [0, 0, 0, 0];
   for (let current = element; current; current = current.parent) {
-    const opacity = Number(current.style.opacity);
-    if (current.style.opacity !== undefined && Number.isFinite(opacity)) rgba[3] *= Math.max(0, Math.min(1, opacity));
+    // Match render.opacityFor: animate-pulse (and opacity transitions) sample
+    // through computed style even when no static opacity-* class is present.
+    const style = current.style;
+    if (!style) continue;
+    const state = getStyleTransitionState(style);
+    const opacityTransition = state?.transitions?.get("opacity");
+    const transitioning = !!opacityTransition && performance.now() < opacityTransition.started + opacityTransition.duration;
+    const animated = styleHasAnimations(style);
+    const hasStatic = style.opacity !== undefined && style.opacity !== "";
+    if (!animated && !transitioning && !hasStatic) continue;
+    const opacity = Number(animated || transitioning ? computedStyleValue(style, 'opacity') : style.opacity);
+    if (Number.isFinite(opacity)) rgba[3] *= Math.max(0, Math.min(1, opacity));
   }
   const { fontSize, lineHeight } = fontMetrics(element);
   const whiteSpace = element.localName === 'input' ? 'nowrap' : inherited(element, 'whiteSpace', 'normal');
@@ -367,12 +405,20 @@ function textEntriesFor(entries, boxes, target, textLayers, styleFrame, hiddenMe
     const placeholder = isPlaceholderText(element);
     if (placeholder) rgba[3] *= 0.6;
     if (rgba[3] <= 0.001) continue;
-    const color = '#' + rgba.map((v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0')).join('');
+    // Opacity-affected text is rasterized at full opacity into a texture; the
+    // display list applies opacityFor when compositing (color-emoji ignore
+    // glyph-color alpha, so baking opacity into `color` does nothing for them).
+    const opacityDrive = opacityTextureDrive(element);
+    const bakeRgba = opacityDrive.texture && opacityDrive.opacity > 0.001
+      ? [rgba[0], rgba[1], rgba[2], Math.min(1, rgba[3] / opacityDrive.opacity)]
+      : rgba;
+    const color = '#' + bakeRgba.map((v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0')).join('');
     // Translation plus a uniform scale (a fitted stage, a zoomed lockup) is shaped
     // directly at the scaled size, so it stays crisp; other transforms go through a texture.
     const matrix = projectPoint.matrixFor(box);
     const scale = uniformTextScale(matrix);
     const rotated = !scale && rotatesText(matrix);
+    const useTexture = rotated || opacityDrive.texture;
     const fontSize = resolvedStyle.fontSize * (scale || 1);
     const lineHeight = resolvedStyle.lineHeight * (scale || 1);
     const textState = element.localName === 'input' ? elementState(element) : null;
@@ -399,9 +445,9 @@ function textEntriesFor(entries, boxes, target, textLayers, styleFrame, hiddenMe
     // inputs inside scroll layers, whose boxes here are in layer space.
     const originX = textState ? bounds.x - (textState.renderScrollLeft ?? 0) : bounds.x + (item?.dx ?? 0);
     const originY = textY + (verticallyCentered ? 1 : 0);
-    const textOrigin = rotated ? { x: originX, y: originY } : projectPoint(box, originX, originY);
+    const textOrigin = useTexture ? { x: originX, y: originY } : projectPoint(box, originX, originY);
     const runWidth = item?.width ?? bounds.width;
-    const transformedWidth = rotated ? runWidth : runWidth * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
+    const transformedWidth = useTexture ? runWidth : runWidth * projectPoint.widthScaleAt(box, bounds.x, bounds.y);
     if (![textOrigin.x, textOrigin.y, transformedWidth, fontSize, lineHeight].every(Number.isFinite)
         || transformedWidth < 0 || fontSize <= 0 || lineHeight <= 0) continue;
     const whiteSpace = resolvedStyle.whiteSpace;
@@ -420,14 +466,14 @@ function textEntriesFor(entries, boxes, target, textLayers, styleFrame, hiddenMe
     const lines = element.localName === 'textarea' ? null : layoutTextLines(element, bounds.width);
     const wrap = element.localName === 'textarea' && whiteSpace !== 'nowrap';
     const base = { x: textOrigin.x, y: textOrigin.y, width: transformedWidth + 0.01, fontSize,
-      layer: target || rotated ? 0 : textLayers?.get(element) ?? 0,
-      target: rotated ? TRANSFORMED_TEXT_TARGET : target,
+      layer: target || useTexture ? 0 : textLayers?.get(element) ?? 0,
+      target: useTexture ? TRANSFORMED_TEXT_TARGET : target,
       lineHeight,
       fontFamily: resolvedStyle.fontFamily,
       fontWeight: resolvedStyle.fontWeight,
       textAlign, color, wrap,
       breakWords: resolvedStyle.breakWords };
-    if (rotated) {
+    if (useTexture) {
       // Room around the content box for glyph overhang (italics, emoji, descenders).
       const pad = Math.ceil(fontSize * 0.5) + 2;
       const border = box.borderBox ?? box;
@@ -436,6 +482,7 @@ function textEntriesFor(entries, boxes, target, textLayers, styleFrame, hiddenMe
       const bottom = Math.max(border.y + border.height, bounds.y + bounds.height) + pad;
       const rect = { x: left, y: top, width: right - left, height: bottom - top };
       Object.assign(base, { clipX: rect.x, clipY: rect.y, clipWidth: rect.width, clipHeight: rect.height });
+      // Signature omits live opacity so pulse reuses one texture; draw applies alpha.
       noteTransformedText(element, rect, border, JSON.stringify([text, color, fontSize, lineHeight,
         resolvedStyle.fontFamily, resolvedStyle.fontWeight, textAlign, resolvedStyle.letterSpacing,
         originX - rect.x, originY - rect.y, bounds.width]));

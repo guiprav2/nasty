@@ -39,6 +39,8 @@ alsa = "0.9"
 libloading = "0.8"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
+# Image clipboard for captureFrame (already in the tree through egui-winit).
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
 rfd = "0.15"
 
 [build-dependencies]

@@ -31,7 +31,7 @@ const CSS_PROPERTIES = new Set([
   "animationIterationCount", "animationDirection", "animationFillMode", "animationPlayState",
   "boxShadow", "filter", "backdropFilter", "objectFit", "objectPosition", "imageRendering", "visibility",
   "cursor", "pointerEvents", "userSelect", "touchAction",
-  "caretColor",
+  "caretColor", "accentColor",
   // csswg-drafts#14598: separate edge + margin (threshold) longhands.
   "overflowAnchorEdge", "overflowAnchorMargin",
   "contentVisibility", "containIntrinsicSize",
@@ -267,6 +267,13 @@ function utilityStyle(utility) {
       ["animationTimingFunction", "cubic-bezier(0, 0, 0.2, 1)"],
       ["animationIterationCount", "infinite"],
     ],
+    // Tailwind default: bounce 1s infinite; per-keyframe easings live on the
+    // bounce keyframes (cubic-bezier spring), not on this shorthand.
+    "animate-bounce": [
+      ["animationName", "bounce"],
+      ["animationDuration", "1s"],
+      ["animationIterationCount", "infinite"],
+    ],
     "origin-center": ["transformOrigin", "50% 50%"], "origin-top": ["transformOrigin", "50% 0%"], "origin-top-right": ["transformOrigin", "100% 0%"],
     "origin-right": ["transformOrigin", "100% 50%"], "origin-bottom-right": ["transformOrigin", "100% 100%"], "origin-bottom": ["transformOrigin", "50% 100%"],
     "origin-bottom-left": ["transformOrigin", "0% 100%"], "origin-left": ["transformOrigin", "0% 50%"], "origin-top-left": ["transformOrigin", "0% 0%"],
@@ -393,6 +400,8 @@ function utilityStyle(utility) {
   if (transitionEase) return ["transitionTimingFunction", transitionEase[1].replaceAll("_", " ")];
   const caret = /^caret-(.+)$/.exec(utility);
   if (caret && colorValue(caret[1])) return ["caretColor", colorValue(caret[1])];
+  const accent = /^accent-(.+)$/.exec(utility);
+  if (accent && colorValue(accent[1])) return ["accentColor", colorValue(accent[1])];
   const roundedNamed = /^rounded-(t|r|b|l|tl|tr|br|bl)(?:-(none|sm|md|lg|xl|2xl|3xl|full))?$/.exec(utility);
   if (roundedNamed) {
     const radius = ({ none: 0, sm: 2, md: 6, lg: 8, xl: 12, "2xl": 16, "3xl": 24, full: 9999 })[roundedNamed[2]] ?? 4;

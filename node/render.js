@@ -433,16 +433,20 @@ function opacityFor(element, generation = 0) {
   const parent = element.parentElement ?? element.parentNode ?? element.parent;
   let opacity = parent?.nodeType === 1 ? opacityFor(parent, generation) : 1;
   const style = element.style;
-  if (style && style.opacity !== undefined && style.opacity !== "") {
+  if (style) {
     const state = getStyleTransitionState(style);
     const transition = state?.transitions.get("opacity");
     const transitioning = !!transition && performance.now() < transition.started + transition.duration;
-    // Spin and pose classes leave a static opacity on the element. Only sample
-    // computed opacity while an opacity transition or animation is running.
-    const raw = transitioning || styleHasAnimations(style)
-      ? Number(computedStyleValue(style, "opacity"))
-      : Number(style.opacity);
-    if (Number.isFinite(raw)) opacity *= Math.max(0, Math.min(1, raw));
+    const animated = styleHasAnimations(style);
+    const hasStatic = style.opacity !== undefined && style.opacity !== "";
+    // animate-pulse sets opacity only via keyframes — there is no static
+    // opacity-* class — so still sample computed style while an animation runs.
+    if (transitioning || animated || hasStatic) {
+      const raw = transitioning || animated
+        ? Number(computedStyleValue(style, "opacity"))
+        : Number(style.opacity);
+      if (Number.isFinite(raw)) opacity *= Math.max(0, Math.min(1, raw));
+    }
   }
   opacityCache.set(element, { generation, value: opacity });
   return opacity;
@@ -484,6 +488,57 @@ function borderColorFor(style, side) {
   return computedStyleValue(style, property)
     ?? computedStyleValue(style, "borderColor")
     ?? null;
+}
+
+function isCheckableInput(element) {
+  if (element?.localName !== "input") return false;
+  const type = element.type;
+  return type === "checkbox" || type === "radio";
+}
+
+const CHECKABLE_UA_BORDER = 1.75;
+const DEFAULT_ACCENT = [0.2, 0.47, 0.96, 1];
+
+function checkableAccentColor(style) {
+  return parseColor(computedStyleValue(style, "accentColor")
+    ?? computedStyleValue(style, "color")
+    ?? null) ?? DEFAULT_ACCENT;
+}
+
+function checkableBorderColor(style, accent) {
+  return parseColor(borderColorFor(style, "Top")
+    ?? computedStyleValue(style, "borderColor")
+    ?? computedStyleValue(style, "color")
+    ?? null) ?? accent ?? DEFAULT_ACCENT;
+}
+
+function contrastingMarkColor(fill) {
+  const luminance = 0.2126 * fill[0] + 0.7152 * fill[1] + 0.0722 * fill[2];
+  const alpha = fill[3] ?? 1;
+  return luminance > 0.55 ? [0.12, 0.12, 0.14, alpha] : [1, 1, 1, alpha];
+}
+
+/** Two thick checkmark arm quads (~✓) in document coordinates. */
+function checkmarkQuads(rect) {
+  const { x, y, width, height } = rect;
+  const s = Math.min(width, height);
+  if (s <= 0) return [];
+  const ox = x + (width - s) / 2;
+  const oy = y + (height - s) / 2;
+  const thickness = Math.max(1.25, s * 0.13);
+  const a = { x: ox + s * 0.22, y: oy + s * 0.52 };
+  const b = { x: ox + s * 0.43, y: oy + s * 0.70 };
+  const c = { x: ox + s * 0.80, y: oy + s * 0.28 };
+  const arm = (p0, p1) => {
+    const dx = p1.x - p0.x, dy = p1.y - p0.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len * thickness / 2, ny = dx / len * thickness / 2;
+    return [
+      [p0.x + nx, p0.y + ny], [p1.x + nx, p1.y + ny],
+      [p1.x - nx, p1.y - ny], [p0.x - nx, p0.y - ny],
+    ];
+  };
+  return [arm(a, b), arm(b, c)];
 }
 
 function splitGradientArgs(body) {
@@ -1114,6 +1169,8 @@ function fastPaintRecipe(element) {
 }
 function buildFastRecipe(element) {
   const style = element.style;
+  // Checkable inputs need UA border fallbacks and checkmark/dot overlays.
+  if (isCheckableInput(element)) return null;
   if (element.localName === "canvas" || element.localName === "video") return null;
   if (parseFilterBlur(computedStyleValue(style, "filter") ?? style.filter) > 0) return null;
   if (style.backdropFilter && style.backdropFilter !== "none") return null;
@@ -1611,6 +1668,38 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       return Number.isFinite(point.x) && Number.isFinite(point.y) ? { ...point, u, v } : null;
     });
     if (!corners.every(Boolean)) return true;
+    const opacity = opacityFor(element, documentData?.paintGeneration ?? 0);
+    if (opacity <= 0.001) return true;
+    // Axis-aligned quads can use image-box (tag 8) which carries opacity — needed
+    // so color-emoji under animate-pulse fade. Rotated quads keep tag 1.
+    const xs = corners.map((point) => point.x), ys = corners.map((point) => point.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+    const axisAligned = corners.every((point) =>
+      (Math.abs(point.x - minX) < 0.5 || Math.abs(point.x - maxX) < 0.5)
+      && (Math.abs(point.y - minY) < 0.5 || Math.abs(point.y - maxY) < 0.5));
+    if (axisAligned) {
+      const rect = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+      if (!(rect.width > 0 && rect.height > 0)) return true;
+      const clips = gpuBoxClips(element, rect.x, rect.y, rect.x + rect.width, rect.y + rect.height);
+      if (clips) {
+        // Same layout as pushImageBox: tag 8 carries per-quad opacity for pulse.
+        const part = [
+          8, texture.textureId,
+          rect.x, rect.y, rect.width, rect.height,
+          0, 0, 1, 1,
+          0, 0, 0, 0,
+        ];
+        for (let index = 0; index < 2; index++) {
+          const clip = clips[index];
+          part.push(...(clip ? [clip.x, clip.y, clip.width, clip.height] : [0, 0, 0, 0]));
+        }
+        part.push(clips[0]?.radius ?? 0, clips[1]?.radius ?? 0, opacity, 0);
+        pushScenePart(Float32Array.from(part), element);
+        commandCount++;
+        return true;
+      }
+      // Fall through to tag 1 when the clip stack needs the tessellated path.
+    }
     let clipped = paintMode.capture ? corners : clipTexturedPolygon(corners, viewport);
     for (const region of clipsFor(box)) clipped = clipConvexPolygon(clipped, region);
     if (!paintMode.capture) clipped = clipConvexPolygon(clipped, windowClip);
@@ -2440,7 +2529,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
         return borderStyle !== "none" && borderStyle !== "hidden" && box.border[side.toLowerCase()] > 0;
       });
       const hasImage = state.image ?? state.video?.image;
-      if (!hasBackground && !hasGradient && !hasBorder && !hasImage && element.localName !== "canvas") {
+      if (!hasBackground && !hasGradient && !hasBorder && !hasImage && element.localName !== "canvas"
+          && !isCheckableInput(element)) {
         const visibleRect = box.clip ? intersection(box.clip, viewport) : viewport;
         if (box.x + box.width > visibleRect.x && box.y + box.height > visibleRect.y
             && box.x < visibleRect.x + visibleRect.width && box.y < visibleRect.y + visibleRect.height) {
@@ -2853,6 +2943,53 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
           }
         }
       }
+      }
+    }
+    if (isCheckableInput(element)) {
+      const chromeBox = box.borderBox;
+      const isRadio = element.type === "radio";
+      const checked = !!element.checked;
+      const accent = withOpacity(checkableAccentColor(style), opacity);
+      const borderTone = withOpacity(checkableBorderColor(style, accent), opacity);
+      const layoutWidths = SIDES.map((side) => box.border[side.toLowerCase()] || 0);
+      const hasLayoutBorder = layoutWidths.some((width) => width > 0);
+      const edge = hasLayoutBorder ? Math.max(...layoutWidths) : CHECKABLE_UA_BORDER;
+      const widths = [edge, edge, edge, edge];
+      let corners = borderCorners;
+      if (isRadio || (corners.tl >= 9990 && corners.tr >= 9990 && corners.br >= 9990 && corners.bl >= 9990)) {
+        const radius = Math.min(chromeBox.width, chromeBox.height) / 2;
+        corners = { tl: radius, tr: radius, br: radius, bl: radius };
+      }
+      const noBorder = [0, 0, 0, 0];
+      if (checked && !isRadio && accent) {
+        if (gpuBox) pushGpuBox(chromeBox, corners, accent, noBorder, null, gpuClips);
+        else push(box, chromeBox, accent, project, Math.min(corners.tl, corners.tr, corners.br, corners.bl), lazyClipRegions());
+      }
+      if (borderTone && edge > 0) {
+        // Draw after the accent fill so the ring stays visible when checked.
+        if (gpuBox) pushGpuBox(chromeBox, corners, null, widths, borderTone, gpuClips);
+        else pushRoundedRing(box, chromeBox, edge, borderTone, corners, project, lazyClipRegions());
+      }
+      if (checked && accent) {
+        if (isRadio) {
+          const inset = Math.max(edge + 1, Math.min(chromeBox.width, chromeBox.height) * 0.28);
+          const inner = {
+            x: chromeBox.x + inset, y: chromeBox.y + inset,
+            width: Math.max(0, chromeBox.width - inset * 2),
+            height: Math.max(0, chromeBox.height - inset * 2),
+          };
+          const innerRadius = Math.min(inner.width, inner.height) / 2;
+          const innerCorners = { tl: innerRadius, tr: innerRadius, br: innerRadius, bl: innerRadius };
+          if (inner.width > 0 && inner.height > 0) {
+            if (gpuBox) pushGpuBox(inner, innerCorners, accent, noBorder, null, gpuClips);
+            else push(box, inner, accent, project, innerRadius, lazyClipRegions());
+          }
+        } else {
+          const mark = withOpacity(contrastingMarkColor(accent), opacity);
+          for (const quad of checkmarkQuads(chromeBox)) {
+            pushTriangle(box, quad, mark, project, lazyClipRegions());
+          }
+        }
       }
     }
     saveSegment(element, box, after, segmentStart, beforeCommands, true);

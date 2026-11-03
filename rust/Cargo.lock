@@ -2199,6 +2199,7 @@ name = "nasty-native"
 version = "0.1.0"
 dependencies = [
  "alsa",
+ "arboard",
  "async-trait",
  "base64 0.22.1",
  "bytemuck",

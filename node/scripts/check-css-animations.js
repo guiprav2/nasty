@@ -10,6 +10,21 @@ assert.equal(spin.animationDuration, "16s");
 assert.equal(spin.animationTimingFunction, "linear");
 assert.equal(spin.animationIterationCount, "infinite");
 
+const pulseUtility = resolveTailwind("animate-pulse");
+assert.equal(pulseUtility.animationName, "pulse");
+assert.equal(pulseUtility.animationDuration, "2s");
+assert.equal(pulseUtility.animationTimingFunction, "cubic-bezier(0.4, 0, 0.6, 1)");
+assert.equal(pulseUtility.animationIterationCount, "infinite");
+
+const pingUtility = resolveTailwind("animate-ping");
+assert.equal(pingUtility.animationName, "ping");
+assert.equal(pingUtility.animationDuration, "1s");
+
+const bounceUtility = resolveTailwind("animate-bounce");
+assert.equal(bounceUtility.animationName, "bounce");
+assert.equal(bounceUtility.animationDuration, "1s");
+assert.equal(bounceUtility.animationIterationCount, "infinite");
+
 const sheenUtility = resolveTailwind("animate-sheen");
 assert.equal(sheenUtility.animationName, "sheen");
 assert.equal(sheenUtility.animationTimingFunction, "linear");
@@ -30,9 +45,12 @@ const glowUtility = resolveTailwind("animate-glow");
 assert.equal(glowUtility.animationName, "glow");
 assert.equal(glowUtility.animationDuration, "5.5s");
 
-for (const name of ["spin", "float", "glow", "sheen", "pulse", "ping"]) {
+for (const name of ["spin", "float", "glow", "sheen", "pulse", "ping", "bounce"]) {
   assert.ok(getRegisteredKeyframes(name)?.length >= 2, `missing keyframes for ${name}`);
 }
+const bounceFrames = getRegisteredKeyframes("bounce");
+assert.equal(bounceFrames[0].easing, "cubic-bezier(0.8, 0, 1, 1)");
+assert.equal(bounceFrames[1].easing, "cubic-bezier(0, 0, 0.2, 1)");
 
 const glowFrames = getRegisteredKeyframes("glow");
 assert.match(glowFrames[0].class.join(" "), /translate\(-50%,-50%\)/);
@@ -50,6 +68,26 @@ const first = computedStyleValue(logo.style, "transform");
 await new Promise((resolve) => setTimeout(resolve, 40));
 const second = computedStyleValue(logo.style, "transform");
 assert.notEqual(first, second, "spin transform should advance");
+
+const pulseEl = doc.createElement("span");
+pulseEl.className = "animate-pulse text-3xl";
+pulseEl.textContent = "✨";
+doc.body.appendChild(pulseEl);
+assert.equal(pulseEl.style.opacity, undefined, "animate-pulse has no static opacity class");
+const pulseA = Number(computedStyleValue(pulseEl.style, "opacity"));
+await new Promise((resolve) => setTimeout(resolve, 120));
+const pulseB = Number(computedStyleValue(pulseEl.style, "opacity"));
+assert.notEqual(pulseA, pulseB, "pulse opacity should advance");
+
+const bounceEl = doc.createElement("span");
+bounceEl.className = "animate-bounce";
+bounceEl.textContent = "💖";
+doc.body.appendChild(bounceEl);
+const bounceA = computedStyleValue(bounceEl.style, "transform");
+await new Promise((resolve) => setTimeout(resolve, 80));
+const bounceB = computedStyleValue(bounceEl.style, "transform");
+assert.notEqual(bounceA, bounceB, "bounce transform should advance");
+assert.match(String(bounceA ?? ""), /translateY/);
 
 const float = doc.createElement("div");
 float.className = "animate-float";

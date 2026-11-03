@@ -77,6 +77,7 @@ import {
   markImageLoadSticky,
   requestImageLoadSchedule,
 } from "./internal/image-load-scheduler.js";
+import { parseHtmlFragment, serializeHtmlChildren, serializeHtmlNode } from "./internal/html.js";
 
 export const VideoDecoder = native.VideoDecoder;
 export const AudioDecoder = native.AudioDecoder;
@@ -298,6 +299,8 @@ export class Window extends NativeWindow {
   #dragHitTestTimer = null;
   #presentationTimer = null;
   #documentPresented = false;
+  // captureFrame requests waiting for their "frame-captured" report, by id.
+  #pendingCaptures = new Map();
   #eventTarget = new EventTarget();
   #eventTimer = null;
   #closeNotified = false;
@@ -307,12 +310,15 @@ export class Window extends NativeWindow {
   #textControlIds = new WeakMap();
   #managedTextControls = new WeakSet();
   #nextTextControlId = 1;
+  #title;
+  #titleFromCtor = false;
+  #autoShowOnDocument = true;
+  #shown = false;
   constructor(options = {}) {
     const initialWidth = options.width ?? 960;
     const initialHeight = options.height ?? 600;
     validateWindowDimension(initialWidth, "width");
     validateWindowDimension(initialHeight, "height");
-    const showAfterSizing = (typeof initialWidth === "string" || typeof initialHeight === "string") && (options.visible ?? true);
     const initialResizable = options.resizable ?? "both";
     if (!RESIZABLE_MODES.has(initialResizable)) {
       throw new TypeError('resizable must be "horizontal", "vertical", "both", or "none"');
@@ -336,7 +342,7 @@ export class Window extends NativeWindow {
     if (typeof initialMaximized !== 'boolean') throw new TypeError('maximized must be a boolean');
     // App data: appId names the app's directory ($HOME/.<appId>); its cache lives in
     // <userDataPath>/cache. Without an appId there is no user data, so no caching.
-    const { appId = null, userDataPath: userDataOption, cachePath: cacheOption, ...nativeOptions } = options;
+    const { appId = null, userDataPath: userDataOption, cachePath: cacheOption, title: titleOption, visible: visibleOption, ...nativeOptions } = options;
     if (appId !== null && (typeof appId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(appId))) {
       throw new TypeError('appId must be a string of letters, digits, ".", "_" or "-"');
     }
@@ -346,10 +352,15 @@ export class Window extends NativeWindow {
     if (appId === null) console.warn("Nasty: Window created without an appId; user data and caching are disabled.");
     const userDataPath = userDataOption !== undefined ? userDataOption : appId ? join(homedir(), `.${appId}`) : null;
     const cachePath = cacheOption !== undefined ? cacheOption : userDataPath ? join(userDataPath, 'cache') : null;
+    const titleFromCtor = titleOption !== undefined;
+    const initialTitle = titleFromCtor ? String(titleOption) : "Nasty";
+    // Stay hidden until a document attaches (unless visible: false, which never auto-shows).
+    const autoShowOnDocument = visibleOption !== false;
     super({ ...nativeOptions,
+      title: initialTitle,
       width: typeof initialWidth === "number" ? Math.max(1, initialWidth) : 960,
       height: typeof initialHeight === "number" ? Math.max(1, initialHeight) : 600,
-      visible: showAfterSizing ? false : options.visible,
+      visible: false,
       resizable: initialResizable, orientation: initialOrientation, borderless: initialBorderless,
       dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized, vsync: initialVsync });
     openWindows.add(this);
@@ -364,14 +375,22 @@ export class Window extends NativeWindow {
     this.#dragAnywhere = initialDragAnywhere;
     this.#maximizable = initialMaximizable;
     this.#vsync = initialVsync;
+    this.#title = initialTitle;
+    this.#titleFromCtor = titleFromCtor;
+    this.#autoShowOnDocument = autoShowOnDocument;
     this.DOMRect = DOMRect;
     this.FileSystemDirectoryHandle = FileSystemDirectoryHandle;
     this.FileSystemFileHandle = FileSystemFileHandle;
     this.#applyWindowDimensions();
-    if (showAfterSizing) {
-      super.show();
-      this.#applyWindowDimensions();
-    }
+  }
+
+  /** Host-level window title. Prefer document.title / head>title once a document is attached. */
+  get title() { return this.#title; }
+  set title(value) {
+    const next = value == null ? "" : String(value);
+    if (this.#title === next) return;
+    this.#title = next;
+    try { super.setTitle(next); } catch { /* native bridge may lag during early boot */ }
   }
 
   /**
@@ -532,6 +551,10 @@ export class Window extends NativeWindow {
         this.#routeNativeEvent(event);
         continue;
       }
+      if (eventType === "frame-captured") {
+        this.#settleCapture(event);
+        continue;
+      }
       if (eventType !== "pointerdown" || event.button !== 0 || !event.dragRequested) {
         routedEvents.push(event);
         continue;
@@ -652,9 +675,44 @@ export class Window extends NativeWindow {
 
   dispatchEvent(event) { return this.#eventTarget.dispatchEvent(event); }
 
+  /**
+   * Captures the next presented frame as composited on the GPU: written to a PNG
+   * file at `path`, or put on the system clipboard when `path` is null. `element`
+   * limits it to that element's border box as it is on screen; `rect` ({x, y,
+   * width, height} in CSS pixels, like a DOMRect) to any region. Resolves once the
+   * file is written or the clipboard holds the image.
+   */
+  captureFrame(path = null, { element = null, rect = null } = {}) {
+    const box = rect ?? element?.getBoundingClientRect() ?? null;
+    // Layout runs in the window's physical pixels, so client coordinates are surface pixels.
+    const region = box ? { x: box.x ?? box.left, y: box.y ?? box.top, width: box.width, height: box.height } : null;
+    let id;
+    try {
+      id = super.captureFrame(path == null ? null : String(path), region);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return new Promise((resolve, reject) => this.#pendingCaptures.set(id, { resolve, reject }));
+  }
+
+  /** Copies the next presented frame (or the part `element` / `rect` covers) to the clipboard. */
+  copyFrame(options) {
+    return this.captureFrame(null, options);
+  }
+
+  #settleCapture(event) {
+    const pending = this.#pendingCaptures.get(event.deltaX);
+    if (!pending) return;
+    this.#pendingCaptures.delete(event.deltaX);
+    if (event.key) pending.reject(new Error(event.key));
+    else pending.resolve();
+  }
+
   #notifyClosed() {
     if (this.#closeNotified) return;
     this.#closeNotified = true;
+    for (const { reject } of this.#pendingCaptures.values()) reject(new DOMException("The window closed before the frame was captured.", "AbortError"));
+    this.#pendingCaptures.clear();
     openWindows.delete(this);
     clearTimeout(this.#presentationTimer);
     this.#presentationTimer = null;
@@ -674,7 +732,7 @@ export class Window extends NativeWindow {
     // Use the public drainEvents path so dragAnywhere + image-ready routing stay unified.
     for (const event of this.drainEvents()) {
       const eventType = event.type || event.kind;
-      if (eventType === "image-ready" || eventType === "image-error") continue; // already routed inside drainEvents
+      if (eventType === "image-ready" || eventType === "image-error" || eventType === "frame-captured") continue; // already handled inside drainEvents
       this.#routeNativeEvent(event);
     }
   }
@@ -840,8 +898,14 @@ export class Window extends NativeWindow {
           && Math.abs(last.x - fields.clientX) <= 4 && Math.abs(last.y - fields.clientY) <= 4;
         const detail = repeat ? last.detail + 1 : 1;
         this.#lastClick = { target: clickTarget, time: now, x: fields.clientX, y: fields.clientY, detail };
+        // Activation toggles before click so handlers see the new checked state.
+        const toggled = activateCheckableInput(nearestFormControl(clickTarget));
         dispatchDomEvent(clickTarget, "click", { ...fields, detail });
         if (detail === 2) dispatchDomEvent(clickTarget, "dblclick", { ...fields, detail });
+        if (toggled) {
+          toggled.dispatchEvent(new Event("input", { bubbles: true }));
+          toggled.dispatchEvent(new Event("change", { bubbles: true }));
+        }
       }
       // Capture ends implicitly after pointerup.
       if (capture) releaseCapturedPointer(document, 1);
@@ -879,7 +943,16 @@ export class Window extends NativeWindow {
     }
     if (nativeEvent.type === "keydown" || nativeEvent.type === "keyup") {
       const active = document.activeElement;
-      if (active) dispatchDomEvent(active, nativeEvent.type, fields);
+      if (active) {
+        const prevented = dispatchDomEvent(active, nativeEvent.type, fields);
+        if (!prevented && nativeEvent.type === "keydown" && fields.key === " ") {
+          const toggled = activateCheckableInput(active);
+          if (toggled) {
+            toggled.dispatchEvent(new Event("input", { bubbles: true }));
+            toggled.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        }
+      }
     }
   }
 
@@ -1051,7 +1124,7 @@ export class Window extends NativeWindow {
     for (const element of candidates) {
       if (!(element.localName === "input" || element.localName === "textarea")) continue;
       if (this.#managedTextControls.has(element) || element.disabled || !visible(element)) continue;
-      if (element.localName === "input" && !["text", "search", "url", "email", "password", "tel", ""].includes(element.type)) continue;
+      if (element.localName === "input" && !["text", "search", "url", "email", "password", "tel", "date", ""].includes(element.type)) continue;
       controls.push(element);
     }
     if (!controls.length) {
@@ -1379,6 +1452,9 @@ export class Window extends NativeWindow {
     this.#bodyAppearanceKey = null;
     if (document) {
       document._attachWindow(this);
+      // Ctor title seeds a matching head > title via the standard document.title setter.
+      if (this.#titleFromCtor) document.title = this.#title;
+      else if (document.title) this.title = document.title;
       this.#documentPresented = false;
       // Image completions must not wait on first present — start the pump now.
       this.#startEventPolling();
@@ -1389,6 +1465,11 @@ export class Window extends NativeWindow {
         catch (error) { if (!this.closed) console.error("Nasty initial layout failed:", error); }
       });
       this.#scheduleAutomaticPresentation();
+      if (this.#autoShowOnDocument && !this.#shown && !this.closed) {
+        try { super.show(); this.#shown = true; } catch (error) {
+          console.error("Nasty window show failed:", error);
+        }
+      }
     } else {
       clearTimeout(this.#presentationTimer);
       this.#presentationTimer = null;
@@ -1648,11 +1729,18 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
       }
     }
   }
-  if (typeof result.flexBasis === "string" && result.flexBasis.endsWith("%")) {
-    result.flexBasisPercent = parseFloat(result.flexBasis) / 100;
-    delete result.flexBasis;
-  } else if (typeof result.flexBasis === "string" && result.flexBasis.endsWith("px")) {
-    result.flexBasis = parseFloat(result.flexBasis);
+  if (typeof result.flexBasis === "string") {
+    if (result.flexBasis.endsWith("%")) {
+      result.flexBasisPercent = parseFloat(result.flexBasis) / 100;
+      delete result.flexBasis;
+    } else if (result.flexBasis === "auto") {
+      // Taffy default flex_basis is Auto; omit the field instead of sending a string.
+      delete result.flexBasis;
+    } else {
+      const resolved = resolveCssLength(result.flexBasis, fontSize, viewport);
+      if (resolved !== undefined) result.flexBasis = resolved;
+      else delete result.flexBasis;
+    }
   }
   for (const [property, value] of Object.entries(result)) {
     if (typeof value === "number" && !Number.isFinite(value)) delete result[property];
@@ -2045,6 +2133,113 @@ function commonInclusiveAncestor(a, b) {
 const POINTER_ACTIVATION_EVENTS = new Set(["click", "dblclick", "pointerdown", "mousedown"]);
 
 
+function siblingAt(node, offset) {
+  const parent = node.parent;
+  if (!parent) return null;
+  return parent.children[parent.children.indexOf(node) + offset] ?? null;
+}
+
+/** When <title> text changes, push to the host Window.title (not a Document API). */
+function syncWindowTitleFromTitleElement(element) {
+  if (!element || element.localName !== "title") return;
+  const view = element.document?.defaultView;
+  if (!view) return;
+  view.title = element.textContent ?? "";
+}
+
+const SIMPLE_SELECTOR = /^(?:[a-z][\w-]*|\*)?(?:[.#][\w-]+|\[[\w-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\]\s]+))?\])*$/i;
+
+function matchesSimpleSelector(element, pattern) {
+  if (!pattern) return false;
+  if (!SIMPLE_SELECTOR.test(pattern)) {
+    throw new DOMException(`Unsupported selector: ${pattern}`, "SyntaxError");
+  }
+  const tag = pattern.match(/^[a-z][\w-]*/i)?.[0];
+  if (tag && tag !== "*" && tag.toLowerCase() !== element.localName) return false;
+  for (const [, type, name] of pattern.matchAll(/([.#])([\w-]+)/g)) {
+    if (type === "#" ? element.id !== name : !element.classList.contains(name)) return false;
+  }
+  for (const match of pattern.matchAll(/\[([\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+)))?\]/g)) {
+    const attr = match[1];
+    const expected = match[2] ?? match[3] ?? match[4];
+    if (expected === undefined) {
+      if (!element.hasAttribute(attr)) return false;
+    } else if (String(element.getAttribute(attr) ?? "") !== expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Tokenize a compound selector into { compound } / { c: '>'|' ' } parts. */
+function tokenizeCompoundSelector(selector) {
+  const tokens = [];
+  let i = 0;
+  const s = selector.trim();
+  while (i < s.length) {
+    if (s[i] === ">") {
+      tokens.push({ c: ">" });
+      i += 1;
+      while (s[i] === " ") i += 1;
+      continue;
+    }
+    if (/\s/.test(s[i])) {
+      while (/\s/.test(s[i])) i += 1;
+      if (s[i] === ">") continue;
+      tokens.push({ c: " " });
+      continue;
+    }
+    if (s[i] === "+" || s[i] === "~") {
+      throw new DOMException(`Unsupported selector: ${selector}`, "SyntaxError");
+    }
+    const start = i;
+    while (i < s.length && !/\s/.test(s[i]) && s[i] !== ">" && s[i] !== "+" && s[i] !== "~") i += 1;
+    tokens.push({ compound: s.slice(start, i) });
+  }
+  return tokens;
+}
+
+function parentElementLike(node) {
+  if (!node) return null;
+  const parent = node.parentElement ?? node.parent ?? null;
+  return parent && parent.nodeType === 1 ? parent : null;
+}
+
+/** Simple selectors plus descendant and child combinators (e.g. head > title). */
+function matchesComplexSelector(element, selector) {
+  if (!selector) return false;
+  if (!/[>\s]/.test(selector)) return matchesSimpleSelector(element, selector);
+  const tokens = tokenizeCompoundSelector(selector);
+  if (!tokens.length || !tokens[tokens.length - 1].compound) {
+    throw new DOMException(`Unsupported selector: ${selector}`, "SyntaxError");
+  }
+  let node = element;
+  let i = tokens.length - 1;
+  if (!matchesSimpleSelector(node, tokens[i].compound)) return false;
+  i -= 1;
+  while (i >= 0) {
+    const comb = tokens[i];
+    i -= 1;
+    if (!comb?.c || i < 0 || !tokens[i].compound) {
+      throw new DOMException(`Unsupported selector: ${selector}`, "SyntaxError");
+    }
+    const compound = tokens[i].compound;
+    i -= 1;
+    if (comb.c === ">") {
+      node = parentElementLike(node);
+      if (!node || !matchesSimpleSelector(node, compound)) return false;
+      continue;
+    }
+    let found = null;
+    for (let cur = parentElementLike(node); cur; cur = parentElementLike(cur)) {
+      if (matchesSimpleSelector(cur, compound)) { found = cur; break; }
+    }
+    if (!found) return false;
+    node = found;
+  }
+  return true;
+}
+
 /** DOM Text node. Measured and painted through its parent Element. */
 export class Text extends EventTarget {
   constructor(document, data = "") {
@@ -2058,6 +2253,8 @@ export class Text extends EventTarget {
   get parentNode() { return this.parent; }
   get parentElement() { return this.parent?.nodeType === 1 ? this.parent : null; }
   get ownerDocument() { return this.document; }
+  get nextSibling() { return siblingAt(this, 1); }
+  get previousSibling() { return siblingAt(this, -1); }
   get textContent() { return this._data; }
   set textContent(value) { this.data = value; }
   get nodeValue() { return this._data; }
@@ -2076,8 +2273,12 @@ export class Text extends EventTarget {
       elementState(parent).text = parent.children.map((child) => (child.nodeType === 3 ? child.data : "")).join("");
     }
     parent._styleChanged();
+    if (parent.localName === "title") syncWindowTitleFromTitleElement(parent);
   }
   remove() { this.parent?.removeChild(this); }
+  cloneNode(_deep = false) {
+    return this.document.createTextNode(this.data);
+  }
   before(...nodes) {
     if (!this.parent) return;
     if (nodes.includes(this)) return this.replaceWith(...nodes);
@@ -2104,6 +2305,145 @@ export class Text extends EventTarget {
   }
 }
 
+/**
+ * DOM Comment node. Not laid out or painted; used as Dominant if/map anchors
+ * (`document.createComment`) and standard HTML comments.
+ */
+export class Comment extends EventTarget {
+  constructor(document, data = "") {
+    super();
+    this.document = document;
+    this.nodeType = 8;
+    this.nodeName = "#comment";
+    this.parent = null;
+    this._data = data == null ? "" : String(data);
+  }
+  get parentNode() { return this.parent; }
+  get parentElement() { return this.parent?.nodeType === 1 ? this.parent : null; }
+  get ownerDocument() { return this.document; }
+  get nextSibling() { return siblingAt(this, 1); }
+  get previousSibling() { return siblingAt(this, -1); }
+  get textContent() { return this._data; }
+  set textContent(value) { this.data = value; }
+  get nodeValue() { return this._data; }
+  set nodeValue(value) { this.data = value; }
+  get data() { return this._data; }
+  set data(value) {
+    this._data = value == null ? "" : String(value);
+  }
+  remove() { this.parent?.removeChild(this); }
+  cloneNode(_deep = false) {
+    return this.document.createComment(this.data);
+  }
+  before(...nodes) {
+    if (!this.parent) return;
+    if (nodes.includes(this)) return this.replaceWith(...nodes);
+    for (const node of nodes) this.parent.insertBefore(node, this);
+  }
+  after(...nodes) {
+    if (!this.parent) return;
+    const parent = this.parent;
+    const siblings = parent.children;
+    let index = siblings.indexOf(this) + 1;
+    while (siblings[index] && nodes.includes(siblings[index])) index++;
+    const next = siblings[index] ?? null;
+    for (const node of nodes) parent.insertBefore(node, next);
+  }
+  replaceWith(...nodes) {
+    if (!this.parent) return;
+    const parent = this.parent;
+    const siblings = parent.children;
+    let index = siblings.indexOf(this) + 1;
+    while (siblings[index] && nodes.includes(siblings[index])) index++;
+    const next = siblings[index] ?? null;
+    if (!nodes.includes(this)) parent.removeChild(this);
+    for (const node of nodes) parent.insertBefore(node, next);
+  }
+}
+
+function isInsertableChild(child) {
+  return child instanceof Element || child instanceof Text || child instanceof Comment;
+}
+
+/** Minimal Attr for NamedNodeMap iteration (`for (const { name, value } of el.attributes)`). */
+export class Attr {
+  constructor(name, value) {
+    this.name = String(name);
+    this.value = String(value);
+    this.nodeName = this.name;
+    this.nodeValue = this.value;
+    this.nodeType = 2;
+  }
+}
+
+/**
+ * Map-backed NamedNodeMap: Element still uses .get/.set/.has/.delete,
+ * while iteration yields Attr-like { name, value } (browser NamedNodeMap shape).
+ */
+export class NamedNodeMap {
+  #map = new Map();
+
+  get length() {
+    return this.#map.size;
+  }
+
+  item(index) {
+    let i = 0;
+    for (const [name, value] of this.#map) {
+      if (i++ === index) return new Attr(name, value);
+    }
+    return null;
+  }
+
+  getNamedItem(name) {
+    const key = String(name).toLowerCase();
+    if (!this.#map.has(key)) return null;
+    return new Attr(key, this.#map.get(key));
+  }
+
+  get(name) {
+    return this.#map.get(name);
+  }
+
+  set(name, value) {
+    this.#map.set(name, value);
+    return this;
+  }
+
+  has(name) {
+    return this.#map.has(name);
+  }
+
+  delete(name) {
+    return this.#map.delete(name);
+  }
+
+  /** Map-compatible: forEach(callback(value, name, mapLike)) */
+  forEach(callback, thisArg) {
+    for (const [name, value] of this.#map) {
+      callback.call(thisArg, value, name, this);
+    }
+  }
+
+  *[Symbol.iterator]() {
+    for (const [name, value] of this.#map) {
+      yield new Attr(name, value);
+    }
+  }
+
+  *entries() {
+    yield* this.#map.entries();
+  }
+
+  *keys() {
+    yield* this.#map.keys();
+  }
+
+  *values() {
+    yield* this.#map.values();
+  }
+}
+
 export class Element extends EventTarget {
   constructor(document, name) {
     super();
@@ -2112,7 +2452,7 @@ export class Element extends EventTarget {
     this.tagName = this.localName.toUpperCase();
     this.parent = null;
     this.children = [];
-    this.attributes = new Map();
+    this.attributes = new NamedNodeMap();
     const state = { image: null, imageLoad: null, imageLoadState: "empty", imageLoadSticky: false, imageConstructor: false, imageAwaySince: null, imageMaxEdge: 0, currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null,
       selectionStyle: {}, textAreaState: null, inputValue: "", selectionStart: 0, selectionEnd: 0, selectionDirection: "none",
       scrollLeft: 0, scrollTop: 0,
@@ -2227,6 +2567,15 @@ export class Element extends EventTarget {
   get title() { return this.getAttribute("title") || ""; }
   set title(value) { this.setAttribute("title", value); }
 
+  get checked() {
+    return this.localName === "input" ? this.hasAttribute("checked") : undefined;
+  }
+  set checked(value) {
+    if (this.localName !== "input") return;
+    if (value) this.setAttribute("checked", "");
+    else this.removeAttribute("checked");
+  }
+
   get disabled() {
     return ["button", "input", "select", "textarea", "fieldset", "option", "optgroup"].includes(this.localName)
       && this.hasAttribute("disabled");
@@ -2286,8 +2635,23 @@ export class Element extends EventTarget {
 
   get nodeType() { return 1; }
   get nodeName() { return this.tagName; }
-  get parentNode() { return this.parent ?? (this === this.document.body ? this.document : null); }
+  get parentNode() {
+    return this.parent
+      ?? (this === this.document.body || this === this.document.head ? this.document : null);
+  }
   get childNodes() { return this.children; }
+  get firstChild() { return this.children[0] ?? null; }
+  get lastChild() { return this.children.at(-1) ?? null; }
+  get firstElementChild() {
+    for (const child of this.children) if (child.nodeType === 1) return child;
+    return null;
+  }
+  get lastElementChild() {
+    for (let i = this.children.length - 1; i >= 0; i--) {
+      if (this.children[i].nodeType === 1) return this.children[i];
+    }
+    return null;
+  }
   get nextSibling() {
     const parent = this.parent;
     if (!parent) return null;
@@ -2305,10 +2669,46 @@ export class Element extends EventTarget {
 
   set textContent(value) {
     const next = value == null ? "" : String(value);
-    if (this.children.length === 0 && elementState(this).text === next) return;
+    if (this.children.length === 0 && elementState(this).text === next) {
+      if (this.localName === "title") syncWindowTitleFromTitleElement(this);
+      return;
+    }
     for (const child of [...this.children]) this.removeChild(child);
     elementState(this).text = next;
     this._styleChanged();
+    if (this.localName === "title") syncWindowTitleFromTitleElement(this);
+  }
+
+  get innerHTML() {
+    return serializeHtmlChildren(this, { getLeafText: (el) => elementState(el).text ?? "" });
+  }
+
+  set innerHTML(html) {
+    for (const child of [...this.children]) this.removeChild(child);
+    elementState(this).text = "";
+    const nodes = parseHtmlFragment(html ?? "", {
+      createElement: (tag) => this.document.createElement(tag),
+      createTextNode: (data) => this.document.createTextNode(data),
+    });
+    for (const node of nodes) this.appendChild(node);
+  }
+
+  get outerHTML() {
+    return serializeHtmlNode(this, { getLeafText: (el) => elementState(el).text ?? "" });
+  }
+
+  set outerHTML(html) {
+    if (!this.parent) {
+      throw new DOMException("This element has no parent. 'outerHTML' is unavailable.", "NoModificationAllowedError");
+    }
+    const parent = this.parent;
+    const next = this.nextSibling;
+    const nodes = parseHtmlFragment(html ?? "", {
+      createElement: (tag) => this.document.createElement(tag),
+      createTextNode: (data) => this.document.createTextNode(data),
+    });
+    parent.removeChild(this);
+    for (const node of nodes) parent.insertBefore(node, next);
   }
 
   get ownerDocument() { return this.document; }
@@ -2394,29 +2794,7 @@ export class Element extends EventTarget {
     return null;
   }
   matches(selector) {
-    return String(selector).split(",").some(part => {
-      const pattern = part.trim();
-      if (!pattern) return false;
-      // tag, #id, .class, and [attr] / [attr=value] / [attr="value"] / [attr='value']
-      if (!/^(?:[a-z][\w-]*|\*)?(?:[.#][\w-]+|\[[\w-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\]\s]+))?\])*$/i.test(pattern)) {
-        throw new DOMException(`Unsupported selector: ${pattern}`, "SyntaxError");
-      }
-      const tag = pattern.match(/^[a-z][\w-]*/i)?.[0];
-      if (tag && tag.toLowerCase() !== this.localName) return false;
-      for (const [, type, name] of pattern.matchAll(/([.#])([\w-]+)/g)) {
-        if (type === "#" ? this.id !== name : !this.classList.contains(name)) return false;
-      }
-      for (const match of pattern.matchAll(/\[([\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+)))?\]/g)) {
-        const attr = match[1];
-        const expected = match[2] ?? match[3] ?? match[4];
-        if (expected === undefined) {
-          if (!this.hasAttribute(attr)) return false;
-        } else if (String(this.getAttribute(attr) ?? "") !== expected) {
-          return false;
-        }
-      }
-      return true;
-    });
+    return String(selector).split(",").some(part => matchesComplexSelector(this, part.trim()));
   }
   querySelectorAll(selector) {
     const found = [];
@@ -2430,6 +2808,37 @@ export class Element extends EventTarget {
     visit(this); return found;
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
+
+  /**
+   * DOM cloneNode. Deep clones copy child nodes and leaf textContent.
+   * The `style` attribute is never copied (style is read-only / Tailwind-only).
+   */
+  cloneNode(deep = false) {
+    const clone = this.document.createElement(this.localName);
+    for (const attr of this.attributes) {
+      if (attr.name === "style") continue;
+      try {
+        clone.setAttribute(attr.name, attr.value);
+      } catch {
+        /* skip attributes the host rejects */
+      }
+    }
+    if (this.localName === "input" || this.localName === "textarea") {
+      clone.value = this.value ?? "";
+    }
+    if (deep) {
+      if (this.children.length) {
+        for (const child of this.children) {
+          clone.appendChild(child.cloneNode(true));
+        }
+      } else {
+        const leaf = elementState(this).text;
+        if (leaf) clone.textContent = leaf;
+      }
+    }
+    return clone;
+  }
+
   append(...children) { for (const child of children) this.appendChild(child); }
   replaceChildren(...children) { for (const child of [...this.children]) this.removeChild(child); this.append(...children); }
   // The mouse is the only pointer, with id 1 (as on pointer events).
@@ -2520,6 +2929,11 @@ export class Element extends EventTarget {
         this._styleChanged("class");
       }
     } else if (name === "hidden") this._styleChanged();
+    else if ((name === "checked" || name === "type") && this.localName === "input") this._styleChanged("class");
+    else if (name === "value" && (this.localName === "input" || this.localName === "textarea")) {
+      // Seed the IDL value from the content attribute (DOMParser / create-time attrs).
+      this.value = value;
+    }
     if (name === "muted" && this.localName === "video") {
       updateVideoVolume(this);
     }
@@ -2547,6 +2961,7 @@ export class Element extends EventTarget {
       const changed = refreshStyleValues(state);
       this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
     } else if (name === "hidden") this._styleChanged();
+    else if ((name === "checked" || name === "type") && this.localName === "input") this._styleChanged("class");
     if (name === "muted" && this.localName === "video") {
       updateVideoVolume(this);
     }
@@ -3605,7 +4020,7 @@ export class Element extends EventTarget {
   }
 
   appendChild(child) {
-    if (!((child instanceof Element) || (child instanceof Text)) || child.document !== this.document) {
+    if (!isInsertableChild(child) || child.document !== this.document) {
       throw new TypeError("child must belong to the same document");
     }
     if (child instanceof Element && (child === this || this.isDescendantOf(child))) throw new Error("layout tree cycle");
@@ -3623,7 +4038,7 @@ export class Element extends EventTarget {
     if (referenceChild == null) return this.appendChild(child);
     const index = this.children.indexOf(referenceChild);
     if (index < 0) throw new Error("reference child not found");
-    if (!((child instanceof Element) || (child instanceof Text)) || child.document !== this.document) throw new TypeError("child must belong to the same document");
+    if (!isInsertableChild(child) || child.document !== this.document) throw new TypeError("child must belong to the same document");
     if (child instanceof Element && (child === this || this.isDescendantOf(child))) throw new Error("layout tree cycle");
     if (child === referenceChild) return child;
     const moved = child.parent === this;
@@ -3712,6 +4127,11 @@ export class Element extends EventTarget {
       (doc.textMetricsDirtyElements ??= new Set()).add(this);
       this.#structureChanged();
       this._styleChanged();
+      return;
+    }
+    if (child instanceof Comment) {
+      // Comments are DOM anchors only (Dominant if/map); layout ignores nodeType !== 1.
+      this.#structureChanged();
       return;
     }
     if (!moved && this.#connected()) child._styleChanged(undefined, true);
@@ -3859,6 +4279,66 @@ function computedProperty(element, style, property, box, context) {
   return specified;
 }
 
+export class DOMParser {
+  parseFromString(string, type = "text/html") {
+    const mime = String(type || "text/html").toLowerCase();
+    if (mime !== "text/html" && mime !== "text/xml" && mime !== "application/xml" && mime !== "image/svg+xml") {
+      throw new TypeError(`Unsupported DOMParser type: ${type}`);
+    }
+    const doc = new Document();
+    const factory = {
+      createElement: (tag) => doc.createElement(tag),
+      createTextNode: (data) => doc.createTextNode(data),
+    };
+    const nodes = parseHtmlFragment(string ?? "", factory);
+    // Full documents often have whitespace text nodes around <html> after
+    // <!doctype>; find the document element among top-level nodes.
+    const isWsText = (n) =>
+      n?.nodeType === 3 && !String(n.data ?? n.textContent ?? "").trim();
+    const topElements = nodes.filter((n) => n?.nodeType === 1);
+    const soleTop =
+      topElements.length === 1 && nodes.every((n) => n === topElements[0] || isWsText(n))
+        ? topElements[0]
+        : null;
+    let content = nodes;
+    let headContent = null;
+    if (soleTop?.localName === "html") {
+      const html = soleTop;
+      const head = html.children.find((c) => c.nodeType === 1 && c.localName === "head");
+      const body = html.children.find((c) => c.nodeType === 1 && c.localName === "body");
+      if (head) headContent = [...head.children];
+      content = body
+        ? [...body.children]
+        : html.children.filter((c) => (c.nodeType === 1 && c.localName !== "head") || c.nodeType === 3);
+    } else if (soleTop?.localName === "body") {
+      content = [...soleTop.children];
+    } else if (soleTop?.localName === "head") {
+      headContent = [...soleTop.children];
+      content = [];
+    }
+    if (headContent) {
+      for (const node of headContent) {
+        if (node.parent) node.parent.removeChild(node);
+        doc.head.appendChild(node);
+      }
+    }
+    for (const node of content) {
+      if (node.parent) node.parent.removeChild(node);
+      doc.body.appendChild(node);
+    }
+    return doc;
+  }
+}
+
+if (typeof globalThis.DOMParser !== "function") {
+  Object.defineProperty(globalThis, "DOMParser", {
+    value: DOMParser,
+    configurable: true,
+    writable: true,
+    enumerable: false,
+  });
+}
+
 export class Document extends EventTarget {
   constructor() {
     super();
@@ -3866,6 +4346,7 @@ export class Document extends EventTarget {
     this.nodeType = 9;
     this.nodeName = "#document";
     registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), textControls: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, sceneGeneration: 0, staticPaintGeneration: 0, hitTestGeneration: 0, transitionFrameGeneration: 0, activeTransitionElements: new Set(), paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null, transformedContentCache: null });
+    this.head = new Element(this, "head");
     this.body = new Element(this, "body");
     registerDocument(this, {
       layout: (width, height, timings) => this.#layout(width, height, timings),
@@ -3907,9 +4388,31 @@ export class Document extends EventTarget {
     return Promise.resolve();
   }
   get ownerDocument() { return null; }
-  contains(node) { return node === this || this.body.contains(node); }
+  contains(node) {
+    return node === this || this.head.contains(node) || this.body.contains(node);
+  }
   elementFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y, true)[0] ?? null; }
   elementsFromPoint(x, y) { return hitTestElementsFromPoint(this, x, y); }
+
+  /** Standard document.title — reads/writes the text of head > title. */
+  get title() {
+    for (const child of this.head.children) {
+      if (child.nodeType === 1 && child.localName === "title") return child.textContent ?? "";
+    }
+    return "";
+  }
+  set title(value) {
+    const next = value == null ? "" : String(value);
+    let titleEl = null;
+    for (const child of this.head.children) {
+      if (child.nodeType === 1 && child.localName === "title") { titleEl = child; break; }
+    }
+    if (!titleEl) {
+      titleEl = this.createElement("title");
+      this.head.appendChild(titleEl);
+    }
+    titleEl.textContent = next;
+  }
 
   dispatchEvent(event) {
     const result = super.dispatchEvent(event);
@@ -3925,8 +4428,26 @@ export class Document extends EventTarget {
     return new Text(this, data);
   }
 
-  querySelector(selector) { return this.body.matches(selector) ? this.body : this.body.querySelector(selector); }
-  querySelectorAll(selector) { return [...(this.body.matches(selector) ? [this.body] : []), ...this.body.querySelectorAll(selector)]; }
+  createComment(data) {
+    return new Comment(this, data);
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+  querySelectorAll(selector) {
+    const found = [];
+    for (const root of [this.head, this.body]) {
+      if (!root) continue;
+      try {
+        if (root.matches(selector)) found.push(root);
+      } catch {
+        /* compound selectors may not match the root itself */
+      }
+      found.push(...root.querySelectorAll(selector));
+    }
+    return found;
+  }
   getElementById(id) { return [...documentState(this).elements].find(element => element.id === String(id)) ?? null; }
 
   #prepareText() {
@@ -4549,7 +5070,8 @@ function normalizeWindowKey(key, text = "") {
   const named = /^Named\((.*)\)$/.exec(String(key || ""));
   // KeyboardEvent.key for the space bar is " " (winit names it Space).
   if (named) return named[1] === "Space" ? " " : named[1];
-  if (text) return text;
+  // With Ctrl held, X11 reports text such as "\x03" for C; KeyboardEvent.key is still "c".
+  if (text && !/^[\u0000-\u001f\u007f]$/.test(text)) return text;
   const character = /^Character\('(.*)'\)$/.exec(String(key || ""));
   return character ? character[1] : String(key || "");
 }
@@ -4676,6 +5198,22 @@ function setFullscreenElement(document, element) {
 function nearestFormControl(element) {
   for (let current = element; current?.nodeType === 1; current = current.parentElement) {
     if (current.localName === "input" || current.localName === "textarea" || current.localName === "button" || current.localName === "select") return current;
+  }
+  return null;
+}
+
+/** Toggle checkbox / check radio; returns the control when its checked state changed. */
+function activateCheckableInput(element) {
+  if (!element || element.localName !== "input" || element.disabled) return null;
+  const type = element.type;
+  if (type === "checkbox") {
+    element.checked = !element.checked;
+    return element;
+  }
+  if (type === "radio") {
+    if (element.checked) return null;
+    element.checked = true;
+    return element;
   }
   return null;
 }

@@ -9,9 +9,9 @@ import vm from 'node:vm';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { Command, InvalidArgumentError } from 'commander';
-import { Window, Document, closeImageDecoder } from '../index.js';
-import { createRainbowUI } from './rainbow/ui.js';
-import { ProcessSampler } from './rainbow/process-sampler.js';
+import { Window, Document, closeImageDecoder } from 'nasty';
+import { createRainbowUI } from './ui.js';
+import { ProcessSampler } from './process-sampler.js';
 
 function parseGlowMode(value) {
   if (value !== 'net' && value !== 'load' && value !== 'both') throw new InvalidArgumentError('must be net, load, or both');
@@ -432,7 +432,7 @@ const browser = {
   Image: function Image(width, height) { return new window.Image(width, height); },
 };
 browser.window = browser; browser.self = browser;
-const source = await readFile(new URL('./rainbow/app.js', import.meta.url), 'utf8');
+const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
 vm.runInNewContext(source, browser, { filename: 'rainbow/app.js' });
 function dispatch() {
   const size = window.size();

@@ -3,6 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./dominant.js": "./dominant.js",
+    "./package.json": "./package.json"
+  },
   "scripts": {
     "build:debug": "cargo build --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js",
     "build:release": "cargo build --release --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js --release",
@@ -23,5 +29,8 @@
     "qrcode-generator": "^2.0.4",
     "trystero": "^0.26.0",
     "ws": "^8.22.0"
+  },
+  "bin": {
+    "nasty-bundle": "./bin/nasty-bundle.js"
   }
 }

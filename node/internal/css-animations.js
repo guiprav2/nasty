@@ -89,13 +89,27 @@ function normalizeKeyframes(keyframes) {
       if (!Number.isFinite(offset) || offset < 0 || offset > 1) {
         throw new TypeError(`animation keyframe offset out of range: ${frame.offset}`);
       }
-      return { offset, class: flattenClassParts(classSource) };
+      const easing = frame.easing != null ? String(frame.easing) : undefined;
+      return { offset, class: flattenClassParts(classSource), ...(easing ? { easing } : {}) };
     }
     throw new TypeError("Invalid animation keyframe");
   });
   normalized.sort((a, b) => a.offset - b.offset || 0);
-  if (normalized[0].offset > 0) normalized.unshift({ offset: 0, class: normalized[0].class.slice() });
-  if (normalized.at(-1).offset < 1) normalized.push({ offset: 1, class: normalized.at(-1).class.slice() });
+  if (normalized[0].offset > 0) {
+    normalized.unshift({
+      offset: 0,
+      class: normalized[0].class.slice(),
+      ...(normalized[0].easing ? { easing: normalized[0].easing } : {}),
+    });
+  }
+  if (normalized.at(-1).offset < 1) {
+    const lastFrame = normalized.at(-1);
+    normalized.push({
+      offset: 1,
+      class: lastFrame.class.slice(),
+      ...(lastFrame.easing ? { easing: lastFrame.easing } : {}),
+    });
+  }
   return normalized;
 }
 
@@ -168,7 +182,10 @@ function sampleKeyframeStyles(frames, progress, easing, width) {
   const from = frames[Math.max(0, toIndex - 1)];
   if (from === to || to.offset === from.offset) return resolveClassList(to.class, width);
   const segment = (progress - from.offset) / (to.offset - from.offset);
-  const t = timingProgress(easing, segment);
+  // CSS: animation-timing-function on a keyframe applies to the interval after
+  // that keyframe (from → to). Fall back to the animation-level easing.
+  const segmentEasing = from.easing || easing;
+  const t = timingProgress(segmentEasing, segment);
   const fromStyles = resolveClassList(from.class, width);
   const toStyles = resolveClassList(to.class, width);
   const properties = new Set([...Object.keys(fromStyles), ...Object.keys(toStyles)]);
@@ -533,7 +550,7 @@ registerKeyframes("float", [
   { offset: 1, class: ["translate-y-0"] },
 ]);
 
-// Tailwind animate-pulse / animate-ping.
+// Tailwind animate-pulse / animate-ping / animate-bounce.
 registerKeyframes("pulse", [
   { offset: 0, class: ["opacity-100"] },
   { offset: 0.5, class: ["opacity-50"] },
@@ -544,6 +561,14 @@ registerKeyframes("ping", [
   { offset: 0, class: ["opacity-100", "[transform:scale(1)]"] },
   { offset: 0.75, class: ["opacity-0", "[transform:scale(2)]"] },
   { offset: 1, class: ["opacity-0", "[transform:scale(2)]"] },
+]);
+
+// Per-keyframe easings match Tailwind's bounce spring (see docs animation page).
+// Midpoint keeps a % unit so translateY interpolates (bare 0 / `none` would be discrete).
+registerKeyframes("bounce", [
+  { offset: 0, class: ["[transform:translateY(-25%)]"], easing: "cubic-bezier(0.8, 0, 1, 1)" },
+  { offset: 0.5, class: ["[transform:translateY(0%)]"], easing: "cubic-bezier(0, 0, 0.2, 1)" },
+  { offset: 1, class: ["[transform:translateY(-25%)]"], easing: "cubic-bezier(0.8, 0, 1, 1)" },
 ]);
 
 // Centering translates stay in every glow frame so animate-glow can replace

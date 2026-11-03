@@ -2075,10 +2075,35 @@ struct Renderer {
     supported_present_modes: Vec<wgpu::PresentMode>,
     backdrop: HashMap<(u32, u32), BackdropResources>,
     surface_copy_src: bool,
-    /// PNG path for the next presented window frame (see `captureFrame`).
-    pending_capture: Option<String>,
+    /// Captures waiting for the next presented window frame (see `captureFrame`).
+    pending_captures: Vec<FrameCapture>,
+    /// Finished captures, reported by `drainEvents` (PNG writes finish off-thread).
+    capture_results: (std::sync::mpsc::Sender<CaptureOutcome>, std::sync::mpsc::Receiver<CaptureOutcome>),
     /// MP4 recording of presented frames (see `startRecording`).
     recorder: Option<frame_recorder::FrameRecorder>,
+}
+
+/// A `captureFrame` request: a PNG path, or the clipboard when `path` is None; and
+/// the surface region in physical pixels (x, y, width, height), or the whole frame.
+struct FrameCapture {
+    id: u32,
+    path: Option<String>,
+    region: Option<(u32, u32, u32, u32)>,
+}
+
+enum CaptureOutcome {
+    Done { id: u32, error: Option<String> },
+    /// Pixels for the clipboard, handed to it by `drainEvents` on the window's thread.
+    Pixels { id: u32, width: u32, height: u32, pixels: Vec<u8> },
+}
+
+/// Region of the window frame to capture, in physical pixels.
+#[napi(object)]
+pub struct CaptureRegion {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 struct PositionedText {
@@ -3901,7 +3926,8 @@ impl Renderer {
             supported_present_modes,
             backdrop: HashMap::new(),
             surface_copy_src,
-            pending_capture: None,
+            pending_captures: Vec::new(),
+            capture_results: std::sync::mpsc::channel(),
             recorder: None,
         })
     }
@@ -4712,10 +4738,23 @@ impl Renderer {
                 }
             }
         }
-        let readback = match (&frame, self.pending_capture.is_some() && self.surface_copy_src) {
-            (Some(frame), true) => Some(self.encode_readback(&mut encoder, &frame.texture)),
-            _ => None,
-        };
+        // Captures wait for a real window frame (not a layer texture render).
+        let mut readbacks = Vec::new();
+        if let Some(frame) = frame.as_ref().filter(|_| self.surface_copy_src && !self.pending_captures.is_empty()) {
+            let (surface_width, surface_height) = (self.config.width, self.config.height);
+            for capture in std::mem::take(&mut self.pending_captures) {
+                let (x, y, width, height) = capture.region.unwrap_or((0, 0, surface_width, surface_height));
+                // Clip to the frame; a region wholly outside it has nothing to read.
+                let (x, y) = (x.min(surface_width), y.min(surface_height));
+                let (width, height) = (width.min(surface_width - x), height.min(surface_height - y));
+                if width == 0 || height == 0 {
+                    let _ = self.capture_results.0.send(CaptureOutcome::Done { id: capture.id, error: Some("the capture region is outside the window".into()) });
+                    continue;
+                }
+                let readback = self.encode_readback(&mut encoder, &frame.texture, (x, y, width, height));
+                readbacks.push((capture, readback));
+            }
+        }
         if let (Some(frame), Some(recorder)) = (&frame, self.recorder.as_mut()) {
             recorder.capture(&self.device, &mut encoder, &frame.texture);
         }
@@ -4725,10 +4764,20 @@ impl Renderer {
         if frame.is_some() {
             if let Some(recorder) = self.recorder.as_mut() { recorder.after_submit(&self.device); }
         }
-        if let Some(readback) = readback {
-            let path = self.pending_capture.take().expect("capture path");
-            let pixels = self.finish_readback(readback)?;
-            let (width, height) = (self.config.width, self.config.height);
+        for (capture, readback) in readbacks {
+            let (width, height) = (readback.2, readback.3);
+            let pixels = match self.finish_readback(readback) {
+                Ok(pixels) => pixels,
+                Err(error) => {
+                    let _ = self.capture_results.0.send(CaptureOutcome::Done { id: capture.id, error: Some(error) });
+                    continue;
+                }
+            };
+            let Some(path) = capture.path else {
+                let _ = self.capture_results.0.send(CaptureOutcome::Pixels { id: capture.id, width, height, pixels });
+                continue;
+            };
+            let results = self.capture_results.0.clone();
             // Encode off the window thread; write beside the target, then rename, so a
             // reader never sees a partial file.
             std::thread::spawn(move || {
@@ -4737,7 +4786,7 @@ impl Renderer {
                     .ok_or_else(|| "frame size mismatch".to_string())
                     .and_then(|frame| frame.save_with_format(&partial, image::ImageFormat::Png).map_err(|error| error.to_string()))
                     .and_then(|_| std::fs::rename(&partial, &path).map_err(|error| error.to_string()));
-                if let Err(error) = result { eprintln!("Nasty: frame capture to {path} failed: {error}"); }
+                let _ = results.send(CaptureOutcome::Done { id: capture.id, error: result.err().map(|error| format!("frame capture to {path} failed: {error}")) });
             });
         }
         // Glyphs prepared for this frame are pinned until trimmed; without this the
@@ -4757,31 +4806,32 @@ impl Renderer {
         })
     }
 
-    /// Copies the composited surface texture into a mappable buffer (rows padded
-    /// to wgpu's copy alignment). Recorded in the frame's own encoder, before present.
-    fn encode_readback(&self, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) -> (wgpu::Buffer, u32) {
-        let (width, height) = (self.config.width, self.config.height);
+    /// Copies a region (x, y, width, height) of the composited surface texture into a
+    /// mappable buffer (rows padded to wgpu's copy alignment). Recorded in the
+    /// frame's own encoder, before present. Returns the buffer, its row pitch and size.
+    fn encode_readback(&self, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture,
+        (x, y, width, height): (u32, u32, u32, u32)) -> (wgpu::Buffer, u32, u32, u32) {
         let padded = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Nasty frame readback"), size: padded as u64 * height as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
         });
         encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(height) } },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
-        (buffer, padded)
+        (buffer, padded, width, height)
     }
 
     /// Waits for a readback and returns tightly packed RGBA with opaque alpha.
-    fn finish_readback(&self, (buffer, padded): (wgpu::Buffer, u32)) -> std::result::Result<Vec<u8>, String> {
+    fn finish_readback(&self, (buffer, padded, width, height): (wgpu::Buffer, u32, u32, u32)) -> std::result::Result<Vec<u8>, String> {
         let slice = buffer.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| { let _ = sender.send(result); });
         let _ = self.device.poll(wgpu::Maintain::Wait);
         receiver.recv().map_err(|error| error.to_string())?.map_err(|error| format!("map frame readback: {error}"))?;
-        let (width, height) = (self.config.width as usize, self.config.height as usize);
+        let (width, height) = (width as usize, height as usize);
         let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
         let mut pixels = Vec::with_capacity(width * height * 4);
         {
@@ -5687,10 +5737,51 @@ struct WindowApp {
     gpu_image_cache: std::collections::HashMap<(String, u32), (u32, u32, u32, (u32, u32), u32)>,
     /// Texture id -> its cache key, so deleting a shared texture only drops a reference.
     gpu_image_cache_keys: std::collections::HashMap<u32, (String, u32)>,
+    /// Ids handed out by `captureFrame`.
+    next_capture_id: u32,
+    /// Image clipboard for `captureFrame` without a path, opened on first use and
+    /// kept: on X11 and Wayland the copied image is served while it lives.
+    image_clipboard: Option<arboard::Clipboard>,
 }
 
 
 impl WindowApp {
+    /// Reports finished frame captures as "frame-captured" events, putting
+    /// clipboard captures on the clipboard first.
+    fn drain_frame_captures(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else { return };
+        let outcomes: Vec<CaptureOutcome> = renderer.capture_results.1.try_iter().collect();
+        for outcome in outcomes {
+            let (id, error) = match outcome {
+                CaptureOutcome::Done { id, error } => (id, error),
+                CaptureOutcome::Pixels { id, width, height, pixels } => {
+                    let result = match self.image_clipboard.as_mut() {
+                        Some(clipboard) => Ok(clipboard),
+                        None => arboard::Clipboard::new().map(|clipboard| self.image_clipboard.insert(clipboard)),
+                    }
+                    .and_then(|clipboard| clipboard.set_image(arboard::ImageData {
+                        width: width as usize,
+                        height: height as usize,
+                        bytes: std::borrow::Cow::Owned(pixels),
+                    }));
+                    (id, result.err().map(|error| format!("copy frame to clipboard: {error}")))
+                }
+            };
+            self.events.push(NativeEvent {
+                kind: "frame-captured".into(),
+                x: 0.0,
+                y: 0.0,
+                key: error,
+                button: None,
+                text: None,
+                modifiers: None,
+                drag_requested: None,
+                delta_x: Some(id as f64),
+                delta_y: None,
+            });
+        }
+    }
+
     fn ensure_image_pool(&mut self) -> std::sync::Arc<ImageDecodePool> {
         if self.image_decode_pool.is_none() {
             let pool = std::sync::Arc::new(ImageDecodePool::default());
@@ -6404,6 +6495,16 @@ impl Window {
         Ok(())
     }
 
+    /// Host-level: update the OS window title after construction (e.g. from document.title).
+    #[napi(js_name = "setTitle")]
+    pub fn set_title(&mut self, title: String) -> Result<()> {
+        self.app.title = title.clone();
+        if let Some(window) = self.app.window.as_ref() {
+            window.set_title(&title);
+        }
+        Ok(())
+    }
+
     #[napi(js_name = "setResizableMode")]
     pub fn set_resizable_mode(&mut self, mode: String) -> Result<()> {
         if !matches!(mode.as_str(), "horizontal" | "vertical" | "both" | "none") {
@@ -7007,16 +7108,40 @@ impl Window {
         Ok(RecordingInfo { frames: summary.frames, duration_ms: summary.duration_ms, width: summary.width, height: summary.height })
     }
 
-    /// Writes the next presented frame, as composited on the GPU, to a PNG file.
+    /// Captures the next presented frame, as composited on the GPU: written to a PNG
+    /// file at `path`, or put on the system clipboard when `path` is null. `region`
+    /// (physical pixels) limits it to part of the window. Returns an id; a
+    /// "frame-captured" event with that id in `deltaX` (and any error in `key`)
+    /// reports when it is done.
     #[napi(js_name = "captureFrame")]
-    pub fn capture_frame(&mut self, path: String) -> Result<()> {
+    pub fn capture_frame(&mut self, path: Option<String>, region: Option<CaptureRegion>) -> Result<u32> {
         let renderer = self.app.renderer.as_mut()
             .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
         if !renderer.surface_copy_src {
             return Err(Error::new(Status::GenericFailure, "this GPU surface cannot be read back"));
         }
-        renderer.pending_capture = Some(path);
-        Ok(())
+        let region = match region {
+            None => None,
+            Some(CaptureRegion { x, y, width, height }) => {
+                if ![x, y, width, height].iter().all(|value| value.is_finite()) {
+                    return Err(Error::new(Status::InvalidArg, "capture region must be finite"));
+                }
+                // Whole pixels covering the region, clipped at the window's top-left.
+                let (left, top) = (x.floor().max(0.0), y.floor().max(0.0));
+                let (right, bottom) = ((x + width).ceil(), (y + height).ceil());
+                if right <= left || bottom <= top {
+                    return Err(Error::new(Status::InvalidArg, "capture region is empty"));
+                }
+                Some((left as u32, top as u32, (right - left) as u32, (bottom - top) as u32))
+            }
+        };
+        self.app.next_capture_id += 1;
+        let id = self.app.next_capture_id;
+        renderer.pending_captures.push(FrameCapture { id, path, region });
+        // The capture rides on the next frame; make sure there is one.
+        self.app.render_pending = true;
+        if let Some(window) = self.app.window.as_ref() { window.request_redraw(); }
+        Ok(id)
     }
 
     #[napi]
@@ -7055,6 +7180,7 @@ impl Window {
             // Upload a bounded batch of decoded images each poll so GPU work
             // stays off the JS heap and cannot monopolize a single turn.
             self.app.drain_image_decode_uploads(32);
+            self.app.drain_frame_captures();
             self.check_error()?;
         }
         Ok(std::mem::take(&mut self.app.events))
