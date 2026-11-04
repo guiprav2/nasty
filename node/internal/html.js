@@ -229,8 +229,9 @@ export function serializeHtmlNode(node, opts = {}) {
 
 export function serializeHtmlChildren(el, opts = {}) {
   if (!el) return '';
-  if (el.children?.length) {
-    return el.children.map((child) => serializeHtmlNode(child, opts)).join('');
+  const nodes = el.childNodes ?? el.children;
+  if (nodes?.length) {
+    return [...nodes].map((child) => serializeHtmlNode(child, opts)).join('');
   }
   const leaf = opts.getLeafText?.(el);
   return leaf ? escapeHtmlText(leaf) : '';

@@ -24,8 +24,10 @@ export function renderedText(element) {
   }
   if (state.text) return state.text;
   // Text-node children (d.text / createTextNode) when no element children.
-  if (element.children?.length && element.children.every((child) => child.nodeType === 3)) {
-    return element.children.map((child) => child.data).join('');
+  const nodes = element.childNodes;
+  if (nodes?.length && ![...nodes].some((child) => child.nodeType === 1)
+      && [...nodes].every((child) => child.nodeType === 3 || child.nodeType === 8)) {
+    return [...nodes].filter((child) => child.nodeType === 3).map((child) => child.data).join('');
   }
   return nerdIcon(element)?.glyph ?? '';
 }

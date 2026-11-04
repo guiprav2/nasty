@@ -667,27 +667,62 @@ function utilityStyle(utility) {
 
 // Interaction variants follow CSS :hover: `hover:` applies while the element or a
 // descendant is hovered, `group-hover:` while an ancestor marked `group` is.
+// `native:` is always active on Nasty (the host is native); Webfoundry gates the
+// same token with html[wf-native-preview] so the web ignores it unless previewing.
 function active(variants, width, interaction) {
-  return variants.every(variant => BREAKPOINTS[variant] !== undefined ? width >= BREAKPOINTS[variant]
-    : variant === "hover" ? !!interaction?.hover
-      : variant === "group-hover" ? !!interaction?.groupHover
-        : false);
+  return variants.every(variant => {
+    if (BREAKPOINTS[variant] !== undefined) return width >= BREAKPOINTS[variant];
+    if (variant === "native") return true;
+    if (variant === "hover") return !!interaction?.hover;
+    if (variant === "group-hover") return !!interaction?.groupHover;
+    // Retargeting arbitrary variants are handled when resolving descendants.
+    if (isRetargetingArbitraryVariant(variant)) return false;
+    // Self arbitrary variants ([&:hover], [&.on], …) need the element; ignore here.
+    if (isArbitraryVariant(variant)) return false;
+    return false;
+  });
 }
 
-export function resolveTailwind(className, width = 0, interaction) {
-  className = String(className);
-  const key = `${width}\0${interaction?.hover ? 1 : 0}${interaction?.groupHover ? 1 : 0}\0${className}`;
-  const cached = classCache.get(key);
-  if (cached) {
-    classCache.delete(key);
-    classCache.set(key, cached);
-    return cached;
-  }
-  const utilities = className.split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index }))
-    .filter(token => !token.variants.includes("selection") && active(token.variants, width, interaction));
+function nativeRank(variants) {
+  return variants.includes("native") ? 1 : 0;
+}
+
+function isArbitraryVariant(variant) {
+  return variant.startsWith("[") && variant.endsWith("]");
+}
+
+/** Decode Tailwind arbitrary-variant underscores (space) / `\_` (literal _). */
+export function decodeArbitraryVariantInner(variant) {
+  if (!isArbitraryVariant(variant)) return "";
+  return variant.slice(1, -1).trim()
+    .replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_");
+}
+
+/**
+ * `[&>div]:…` / `[&_p]:…` retarget the utility onto matching relatives.
+ * `[&:hover]:…` / `[&.on]:…` stay on the element that owns the class.
+ */
+export function isRetargetingArbitraryVariant(variant) {
+  const inner = decodeArbitraryVariantInner(variant);
+  if (!inner.startsWith("&")) return false;
+  const rest = inner.slice(1);
+  return /^\s*[>+~\s]/.test(rest);
+}
+
+export function classHasRetargetingArbitrary(className) {
+  return String(className).split(/\s+/).filter(Boolean)
+    .some(token => parseToken(token).variants.some(isRetargetingArbitraryVariant));
+}
+
+function sortUtilities(utilities) {
   utilities.sort((a, b) => Number(a.important) - Number(b.important)
     || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
+    || nativeRank(a.variants) - nativeRank(b.variants)
     || a.variants.length - b.variants.length || a.index - b.index);
+  return utilities;
+}
+
+function declarationsToValues(utilities) {
   const values = {};
   let translateX, translateY;
   let rotation, scaleX, scaleY;
@@ -723,8 +758,6 @@ export function resolveTailwind(className, width = 0, interaction) {
     (scaleX !== undefined || scaleY !== undefined) && `scale(${scaleX ?? 1}, ${scaleY ?? 1})`,
   ].filter(Boolean).join(" ");
   if (translation) values.transform = [translation, values.transform].filter(Boolean).join(" ");
-  // Defaults stand in for Tailwind's stylesheet order and preflight: border widths
-  // assume solid and transition-* assumes 150ms unless a style utility says otherwise.
   for (const [property, value] of Object.entries(defaults)) if (values[property] === undefined) values[property] = value;
   Object.assign(values, overrides);
   if (ringWidth !== undefined || ringColor !== undefined) {
@@ -737,10 +770,44 @@ export function resolveTailwind(className, width = 0, interaction) {
     if (gradientTo) stops.push(`${gradientTo} 100%`);
     values.backgroundImage = `linear-gradient(${gradientDirection}, ${stops.join(", ")})`;
   }
-  Object.freeze(values);
+  return values;
+}
+
+export function resolveTailwind(className, width = 0, interaction) {
+  className = String(className);
+  const key = `${width}\0${interaction?.hover ? 1 : 0}${interaction?.groupHover ? 1 : 0}\0${className}`;
+  const cached = classCache.get(key);
+  if (cached) {
+    classCache.delete(key);
+    classCache.set(key, cached);
+    return cached;
+  }
+  const utilities = sortUtilities(className.split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index }))
+    .filter(token => !token.variants.includes("selection") && active(token.variants, width, interaction)));
+  // native:* declarations win over the same property from a non-native utility,
+  // regardless of source order (still after !important and breakpoint rank).
+  const values = Object.freeze(declarationsToValues(utilities));
   classCache.set(key, values);
   if (classCache.size > 1024) classCache.delete(classCache.keys().next().value);
   return values;
+}
+
+/**
+ * Resolve utilities from `ownerClassName` whose arbitrary `[&…]:` variants
+ * retarget onto another element. `variantMatches(variant)` returns whether the
+ * target matches that variant relative to the owner.
+ */
+export function resolveRetargetedTailwind(ownerClassName, width, interaction, variantMatches) {
+  const utilities = sortUtilities(String(ownerClassName).split(/\s+/).filter(Boolean)
+    .map((token, index) => ({ ...parseToken(token), index }))
+    .filter(token => {
+      if (token.variants.includes("selection")) return false;
+      const retarget = token.variants.filter(isRetargetingArbitraryVariant);
+      if (!retarget.length || !retarget.every(variantMatches)) return false;
+      const rest = token.variants.filter(v => !isRetargetingArbitraryVariant(v));
+      return active(rest, width, interaction);
+    }));
+  return Object.freeze(declarationsToValues(utilities));
 }
 
 // Tailwind's selection variant styles the standard ::selection pseudo-element;
@@ -763,6 +830,7 @@ function resolveSelectionUncached(className, width) {
       && active(token.variants.filter(variant => variant !== "selection"), width));
   utilities.sort((a, b) => Number(a.important) - Number(b.important)
     || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
+    || nativeRank(a.variants) - nativeRank(b.variants)
     || a.variants.length - b.variants.length || a.index - b.index);
   const values = {};
   for (const { utility } of utilities) {

@@ -59,7 +59,13 @@ import { scrollHostElement } from "./internal/scroll-quads.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
 import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics } from "./internal/text-metrics.js";
 import { blocksWindowDrag, elementsFromPoint as hitTestElementsFromPoint, trackClickListener } from "./internal/dom-hit-testing.js";
-import { resolveTailwind, resolveTailwindSelection } from "./tailwind.js";
+import {
+  classHasRetargetingArbitrary,
+  decodeArbitraryVariantInner,
+  resolveRetargetedTailwind,
+  resolveTailwind,
+  resolveTailwindSelection,
+} from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, hasVideoAudio, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
 import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
@@ -2136,7 +2142,8 @@ const POINTER_ACTIVATION_EVENTS = new Set(["click", "dblclick", "pointerdown", "
 function siblingAt(node, offset) {
   const parent = node.parent;
   if (!parent) return null;
-  return parent.children[parent.children.indexOf(node) + offset] ?? null;
+  const nodes = parent.childNodes;
+  return nodes[nodes.indexOf(node) + offset] ?? null;
 }
 
 /** When <title> text changes, push to the host Window.title (not a Document API). */
@@ -2147,7 +2154,30 @@ function syncWindowTitleFromTitleElement(element) {
   view.title = element.textContent ?? "";
 }
 
-const SIMPLE_SELECTOR = /^(?:[a-z][\w-]*|\*)?(?:[.#][\w-]+|\[[\w-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\]\s]+))?\])*$/i;
+const SIMPLE_SELECTOR = /^(?:[a-z][\w-]*|\*)?(?:[.#][\w-]+|\[[\w-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\]\s]+))?\]|:(?:first-child|last-child|only-child|first-of-type|last-of-type|only-of-type))*$/i;
+
+function elementChildren(parent) {
+  return [...(parent?.children ?? [])];
+}
+
+function matchesPseudoClass(element, pseudo) {
+  const parent = parentElementLike(element);
+  if (!parent) {
+    return pseudo === "first-child" || pseudo === "last-child" || pseudo === "only-child"
+      || pseudo === "first-of-type" || pseudo === "last-of-type" || pseudo === "only-of-type";
+  }
+  const siblings = elementChildren(parent);
+  const sameType = siblings.filter(child => child.localName === element.localName);
+  switch (pseudo) {
+    case "first-child": return siblings[0] === element;
+    case "last-child": return siblings[siblings.length - 1] === element;
+    case "only-child": return siblings.length === 1 && siblings[0] === element;
+    case "first-of-type": return sameType[0] === element;
+    case "last-of-type": return sameType[sameType.length - 1] === element;
+    case "only-of-type": return sameType.length === 1 && sameType[0] === element;
+    default: return false;
+  }
+}
 
 function matchesSimpleSelector(element, pattern) {
   if (!pattern) return false;
@@ -2167,6 +2197,9 @@ function matchesSimpleSelector(element, pattern) {
     } else if (String(element.getAttribute(attr) ?? "") !== expected) {
       return false;
     }
+  }
+  for (const [, pseudo] of pattern.matchAll(/:(first-child|last-child|only-child|first-of-type|last-of-type|only-of-type)/g)) {
+    if (!matchesPseudoClass(element, pseudo)) return false;
   }
   return true;
 }
@@ -2204,6 +2237,77 @@ function parentElementLike(node) {
   const parent = node.parentElement ?? node.parent ?? null;
   return parent && parent.nodeType === 1 ? parent : null;
 }
+
+const ARB_ROOT_ATTR = "data-tw-arb-root";
+
+/** Whether `target` matches a Tailwind `[&…]` variant relative to `owner`. */
+function matchesAmpVariant(owner, target, variant) {
+  const inner = decodeArbitraryVariantInner(variant);
+  if (!inner.startsWith("&")) return false;
+  const rest = inner.slice(1);
+  if (!/^\s*[>+~\s]/.test(rest)) return false;
+  const relative = rest.trimStart().startsWith(">") || rest.trimStart().startsWith("+") || rest.trimStart().startsWith("~")
+    ? rest.trimStart()
+    : rest; // leading space = descendant
+  const prev = owner.getAttribute(ARB_ROOT_ATTR);
+  owner.setAttribute(ARB_ROOT_ATTR, "1");
+  try {
+    const absolute = `[${ARB_ROOT_ATTR}="1"]` + (relative.startsWith(">") || relative.startsWith("+") || relative.startsWith("~") || relative.startsWith(" ")
+      ? relative
+      : ` ${relative}`);
+    return target.matches(absolute);
+  } catch {
+    return false;
+  } finally {
+    if (prev == null) owner.removeAttribute(ARB_ROOT_ATTR);
+    else owner.setAttribute(ARB_ROOT_ATTR, prev);
+  }
+}
+
+function ancestorRetargetedValues(element, width, interaction) {
+  const layers = [];
+  for (let ancestor = parentElementLike(element); ancestor; ancestor = parentElementLike(ancestor)) {
+    const className = ancestor.className;
+    if (!classHasRetargetingArbitrary(className)) continue;
+    const values = resolveRetargetedTailwind(className, width, interaction,
+      variant => matchesAmpVariant(ancestor, element, variant));
+    if (Object.keys(values).length) layers.push(values);
+  }
+  // Root → parent so nearer ancestors overwrite farther ones.
+  return layers.length ? Object.assign({}, ...layers.reverse()) : null;
+}
+
+function applyTailwindClassValues(element, ownValues) {
+  const state = styleData.get(element.style);
+  const width = documentState(element.document).viewport.width;
+  const interaction = interactionState(element, state);
+  const fromAncestors = ancestorRetargetedValues(element, width, interaction);
+  const next = fromAncestors ? { ...ownValues, ...fromAncestors } : ownValues;
+  state.classValues = next;
+  return next;
+}
+
+function refreshDescendantArbitraryStyles(root) {
+  const visit = element => {
+    if (element.nodeType !== 1) return;
+    const state = styleData.get(element.style);
+    if (!state) return;
+    const width = documentState(element.document).viewport.width;
+    const own = resolveTailwind(element.className, width, interactionState(element, state));
+    const before = state.classValues;
+    applyTailwindClassValues(element, own);
+    const after = state.classValues;
+    const changed = refreshStyleValues(state);
+    if (changed.size) {
+      element._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
+    } else if (before !== after && Object.keys(after).length !== Object.keys(before || {}).length) {
+      element._styleChanged("class");
+    }
+    for (const child of element.children) visit(child);
+  };
+  for (const child of root.children ?? []) visit(child);
+}
+
 
 /** Simple selectors plus descendant and child combinators (e.g. head > title). */
 function matchesComplexSelector(element, selector) {
@@ -2269,8 +2373,8 @@ export class Text extends EventTarget {
     const doc = documentState(parent.document);
     doc.textMetricsDirty = true;
     (doc.textMetricsDirtyElements ??= new Set()).add(parent);
-    if (!parent.children.some((child) => child.nodeType === 1)) {
-      elementState(parent).text = parent.children.map((child) => (child.nodeType === 3 ? child.data : "")).join("");
+    if (![...parent.childNodes].some((child) => child.nodeType === 1)) {
+      elementState(parent).text = [...parent.childNodes].map((child) => (child.nodeType === 3 ? child.data : "")).join("");
     }
     parent._styleChanged();
     if (parent.localName === "title") syncWindowTitleFromTitleElement(parent);
@@ -2287,7 +2391,7 @@ export class Text extends EventTarget {
   after(...nodes) {
     if (!this.parent) return;
     const parent = this.parent;
-    const siblings = parent.children;
+    const siblings = parent.childNodes;
     let index = siblings.indexOf(this) + 1;
     while (siblings[index] && nodes.includes(siblings[index])) index++;
     const next = siblings[index] ?? null;
@@ -2296,7 +2400,7 @@ export class Text extends EventTarget {
   replaceWith(...nodes) {
     if (!this.parent) return;
     const parent = this.parent;
-    const siblings = parent.children;
+    const siblings = parent.childNodes;
     let index = siblings.indexOf(this) + 1;
     while (siblings[index] && nodes.includes(siblings[index])) index++;
     const next = siblings[index] ?? null;
@@ -2343,7 +2447,7 @@ export class Comment extends EventTarget {
   after(...nodes) {
     if (!this.parent) return;
     const parent = this.parent;
-    const siblings = parent.children;
+    const siblings = parent.childNodes;
     let index = siblings.indexOf(this) + 1;
     while (siblings[index] && nodes.includes(siblings[index])) index++;
     const next = siblings[index] ?? null;
@@ -2352,7 +2456,7 @@ export class Comment extends EventTarget {
   replaceWith(...nodes) {
     if (!this.parent) return;
     const parent = this.parent;
-    const siblings = parent.children;
+    const siblings = parent.childNodes;
     let index = siblings.indexOf(this) + 1;
     while (siblings[index] && nodes.includes(siblings[index])) index++;
     const next = siblings[index] ?? null;
@@ -2445,13 +2549,14 @@ export class NamedNodeMap {
 }
 
 export class Element extends EventTarget {
+  #childNodes = [];
+
   constructor(document, name) {
     super();
     this.document = document;
     this.localName = String(name).toLowerCase();
     this.tagName = this.localName.toUpperCase();
     this.parent = null;
-    this.children = [];
     this.attributes = new NamedNodeMap();
     const state = { image: null, imageLoad: null, imageLoadState: "empty", imageLoadSticky: false, imageConstructor: false, imageAwaySince: null, imageMaxEdge: 0, currentSrc: "", imageRequest: 0, resolveImageLoad: null, rejectImageLoad: null, canvasWidth: 300, canvasHeight: 150, canvasContext: null,
       selectionStyle: {}, textAreaState: null, inputValue: "", selectionStart: 0, selectionEnd: 0, selectionDirection: "none",
@@ -2540,8 +2645,8 @@ export class Element extends EventTarget {
 
   get textContent() {
     const own = elementState(this).text ?? "";
-    if (!this.children.length) return own;
-    return this.children.map((child) => child.textContent).join("");
+    if (!this.#childNodes.length) return own;
+    return this.#childNodes.map((child) => child.textContent).join("");
   }
 
   get value() { return this.localName === "input" || this.localName === "textarea" ? elementState(this).inputValue : undefined; }
@@ -2639,28 +2744,45 @@ export class Element extends EventTarget {
     return this.parent
       ?? (this === this.document.body || this === this.document.head ? this.document : null);
   }
-  get childNodes() { return this.children; }
-  get firstChild() { return this.children[0] ?? null; }
-  get lastChild() { return this.children.at(-1) ?? null; }
+  /** All child nodes (elements, text, comments). */
+  get childNodes() { return this.#childNodes; }
+  /** Element children only — comments and text are omitted, as in browsers. */
+  get children() { return this.#childNodes.filter((child) => child.nodeType === 1); }
+  get firstChild() { return this.#childNodes[0] ?? null; }
+  get lastChild() { return this.#childNodes.at(-1) ?? null; }
   get firstElementChild() {
-    for (const child of this.children) if (child.nodeType === 1) return child;
+    for (const child of this.#childNodes) if (child.nodeType === 1) return child;
     return null;
   }
   get lastElementChild() {
-    for (let i = this.children.length - 1; i >= 0; i--) {
-      if (this.children[i].nodeType === 1) return this.children[i];
+    for (let i = this.#childNodes.length - 1; i >= 0; i--) {
+      if (this.#childNodes[i].nodeType === 1) return this.#childNodes[i];
     }
     return null;
   }
   get nextSibling() {
     const parent = this.parent;
     if (!parent) return null;
-    return parent.children[parent.children.indexOf(this) + 1] ?? null;
+    const nodes = parent.childNodes;
+    return nodes[nodes.indexOf(this) + 1] ?? null;
   }
   get previousSibling() {
     const parent = this.parent;
     if (!parent) return null;
-    return parent.children[parent.children.indexOf(this) - 1] ?? null;
+    const nodes = parent.childNodes;
+    return nodes[nodes.indexOf(this) - 1] ?? null;
+  }
+  get nextElementSibling() {
+    for (let node = this.nextSibling; node; node = node.nextSibling) {
+      if (node.nodeType === 1) return node;
+    }
+    return null;
+  }
+  get previousElementSibling() {
+    for (let node = this.previousSibling; node; node = node.previousSibling) {
+      if (node.nodeType === 1) return node;
+    }
+    return null;
   }
   contains(node) {
     for (let current = node; current; current = current.parentNode) if (current === this) return true;
@@ -2669,11 +2791,11 @@ export class Element extends EventTarget {
 
   set textContent(value) {
     const next = value == null ? "" : String(value);
-    if (this.children.length === 0 && elementState(this).text === next) {
+    if (this.#childNodes.length === 0 && elementState(this).text === next) {
       if (this.localName === "title") syncWindowTitleFromTitleElement(this);
       return;
     }
-    for (const child of [...this.children]) this.removeChild(child);
+    for (const child of [...this.#childNodes]) this.removeChild(child);
     elementState(this).text = next;
     this._styleChanged();
     if (this.localName === "title") syncWindowTitleFromTitleElement(this);
@@ -2684,7 +2806,7 @@ export class Element extends EventTarget {
   }
 
   set innerHTML(html) {
-    for (const child of [...this.children]) this.removeChild(child);
+    for (const child of [...this.#childNodes]) this.removeChild(child);
     elementState(this).text = "";
     const nodes = parseHtmlFragment(html ?? "", {
       createElement: (tag) => this.document.createElement(tag),
@@ -2827,8 +2949,8 @@ export class Element extends EventTarget {
       clone.value = this.value ?? "";
     }
     if (deep) {
-      if (this.children.length) {
-        for (const child of this.children) {
+      if (this.#childNodes.length) {
+        for (const child of this.#childNodes) {
           clone.appendChild(child.cloneNode(true));
         }
       } else {
@@ -2840,7 +2962,7 @@ export class Element extends EventTarget {
   }
 
   append(...children) { for (const child of children) this.appendChild(child); }
-  replaceChildren(...children) { for (const child of [...this.children]) this.removeChild(child); this.append(...children); }
+  replaceChildren(...children) { for (const child of [...this.#childNodes]) this.removeChild(child); this.append(...children); }
   // The mouse is the only pointer, with id 1 (as on pointer events).
   setPointerCapture(id) {
     const state = documentState(this.document);
@@ -2908,8 +3030,9 @@ export class Element extends EventTarget {
       state.hasResponsiveUtilities = /(?:^|\s)(?:sm|md|lg|xl|2xl):/.test(value);
       state.hasHoverUtilities = /(?:^|\s|:)hover:/.test(value);
       state.hasGroupHoverUtilities = /(?:^|\s|:)group-hover:/.test(value);
+      state.hasRetargetingArbitrary = classHasRetargetingArbitrary(value);
       const styles = resolveTailwind(value, width, interactionState(this, state));
-      state.classValues = styles;
+      applyTailwindClassValues(this, styles);
       state.selectionValues = resolveTailwindSelection(value, width);
       elementState(this).selectionStyle = state.selectionValues;
       const changed = refreshStyleValues(state);
@@ -2927,6 +3050,10 @@ export class Element extends EventTarget {
       } else if ((nerdIcon(this)?.glyph ?? null) !== (elementState(this).nerdGlyph ?? null)) {
         // Nerd Font icon tokens resolve to no CSS but change the element's text.
         this._styleChanged("class");
+      }
+      // Parent `[&>…]:` utilities paint onto matching descendants — refresh them.
+      if (state.hasRetargetingArbitrary || classHasRetargetingArbitrary(oldValue ?? "")) {
+        refreshDescendantArbitraryStyles(this);
       }
     } else if (name === "hidden") this._styleChanged();
     else if ((name === "checked" || name === "type") && this.localName === "input") this._styleChanged("class");
@@ -3924,16 +4051,19 @@ export class Element extends EventTarget {
 
   _refreshTailwind(width) {
     const state = styleData.get(this.style);
-    if (!state.hasResponsiveUtilities && !state.hasHoverUtilities && !state.hasGroupHoverUtilities) return false;
-    const next = resolveTailwind(this.className, width, interactionState(this, state));
+    if (!state.hasResponsiveUtilities && !state.hasHoverUtilities && !state.hasGroupHoverUtilities
+        && !ancestorRetargetedValues(this, width, interactionState(this, state))) return false;
+    const own = resolveTailwind(this.className, width, interactionState(this, state));
     const nextSelection = resolveTailwindSelection(this.className, width);
     if (JSON.stringify(nextSelection) !== JSON.stringify(state.selectionValues)) {
       state.selectionValues = nextSelection;
       elementState(this).selectionStyle = nextSelection;
     }
-    if (Object.keys(next).length === Object.keys(state.classValues).length
-      && Object.keys(next).every(key => Object.is(next[key], state.classValues[key]))) return false;
-    state.classValues = next;
+    const previous = state.classValues;
+    applyTailwindClassValues(this, own);
+    const next = state.classValues;
+    if (Object.keys(next).length === Object.keys(previous).length
+      && Object.keys(next).every(key => Object.is(next[key], previous[key]))) return false;
     const changed = refreshStyleValues(state);
     this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
     return changed.size > 0;
@@ -4026,9 +4156,9 @@ export class Element extends EventTarget {
     if (child instanceof Element && (child === this || this.isDescendantOf(child))) throw new Error("layout tree cycle");
     const moved = child.parent === this;
     if (child.parent) child.parent.removeChild(child);
-    this.children.push(child);
+    this.#childNodes.push(child);
     child.parent = this;
-    recordMutation({ type: "childList", target: this, addedNodes: [child], removedNodes: [], previousSibling: this.children.at(-2) ?? null, nextSibling: null });
+    recordMutation({ type: "childList", target: this, addedNodes: [child], removedNodes: [], previousSibling: this.#childNodes.at(-2) ?? null, nextSibling: null });
     this.#childInserted(child, moved);
     this.#syncChildren();
     return child;
@@ -4036,17 +4166,17 @@ export class Element extends EventTarget {
 
   insertBefore(child, referenceChild) {
     if (referenceChild == null) return this.appendChild(child);
-    const index = this.children.indexOf(referenceChild);
+    const index = this.#childNodes.indexOf(referenceChild);
     if (index < 0) throw new Error("reference child not found");
     if (!isInsertableChild(child) || child.document !== this.document) throw new TypeError("child must belong to the same document");
     if (child instanceof Element && (child === this || this.isDescendantOf(child))) throw new Error("layout tree cycle");
     if (child === referenceChild) return child;
     const moved = child.parent === this;
     if (child.parent) child.parent.removeChild(child);
-    const insertionIndex = this.children.indexOf(referenceChild);
-    this.children.splice(insertionIndex, 0, child);
+    const insertionIndex = this.#childNodes.indexOf(referenceChild);
+    this.#childNodes.splice(insertionIndex, 0, child);
     child.parent = this;
-    recordMutation({ type: "childList", target: this, addedNodes: [child], removedNodes: [], previousSibling: this.children[insertionIndex - 1] ?? null, nextSibling: referenceChild });
+    recordMutation({ type: "childList", target: this, addedNodes: [child], removedNodes: [], previousSibling: this.#childNodes[insertionIndex - 1] ?? null, nextSibling: referenceChild });
     this.#childInserted(child, moved);
     this.#syncChildren();
     return child;
@@ -4057,7 +4187,7 @@ export class Element extends EventTarget {
   // ChildNode before/after/replaceWith. Nodes go in order ahead of the first
   // sibling that is not itself being moved (the standard's "viable" sibling).
   #viableNextSibling(nodes) {
-    const siblings = this.parent.children;
+    const siblings = this.parent.childNodes;
     let index = siblings.indexOf(this) + 1;
     while (siblings[index] && nodes.includes(siblings[index])) index++;
     return siblings[index] ?? null;
@@ -4081,17 +4211,17 @@ export class Element extends EventTarget {
   }
 
   removeChild(child) {
-    const index = this.children.indexOf(child);
+    const index = this.#childNodes.indexOf(child);
     if (index < 0) throw new Error("child not found");
-    const previousSibling = this.children[index - 1] ?? null;
-    const nextSibling = this.children[index + 1] ?? null;
-    this.children.splice(index, 1);
+    const previousSibling = this.#childNodes[index - 1] ?? null;
+    const nextSibling = this.#childNodes[index + 1] ?? null;
+    this.#childNodes.splice(index, 1);
     child.parent = null;
     recordMutation({ type: "childList", target: this, addedNodes: [], removedNodes: [child], previousSibling, nextSibling });
     if (child instanceof Element && child.localName === "video") child.pause();
     if (child instanceof Text) {
-      if (!this.children.some((c) => c.nodeType === 1)) {
-        elementState(this).text = this.children.map((c) => (c.nodeType === 3 ? c.data : "")).join("");
+      if (!this.#childNodes.some((c) => c.nodeType === 1)) {
+        elementState(this).text = this.#childNodes.map((c) => (c.nodeType === 3 ? c.data : "")).join("");
       }
       const doc = documentState(this.document);
       doc.textMetricsDirty = true;
@@ -4117,8 +4247,8 @@ export class Element extends EventTarget {
     // reordering within the same parent keeps the same ancestry.
     if (child instanceof Text) {
       // Mirror pure-text children onto elementState.text for the leaf measure path.
-      if (!this.children.some((c) => c.nodeType === 1)) {
-        elementState(this).text = this.children.map((c) => (c.nodeType === 3 ? c.data : "")).join("");
+      if (!this.#childNodes.some((c) => c.nodeType === 1)) {
+        elementState(this).text = this.#childNodes.map((c) => (c.nodeType === 3 ? c.data : "")).join("");
       } else {
         elementState(this).text = "";
       }
@@ -4131,11 +4261,27 @@ export class Element extends EventTarget {
     }
     if (child instanceof Comment) {
       // Comments are DOM anchors only (Dominant if/map); layout ignores nodeType !== 1.
+      // :first-child / :last-child ignore comments, but sibling element targets may
+      // still need a refresh when peers move around the anchor.
       this.#structureChanged();
+      if (!moved && this.#connected() && styleData.get(this.style)?.hasRetargetingArbitrary) {
+        refreshDescendantArbitraryStyles(this);
+      }
       return;
     }
-    if (!moved && this.#connected()) child._styleChanged(undefined, true);
-    else this.#structureChanged();
+    if (!moved && this.#connected()) {
+      if (child instanceof Element) {
+        const state = styleData.get(child.style);
+        if (state) {
+          const width = documentState(this.document).viewport.width;
+          applyTailwindClassValues(child, resolveTailwind(child.className, width, interactionState(child, state)));
+          refreshStyleValues(state);
+        }
+      }
+      child._styleChanged(undefined, true);
+      // Sibling :first-child / :last-child targets can change when a peer is inserted.
+      if (styleData.get(this.style)?.hasRetargetingArbitrary) refreshDescendantArbitraryStyles(this);
+    } else this.#structureChanged();
   }
 
   #connected() {
@@ -4233,7 +4379,7 @@ function flushChildSync(doc) {
       (doc.textMetricsDirtyElements ??= new Set()).add(parent);
       doc.textMetricsDirty = true;
     }
-    const children = isContentSkipped(parent) || inline ? [] : parent.children.filter((child) => child.nodeType === 1).map((child) => elementState(child).handle);
+    const children = isContentSkipped(parent) || inline ? [] : parent.children.map((child) => elementState(child).handle);
     doc.layoutTree.setChildren(parentState.handle, children);
   }
 }
@@ -4304,16 +4450,16 @@ export class DOMParser {
     let headContent = null;
     if (soleTop?.localName === "html") {
       const html = soleTop;
-      const head = html.children.find((c) => c.nodeType === 1 && c.localName === "head");
-      const body = html.children.find((c) => c.nodeType === 1 && c.localName === "body");
-      if (head) headContent = [...head.children];
+      const head = html.children.find((c) => c.localName === "head");
+      const body = html.children.find((c) => c.localName === "body");
+      if (head) headContent = [...head.childNodes];
       content = body
-        ? [...body.children]
-        : html.children.filter((c) => (c.nodeType === 1 && c.localName !== "head") || c.nodeType === 3);
+        ? [...body.childNodes]
+        : [...html.childNodes].filter((c) => (c.nodeType === 1 && c.localName !== "head") || c.nodeType === 3);
     } else if (soleTop?.localName === "body") {
-      content = [...soleTop.children];
+      content = [...soleTop.childNodes];
     } else if (soleTop?.localName === "head") {
-      headContent = [...soleTop.children];
+      headContent = [...soleTop.childNodes];
       content = [];
     }
     if (headContent) {
