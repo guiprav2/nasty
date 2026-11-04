@@ -88,6 +88,8 @@ export function transformedTextTexture(element) {
  */
 export function paintTransformedText(window) {
   const ready = [];
+  // Older android-arm64 addons predate createLayerTexture; skip GPU text layers.
+  if (typeof window.createLayerTexture !== 'function') return ready;
   for (const [element, entry] of entries) {
     const width = Math.max(1, Math.ceil(entry.width));
     const height = Math.max(1, Math.ceil(entry.height));

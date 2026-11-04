@@ -66,10 +66,15 @@ export class ResizeObserver {
   }
 }
 
-export function notifyResizeObservers() {
+/**
+ * Broadcasts size changes, once per rendering step as the spec does: from the
+ * window's present, after layout. `boxOf(target)` reads the layout just made,
+ * so a notification never forces (or recursively starts) another layout.
+ */
+export function notifyResizeObservers(boxOf = boxSize) {
   for (const observer of observers) {
     for (const [target, previous] of observer.targets) {
-      const next = boxSize(target);
+      const next = boxOf(target);
       if (sameSize(previous, next)) continue;
       observer.targets.set(target, next);
       observer.enqueue(target, next);

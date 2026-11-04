@@ -793,8 +793,137 @@ function angleValue(value) {
   return match[2] === "rad" ? amount : match[2] === "turn" ? amount * Math.PI * 2 : amount * Math.PI / 180;
 }
 
-function parseTransform(source, width, height) {
-  return parseCssTransform(source, width, height);
+/**
+ * Parse a CSS box-shadow list into layers.
+ * Supports Tailwind defaults and arbitrary shadow-[…] values (underscores already spaces).
+ */
+function parseBoxShadowList(source) {
+  const text = String(source ?? "").trim();
+  if (!text || text === "none") return [];
+  const layers = [];
+  let depth = 0, start = 0;
+  for (let i = 0; i <= text.length; i++) {
+    const ch = text[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    if ((ch === "," && depth === 0) || i === text.length) {
+      const piece = text.slice(start, i).trim();
+      start = i + 1;
+      if (!piece) continue;
+      const layer = parseBoxShadowLayer(piece);
+      if (layer) layers.push(layer);
+    }
+  }
+  return layers;
+}
+
+function parseBoxShadowLayer(piece) {
+  const inset = /\binset\b/i.test(piece);
+  const withoutInset = piece.replace(/\binset\b/gi, " ").trim();
+  // Color may be at start or end; lengths are offset-x offset-y blur spread.
+  const colorMatch = withoutInset.match(/(#(?:[0-9a-f]{3,8})\b|rgba?\([^)]*\)|hsla?\([^)]*\)|hwb\([^)]*\)|[a-z]{3,})/i);
+  let color = colorMatch ? colorMatch[0] : "rgba(0,0,0,0.1)";
+  const lengthsText = withoutInset.replace(color, " ").replace(/\s+/g, " ").trim();
+  const nums = [...lengthsText.matchAll(/([-+]?(?:\d+\.?\d*|\.\d+))(px)?/gi)].map(m => Number(m[1]));
+  if (!nums.length) return null;
+  const [offsetX = 0, offsetY = 0, blur = 0, spread = 0] = nums;
+  return { inset, offsetX, offsetY, blur: Math.max(0, blur), spread, color };
+}
+
+/** Extent beyond the border box needed to cover all shadow layers (CSS px). */
+function boxShadowOutset(source) {
+  let max = 0;
+  for (const layer of parseBoxShadowList(source)) {
+    if (layer.inset) continue;
+    max = Math.max(max, Math.abs(layer.offsetX) + layer.blur + Math.max(0, layer.spread),
+      Math.abs(layer.offsetY) + layer.blur + Math.max(0, layer.spread));
+  }
+  return max;
+}
+
+/**
+ * Approximate CSS box-shadow with stacked outer rings (annuli).
+ * Full fills would sit under translucent backgrounds (e.g. bg-white/60) and tint them.
+ * Rings (0 0 0 Npx color) stay on the dedicated ring path.
+ */
+// mode: "hard" paints blur≤0 offset fills (CSS: under background+border);
+// "soft" paints blurred outer glows (safe after the border). Ring shadows
+// (0 0 0 Npx) stay on the dedicated after-pass path.
+function paintBoxShadows(box, shadowText, opacity, corners, project, pushGpuBox, gpuBoxClips, element, paintMode, mode = "soft") {
+  const layers = parseBoxShadowList(shadowText);
+  if (!layers.length) return;
+  const { x, y, width, height } = box.borderBox;
+  for (const layer of layers) {
+    if (layer.inset) continue; // inset shadows need a clip path; skip until supported
+    const color = withOpacity(parseColor(layer.color), opacity);
+    if (!color) continue;
+    const ox = layer.offsetX;
+    const oy = layer.offsetY;
+    const blur = layer.blur;
+    const spread = Math.max(0, layer.spread);
+    if (blur <= 0 && spread <= 0 && ox === 0 && oy === 0) continue;
+    // Hard drop shadow (e.g. shadow-[0_6px_0_#be185d]): offset fill, same shape as the box.
+    // Must paint under fill+border — an after-pass fill covers the bottom of a white ring.
+    if (blur <= 0) {
+      if (mode !== "hard") continue;
+      const grow = spread;
+      const rect = {
+        x: x + ox - grow,
+        y: y + oy - grow,
+        width: width + grow * 2,
+        height: height + grow * 2,
+      };
+      const growCorner = (radius) => radius > 0 ? radius + grow : grow;
+      const shadowCorners = {
+        tl: growCorner(corners.tl), tr: growCorner(corners.tr),
+        br: growCorner(corners.br), bl: growCorner(corners.bl),
+      };
+      // Prefer clips for the shadow rect; fall back to the box clips so a scaled
+      // ancestor's similarity is not lost (clips ?? [] drew in layout space).
+      const clips = !paintMode.capture
+        ? (gpuBoxClips(element, rect.x, rect.y, rect.x + rect.width, rect.y + rect.height)
+          ?? gpuBoxClips(element, x, y, x + width, y + height))
+        : null;
+      if (clips) pushGpuBox(rect, shadowCorners, color, [0, 0, 0, 0], null, clips);
+      continue;
+    }
+    if (mode !== "soft") continue;
+    // Soft outer glow: thin concentric rings. CSS blur spreads alpha thinly —
+    // thick annuli at high opacity read as "ignoring opacity" vs the browser.
+    const steps = Math.min(10, Math.max(4, Math.ceil(blur / 5)));
+    const thickness = Math.max(1.5, blur / steps);
+    const boxClips = !paintMode.capture ? gpuBoxClips(element, x, y, x + width, y + height) : null;
+    for (let step = 1; step <= steps; step++) {
+      const t = step / steps;
+      // Approximate a Gaussian falloff; keep total energy well under the source alpha.
+      const falloff = Math.exp(-2.8 * t * t);
+      const grow = Math.max(thickness, spread + blur * t);
+      const alphaScale = (0.22 / steps) * falloff;
+      const stroke = withOpacity(color, alphaScale);
+      if (!stroke || stroke[3] < 0.004) continue;
+      const rect = {
+        x: x + ox - grow,
+        y: y + oy - grow,
+        width: width + grow * 2,
+        height: height + grow * 2,
+      };
+      const growCorner = (radius) => radius > 0 ? radius + grow : grow;
+      const shadowCorners = {
+        tl: growCorner(corners.tl), tr: growCorner(corners.tr),
+        br: growCorner(corners.br), bl: growCorner(corners.bl),
+      };
+      const clips = !paintMode.capture
+        ? (gpuBoxClips(element, rect.x, rect.y, rect.x + rect.width, rect.y + rect.height) ?? boxClips)
+        : null;
+      if (clips) {
+        pushGpuBox(rect, shadowCorners, null, [thickness, thickness, thickness, thickness], stroke, clips);
+      }
+    }
+  }
+}
+
+function parseTransform(source, width, height, context = {}) {
+  return parseCssTransform(source, width, height, context);
 }
 function transformOrigin(source, width, height) {
   const parts = String(source ?? "50% 50% 0px").trim().split(/\s+/);
@@ -1048,8 +1177,9 @@ function paintOrder(boxes) {
       result.push({ box, after: false });
       const descendants = children.get(box.element);
       if (descendants) visit(descendants);
-      if (/^0 0 0 \d+(?:\.\d+)?px .+$/.test(String(paintStyleValue(box.element.style, "boxShadow") ?? ""))) {
-        result.push({ box, after: true });
+      {
+        const shadow = String(paintStyleValue(box.element.style, "boxShadow") ?? "");
+        if (shadow && shadow !== "none") result.push({ box, after: true });
       }
     }
   };
@@ -1182,8 +1312,9 @@ function buildFastRecipe(element) {
   let ring = null;
   if (shadow && shadow !== "none") {
     const match = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(shadow);
-    if (!match) return null;
-    ring = { spread: Number(match[1]), color: parseColor(match[2]) };
+    // Ring shadows stay on the fast after-pass. Soft/hard shadows still allow a
+    // fast bg+border recipe; the general after-pass paints those separately.
+    if (match) ring = { spread: Number(match[1]), color: parseColor(match[2]) };
   }
   const borderActive = SIDES.map((side) => {
     const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
@@ -1782,7 +1913,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     if (!box) return false;
     const shadow = String(paintStyleValue(owner.style, "boxShadow") ?? "");
     const ring = /^0 0 0 (\d+(?:\.\d+)?)px/.exec(shadow);
-    const spread = !shadow || shadow === "none" ? 0 : ring ? Number(ring[1]) : 48;
+    const spread = !shadow || shadow === "none" ? 0 : ring ? Number(ring[1]) : boxShadowOutset(shadow);
     const rect = windowRectOf(box, { x: box.borderBox.x - spread, y: box.borderBox.y - spread,
       width: box.borderBox.width + spread * 2, height: box.borderBox.height + spread * 2 });
     if (!rectsOverlap(rect, layerTextBounds)) return false;
@@ -2100,7 +2231,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     };
     if (after) {
       const ring = recipe.ring;
-      if (!ring?.color) return true;
+      if (!ring?.color) return false; // non-ring shadows: fall through to general after-pass
       const spread = ring.spread;
       const ringRect = { x: borderBox.x - spread, y: borderBox.y - spread,
         width: borderBox.width + spread * 2, height: borderBox.height + spread * 2 };
@@ -2115,7 +2246,34 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     const clips = gpuBoxClips(element, borderBox.x, borderBox.y, borderBox.x + borderBox.width, borderBox.y + borderBox.height);
     if (!clips) return false;
     addVisibleAncestors(element);
+    const widths = SIDES.map((side, index) => {
+      if (!recipe.borderActive[index]) return 0;
+      const fromBox = box.border[side.toLowerCase()] || 0;
+      if (fromBox > 0) return fromBox;
+      // Fall back to authored style widths when layout border is still 0.
+      return Number.parseFloat(element.style[`border${side}Width`] ?? element.style.borderWidth) || 0;
+    });
     const noBorder = [0, 0, 0, 0];
+    // Resolve border thickness before the color gate. widths[] can be all 0 when
+    // layout edges are still 0 and Number("4px") was NaN; that used to null out
+    // borderColor and skip the ring even though recipe.borderColor was set.
+    let borderThickness = widths.find((value) => value > 0) || 0;
+    if (!(borderThickness > 0) && recipe.borderColor) {
+      borderThickness = Number.parseFloat(element.style.borderTopWidth)
+        || Number.parseFloat(element.style.borderWidth)
+        || Math.max(box.border.top, box.border.right, box.border.bottom, box.border.left)
+        || 0;
+    }
+    const borderColor = recipe.borderColor && borderThickness > 0
+      ? withOpacity(recipe.borderColor, opacity) : null;
+    // Hard offset shadows under fill+border (CSS order). Soft/ring stay on after.
+    const shadowText = String(paintStyleValue(element.style, "boxShadow") ?? "");
+    if (shadowText && shadowText !== "none" && !recipe.ring) {
+      paintBoxShadows(box, shadowText, opacity, cornersOf(), () => null, pushGpuBox, gpuBoxClips, element, paintMode, "hard");
+    }
+    // GPU boxes paint fills only. Element borders tessellate via pushRoundedRing:
+    // Android GLES drops GPU-box border rings on circular buttons (card
+    // border-only instances and soft-glow rings still look fine, but ± pills do not).
     if (recipe.background && recipe.background[3] > 0) {
       pushGpuBox(borderBox, cornersOf(), withOpacity(recipe.background, opacity), noBorder, null, clips);
     }
@@ -2140,9 +2298,16 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
           cornersOf(), clips, opacity);
       }
     }
-    const widths = SIDES.map((side, index) => recipe.borderActive[index] ? (box.border[side.toLowerCase()] || 0) : 0);
-    if (recipe.borderColor && widths.some((value) => value > 0)) {
-      pushGpuBox(borderBox, cornersOf(), null, widths, withOpacity(recipe.borderColor, opacity), clips);
+    if (borderColor) {
+      const projectLocal = (x, y) => {
+        const point = projectPoint(box, box.x + x, box.y + y);
+        return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
+      };
+      // Empty clipRegions (not null): skip layout-space box.clip. Under a scaled
+      // ancestor, projected ring vertices are screen-space while box.clip stays in
+      // layout space, which erases the ring. clipsFor() polygons also dropped these
+      // circular borders on Android; windowClip alone is enough here.
+      pushRoundedRing(box, borderBox, borderThickness, borderColor, cornersOf(), projectLocal, []);
     }
     return true;
   };
@@ -2167,7 +2332,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   const clipSignature = (box) => {
     const shadow = String(paintStyleValue(box.element.style, "boxShadow") ?? "");
     const ring = /^0 0 0 (\d+(?:\.\d+)?)px/.exec(shadow);
-    const spread = !shadow || shadow === "none" ? 0 : ring ? Number(ring[1]) : 48;
+    const spread = !shadow || shadow === "none" ? 0 : ring ? Number(ring[1]) : boxShadowOutset(shadow);
     const left = box.x - spread, top = box.y - spread;
     const right = box.x + box.width + spread, bottom = box.y + box.height + spread;
     const inside = (rect, radius) => insideClip(rect, radius, left, top, right, bottom);
@@ -2481,29 +2646,34 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       }
     }
     if (entry.after) {
-      const ring = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(String(paintStyleValue(box.element.style, "boxShadow") ?? ""));
-      if (!ring) {
+      const shadowText = String(paintStyleValue(box.element.style, "boxShadow") ?? "");
+      if (!shadowText || shadowText === "none") {
         values = [];
         continue;
       }
-      const spread = Number(ring[1]);
-      const color = withOpacity(parseColor(ring[2]), opacity);
       const project = (x, y) => {
         const point = projectPoint(box, box.x + x, box.y + y);
         return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : null;
       };
-      const { x, y, width: ringWidth, height } = box.borderBox;
-      const corners = cornerRadiiFor(box.element.style, ringWidth, height);
-      const ringRect = { x: x - spread, y: y - spread, width: ringWidth + spread * 2, height: height + spread * 2 };
-      const ringClips = !paintMode.capture
-        ? gpuBoxClips(element, ringRect.x, ringRect.y, ringRect.x + ringRect.width, ringRect.y + ringRect.height) : null;
-      if (ringClips && color) {
-        const grow = (radius) => radius > 0 ? radius + spread : 0;
-        pushGpuBox(ringRect, { tl: grow(corners.tl), tr: grow(corners.tr), br: grow(corners.br), bl: grow(corners.bl) },
-          null, [spread, spread, spread, spread], color, ringClips);
+      const { x, y, width: boxWidth, height: boxHeight } = box.borderBox;
+      const corners = cornerRadiiFor(box.element.style, boxWidth, boxHeight);
+      const ring = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(shadowText);
+      if (ring) {
+        const spread = Number(ring[1]);
+        const color = withOpacity(parseColor(ring[2]), opacity);
+        const ringRect = { x: x - spread, y: y - spread, width: boxWidth + spread * 2, height: boxHeight + spread * 2 };
+        const ringClips = !paintMode.capture
+          ? gpuBoxClips(element, ringRect.x, ringRect.y, ringRect.x + ringRect.width, ringRect.y + ringRect.height) : null;
+        if (ringClips && color) {
+          const grow = (radius) => radius > 0 ? radius + spread : 0;
+          pushGpuBox(ringRect, { tl: grow(corners.tl), tr: grow(corners.tr), br: grow(corners.br), bl: grow(corners.bl) },
+            null, [spread, spread, spread, spread], color, ringClips);
+        } else {
+          const clipRegions = clipsFor(box);
+          pushRoundedRing(box, { x, y, width: boxWidth, height: boxHeight }, spread, color, corners, project, clipRegions);
+        }
       } else {
-        const clipRegions = clipsFor(box);
-        pushRoundedRing(box, { x, y, width: ringWidth, height }, spread, color, corners, project, clipRegions);
+        paintBoxShadows(box, shadowText, opacity, corners, project, pushGpuBox, gpuBoxClips, element, paintMode, "soft");
       }
       saveSegment(element, box, after, segmentStart, beforeCommands, false);
       if (values.length) pushScenePart(Float32Array.from(values), element, commandCount - beforeCommands);
@@ -2604,8 +2774,17 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
         box.borderBox.x + box.borderBox.width, box.borderBox.y + box.borderBox.height)
       : null;
     const gpuBox = !!gpuClips;
+    const styleBorderWidth = (side) => Number.parseFloat(style[`border${side}Width`] ?? style.borderWidth) || 0;
+    // Hard offset shadows under fill+border (CSS order). Soft glows stay on after.
+    {
+      const shadowText = String(paintStyleValue(style, "boxShadow") ?? "");
+      if (shadowText && shadowText !== "none" && !/^0 0 0 \d/.test(shadowText)) {
+        paintBoxShadows(box, shadowText, opacity, borderCorners, project, pushGpuBox, gpuBoxClips, element, paintMode, "hard");
+      }
+    }
     if (gpuBox) {
       const noBorder = [0, 0, 0, 0];
+      // Defer border to the shared border pass below (with style-width fallback).
       if (backgroundColor && backgroundColor[3] > 0) {
         pushGpuBox(box.borderBox, borderCorners, backgroundColor, noBorder, null, gpuClips);
       }
@@ -2885,7 +3064,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       const thicknesses = SIDES.map((side) => {
         const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
         if (borderStyle === "none" || borderStyle === "hidden") return 0;
-        const thickness = border[side.toLowerCase()] || 0;
+        const thickness = border[side.toLowerCase()] || styleBorderWidth(side);
         return thickness > 0 ? thickness : 0;
       });
       const active = thicknesses.map((thickness) => thickness > 0);
@@ -2895,13 +3074,16 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       const firstColor = colors.find((color, i) => active[i] && color);
       const uniformColor = !!firstColor && colors.every((color, i) => !active[i] || color === firstColor);
       const anyRadius = borderCorners.tl > 0 || borderCorners.tr > 0 || borderCorners.br > 0 || borderCorners.bl > 0;
-      if (gpuBox && uniformColor && firstColor) {
-        // Drawn after the image/canvas content, as CSS paints borders above it.
+      // Tessellate element borders (including under gpuBox fills). GPU-box border
+      // rings vanish on Android GLES for circular controls; triangle rings do not.
+      if (anyRadius && uniformWidth && uniformColor && firstColor) {
+        const thickness = thicknesses.find((value, i) => active[i]) || 0;
+        // Transformed: [] skips layout-space box.clip (see fastPaint border note).
+        const borderClips = transformed ? [] : lazyClipRegions();
+        pushRoundedRing(box, borderBox, thickness, withOpacity(parseColor(firstColor), opacity), borderCorners, project, borderClips);
+      } else if (gpuBox && uniformColor && firstColor) {
         pushGpuBox(borderBox, borderCorners, null, [thicknesses[0], thicknesses[1], thicknesses[2], thicknesses[3]],
           withOpacity(parseColor(firstColor), opacity), gpuClips);
-      } else if (anyRadius && uniformWidth && uniformColor && firstColor) {
-        const thickness = thicknesses.find((value, i) => active[i]) || 0;
-        pushRoundedRing(box, borderBox, thickness, withOpacity(parseColor(firstColor), opacity), borderCorners, project, lazyClipRegions());
       } else if (anyRadius && uniformWidth) {
         // Differently coloured sides of a rounded box: each side owns the arc of
         // the ring between the diagonals that join the box's corners to the

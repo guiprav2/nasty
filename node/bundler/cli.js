@@ -18,7 +18,7 @@ export async function runCli(argv) {
     .option('--name <name>', 'product / output name (default: cwd basename)')
     .option('--out <dir>', 'output directory', '.')
     .option('--skip-native-build', 'reuse existing release native addon', false)
-    .option('--rebuild-runtime', 'force rebuild of the cached linux runtime AppImage', false)
+    .option('--rebuild-runtime', 'force rebuild of the cached linux AppImage / android runtime APK', false)
     .helpOption('-h, --help');
 
   program.parse(argv, { from: 'user' });
@@ -59,6 +59,8 @@ export async function runCli(argv) {
     }
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
-    return error && error.code === 'NASTY_BUNDLE_STUB' ? 2 : 1;
+    return error && (error.code === 'NASTY_BUNDLE_STUB' || error.code === 'NASTY_ANDROID_TOOLCHAIN')
+      ? 2
+      : 1;
   }
 }

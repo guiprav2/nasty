@@ -236,11 +236,11 @@ function admitImage(element, window, layoutBox = null) {
   state.imageAwaySince = null;
   // Prefer layout-snapshot box for decode maxEdge (no forced layout/getBoundingClientRect).
   if (layoutBox && layoutBox.width > 0 && layoutBox.height > 0) {
-    const dpr = window.devicePixelRatio?.() ?? 1;
-    // 2× CSS pixels is enough for sharp thumbs; hard-cap so gallery opens stay light.
+    // Layout boxes are already surface pixels (1 CSS px = 1 surface px).
+    // 2× the laid-out edge is enough for sharp thumbs; hard-cap gallery opens.
     state.imageMaxEdge = Math.min(
       1024,
-      Math.max(64, Math.ceil(Math.max(layoutBox.width, layoutBox.height) * dpr * 2)),
+      Math.max(64, Math.ceil(Math.max(layoutBox.width, layoutBox.height) * 2)),
     );
   }
   element._beginImageLoad(element.src, window, state.imageRequest);

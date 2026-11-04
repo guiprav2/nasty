@@ -70,6 +70,32 @@ import { decodeVideoFrame, getVideoAudioClock, hasVideoAudio, pauseVideoAudio, s
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
 import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
 import { ResizeObserver, notifyResizeObservers } from "./internal/resize-observer.js";
+
+// Resize observations are broadcast in the rendering step that follows a reflow
+// (Window.presentDocument), never from inside layout: reading a box there could
+// force another layout, which during a layout transition would recurse until the
+// transition ended. A document no window presents gets them on a microtask.
+function queueResizeObservations(document) {
+  const state = documentState(document);
+  if (state.resizeObservationsPending) return;
+  state.resizeObservationsPending = true;
+  if (state.defaultView) return;
+  queueMicrotask(() => broadcastResizeObservations(document));
+}
+
+function broadcastResizeObservations(document) {
+  const state = documentState(document);
+  if (!state.resizeObservationsPending) return;
+  state.resizeObservationsPending = false;
+  const lookups = new Map();
+  notifyResizeObservers((target) => {
+    if (!target.isConnected) return { x: 0, y: 0, width: 0, height: 0 };
+    let lookup = lookups.get(target.document);
+    if (!lookup) lookups.set(target.document, lookup = documentLiveLookup(target.document));
+    const box = lookup(target);
+    return box ? { x: box.x, y: box.y, width: box.width, height: box.height } : { x: 0, y: 0, width: 0, height: 0 };
+  });
+}
 import { nerdIcon, renderedText } from "./internal/nerd-icon.js";
 import { canScroll, canScrollByUser, clipsOverflow, overflowAnchorPolicy, overflowMode, userScrollableStyle } from "./internal/overflow.js";
 import { applyIntrinsicSize, insideSkippedContent, isContentSkipped, noteContentVisibility, reconcileContentVisibility } from './internal/content-visibility.js';
@@ -202,7 +228,11 @@ const FILE_TYPES = {
   ".mov": "video/quicktime", ".mp4": "video/mp4", ".webm": "video/webm", ".mp3": "audio/mpeg", ".ogg": "audio/ogg",
   ".wav": "audio/wav", ".json": "application/json", ".pdf": "application/pdf", ".txt": "text/plain", ".zip": "application/zip",
 };
-const ACCEPT_ALL_TYPES = Object.groupBy(Object.entries(FILE_TYPES), ([, type]) => type);
+// Manual groupBy — Object.groupBy is Node 21+; nodejs-mobile is still on 18.
+const ACCEPT_ALL_TYPES = Object.create(null);
+for (const entry of Object.entries(FILE_TYPES)) {
+  (ACCEPT_ALL_TYPES[entry[1]] ??= []).push(entry);
+}
 
 /** File System Access file handle. Like the directory handle, Nasty adds `.path`. */
 export class FileSystemFileHandle {
@@ -312,6 +342,8 @@ export class Window extends NativeWindow {
   #closeNotified = false;
   #pressedElement = null;
   #lastClick = null;
+  /** Active touch/pen gesture for click-slop and touch pan scrolling. */
+  #pointerGesture = null;
   #hoveredElement = null;
   #textControlIds = new WeakMap();
   #managedTextControls = new WeakSet();
@@ -455,6 +487,16 @@ export class Window extends NativeWindow {
     validateWindowDimension(value, "height");
     this.#height = value;
     this.#applyWindowDimensions();
+  }
+
+  /** Device pixels per CSS px (winit scale factor). Used to size rem/px on HiDPI. */
+  devicePixelRatio() {
+    try {
+      const ratio = Number(super.displaySize()?.scaleFactor);
+      return Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
+    } catch {
+      return 1;
+    }
   }
 
   #applyWindowDimensions() {
@@ -821,11 +863,13 @@ export class Window extends NativeWindow {
     };
     const key = normalizeWindowKey(nativeEvent.key, nativeEvent.text);
     const modifiers = String(nativeEvent.modifiers || "");
+    const pointerId = Number.isFinite(nativeEvent.pointerId) ? nativeEvent.pointerId : 1;
+    const pointerType = nativeEvent.pointerType || "mouse";
     Object.assign(fields, {
       // winit formats its ModifiersState as "ModifiersState(SHIFT | CONTROL)".
       key, text: nativeEvent.text ?? "", ctrlKey: /CTRL|CONTROL/i.test(modifiers),
       shiftKey: /SHIFT/i.test(modifiers), altKey: /ALT/i.test(modifiers), metaKey: /SUPER|META|LOGO/i.test(modifiers),
-      pointerId: 1, pointerType: "mouse", isPrimary: true,
+      pointerId, pointerType, isPrimary: pointerType === "mouse" ? pointerId === 1 : true,
     });
     // Like a browser, Escape leaves fullscreen and is not delivered to the page.
     if (nativeEvent.type === "keydown" && key === "Escape" && this.#document?.fullscreenElement) {
@@ -839,7 +883,7 @@ export class Window extends NativeWindow {
     if (!document || !["pointermove", "pointerdown", "pointerup", "pointercancel", "wheel", "keydown", "keyup"].includes(nativeEvent.type)) return;
     if (nativeEvent.type === "pointermove") {
       this.#lastWheelDocument = null;
-      const capture = capturedPointerTarget(document);
+      const capture = capturedPointerTarget(document, pointerId);
       // While captured, the pointer behaves as if it were over the capturing
       // element: hit-tested only for window dragging, never for dispatch.
       const hit = document.elementFromPoint(fields.clientX, fields.clientY);
@@ -855,6 +899,20 @@ export class Window extends NativeWindow {
       if (blocked !== this.#dragBlocked) {
         this.#dragBlocked = blocked;
         super.setDragBlocked(blocked);
+      }
+      // Touch pan: finger movement scrolls overflow containers (content follows the finger).
+      const gesture = this.#pointerGesture;
+      if (gesture && gesture.pointerId === pointerId && pointerType === "touch" && state.pointerPressed) {
+        const dx = fields.clientX - gesture.lastX;
+        const dy = fields.clientY - gesture.lastY;
+        gesture.lastX = fields.clientX;
+        gesture.lastY = fields.clientY;
+        if (Math.hypot(fields.clientX - gesture.startX, fields.clientY - gesture.startY) > TOUCH_CLICK_SLOP_PX) {
+          gesture.moved = true;
+        }
+        if ((dx || dy) && document.scrollAt(fields.clientX, fields.clientY, -dx, -dy, this.#pressedElement)) {
+          gesture.scrolled = true;
+        }
       }
       if (target !== this.#hoveredElement) {
         if (this.#hoveredElement) {
@@ -876,8 +934,16 @@ export class Window extends NativeWindow {
     }
     if (nativeEvent.type === "pointerdown") {
       const target = document.elementFromPoint(fields.clientX, fields.clientY);
+      const previousPressed = this.#pressedElement;
       this.#pressedElement = target;
       documentState(document).pointerPressed = true;
+      updatePressedChain(previousPressed, target);
+      this.#pointerGesture = {
+        pointerId, pointerType,
+        startX: fields.clientX, startY: fields.clientY,
+        lastX: fields.clientX, lastY: fields.clientY,
+        moved: false, scrolled: false,
+      };
       const control = nearestFormControl(target);
       if (control) control.focus();
       else document.activeElement?.blur();
@@ -886,15 +952,23 @@ export class Window extends NativeWindow {
       return;
     }
     if (nativeEvent.type === "pointerup") {
-      const capture = capturedPointerTarget(document);
+      const capture = capturedPointerTarget(document, pointerId);
       const target = capture ?? document.elementFromPoint(fields.clientX, fields.clientY);
       documentState(document).pointerPressed = false;
+      updatePressedChain(this.#pressedElement, null);
       if (target) dispatchDomEvent(target, "pointerup", fields);
       if (target) dispatchDomEvent(target, "mouseup", fields);
+      const gesture = this.#pointerGesture;
+      // Touch/pen: browsers suppress click after a pan or travel past the slop.
+      // Mouse clicks still fire after small movement.
+      const suppressClick = gesture && gesture.pointerId === pointerId && gesture.pointerType === "touch"
+        && (gesture.scrolled || gesture.moved
+          || Math.hypot(fields.clientX - gesture.startX, fields.clientY - gesture.startY) > TOUCH_CLICK_SLOP_PX);
       // As in browsers (Pointer Events), click goes to the nearest common
       // ancestor of the pointerdown and pointerup targets, so a press that
       // ends on a capturing ancestor still clicks it.
-      const clickTarget = target && this.#pressedElement ? commonInclusiveAncestor(target, this.#pressedElement) : null;
+      const clickTarget = !suppressClick && target && this.#pressedElement
+        ? commonInclusiveAncestor(target, this.#pressedElement) : null;
       if (clickTarget) {
         // Consecutive clicks on one target, close in time and place, count up
         // in `detail`; the second dispatches dblclick, as in a browser.
@@ -914,17 +988,20 @@ export class Window extends NativeWindow {
         }
       }
       // Capture ends implicitly after pointerup.
-      if (capture) releaseCapturedPointer(document, 1);
+      if (capture) releaseCapturedPointer(document, pointerId);
       this.#pressedElement = null;
+      this.#pointerGesture = null;
       return;
     }
     if (nativeEvent.type === "pointercancel") {
-      const capture = capturedPointerTarget(document);
+      const capture = capturedPointerTarget(document, pointerId);
       const target = capture ?? this.#pressedElement ?? document.elementFromPoint(fields.clientX, fields.clientY);
       documentState(document).pointerPressed = false;
+      updatePressedChain(this.#pressedElement, null);
       if (target) dispatchDomEvent(target, "pointercancel", fields);
-      if (capture) releaseCapturedPointer(document, 1);
+      if (capture) releaseCapturedPointer(document, pointerId);
       this.#pressedElement = null;
+      this.#pointerGesture = null;
       return;
     }
     if (nativeEvent.type === "wheel") {
@@ -1392,6 +1469,7 @@ export class Window extends NativeWindow {
       this.#documentPresented = true;
       this.#startEventPolling();
     }
+    if (this.#document) broadcastResizeObservations(this.#document);
     return result;
   }
 
@@ -1626,19 +1704,38 @@ export { buildOrderedDisplayList } from "./render.js";
 export { buildTransformedDisplayList } from "./render.js";
 export { closeImageDecoder } from "./image-decoder.js";
 
+/** Surface scale factor when recorded on the viewport (for touch slop, etc.). */
+function viewportDevicePixelRatio(viewport) {
+  const ratio = Number(viewport?.devicePixelRatio);
+  return Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
+}
+
+/** Width passed to resolveTailwind for breakpoints. Layout is 1 CSS px = 1 surface px. */
+function tailwindViewportWidth(viewport) {
+  return viewport?.width || 0;
+}
+
 function resolveCssLength(value, fontSize, viewport) {
   if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
   if (typeof value !== "string") return undefined;
   const text = value.trim();
-  const simple = /^([-+]?(?:\d+\.?\d*|\.\d+))(px|rem|em|vh|vw)?$/i.exec(text);
+  const simple = /^([-+]?(?:\d+\.?\d*|\.\d+))(px|rem|em|vh|vw|dvh|dvw|svh|svw|lvh|lvw)?$/i.exec(text);
   if (simple) {
     const amount = Number(simple[1]);
     switch ((simple[2] || "px").toLowerCase()) {
       case "px": return amount;
       case "rem": return amount * 16;
       case "em": return amount * fontSize;
-      case "vh": return amount * viewport.height / 100;
-      case "vw": return amount * viewport.width / 100;
+      case "vh":
+      case "dvh":
+      case "svh":
+      case "lvh":
+        return amount * viewport.height / 100;
+      case "vw":
+      case "dvw":
+      case "svw":
+      case "lvw":
+        return amount * viewport.width / 100;
     }
   }
   const fn = /^(min|max|clamp)\((.*)\)$/i.exec(text);
@@ -2279,7 +2376,7 @@ function ancestorRetargetedValues(element, width, interaction) {
 
 function applyTailwindClassValues(element, ownValues) {
   const state = styleData.get(element.style);
-  const width = documentState(element.document).viewport.width;
+  const width = tailwindViewportWidth(documentState(element.document).viewport);
   const interaction = interactionState(element, state);
   const fromAncestors = ancestorRetargetedValues(element, width, interaction);
   const next = fromAncestors ? { ...ownValues, ...fromAncestors } : ownValues;
@@ -2292,7 +2389,7 @@ function refreshDescendantArbitraryStyles(root) {
     if (element.nodeType !== 1) return;
     const state = styleData.get(element.style);
     if (!state) return;
-    const width = documentState(element.document).viewport.width;
+    const width = tailwindViewportWidth(documentState(element.document).viewport);
     const own = resolveTailwind(element.className, width, interactionState(element, state));
     const before = state.classValues;
     applyTailwindClassValues(element, own);
@@ -3025,11 +3122,12 @@ export class Element extends EventTarget {
     this.attributes.set(name, value);
     recordMutation({ type: "attributes", target: this, attributeName: name, oldValue: oldValue ?? null, addedNodes: [], removedNodes: [] });
     if (name === "class") {
-      const width = documentState(this.document).viewport.width;
+      const width = tailwindViewportWidth(documentState(this.document).viewport);
       const state = styleData.get(this.style);
       state.hasResponsiveUtilities = /(?:^|\s)(?:sm|md|lg|xl|2xl):/.test(value);
       state.hasHoverUtilities = /(?:^|\s|:)hover:/.test(value);
       state.hasGroupHoverUtilities = /(?:^|\s|:)group-hover:/.test(value);
+      state.hasActiveUtilities = /(?:^|\s|:)active:/.test(value);
       state.hasRetargetingArbitrary = classHasRetargetingArbitrary(value);
       const styles = resolveTailwind(value, width, interactionState(this, state));
       applyTailwindClassValues(this, styles);
@@ -3084,6 +3182,9 @@ export class Element extends EventTarget {
     if (name === "class") {
       const state = styleData.get(this.style);
       state.hasResponsiveUtilities = false;
+      state.hasHoverUtilities = false;
+      state.hasGroupHoverUtilities = false;
+      state.hasActiveUtilities = false;
       state.classValues = {};
       const changed = refreshStyleValues(state);
       this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
@@ -4052,6 +4153,7 @@ export class Element extends EventTarget {
   _refreshTailwind(width) {
     const state = styleData.get(this.style);
     if (!state.hasResponsiveUtilities && !state.hasHoverUtilities && !state.hasGroupHoverUtilities
+        && !state.hasActiveUtilities
         && !ancestorRetargetedValues(this, width, interactionState(this, state))) return false;
     const own = resolveTailwind(this.className, width, interactionState(this, state));
     const nextSelection = resolveTailwindSelection(this.className, width);
@@ -4273,7 +4375,7 @@ export class Element extends EventTarget {
       if (child instanceof Element) {
         const state = styleData.get(child.style);
         if (state) {
-          const width = documentState(this.document).viewport.width;
+          const width = tailwindViewportWidth(documentState(this.document).viewport);
           applyTailwindClassValues(child, resolveTailwind(child.className, width, interactionState(child, state)));
           refreshStyleValues(state);
         }
@@ -4491,7 +4593,7 @@ export class Document extends EventTarget {
     registerMutationDocument(this);
     this.nodeType = 9;
     this.nodeName = "#document";
-    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), textControls: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, sceneGeneration: 0, staticPaintGeneration: 0, hitTestGeneration: 0, transitionFrameGeneration: 0, activeTransitionElements: new Set(), paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null, transformedContentCache: null });
+    registerDocumentState(this, { layoutTree: new LayoutWorker(), elements: new Set(), textControls: new Set(), dirty: true, geometryDirty: true, geometryGeneration: 0, sceneGeneration: 0, staticPaintGeneration: 0, hitTestGeneration: 0, transitionFrameGeneration: 0, activeTransitionElements: new Set(), paintGeneration: 0, paintDirtyElements: new Set(), renderBoxCache: new WeakMap(), boxesSnapshot: null, viewport: { width: 0, height: 0, devicePixelRatio: 1 }, defaultView: null, baseURI: pathToFileURL(`${resolve(process.cwd())}${sep}`).href, layoutSnapshot: null, transformedContentCache: null });
     this.head = new Element(this, "head");
     this.body = new Element(this, "body");
     registerDocument(this, {
@@ -4640,10 +4742,13 @@ export class Document extends EventTarget {
     if (!Number.isFinite(width) || !Number.isFinite(height) || width < 0 || height < 0) {
       throw new RangeError("viewport must have finite nonnegative dimensions");
     }
-    if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height) {
-      documentState(this).viewport = { width, height };
+    const dpr = documentState(this).defaultView?.devicePixelRatio?.() ?? documentState(this).viewport.devicePixelRatio ?? 1;
+    if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height
+      || dpr !== documentState(this).viewport.devicePixelRatio) {
+      documentState(this).viewport = { width, height, devicePixelRatio: dpr };
       setHostStyle(this.body, { width, height });
-      for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(width);
+      const cssWidth = tailwindViewportWidth(documentState(this).viewport);
+      for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(cssWidth);
       // Responsive classes that changed queued themselves above. Besides those, only
       // styles written in viewport units depend on the viewport.
       for (const element of documentState(this).elements) {
@@ -4683,13 +4788,16 @@ export class Document extends EventTarget {
     const size = documentState(this).defaultView?.size();
     const width = size?.width ?? documentState(this).viewport.width;
     const height = size?.height ?? documentState(this).viewport.height;
+    const dpr = documentState(this).defaultView?.devicePixelRatio?.() ?? documentState(this).viewport.devicePixelRatio ?? 1;
     let didReflow = false;
-    if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height) {
-      documentState(this).viewport = { width, height };
+    if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height
+      || dpr !== documentState(this).viewport.devicePixelRatio) {
+      documentState(this).viewport = { width, height, devicePixelRatio: dpr };
       if (documentState(this).defaultView) {
         setHostStyle(this.body, { width, height });
       }
-      for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(width);
+      const cssWidth = tailwindViewportWidth(documentState(this).viewport);
+      for (const element of documentState(this).elements) if (element !== this.body) element._refreshTailwind(cssWidth);
       // Responsive classes that changed queued themselves above. Besides those, only
       // styles written in viewport units depend on the viewport.
       for (const element of documentState(this).elements) {
@@ -4754,7 +4862,7 @@ export class Document extends EventTarget {
     }
     if (timings) timings.layout = performance.now() - started;
     if (didReflow) requestImageLoadSchedule(this);
-    if (didReflow) notifyResizeObservers();
+    if (didReflow) queueResizeObservations(this);
   }
 
   /** Screen-space boxes at the current scroll offsets, derived from the
@@ -5243,36 +5351,49 @@ function releaseCapturedPointer(document, pointerId) {
   dispatchPointerCaptureEvent(element, "lostpointercapture", pointerId);
 }
 
-/** The element capturing the mouse; capture ends when that element leaves the document. */
-function capturedPointerTarget(document) {
-  const element = documentState(document).pointerCapture?.get(1);
+/** Max finger travel (surface px) before a touch is treated as a pan, not a click. */
+const TOUCH_CLICK_SLOP_PX = 10;
+
+/** The element capturing `pointerId`; capture ends when that element leaves the document. */
+function capturedPointerTarget(document, pointerId = 1) {
+  const element = documentState(document).pointerCapture?.get(pointerId);
   if (!element) return null;
   if (element.isConnected) return element;
-  releaseCapturedPointer(document, 1);
+  releaseCapturedPointer(document, pointerId);
   return null;
 }
 
-// :hover state for Tailwind's hover: and group-hover: variants. Like CSS, an element
-// counts as hovered while the pointer is over it or any of its descendants.
+// :hover / :active for Tailwind hover:, group-hover:, and active:. Like CSS, an
+// element counts as hovered/pressed while the pointer is over it or a descendant.
 const GROUP_CLASS = /(?:^|\s)group(?:\s|$)/;
 function interactionState(element, state) {
-  if (!state.hasHoverUtilities && !state.hasGroupHoverUtilities) return undefined;
+  if (!state.hasHoverUtilities && !state.hasGroupHoverUtilities && !state.hasActiveUtilities) return undefined;
   let groupHover = false;
   if (state.hasGroupHoverUtilities) {
     for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
       if (elementState(ancestor).hovered && GROUP_CLASS.test(ancestor.className)) { groupHover = true; break; }
     }
   }
-  return { hover: !!elementState(element).hovered, groupHover };
+  return {
+    hover: !!elementState(element).hovered,
+    groupHover,
+    pressed: !!elementState(element).pressed,
+  };
+}
+
+function ancestorChain(element) {
+  const elements = new Set();
+  for (let current = element; current?.style; current = current.parentElement) elements.add(current);
+  return elements;
+}
+
+function refreshInteractionStyles(elements) {
+  const cssWidth = tailwindViewportWidth(documentState(elements.values().next().value.document).viewport);
+  for (const element of elements) element._refreshTailwind(cssWidth);
 }
 
 function updateHoverChain(previous, next) {
-  const chain = element => {
-    const elements = new Set();
-    for (let current = element; current?.style; current = current.parentElement) elements.add(current);
-    return elements;
-  };
-  const before = chain(previous), after = chain(next);
+  const before = ancestorChain(previous), after = ancestorChain(next);
   const flipped = [];
   for (const element of before) if (!after.has(element)) { elementState(element).hovered = false; flipped.push(element); }
   for (const element of after) if (!before.has(element)) { elementState(element).hovered = true; flipped.push(element); }
@@ -5288,7 +5409,24 @@ function updateHoverChain(previous, next) {
     if (styleData.get(element.style)?.hasHoverUtilities) refresh.add(element);
     if (GROUP_CLASS.test(element.className)) collectGroupDescendants(element);
   }
-  for (const element of refresh) element._refreshTailwind(documentState(element.document).viewport.width);
+  if (refresh.size) refreshInteractionStyles(refresh);
+}
+
+/** Toggle :active on the pressed target and its ancestors (CSS :active bubbling). */
+function updatePressedChain(previous, next) {
+  const before = ancestorChain(previous), after = ancestorChain(next);
+  const refresh = new Set();
+  for (const element of before) {
+    if (after.has(element)) continue;
+    elementState(element).pressed = false;
+    if (styleData.get(element.style)?.hasActiveUtilities) refresh.add(element);
+  }
+  for (const element of after) {
+    if (before.has(element)) continue;
+    elementState(element).pressed = true;
+    if (styleData.get(element.style)?.hasActiveUtilities) refresh.add(element);
+  }
+  if (refresh.size) refreshInteractionStyles(refresh);
 }
 
 /** Dispatches a bubbling host event; returns true when a listener called preventDefault(). */

@@ -87,6 +87,20 @@ function finishTransition(state, property, transition) {
 }
 
 const kebab = (name) => name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+
+// A shorthand named in transition-property covers its longhands, as in CSS.
+const SIDES = ["top", "right", "bottom", "left"];
+const SHORTHAND_LONGHANDS = new Map([
+  ["border-color", SIDES.map((side) => `border-${side}-color`)],
+  ["border-width", SIDES.map((side) => `border-${side}-width`)],
+  ["border-radius", ["border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius"]],
+  ["padding", SIDES.map((side) => `padding-${side}`)],
+  ["margin", SIDES.map((side) => `margin-${side}`)],
+  ["inset", SIDES],
+  ["gap", ["row-gap", "column-gap"]],
+]);
+const namesProperty = (name, property, targetName) => name === "all" || name === targetName || name === property
+  || !!SHORTHAND_LONGHANDS.get(name)?.includes(targetName);
 const sameColor = (a, b) => a.every((value, i) => Math.abs(value - b[i]) < 1e-6);
 const distance = (a, b) => Math.hypot(...a.map((value, i) => value - b[i]));
 
@@ -124,7 +138,7 @@ function transitionOptions(state, property) {
   // are matched below; only the longhand list is a bare list of property names.
   if (shorthand === undefined) {
     const properties = splitList(String(state.values.transitionProperty ?? "all"));
-    const selectedProperty = properties.find((name) => name === "all" || name === targetName || name === property);
+    const selectedProperty = properties.find((name) => namesProperty(name, property, targetName));
     if (!selectedProperty) return null;
     const index = properties.indexOf(selectedProperty);
     const duration = Math.max(0, toMilliseconds(durations[index % durations.length]) ?? 0);
@@ -135,7 +149,7 @@ function transitionOptions(state, property) {
   let selectedIndex = -1;
   for (const [entryIndex, entry] of splitList(String(shorthand)).entries()) {
     const properties = [...entry.matchAll(/(?:^|\s)(all|[a-zA-Z-]+)(?=\s|$)/g)].map((match) => match[1]);
-    if (!properties.some((name) => name === "all" || name === targetName || name === property)) continue;
+    if (!properties.some((name) => namesProperty(name, property, targetName))) continue;
     const times = [...entry.matchAll(/-?\d*\.?\d+(?:ms|s)\b/g)].map((match) => match[0]);
     if (!times.length) continue;
     const duration = Math.max(0, toMilliseconds(times[0]));
@@ -239,22 +253,50 @@ function interpolableParts(value) {
   return { source, numbers, shape };
 }
 
+const sameInterpolable = (a, b) => typeof a === "number" || typeof b === "number"
+  ? a === b
+  : a.source === b.source;
+
+// CSS Transitions "starting of transitions": a change while a transition runs
+// starts from the current value; a change back to where that transition came
+// from reverses it, shortened by how far it got.
 export function startInterpolableTransition(state, property, target, now = performance.now()) {
   const options = transitionOptions(state, property);
   if (!options) { state.transitions.delete(property); return; }
-  const previous = state.values[property];
-  if (typeof previous === "number" && typeof target === "number") {
-    state.transitions.set(property, { from: previous, to: target, numeric: true, started: now + options.delay, duration: options.duration, easing: options.easing });
-    return;
+  const running = state.transitions.get(property);
+  const active = running && now < running.started + running.duration;
+  const before = active ? sampleInterpolableTransition(state, property, now) : state.values[property];
+  let from, to, numeric = false;
+  if (typeof before === "number" && typeof target === "number") {
+    from = before;
+    to = target;
+    numeric = true;
+  } else {
+    from = interpolableParts(before ?? "none");
+    to = interpolableParts(target);
+    if (from.shape !== to.shape || from.numbers.length !== to.numbers.length || from.numbers.some((part, i) => part.unit !== to.numbers[i].unit)
+      || !from.numbers.length) {
+      state.transitions.delete(property);
+      return;
+    }
   }
-  const from = interpolableParts(previous ?? "none");
-  const to = interpolableParts(target);
-  if (from.shape !== to.shape || from.numbers.length !== to.numbers.length || from.numbers.some((part, i) => part.unit !== to.numbers[i].unit)) {
-    state.transitions.delete(property);
-    return;
+  if (sameInterpolable(from, to)) { state.transitions.delete(property); return; }
+  let { duration, delay } = options;
+  let reversingAdjustedStart = from;
+  let reversingShorteningFactor = 1;
+  const runningNumeric = !!running?.numeric;
+  if (active && runningNumeric === numeric && sameInterpolable(running.reversingAdjustedStart, to)) {
+    const progress = Math.max(0, Math.min(1, (now - running.started) / running.duration));
+    const output = timingProgress(running.easing, progress);
+    reversingAdjustedStart = running.to;
+    reversingShorteningFactor = Math.max(0, Math.min(1, output * running.reversingShorteningFactor + (1 - running.reversingShorteningFactor)));
+    duration *= reversingShorteningFactor;
+    if (delay < 0) delay *= reversingShorteningFactor;
   }
-  if (!from.numbers.length) { state.transitions.delete(property); return; }
-  state.transitions.set(property, { from, to, started: now + options.delay, duration: options.duration, easing: options.easing });
+  if (duration <= 0) { state.transitions.delete(property); return; }
+  state.transitions.set(property, {
+    from, to, numeric, started: now + delay, duration, easing: options.easing, reversingAdjustedStart, reversingShorteningFactor,
+  });
 }
 
 function sampleInterpolableTransition(state, property, now = performance.now()) {

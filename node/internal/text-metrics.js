@@ -23,7 +23,7 @@ export function inherited(element, name, fallback) {
   return fallback;
 }
 export function textStyle(element) {
-  const size = parseFloat(inherited(element, 'fontSize', 16));
+  const size = parseFloat(inherited(element, 'fontSize', 16)) || 16;
   const weight = inherited(element, 'fontWeight', 400);
   const requestedFamilies = fontFamilies(inherited(element, 'fontFamily', 'sans-serif'))
     .map(name => ['sans-serif', 'ui-sans-serif', 'system-ui'].includes(name) ? systemFontFamily

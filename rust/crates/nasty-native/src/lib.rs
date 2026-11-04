@@ -36,7 +36,7 @@ mod android_camera;
 use image_decode_pool::{ImageDecodePool, ImageJobOutcome};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent as OsWindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent as OsWindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
@@ -1568,6 +1568,11 @@ pub struct NativeEvent {
     pub delta_x: Option<f64>,
     #[napi(js_name = "deltaY")]
     pub delta_y: Option<f64>,
+    /// "mouse" | "touch" | "pen"; omitted for non-pointer events.
+    #[napi(js_name = "pointerType")]
+    pub pointer_type: Option<String>,
+    #[napi(js_name = "pointerId")]
+    pub pointer_id: Option<u32>,
 }
 
 #[napi(object)]
@@ -5741,6 +5746,7 @@ struct WindowApp {
     next_capture_id: u32,
     /// Image clipboard for `captureFrame` without a path, opened on first use and
     /// kept: on X11 and Wayland the copied image is served while it lives.
+    #[cfg(not(target_os = "android"))]
     image_clipboard: Option<arboard::Clipboard>,
 }
 
@@ -5755,16 +5761,25 @@ impl WindowApp {
             let (id, error) = match outcome {
                 CaptureOutcome::Done { id, error } => (id, error),
                 CaptureOutcome::Pixels { id, width, height, pixels } => {
-                    let result = match self.image_clipboard.as_mut() {
-                        Some(clipboard) => Ok(clipboard),
-                        None => arboard::Clipboard::new().map(|clipboard| self.image_clipboard.insert(clipboard)),
+                    #[cfg(target_os = "android")]
+                    {
+                        let _ = (width, height, pixels);
+                        (id, Some("copy frame to clipboard is unsupported on Android".into()))
                     }
-                    .and_then(|clipboard| clipboard.set_image(arboard::ImageData {
-                        width: width as usize,
-                        height: height as usize,
-                        bytes: std::borrow::Cow::Owned(pixels),
-                    }));
-                    (id, result.err().map(|error| format!("copy frame to clipboard: {error}")))
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        let result = match self.image_clipboard.as_mut() {
+                            Some(clipboard) => Ok(clipboard),
+                            None => arboard::Clipboard::new()
+                                .map(|clipboard| self.image_clipboard.insert(clipboard)),
+                        }
+                        .and_then(|clipboard| clipboard.set_image(arboard::ImageData {
+                            width: width as usize,
+                            height: height as usize,
+                            bytes: std::borrow::Cow::Owned(pixels),
+                        }));
+                        (id, result.err().map(|error| format!("copy frame to clipboard: {error}")))
+                    }
                 }
             };
             self.events.push(NativeEvent {
@@ -5778,6 +5793,8 @@ impl WindowApp {
                 drag_requested: None,
                 delta_x: Some(id as f64),
                 delta_y: None,
+                pointer_type: None,
+                pointer_id: None,
             });
         }
     }
@@ -5813,6 +5830,8 @@ impl WindowApp {
                 drag_requested: None,
                 delta_x: Some(id as f64),
                 delta_y: Some(f64::from(height)),
+                pointer_type: None,
+                pointer_id: None,
             });
             return id;
         }
@@ -5859,6 +5878,8 @@ impl WindowApp {
                             drag_requested: None,
                             delta_x: Some(id as f64),
                             delta_y: Some(f64::from(height)),
+                            pointer_type: None,
+                            pointer_id: None,
                         });
                     }
                     Err(error) => self.events.push(NativeEvent {
@@ -5872,6 +5893,8 @@ impl WindowApp {
                         drag_requested: None,
                         delta_x: Some(id as f64),
                         delta_y: None,
+                        pointer_type: None,
+                        pointer_id: None,
                     }),
                 },
                 ImageJobOutcome::Failed { id, error } => self.events.push(NativeEvent {
@@ -5885,6 +5908,8 @@ impl WindowApp {
                     drag_requested: None,
                     delta_x: Some(id as f64),
                     delta_y: None,
+                    pointer_type: None,
+                    pointer_id: None,
                 }),
             }
         }
@@ -5961,6 +5986,8 @@ impl ApplicationHandler for WindowApp {
                     drag_requested: None,
                     delta_x: None,
                     delta_y: None,
+                    pointer_type: Some("mouse".into()),
+                    pointer_id: Some(1),
                 });
             }
             OsWindowEvent::Resized(size) => {
@@ -5983,6 +6010,8 @@ impl ApplicationHandler for WindowApp {
                     drag_requested: None,
                     delta_x: None,
                     delta_y: None,
+                    pointer_type: None,
+                    pointer_id: None,
                 });
             }
             OsWindowEvent::Moved(_) => {
@@ -6004,22 +6033,24 @@ impl ApplicationHandler for WindowApp {
                         drag_requested: None,
                         delta_x: None,
                         delta_y: None,
+                        pointer_type: None,
+                        pointer_id: None,
                     });
                 }
             }
             OsWindowEvent::CursorMoved { position, .. } => {
-                // Layout, hit-testing, and DOM geometry use logical CSS pixels.
-                // Winit cursor positions are physical; convert before publishing.
+                // Layout and hit-testing use Window.size() physical pixels.
+                // Keep pointer coordinates in that same surface space.
                 let scale = self.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0).max(0.01);
-                let logical_x = position.x / scale;
-                let logical_y = position.y / scale;
-                self.cursor = (logical_x, logical_y);
+                let x = position.x;
+                let y = position.y;
+                self.cursor = (x, y);
                 if let Some(window) = self.window.as_ref() {
                     let logical_size = window.inner_size().to_logical::<f64>(scale);
                     let direction = resize_direction(
                         &self.resizable,
-                        logical_x,
-                        logical_y,
+                        x / scale,
+                        y / scale,
                         logical_size.width,
                         logical_size.height,
                     );
@@ -6039,8 +6070,8 @@ impl ApplicationHandler for WindowApp {
                 }
                 self.events.push(NativeEvent {
                     kind: "pointermove".into(),
-                    x: logical_x,
-                    y: logical_y,
+                    x,
+                    y,
                     key: None,
                     button: None,
                     text: None,
@@ -6048,6 +6079,8 @@ impl ApplicationHandler for WindowApp {
                     drag_requested: None,
                     delta_x: None,
                     delta_y: None,
+                    pointer_type: Some("mouse".into()),
+                    pointer_id: Some(1),
                 });
             }
             OsWindowEvent::CursorLeft { .. } => {
@@ -6070,14 +6103,13 @@ impl ApplicationHandler for WindowApp {
                 // borderless window configured with a drag modifier consumes
                 // every left click before the native resize request below.
                 let resize_direction = self.window.as_ref().and_then(|window| {
-                    let scale = window.scale_factor();
-                    let size = window.inner_size().to_logical::<f64>(scale);
+                    let size = window.inner_size();
                     resize_direction(
                         &self.resizable,
                         self.cursor.0,
                         self.cursor.1,
-                        size.width,
-                        size.height,
+                        size.width as f64,
+                        size.height as f64,
                     )
                 });
                 if button == MouseButton::Left
@@ -6096,6 +6128,8 @@ impl ApplicationHandler for WindowApp {
                             drag_requested: Some(drag_key_down),
                             delta_x: None,
                             delta_y: None,
+                            pointer_type: Some("mouse".into()),
+                            pointer_id: Some(1),
                         });
                     } else {
                         self.events.push(NativeEvent {
@@ -6109,6 +6143,8 @@ impl ApplicationHandler for WindowApp {
                             drag_requested: Some(false),
                             delta_x: None,
                             delta_y: None,
+                            pointer_type: Some("mouse".into()),
+                            pointer_id: Some(1),
                         });
                     }
                     return;
@@ -6134,7 +6170,105 @@ impl ApplicationHandler for WindowApp {
                     drag_requested: None,
                     delta_x: None,
                     delta_y: None,
+                    pointer_type: Some("mouse".into()),
+                    pointer_id: Some(1),
                 });
+            }
+            // Android (and other touch screens) deliver fingers as Touch, not
+            // mouse. Map them to the same pointer events JS already turns into
+            // click / drag / scroll, with pointerType "touch". Coordinates stay
+            // in physical surface pixels to match Window.size() layout space.
+            OsWindowEvent::Touch(touch) => {
+                let x = touch.location.x;
+                let y = touch.location.y;
+                self.cursor = (x, y);
+                let pointer_id = Some(touch.id as u32);
+                let pointer_type = Some("touch".into());
+                let modifiers = Some(format!("{:?}", self.modifiers));
+                match touch.phase {
+                    TouchPhase::Started => {
+                        self.left_mouse_down = true;
+                        // Move first so hover / hit-test match the contact point.
+                        self.events.push(NativeEvent {
+                            kind: "pointermove".into(),
+                            x,
+                            y,
+                            key: None,
+                            button: None,
+                            text: None,
+                            modifiers: modifiers.clone(),
+                            drag_requested: None,
+                            delta_x: None,
+                            delta_y: None,
+                            pointer_type: pointer_type.clone(),
+                            pointer_id,
+                        });
+                        self.events.push(NativeEvent {
+                            kind: "pointerdown".into(),
+                            x,
+                            y,
+                            key: None,
+                            button: Some(0),
+                            text: None,
+                            modifiers,
+                            drag_requested: None,
+                            delta_x: None,
+                            delta_y: None,
+                            pointer_type,
+                            pointer_id,
+                        });
+                    }
+                    TouchPhase::Moved => {
+                        self.events.push(NativeEvent {
+                            kind: "pointermove".into(),
+                            x,
+                            y,
+                            key: None,
+                            button: None,
+                            text: None,
+                            modifiers,
+                            drag_requested: None,
+                            delta_x: None,
+                            delta_y: None,
+                            pointer_type,
+                            pointer_id,
+                        });
+                    }
+                    TouchPhase::Ended => {
+                        self.left_mouse_down = false;
+                        self.events.push(NativeEvent {
+                            kind: "pointerup".into(),
+                            x,
+                            y,
+                            key: None,
+                            button: Some(0),
+                            text: None,
+                            modifiers,
+                            drag_requested: None,
+                            delta_x: None,
+                            delta_y: None,
+                            pointer_type,
+                            pointer_id,
+                        });
+                    }
+                    TouchPhase::Cancelled => {
+                        self.left_mouse_down = false;
+                        self.events.push(NativeEvent {
+                            kind: "pointercancel".into(),
+                            x,
+                            y,
+                            key: None,
+                            button: Some(0),
+                            text: None,
+                            modifiers,
+                            drag_requested: None,
+                            delta_x: None,
+                            delta_y: None,
+                            pointer_type,
+                            pointer_id,
+                        });
+                    }
+                }
             }
             OsWindowEvent::MouseWheel { delta, .. } => {
                 if (self.drag_key_is_down() && !self.drag_blocked) || self.drag_active { return; }
@@ -6156,6 +6290,8 @@ impl ApplicationHandler for WindowApp {
                     drag_requested: None,
                     delta_x: Some(delta_x),
                     delta_y: Some(delta_y),
+                    pointer_type: None,
+                    pointer_id: None,
                 });
             }
             OsWindowEvent::ModifiersChanged(modifiers) => {
@@ -6173,22 +6309,19 @@ impl ApplicationHandler for WindowApp {
                 }
                 self.update_drag_cursor();
                 self.events.push(NativeEvent {
-                kind: if event.state.is_pressed() {
-                    "keydown"
-                } else {
-                    "keyup"
-                }
-                .into(),
-                x: self.cursor.0,
-                y: self.cursor.1,
-                key: Some(format!("{:?}", event.logical_key)),
-                button: None,
-                text: event.text.map(|text| text.to_string()),
-                modifiers: Some(format!("{:?}", self.modifiers)),
+                    kind: if event.state.is_pressed() { "keydown" } else { "keyup" }.into(),
+                    x: self.cursor.0,
+                    y: self.cursor.1,
+                    key: Some(format!("{:?}", event.logical_key)),
+                    button: None,
+                    text: event.text.map(|text| text.to_string()),
+                    modifiers: Some(format!("{:?}", self.modifiers)),
                     drag_requested: None,
-                delta_x: None,
-                delta_y: None,
-            })
+                    delta_x: None,
+                    delta_y: None,
+                    pointer_type: None,
+                    pointer_id: None,
+                });
             }
             OsWindowEvent::Ime(ime) => {
                 let (kind, text, cursor) = match ime {
@@ -6208,6 +6341,8 @@ impl ApplicationHandler for WindowApp {
                     drag_requested: None,
                     delta_x: None,
                     delta_y: None,
+                    pointer_type: None,
+                    pointer_id: None,
                 });
             }
             OsWindowEvent::RedrawRequested if self.render_pending => {

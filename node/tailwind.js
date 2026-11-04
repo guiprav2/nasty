@@ -70,7 +70,8 @@ function parseLength(value) {
   if (value === "auto" || value === "min-content" || value === "max-content" || value === "fit-content") return value;
   const fraction = /^(\d+)\/(\d+)$/.exec(value);
   if (fraction) return `${100 * Number(fraction[1]) / Number(fraction[2])}%`;
-  if (/^-?(?:\d+\.?\d*|\.\d+)(?:px|%|rem|em|vw|vh)?$/.test(value)) {
+  // Include dynamic/small/large viewport units used by mobile Tailwind (dvw/dvh/…).
+  if (/^-?(?:\d+\.?\d*|\.\d+)(?:px|%|rem|em|vw|vh|dvw|dvh|svw|svh|lvw|lvh)?$/.test(value)) {
     if (/^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) return arbitrary ? undefined : Number(value) * 4;
     if (value.endsWith("rem") || value.endsWith("em")) return Number.parseFloat(value) * 16;
     return value.endsWith("px") ? Number.parseFloat(value) : value;
@@ -145,6 +146,20 @@ function animationLonghands(raw) {
 
 function utilityStyle(utility) {
   if (utility.startsWith("[") && utility.endsWith("]")) return arbitraryValue(utility);
+  // Clears background-image (including gradients). Distinct from bg-transparent
+  // which only sets background-color.
+  if (utility === "bg-none") return ["backgroundImage", "none"];
+  // Arbitrary box-shadow: shadow-[0_0_40px_rgba(…)]
+  const shadowArbitrary = /^shadow-\[(.+)\]$/.exec(utility);
+  if (shadowArbitrary) {
+    return ["boxShadow", shadowArbitrary[1].replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_")];
+  }
+  // Arbitrary filter drop-shadow: drop-shadow-[3px_3px_0_#db2777]
+  const dropShadowArbitrary = /^drop-shadow-\[(.+)\]$/.exec(utility);
+  if (dropShadowArbitrary) {
+    const args = dropShadowArbitrary[1].replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_");
+    return ["filter", `drop-shadow(${args})`];
+  }
   const gradient = /^bg-gradient-to-(t|tr|r|br|b|bl|l|tl)$/.exec(utility);
   if (gradient) return ["__gradientDirection", ({ t: "to top", tr: "to top right", r: "to right", br: "to bottom right", b: "to bottom", bl: "to bottom left", l: "to left", tl: "to top left" })[gradient[1]]];
   const gradientStop = /^(from|via|to)-(.+)$/.exec(utility);
@@ -178,6 +193,21 @@ function utilityStyle(utility) {
     if (!Number.isFinite(amount)) return null;
     const signed = negative ? -amount : amount;
     return axis ? [[`__scale${axis.toUpperCase()}`, signed]] : [["__scaleX", signed], ["__scaleY", signed]];
+  }
+  // skew-* composes with translate/rotate/scale (Tailwind order: translate, rotate, skew, scale).
+  const skew = /^(-)?skew-([xy])-(.+)$/.exec(utility);
+  if (skew) {
+    const [, negative, axis, raw] = skew;
+    const amount = raw.startsWith("[") && raw.endsWith("]") ? raw.slice(1, -1)
+      : /^\d+$/.test(raw) ? `${raw}deg` : null;
+    if (!amount || !/^-?(?:\d+\.?\d*|\.\d+)(?:deg|rad|turn|grad)$/.test(amount)) return null;
+    const signed = negative ? (amount.startsWith("-") ? amount.slice(1) : `-${amount}`) : amount;
+    return [[`__skew${axis.toUpperCase()}`, signed]];
+  }
+  // transform-[scale(1.5)] / transform-[rotate(12deg)_translateX(4px)] arbitrary transform lists.
+  const transformArbitrary = /^transform-\[(.+)\]$/.exec(utility);
+  if (transformArbitrary) {
+    return ["transform", transformArbitrary[1].replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_")];
   }
   // transition-* sets the property list; its 150ms / cubic-bezier defaults only
   // apply when no duration-* / ease-* utility is present, as in Tailwind's CSS order.
@@ -251,6 +281,15 @@ function utilityStyle(utility) {
     grow: ["flexGrow", 1], shrink: ["flexShrink", 1], static: ["position", "static"], relative: ["position", "relative"], absolute: ["position", "absolute"], fixed: ["position", "fixed"], sticky: ["position", "sticky"],
     "items-start": ["alignItems", "flex-start"], "items-end": ["alignItems", "flex-end"], "items-center": ["alignItems", "center"], "items-stretch": ["alignItems", "stretch"],
     "justify-start": ["justifyContent", "flex-start"], "justify-end": ["justifyContent", "flex-end"], "justify-center": ["justifyContent", "center"], "justify-between": ["justifyContent", "space-between"], "justify-around": ["justifyContent", "space-around"], "justify-evenly": ["justifyContent", "space-evenly"],
+    // box-shadow utilities (Tailwind defaults); shadow-none clears native: card chrome.
+    "shadow-none": ["boxShadow", "none"],
+    shadow: ["boxShadow", "0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)"],
+    "shadow-sm": ["boxShadow", "0 1px 2px 0 rgb(0 0 0 / 0.05)"],
+    "shadow-md": ["boxShadow", "0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)"],
+    "shadow-lg": ["boxShadow", "0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)"],
+    "shadow-xl": ["boxShadow", "0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)"],
+    "shadow-2xl": ["boxShadow", "0 25px 50px -12px rgb(0 0 0 / 0.25)"],
+    "shadow-inner": ["boxShadow", "inset 0 2px 4px 0 rgb(0 0 0 / 0.05)"],
     "font-display": ["fontFamily", "Fraunces, ui-serif, Georgia, serif"],
     "font-sans": ["fontFamily", "Outfit, ui-sans-serif, system-ui, sans-serif"],
     "font-serif": ["fontFamily", "ui-serif, Georgia, serif"],
@@ -274,6 +313,12 @@ function utilityStyle(utility) {
       ["animationDuration", "1s"],
       ["animationIterationCount", "infinite"],
     ],
+    // transform / transform-none / gpu|cpu: match Tailwind's utility names. Composition
+    // of translate/rotate/skew/scale still wins when those helpers are present.
+    transform: ["transform", "translateX(0) translateY(0) rotate(0) skewX(0) skewY(0) scaleX(1) scaleY(1)"],
+    "transform-none": ["transform", "none"],
+    "transform-gpu": ["transform", "translate3d(0,0,0)"],
+    "transform-cpu": ["transform", "translateX(0) translateY(0)"],
     "origin-center": ["transformOrigin", "50% 50%"], "origin-top": ["transformOrigin", "50% 0%"], "origin-top-right": ["transformOrigin", "100% 0%"],
     "origin-right": ["transformOrigin", "100% 50%"], "origin-bottom-right": ["transformOrigin", "100% 100%"], "origin-bottom": ["transformOrigin", "50% 100%"],
     "origin-bottom-left": ["transformOrigin", "0% 100%"], "origin-left": ["transformOrigin", "0% 50%"], "origin-top-left": ["transformOrigin", "0% 0%"],
@@ -304,7 +349,11 @@ function utilityStyle(utility) {
     "object-right": ["objectPosition", "100% 50%"], "object-left-top": ["objectPosition", "0% 0%"],
     "object-left-bottom": ["objectPosition", "0% 100%"], "object-right-top": ["objectPosition", "100% 0%"],
     "object-right-bottom": ["objectPosition", "100% 100%"],
-    transition: ["transition", "all 150ms ease"], "transition-none": ["transition", "none"],
+    // Tailwind's `transition` lists the cheap visual properties; layout properties
+    // such as height only transition when named (transition-all, transition-[height]).
+    transition: [["transitionProperty", "color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, backdrop-filter"],
+      ["__default:transitionDuration", "150ms"], ["__default:transitionTimingFunction", "cubic-bezier(0.4, 0, 0.2, 1)"]],
+    "transition-none": ["transitionProperty", "none"],
     "leading-none": ["lineHeight", "1"], "leading-tight": ["lineHeight", "1.25"], "leading-snug": ["lineHeight", "1.375"], "leading-normal": ["lineHeight", "normal"], "leading-relaxed": ["lineHeight", "1.625"], "leading-loose": ["lineHeight", "2"],
     // Radius shorthands expand to corner longhands for read-only CSSOM parity.
     "rounded": [["borderRadius", 4], ["borderTopLeftRadius", 4], ["borderTopRightRadius", 4], ["borderBottomRightRadius", 4], ["borderBottomLeftRadius", 4]],
@@ -667,14 +716,36 @@ function utilityStyle(utility) {
 
 // Interaction variants follow CSS :hover: `hover:` applies while the element or a
 // descendant is hovered, `group-hover:` while an ancestor marked `group` is.
-// `native:` is always active on Nasty (the host is native); Webfoundry gates the
-// same token with html[wf-native-preview] so the web ignores it unless previewing.
+// `native:` is always on in Nasty (desktop and Android). `desktop:` / `mobile:`
+// follow the host. Precedence for the same property: desktop|mobile > native > bare.
+// Webfoundry gates with html[wf-desktop-preview] / html[wf-mobile-preview] and
+// html:where([wf-native-preview]) so native beats bare but loses to desktop/mobile.
+let hostKind = typeof process !== "undefined" && process.platform === "android" ? "mobile" : "desktop";
+
+/** Test helper: force which platform variants are active (`desktop` | `mobile`). */
+export function setTailwindHostKind(kind) {
+  if (kind !== "desktop" && kind !== "mobile") {
+    throw new TypeError('host kind must be "desktop" or "mobile"');
+  }
+  hostKind = kind;
+  classCache.clear();
+  selectionCache.clear();
+}
+
+export function getTailwindHostKind() {
+  return hostKind;
+}
+
 function active(variants, width, interaction) {
   return variants.every(variant => {
     if (BREAKPOINTS[variant] !== undefined) return width >= BREAKPOINTS[variant];
     if (variant === "native") return true;
+    if (variant === "desktop") return hostKind === "desktop";
+    if (variant === "mobile") return hostKind === "mobile";
     if (variant === "hover") return !!interaction?.hover;
     if (variant === "group-hover") return !!interaction?.groupHover;
+    // :active while the pointer is pressed on the element or a descendant.
+    if (variant === "active") return !!interaction?.pressed;
     // Retargeting arbitrary variants are handled when resolving descendants.
     if (isRetargetingArbitraryVariant(variant)) return false;
     // Self arbitrary variants ([&:hover], [&.on], …) need the element; ignore here.
@@ -683,8 +754,15 @@ function active(variants, width, interaction) {
   });
 }
 
-function nativeRank(variants) {
-  return variants.includes("native") ? 1 : 0;
+/**
+ * Prefer host-specific utilities over shared native: over bare for the same property.
+ * Rank: desktop|mobile (active host) = 2, native = 1, else 0.
+ */
+function platformRank(variants) {
+  if (hostKind === "mobile" && variants.includes("mobile")) return 2;
+  if (hostKind === "desktop" && variants.includes("desktop")) return 2;
+  if (variants.includes("native")) return 1;
+  return 0;
 }
 
 function isArbitraryVariant(variant) {
@@ -717,7 +795,7 @@ export function classHasRetargetingArbitrary(className) {
 function sortUtilities(utilities) {
   utilities.sort((a, b) => Number(a.important) - Number(b.important)
     || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
-    || nativeRank(a.variants) - nativeRank(b.variants)
+    || platformRank(a.variants) - platformRank(b.variants)
     || a.variants.length - b.variants.length || a.index - b.index);
   return utilities;
 }
@@ -725,7 +803,7 @@ function sortUtilities(utilities) {
 function declarationsToValues(utilities) {
   const values = {};
   let translateX, translateY;
-  let rotation, scaleX, scaleY;
+  let rotation, skewX, skewY, scaleX, scaleY;
   const defaults = {};
   const overrides = {};
   let ringWidth, ringColor;
@@ -738,6 +816,8 @@ function declarationsToValues(utilities) {
       if (property === "__translateX") translateX = value;
       else if (property === "__translateY") translateY = value;
       else if (property === "__rotate") rotation = value;
+      else if (property === "__skewX") skewX = value;
+      else if (property === "__skewY") skewY = value;
       else if (property === "__scaleX") scaleX = value;
       else if (property === "__scaleY") scaleY = value;
       else if (property.startsWith("__default:")) defaults[property.slice(10)] = value;
@@ -748,16 +828,37 @@ function declarationsToValues(utilities) {
       else if (property === "__gradientFrom") gradientFrom = value;
       else if (property === "__gradientVia") gradientVia = value;
       else if (property === "__gradientTo") gradientTo = value;
-      else values[property] = value;
+      else {
+        values[property] = value;
+        // Explicit background-image (e.g. bg-none) wins over earlier gradient tokens.
+        if (property === "backgroundImage") {
+          gradientDirection = undefined;
+          gradientFrom = undefined;
+          gradientVia = undefined;
+          gradientTo = undefined;
+        }
+      }
     }
   }
+  // Tailwind transform composition order: translate → rotate → skew → scale.
   const translation = [
     translateX !== undefined && `translateX(${typeof translateX === "number" ? `${translateX}px` : translateX})`,
     translateY !== undefined && `translateY(${typeof translateY === "number" ? `${translateY}px` : translateY})`,
     rotation !== undefined && `rotate(${rotation})`,
+    skewX !== undefined && `skewX(${skewX})`,
+    skewY !== undefined && `skewY(${skewY})`,
     (scaleX !== undefined || scaleY !== undefined) && `scale(${scaleX ?? 1}, ${scaleY ?? 1})`,
   ].filter(Boolean).join(" ");
-  if (translation) values.transform = [translation, values.transform].filter(Boolean).join(" ");
+  if (translation) {
+    const existing = values.transform;
+    // Helper utilities replace transform-none / transform / transform-gpu|cpu placeholders.
+    if (!existing || existing === "none"
+      || existing.startsWith("translateX(0)") || existing.startsWith("translate3d(0")) {
+      values.transform = translation;
+    } else {
+      values.transform = `${translation} ${existing}`;
+    }
+  }
   for (const [property, value] of Object.entries(defaults)) if (values[property] === undefined) values[property] = value;
   Object.assign(values, overrides);
   if (ringWidth !== undefined || ringColor !== undefined) {
@@ -775,7 +876,7 @@ function declarationsToValues(utilities) {
 
 export function resolveTailwind(className, width = 0, interaction) {
   className = String(className);
-  const key = `${width}\0${interaction?.hover ? 1 : 0}${interaction?.groupHover ? 1 : 0}\0${className}`;
+  const key = `${hostKind}\0${width}\0${interaction?.hover ? 1 : 0}${interaction?.groupHover ? 1 : 0}${interaction?.pressed ? 1 : 0}\0${className}`;
   const cached = classCache.get(key);
   if (cached) {
     classCache.delete(key);
@@ -784,8 +885,8 @@ export function resolveTailwind(className, width = 0, interaction) {
   }
   const utilities = sortUtilities(className.split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index }))
     .filter(token => !token.variants.includes("selection") && active(token.variants, width, interaction)));
-  // native:* declarations win over the same property from a non-native utility,
-  // regardless of source order (still after !important and breakpoint rank).
+  // desktop|mobile > native > bare for the same property (see platformRank)
+  // when that platform is active (still after !important and breakpoint rank).
   const values = Object.freeze(declarationsToValues(utilities));
   classCache.set(key, values);
   if (classCache.size > 1024) classCache.delete(classCache.keys().next().value);
@@ -816,7 +917,7 @@ const selectionCache = new Map();
 // Element construction resolves selection styles for every class change; cache
 // like resolveTailwind (results are frozen).
 export function resolveTailwindSelection(className, width = 0) {
-  const key = `${width}\0${className}`;
+  const key = `${hostKind}\0${width}\0${className}`;
   const cached = selectionCache.get(key);
   if (cached) return cached;
   const values = resolveSelectionUncached(className, width);
@@ -830,7 +931,7 @@ function resolveSelectionUncached(className, width) {
       && active(token.variants.filter(variant => variant !== "selection"), width));
   utilities.sort((a, b) => Number(a.important) - Number(b.important)
     || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
-    || nativeRank(a.variants) - nativeRank(b.variants)
+    || platformRank(a.variants) - platformRank(b.variants)
     || a.variants.length - b.variants.length || a.index - b.index);
   const values = {};
   for (const { utility } of utilities) {

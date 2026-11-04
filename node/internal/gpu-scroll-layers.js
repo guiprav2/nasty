@@ -444,6 +444,8 @@ function allocateTiles(window, layer, hostBox, width, height, geometry, banded) 
     }
   }
   missing.sort((a, b) => Number(b.visible) - Number(a.visible) || a.distance - b.distance);
+  // Older android-arm64 addons predate createLayerTexture; leave tiles unallocated.
+  if (typeof window.createLayerTexture !== 'function') return fresh;
   for (const { key, wanted } of missing) {
     layer.tiles.set(key, { id: window.createLayerTexture(wanted.width, wanted.height), ...wanted });
     fresh.push(wanted);

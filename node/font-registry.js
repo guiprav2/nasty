@@ -22,17 +22,28 @@ export function fontFileStem(family) {
 export function fontFamilies(value) {
   return String(value || '').split(',').map(name => name.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
 }
+function listFontDir(path) {
+  try {
+    return readdirSync(path);
+  } catch (error) {
+    if (error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) return [];
+    throw error;
+  }
+}
 export function findFontFiles(family) {
   const stem = family === 'Symbols Nerd Font' ? 'nerd_symbols' : fontFileStem(family);
   if (!stem) return [];
   const directory = (() => {
-    const hasFamily = path => readdirSync(path).some(file => {
+    const hasFamily = path => listFontDir(path).some(file => {
       const lower = file.toLowerCase().replace(/\.[^.]+$/, '');
       return lower === stem || lower.startsWith(`${stem}_`) || lower.startsWith(`${stem}-`);
     });
-    return hasFamily(fontDirectory()) ? fontDirectory() : sharedFontDirectory;
+    const preferred = fontDirectory();
+    if (hasFamily(preferred)) return preferred;
+    if (preferred !== sharedFontDirectory && hasFamily(sharedFontDirectory)) return sharedFontDirectory;
+    return preferred;
   })();
-  return readdirSync(directory).filter(file => {
+  return listFontDir(directory).filter(file => {
     const lower = file.toLowerCase();
     return /\.(ttf|otf|woff2?)$/i.test(file)
       && (lower.replace(/\.[^.]+$/, '') === stem || lower.startsWith(`${stem}_`) || lower.startsWith(`${stem}-`));
@@ -43,7 +54,16 @@ const nativeFonts = new Map();
 // Color emoji fallback. The face is large, so it only travels with runs that contain
 // emoji; cosmic-text's fallback then finds it for codepoints the run's fonts lack.
 export const EMOJI_FAMILY = 'Noto Color Emoji';
-const EMOJI_PATTERN = /\p{Extended_Pictographic}/u;
+// Prefer Unicode property escapes; fall back when ICU props are missing (nodejs-mobile).
+const EMOJI_PATTERN = (() => {
+  try {
+    const re = new RegExp('\\p{Extended_Pictographic}', 'u');
+    if (re.test('\u{1F600}')) return re;
+  } catch {
+    // Incomplete ICU / older mobile Node builds reject \\p{…}.
+  }
+  return /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
+})();
 function nativeFontsFor(family) {
   if (!nativeFonts.has(family)) nativeFonts.set(family, findFontFiles(family).map(file => ({ family, data: readFileSync(file) })));
   return nativeFonts.get(family);
