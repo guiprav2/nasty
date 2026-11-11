@@ -6,6 +6,12 @@ edition.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# NastyOS-only shims (fullscreen-always window, optional input bridge).
+# Desktop Linux/Android/Windows builds leave this off so winit stays unchanged.
+nastyos = []
+
 [dependencies]
 napi = { version = "3", default-features = false, features = ["napi4"] }
 napi-derive = "3"

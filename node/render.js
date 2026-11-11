@@ -3,7 +3,7 @@ import { assembledMap, prepareScrollLayers, scrollLayerQuads } from "./internal/
 import { transformedTextTexture } from "./internal/transformed-text.js";
 import { clipTexturedPolygon, quadCommands, scrollHostId } from "./internal/scroll-quads.js";
 import { computedStyleValue, getStyleTransitionState, hasActiveStyleTransition, styleHasAnimations, styleMeshRevision } from "./internal/css-transitions.js";
-import { canvasCommands, canvasSurface, canvasTriangleBuffer, canvasVersion } from "./canvas-2d.js";
+import { canvasCommands, canvasImageLayers, canvasSurface, canvasTriangleBuffer, canvasVersion } from "./canvas-2d.js";
 import { objectFitLayout, objectPositionFractions } from "./internal/object-fit.js";
 import { renderedText } from "./internal/nerd-icon.js";
 import { transformMatrix as parseCssTransform } from "./internal/css-transform.js";
@@ -405,9 +405,9 @@ export function displayListTextLayers(list) {
 
 export function parseColor(value) {
   if (!value || value === "transparent") return null;
-  let match = /^#([\da-f]{3}|[\da-f]{6}|[\da-f]{8})$/i.exec(value);
+  let match = /^#([\da-f]{3,4}|[\da-f]{6}|[\da-f]{8})$/i.exec(value);
   if (match) {
-    const hex = match[1].length === 3 ? [...match[1]].map((digit) => digit + digit).join("") : match[1];
+    const hex = match[1].length <= 4 ? [...match[1]].map((digit) => digit + digit).join("") : match[1];
     const channels = [0, 2, 4].map((index) => Number.parseInt(hex.slice(index, index + 2), 16) / 255);
     return channels.concat(hex.length === 8 ? Number.parseInt(hex.slice(6, 8), 16) / 255 : 1);
   }
@@ -3023,6 +3023,27 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     const state = elementState(box.element);
     const image = canvasOnGpu ? null : state.image ?? state.video?.image;
     const content = box.contentBox;
+    // Projects layout-space textured corners, clips them like the element's
+    // content, and draws them as one textured GPU polygon.
+    const pushTexturedPolygon = (textureId, points) => {
+      const corners = points.map(({ x, y, u, v }) => {
+        const point = projectPoint(box, x, y);
+        return Number.isFinite(point.x) && Number.isFinite(point.y) ? { ...point, u, v } : null;
+      });
+      if (!corners.every(Boolean)) return;
+      let clipped = paintMode.capture ? corners : clipTexturedPolygon(corners, viewport);
+      for (const region of lazyClipRegions()) clipped = clipConvexPolygon(clipped, region);
+      if (!paintMode.capture) clipped = clipConvexPolygon(clipped, windowClip);
+      if (clipped.length < 3) return;
+      const triangles = [];
+      for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
+      const scissor = screenSpaceBounds(clipped, viewport);
+      if (scissor.width > 0 && scissor.height > 0) {
+        values.push(1, textureId, scissor.x, scissor.y, scissor.width, scissor.height, triangles.length);
+        for (const point of triangles) values.push(point.x, point.y, point.u, point.v, point.reciprocalW);
+        commandCount++;
+      }
+    };
     if (image && content.width > 0 && content.height > 0) {
       const fit = style.objectFit ?? "fill";
       const [positionX, positionY] = objectPositionFractions(computedStyleValue(style, "objectPosition"));
@@ -3034,30 +3055,22 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
         height: layout.height,
       };
       const { u0, v0, u1, v1 } = layout;
-      const corners = [
-        [imageRect.x, imageRect.y, u0, v0], [imageRect.x + imageRect.width, imageRect.y, u1, v0],
-        [imageRect.x + imageRect.width, imageRect.y + imageRect.height, u1, v1], [imageRect.x, imageRect.y + imageRect.height, u0, v1],
-      ].map(([x, y, u, v]) => {
-        const point = projectPoint(box, x, y);
-        return Number.isFinite(point.x) && Number.isFinite(point.y) ? { ...point, u, v } : null;
-      });
-      if (corners.every(Boolean)) {
-        // Corners are already in screen space (including CSS transforms). Clip in
-        // that same space: viewport first, then overflow/window regions. Using the
-        // untransformed content box here used to chop floating/spinning images.
-        let clipped = paintMode.capture ? corners : clipTexturedPolygon(corners, viewport);
-        for (const region of lazyClipRegions()) clipped = clipConvexPolygon(clipped, region);
-        if (!paintMode.capture) clipped = clipConvexPolygon(clipped, windowClip);
-        if (clipped.length >= 3) {
-          const triangles = [];
-          for (let i = 1; i < clipped.length - 1; i++) triangles.push(clipped[0], clipped[i], clipped[i + 1]);
-          const scissor = screenSpaceBounds(clipped, viewport);
-          if (scissor.width > 0 && scissor.height > 0) {
-            values.push(1, sampledTextureId(box.element, image.textureId), scissor.x, scissor.y, scissor.width, scissor.height, triangles.length);
-            for (const point of triangles) values.push(point.x, point.y, point.u, point.v, point.reciprocalW);
-            commandCount++;
-          }
-        }
+      // Corners are projected to screen space (including CSS transforms) and
+      // clipped there: viewport first, then overflow/window regions.
+      pushTexturedPolygon(sampledTextureId(box.element, image.textureId), [
+        { x: imageRect.x, y: imageRect.y, u: u0, v: v0 }, { x: imageRect.x + imageRect.width, y: imageRect.y, u: u1, v: v0 },
+        { x: imageRect.x + imageRect.width, y: imageRect.y + imageRect.height, u: u1, v: v1 }, { x: imageRect.x, y: imageRect.y + imageRect.height, u: u0, v: v1 },
+      ]);
+    }
+    // drawImage of GPU-only pictures: textured layers above the canvas raster,
+    // mapped from canvas pixels into the content box and clipped to it.
+    const imageLayers = box.element.localName === "canvas" && !canvasOnGpu && content.width > 0 && content.height > 0
+      ? canvasImageLayers(state.canvasContext) : null;
+    if (imageLayers?.length) {
+      const scaleX = content.width / Math.max(1, box.element.width), scaleY = content.height / Math.max(1, box.element.height);
+      for (const layer of imageLayers) {
+        const points = clipTexturedPolygon(layer.corners.map(({ x, y, u, v }) => ({ x: content.x + x * scaleX, y: content.y + y * scaleY, u, v })), content);
+        if (points.length >= 3) pushTexturedPolygon(sampledTextureId(box.element, layer.textureId), points);
       }
     }
     {

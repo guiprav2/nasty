@@ -5,6 +5,8 @@
  * RGBA and only texture handles cross into JS (never pixel buffers).
  * Sources: file://, filesystem paths, data: URIs, http(s):// and bare URLs.
  */
+import { open, readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { elementState } from "./internal/dom-state.js";
 
 const DEFAULT_MAX_EDGE = 8192;
@@ -82,7 +84,87 @@ export async function loadImage(path, window, maxEdge = DEFAULT_MAX_EDGE) {
   }
   ensureWindowHook(window);
   const edge = Math.min(DEFAULT_MAX_EDGE, Math.max(1, Math.floor(maxEdge || DEFAULT_MAX_EDGE)));
+  // The native decoder knows raster formats only; SVG is rasterized here first.
+  if (await isSvgSource(path)) {
+    const svg = await rasterizeSvg(String(path), window, edge).catch(error => {
+      console.warn(`Nasty: SVG rasterization failed for ${String(path).slice(0, 120)}:`, error?.message || error);
+      return null;
+    });
+    if (svg) {
+      const result = await submitDecode(svg.dataUrl, window, edge);
+      // Layout uses the SVG's own size, not the oversampled raster's.
+      return { ...result, naturalWidth: svg.width, naturalHeight: svg.height };
+    }
+  }
+  return submitDecode(path, window, edge);
+}
 
+// SVG by data: MIME type, by .svg URL, or — for local files, including the
+// extensionless hash names of Nasty's http image cache — by content: an <svg>
+// root after any XML declaration, comments or doctype. Raster formats begin with
+// binary magic bytes, so the sniff never mistakes them.
+async function isSvgSource(path) {
+  const source = String(path);
+  if (/^data:/i.test(source)) return /^data:image\/svg\+xml[;,]/i.test(source);
+  if (/\.svg(?:[?#].*)?$/is.test(source)) return true;
+  if (/^[a-z][\w+.-]*:/i.test(source) && !/^file:/i.test(source)) return false;
+  let handle;
+  try {
+    const file = /^file:/i.test(source) ? fileURLToPath(source.replace(/[?#].*$/s, "")) : source;
+    handle = await open(file, "r");
+    const { buffer, bytesRead } = await handle.read(Buffer.alloc(1024), 0, 1024, 0);
+    return looksLikeSvg(buffer.subarray(0, bytesRead));
+  } catch {
+    return false;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+function looksLikeSvg(bytes) {
+  let text = bytes.toString("utf8").replace(/^\uFEFF/, "");
+  // Skip prolog: whitespace, <?xml …?>, comments, <!DOCTYPE …>.
+  for (;;) {
+    const before = text;
+    text = text.replace(/^\s+/, "").replace(/^<\?[\s\S]*?\?>/, "").replace(/^<!--[\s\S]*?-->/, "").replace(/^<!DOCTYPE[^>]*>/i, "");
+    if (text === before) break;
+  }
+  return /^<svg[\s>:/]/i.test(text) || /^<[\w-]+:svg[\s>]/i.test(text);
+}
+
+async function svgBytes(source) {
+  if (/^data:/i.test(source)) {
+    const comma = source.indexOf(",");
+    const meta = source.slice(5, comma);
+    const body = source.slice(comma + 1);
+    return /;base64$/i.test(meta) ? Buffer.from(body, "base64") : Buffer.from(decodeURIComponent(body), "utf8");
+  }
+  if (/^https?:/i.test(source)) {
+    const response = await fetch(source);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return Buffer.from(await response.arrayBuffer());
+  }
+  const file = /^file:/i.test(source) ? fileURLToPath(source.replace(/[?#].*$/s, "")) : source.replace(/[?#].*$/s, "");
+  return readFile(file);
+}
+
+let resvgModule = null;
+// SVG → PNG data URL via resvg, oversampled for the display (at least 2x) and
+// capped by the texture edge. Resolves { dataUrl, width, height } (intrinsic CSS px).
+async function rasterizeSvg(source, window, edge) {
+  resvgModule ??= import("@resvg/resvg-js");
+  const { Resvg } = await resvgModule;
+  const bytes = await svgBytes(source);
+  const probe = new Resvg(bytes);
+  const width = probe.width, height = probe.height;
+  if (!(width > 0 && height > 0)) throw new Error("SVG has no intrinsic size");
+  const dpr = Number(window.devicePixelRatio?.() ?? 1) || 1;
+  const scale = Math.min(Math.max(2, dpr), edge / Math.max(width, height));
+  const png = new Resvg(bytes, { fitTo: { mode: "zoom", value: scale } }).render().asPng();
+  return { dataUrl: `data:image/png;base64,${Buffer.from(png).toString("base64")}`, width, height };
+}
+
+function submitDecode(path, window, edge) {
   // Register the waiter BEFORE submit so a synchronous drain/present cannot
   // deliver image-ready before the promise exists (lost completion → blank img).
   let resolveFn, rejectFn;

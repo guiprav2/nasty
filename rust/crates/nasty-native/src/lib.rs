@@ -5921,6 +5921,19 @@ impl ApplicationHandler for WindowApp {
         if self.window.is_some() || self.closed {
             return;
         }
+        // NastyOS builds: fullscreen, undecorated, non-resizable — do not change
+        // the desktop/Android attribute path when the feature is off.
+        #[cfg(feature = "nastyos")]
+        let attributes = OsWindow::default_attributes()
+            .with_title(self.title.clone())
+            .with_visible(self.visible)
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(false)
+            .with_maximized(true)
+            .with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)))
+            .with_inner_size(LogicalSize::new(self.width, self.height));
+        #[cfg(not(feature = "nastyos"))]
         let attributes = OsWindow::default_attributes()
             .with_title(self.title.clone())
             .with_visible(self.visible)
@@ -5935,6 +5948,7 @@ impl ApplicationHandler for WindowApp {
                 match Renderer::new(window.clone(), self.borderless || self.body_transparent, self.vsync) {
                     Ok(renderer) => {
                         self.text_editor = Some(TextEditor::new(window.as_ref()));
+                        #[cfg(not(feature = "nastyos"))]
                         self.apply_resizable(&window);
                         self.window = Some(window);
                         self.renderer = Some(renderer);
@@ -6567,6 +6581,12 @@ impl Window {
                 "orientation must be auto, portrait, or landscape",
             ));
         }
+        #[cfg(feature = "nastyos")]
+        let resizable = String::from("none");
+        #[cfg(feature = "nastyos")]
+        let borderless = true;
+        #[cfg(not(feature = "nastyos"))]
+        let borderless = options.borderless.unwrap_or(false);
         let app = WindowApp {
             title: options.title.unwrap_or_else(|| "Nasty".into()),
             width: options.width.unwrap_or(960.0),
@@ -6574,7 +6594,7 @@ impl Window {
             visible: options.visible.unwrap_or(true),
             resizable,
             orientation,
-            borderless: options.borderless.unwrap_or(false),
+            borderless,
             drag_anywhere: match options.drag_anywhere {
                 None | Some(Either::A(false)) => None,
                 Some(Either::A(true)) => Some("*".into()),

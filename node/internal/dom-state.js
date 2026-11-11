@@ -46,6 +46,8 @@ export function documentBoxes(document, timings) {
 /** Boxes for painting: scroll-layer content keeps its layer-space geometry
  *  across scrolls, so this never re-derives screen positions. */
 export function documentPaintBoxes(document, timings) {
+  const state = documentData.get(document);
+  if (state?.paintBoxesOverride) return state.paintBoxesOverride;
   const internals = documents.get(document);
   if (!internals) throw new TypeError("document is not managed by Nasty");
   return internals.paintBoxes(timings);

@@ -76,3 +76,19 @@ test('children is elements-only; childNodes keeps comments; :first-child ignores
   assert.equal(root.matches('div:first-child'), true);
   assert.equal(root.style.flexGrow, 1);
 });
+
+test('retargeted utilities apply to a subtree assembled while detached', () => {
+  const doc = new Document();
+  const parent = doc.createElement('div');
+  parent.className = '[&>div]:opacity-40';
+  const child = doc.createElement('div');
+  parent.appendChild(child);
+  doc.body.appendChild(parent);
+  assert.equal(child.style.opacity, 0.4);
+});
+
+test('[line-height:100px] stays a length, not a 100× multiplier', async () => {
+  const { resolveTailwind } = await import('../tailwind.js');
+  assert.equal(resolveTailwind('[line-height:100px]').lineHeight, '100px');
+  assert.equal(resolveTailwind('[line-height:1.5]').lineHeight, '1.5');
+});

@@ -1,6 +1,18 @@
 // Small JavaScript Tailwind utility resolver. Utilities become the existing
 // element style values directly; no stylesheet or CSS parser is involved.
 import { tailwindPalette } from "./tailwind-palette.js";
+import { adwaitaClasses } from "./adwaita.generated.js";
+import { materialClasses } from "./material.generated.js";
+import { fluentClasses } from "./fluent.generated.js";
+import { defaultHostKind, defaultOsKind } from "./internal/platform.js";
+
+// Generated theme class tables: adw-* (adwaita-web), and-* (Material / Beer CSS),
+// win-* (Fluent 2 / Kendo Fluent theme).
+const THEME_TABLES = { adw: adwaitaClasses, and: materialClasses, win: fluentClasses };
+const themeClassEntries = utility => {
+  const table = THEME_TABLES[utility.slice(0, utility.indexOf("-"))];
+  return table && Object.hasOwn(table, utility) ? table[utility] : null;
+};
 const tokenCache = new Map();
 const classCache = new Map();
 const LENGTHS = new Set([
@@ -59,6 +71,63 @@ function parseToken(token) {
   return parsed;
 }
 
+// Adwaita (adw-*) classes are generated tables of arbitrary-property tokens with
+// their own variants (hover:, [&.adw-flat]:, [&_.adw-icon]:, dark:, max-md:).
+// A class token expands into one parsed token per entry; variants written in
+// front of the class (md:adw-button, lin:adw-card) prefix every entry.
+const expandCache = new Map();
+function expandToken(token) {
+  let expanded = expandCache.get(token);
+  if (expanded) return expanded;
+  const parsed = parseToken(token);
+  const entries = !parsed.declarations ? themeClassEntries(parsed.utility) : null;
+  expanded = entries
+    ? entries.map(([variants, important, tokens, spec]) => ({
+      utility: parsed.utility,
+      variants: [...parsed.variants, ...variants],
+      important: parsed.important || important,
+      // Upstream CSS specificity (and-*: Beer's `*` < `button` < `.chip`), plus the
+      // variants written in front of the class, as for plain tokens (specOf).
+      ...(spec === undefined ? {} : { spec: spec + parsed.variants.length * 1000 }),
+      declarations: tokens.flatMap(utility => {
+        const pairs = utilityStyle(utility);
+        return !pairs ? [] : Array.isArray(pairs[0]) ? pairs : [pairs];
+      }),
+    })).filter(entry => entry.declarations.length)
+    : [parsed];
+  expandCache.set(token, expanded);
+  if (expandCache.size > 4096) expandCache.delete(expandCache.keys().next().value);
+  return expanded;
+}
+
+function tokensOf(className) {
+  return String(className).split(/\s+/).filter(Boolean)
+    .flatMap((token, index) => expandToken(token).map((parsed, sub) => ({ ...parsed, index: index + sub / 10000 })));
+}
+
+/**
+ * Which variant kinds a class list uses once adw-* classes are expanded, so
+ * callers know when hover/press/viewport/self-selector changes need a re-resolve.
+ */
+export function classUtilityFlags(className) {
+  const flags = { responsive: false, hover: false, groupHover: false, active: false, retargeting: false, self: false, context: false };
+  for (const { variants } of tokensOf(className)) {
+    for (const variant of variants) {
+      if (BREAKPOINTS[variant] !== undefined || /^(max|min)-/.test(variant)) flags.responsive = true;
+      else if (variant === "hover") flags.hover = true;
+      else if (variant === "group-hover") flags.groupHover = true;
+      else if (variant === "active") flags.active = true;
+      else if (isRetargetingArbitraryVariant(variant)) flags.retargeting = true;
+      else if (isArbitraryVariant(variant)) {
+        flags.self = true;
+        // [:has(>main)>&] / [.x_&]: depends on the tree around the element.
+        if (!decodeArbitraryVariantInner(variant).startsWith("&") || /:has\(/.test(variant)) flags.context = true;
+      }
+    }
+  }
+  return flags;
+}
+
 function parseLength(value) {
   const arbitrary = value.startsWith("[") && value.endsWith("]");
   if (arbitrary) value = value.slice(1, -1);
@@ -87,10 +156,15 @@ function arbitraryValue(raw) {
   const property = kebabToCamel(body.slice(0, colon));
   let value = body.slice(colon + 1).replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_").trim();
   if (!CSS_PROPERTIES.has(property) || !value) return null;
+  // [color:inherit]: no own value, so the element inherits (generated theme tables
+  // emit it only for inherited properties). declarationsToValues clears the property.
+  if (value === "inherit") return [property, "inherit"];
   if (property === "direction" && value !== "ltr" && value !== "rtl") return null;
   if (LENGTHS.has(property) && property !== "lineHeight" && /^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) return null;
   if (UNITLESS.has(property) && /^-?(?:\d+\.?\d*|\.\d+)$/.test(value)) value = Number(value);
-  else if (LENGTHS.has(property) && /^-?(?:\d+\.?\d*|\.\d+)px$/.test(value)) value = Number.parseFloat(value);
+  // line-height keeps its unit: a bare number means a multiplier ([line-height:100px]
+  // must not become line-height: 100 → 100× the font size).
+  else if (LENGTHS.has(property) && property !== "lineHeight" && /^-?(?:\d+\.?\d*|\.\d+)px$/.test(value)) value = Number.parseFloat(value);
   return [property, value];
 }
 
@@ -159,6 +233,12 @@ function utilityStyle(utility) {
   if (dropShadowArbitrary) {
     const args = dropShadowArbitrary[1].replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_");
     return ["filter", `drop-shadow(${args})`];
+  }
+  // Webfoundry Google Fonts: gfont-[Playfair_Display] → font-family: "Playfair Display"
+  const gfont = /^gfont-\[(.+)\]$/.exec(utility);
+  if (gfont) {
+    const family = gfont[1].replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_").trim();
+    return family ? ["fontFamily", family] : null;
   }
   const gradient = /^bg-gradient-to-(t|tr|r|br|b|bl|l|tl)$/.exec(utility);
   if (gradient) return ["__gradientDirection", ({ t: "to top", tr: "to top right", r: "to right", br: "to bottom right", b: "to bottom", bl: "to bottom left", l: "to left", tl: "to top left" })[gradient[1]]];
@@ -716,11 +796,13 @@ function utilityStyle(utility) {
 
 // Interaction variants follow CSS :hover: `hover:` applies while the element or a
 // descendant is hovered, `group-hover:` while an ancestor marked `group` is.
-// `native:` is always on in Nasty (desktop and Android). `desktop:` / `mobile:`
-// follow the host. Precedence for the same property: desktop|mobile > native > bare.
+// `native:` is always on in Nasty (desktop, Android, NastyOS). `desktop:` /
+// `mobile:` follow the host. Precedence for the same property:
+// desktop|mobile > native > bare.
 // Webfoundry gates with html[wf-desktop-preview] / html[wf-mobile-preview] and
 // html:where([wf-native-preview]) so native beats bare but loses to desktop/mobile.
-let hostKind = typeof process !== "undefined" && process.platform === "android" ? "mobile" : "desktop";
+// NastyOS and Android use mobile hostKind (fullscreen single viewport).
+let hostKind = defaultHostKind();
 
 /** Test helper: force which platform variants are active (`desktop` | `mobile`). */
 export function setTailwindHostKind(kind) {
@@ -736,12 +818,54 @@ export function getTailwindHostKind() {
   return hostKind;
 }
 
+// `win:` / `lin:` / `mac:` / `android:` / `nastyos:` follow the OS, independently
+// of the desktop:/mobile: host kind. Android is android:, never lin:. NastyOS
+// is nastyos:, never lin:.
+const OS_KIND_VALUES = new Set(["win", "lin", "mac", "android", "nastyos"]);
+let osKind = defaultOsKind();
+
+/** Test helper: force which OS variant is active (`win` | `lin` | `mac` | `android` | `nastyos` | null). */
+export function setTailwindOsKind(kind) {
+  if (kind !== null && !OS_KIND_VALUES.has(kind)) {
+    throw new TypeError('os kind must be "win", "lin", "mac", "android", "nastyos", or null');
+  }
+  osKind = kind;
+  classCache.clear();
+  selectionCache.clear();
+}
+
+export function getTailwindOsKind() {
+  return osKind;
+}
+
+// `dark:` (Adwaita dark theme entries and user dark: utilities). Light by default.
+let colorScheme = "light";
+
+export function setTailwindColorScheme(scheme) {
+  if (scheme !== "light" && scheme !== "dark") throw new TypeError('color scheme must be "light" or "dark"');
+  colorScheme = scheme;
+  classCache.clear();
+  selectionCache.clear();
+}
+
+export function getTailwindColorScheme() {
+  return colorScheme;
+}
+
 function active(variants, width, interaction) {
   return variants.every(variant => {
     if (BREAKPOINTS[variant] !== undefined) return width >= BREAKPOINTS[variant];
+    if (variant.startsWith("max-") && BREAKPOINTS[variant.slice(4)] !== undefined) return width < BREAKPOINTS[variant.slice(4)];
+    // Arbitrary breakpoints: min-[601px]: (width >= 601), max-[601px]: (width < 601).
+    const arbitraryWidth = /^(min|max)-\[(\d+(?:\.\d+)?)px\]$/.exec(variant);
+    if (arbitraryWidth) return arbitraryWidth[1] === "min" ? width >= Number(arbitraryWidth[2]) : width < Number(arbitraryWidth[2]);
     if (variant === "native") return true;
     if (variant === "desktop") return hostKind === "desktop";
     if (variant === "mobile") return hostKind === "mobile";
+    if (variant === "win" || variant === "lin" || variant === "mac" || variant === "android" || variant === "nastyos") {
+      return osKind === variant;
+    }
+    if (variant === "dark") return colorScheme === "dark";
     if (variant === "hover") return !!interaction?.hover;
     if (variant === "group-hover") return !!interaction?.groupHover;
     // :active while the pointer is pressed on the element or a descendant.
@@ -759,6 +883,7 @@ function active(variants, width, interaction) {
  * Rank: desktop|mobile (active host) = 2, native = 1, else 0.
  */
 function platformRank(variants) {
+  if (osKind && variants.includes(osKind)) return 3;
   if (hostKind === "mobile" && variants.includes("mobile")) return 2;
   if (hostKind === "desktop" && variants.includes("desktop")) return 2;
   if (variants.includes("native")) return 1;
@@ -769,11 +894,25 @@ function isArbitraryVariant(variant) {
   return variant.startsWith("[") && variant.endsWith("]");
 }
 
+// Variant strings repeat across every element and every re-resolve (theme tables
+// hold a few thousand distinct ones); classify each once.
+const variantInfoCache = new Map();
+function variantInfo(variant) {
+  let info = variantInfoCache.get(variant);
+  if (info) return info;
+  const inner = isArbitraryVariant(variant)
+    ? variant.slice(1, -1).trim().replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_")
+    : "";
+  const retargeting = computeRetargeting(inner);
+  info = { inner, retargeting, self: isArbitraryVariant(variant) && (inner.startsWith("&") ? !retargeting : computeContext(inner)) };
+  variantInfoCache.set(variant, info);
+  if (variantInfoCache.size > 16384) variantInfoCache.delete(variantInfoCache.keys().next().value);
+  return info;
+}
+
 /** Decode Tailwind arbitrary-variant underscores (space) / `\_` (literal _). */
 export function decodeArbitraryVariantInner(variant) {
-  if (!isArbitraryVariant(variant)) return "";
-  return variant.slice(1, -1).trim()
-    .replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_");
+  return variantInfo(variant).inner;
 }
 
 /**
@@ -781,23 +920,127 @@ export function decodeArbitraryVariantInner(variant) {
  * `[&:hover]:…` / `[&.on]:…` stay on the element that owns the class.
  */
 export function isRetargetingArbitraryVariant(variant) {
-  const inner = decodeArbitraryVariantInner(variant);
+  return variantInfo(variant).retargeting;
+}
+
+function computeRetargeting(inner) {
   if (!inner.startsWith("&")) return false;
-  const rest = inner.slice(1);
-  return /^\s*[>+~\s]/.test(rest);
+  // Any top-level combinator, also after an owner compound: [&.adw-flat_.adw-icon].
+  let depth = 0;
+  for (const c of inner.slice(1)) {
+    if (c === "[" || c === "(") depth++;
+    else if (c === "]" || c === ")") depth--;
+    else if (depth === 0 && (c === ">" || c === "+" || c === "~" || /\s/.test(c))) return true;
+  }
+  return false;
+}
+
+/**
+ * `[&.on]:…` / `[&[disabled]]:…` / `[&:first-child]:…`: conditions on the owner itself.
+ * Context variants (`[:has(>main)>&.fixed]`) also condition the owner: `&` ends the
+ * selector, which is matched against the owner together with its ancestors.
+ */
+export function isSelfArbitraryVariant(variant) {
+  return variantInfo(variant).self;
+}
+
+/** `[<ancestors> > &<conditions>]`: the owner in an ancestor context (nothing after &'s compound). */
+export function isContextArbitraryVariant(variant) {
+  return isArbitraryVariant(variant) && computeContext(decodeArbitraryVariantInner(variant));
+}
+
+function computeContext(inner) {
+  const amp = inner.indexOf("&");
+  if (amp <= 0 || inner.indexOf("&", amp + 1) !== -1) return false;
+  let depth = 0;
+  for (const c of inner.slice(amp + 1)) {
+    if (c === "[" || c === "(") depth++;
+    else if (c === "]" || c === ")") depth--;
+    else if (depth === 0 && (c === ">" || c === "+" || c === "~" || /\s/.test(c))) return false;
+  }
+  return true;
 }
 
 export function classHasRetargetingArbitrary(className) {
-  return String(className).split(/\s+/).filter(Boolean)
-    .some(token => parseToken(token).variants.some(isRetargetingArbitraryVariant));
+  return tokensOf(className).some(token => token.variants.some(isRetargetingArbitraryVariant));
 }
+
+/**
+ * Whether `className` holds the marker class `name`, either bare or behind
+ * variants that are active now (android:and-border on Android). Lets compound
+ * rules such as [&.and-border]: see platform-scoped markers.
+ */
+export function classTokenActive(className, name, width = 0) {
+  for (const token of String(className).split(/\s+/)) {
+    if (!token) continue;
+    if (token === name) return true;
+    if (!token.endsWith(`:${name}`)) continue;
+    const { utility, variants, important } = parseToken(token);
+    if (utility === name && !important && active(variants, width)) return true;
+  }
+  return false;
+}
+
+export function classHasSelfArbitrary(className) {
+  return tokensOf(className).some(token => token.variants.some(isSelfArbitraryVariant));
+}
+
+/**
+ * Resolve utilities whose self arbitrary variants ([&.adw-flat]:…) all match the
+ * owner element. `variantMatches(variant)` tests one variant against it.
+ */
+export function resolveSelfArbitraryTailwind(className, width, interaction, variantMatches) {
+  const utilities = sortUtilities(tokensOf(className).filter(token => {
+    if (token.variants.includes("selection")) return false;
+    if (token.variants.some(isRetargetingArbitraryVariant)) return false;
+    const self = token.variants.filter(isSelfArbitraryVariant);
+    if (!self.length || !self.every(variantMatches)) return false;
+    return active(token.variants.filter(v => !isSelfArbitraryVariant(v)), width, interaction);
+  }));
+  return Object.freeze(declarationsToValues(utilities));
+}
+
+// Specificity as a*1e6 + b*1e3 + c. Generated theme entries carry upstream's
+// (gen.mjs); a plain utility weighs one class plus one per variant, which orders
+// plain tokens exactly as the variant count did.
+const specOf = utility => utility.spec ?? 1000 * (1 + utility.variants.length);
 
 function sortUtilities(utilities) {
   utilities.sort((a, b) => Number(a.important) - Number(b.important)
     || Math.max(0, ...a.variants.map(v => BREAKPOINTS[v] ?? 0)) - Math.max(0, ...b.variants.map(v => BREAKPOINTS[v] ?? 0))
     || platformRank(a.variants) - platformRank(b.variants)
-    || a.variants.length - b.variants.length || a.index - b.index);
+    || specOf(a) - specOf(b) || (a.layer ?? 0) - (b.layer ?? 0) || a.index - b.index);
   return utilities;
+}
+
+/** Whether any utility in `className` carries upstream specificity (and-* tables). */
+export function classHasSpecificity(className) {
+  return tokensOf(className).some(token => token.spec !== undefined);
+}
+
+/**
+ * One cascade over an element's own utilities, its self arbitrary variants and
+ * ancestors' retargeting variants, ordered like CSS: !important, breakpoint,
+ * platform, specificity, then layer (own < self < farther < nearer ancestor) and
+ * class order. `sources` = [{ className, kind: "own" | "self" | "retarget",
+ * variantMatches?, layer }].
+ */
+export function resolveCascadedTailwind(sources, width, interaction) {
+  const utilities = [];
+  for (const { className, kind, variantMatches, layer } of sources) {
+    for (const token of tokensOf(className)) {
+      if (token.variants.includes("selection")) continue;
+      const retarget = token.variants.filter(isRetargetingArbitraryVariant);
+      const self = token.variants.filter(isSelfArbitraryVariant);
+      const rest = token.variants.filter(v => !isRetargetingArbitraryVariant(v) && !isSelfArbitraryVariant(v));
+      if (kind === "own" && (retarget.length || self.length)) continue;
+      if (kind === "self" && (retarget.length || !self.length || !self.every(variantMatches))) continue;
+      if (kind === "retarget" && (!retarget.length || self.length || !retarget.every(variantMatches))) continue;
+      if (kind === "self" ? !active(rest, width, interaction) : !active(kind === "retarget" ? rest : token.variants, width, interaction)) continue;
+      utilities.push({ ...token, layer });
+    }
+  }
+  return Object.freeze(declarationsToValues(sortUtilities(utilities)));
 }
 
 function declarationsToValues(utilities) {
@@ -829,7 +1072,8 @@ function declarationsToValues(utilities) {
       else if (property === "__gradientVia") gradientVia = value;
       else if (property === "__gradientTo") gradientTo = value;
       else {
-        values[property] = value;
+        if (value === "inherit") delete values[property];
+        else values[property] = value;
         // Explicit background-image (e.g. bg-none) wins over earlier gradient tokens.
         if (property === "backgroundImage") {
           gradientDirection = undefined;
@@ -876,14 +1120,14 @@ function declarationsToValues(utilities) {
 
 export function resolveTailwind(className, width = 0, interaction) {
   className = String(className);
-  const key = `${hostKind}\0${width}\0${interaction?.hover ? 1 : 0}${interaction?.groupHover ? 1 : 0}${interaction?.pressed ? 1 : 0}\0${className}`;
+  const key = `${hostKind}${osKind}${colorScheme}\0${width}\0${interaction?.hover ? 1 : 0}${interaction?.groupHover ? 1 : 0}${interaction?.pressed ? 1 : 0}\0${className}`;
   const cached = classCache.get(key);
   if (cached) {
     classCache.delete(key);
     classCache.set(key, cached);
     return cached;
   }
-  const utilities = sortUtilities(className.split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index }))
+  const utilities = sortUtilities(tokensOf(className)
     .filter(token => !token.variants.includes("selection") && active(token.variants, width, interaction)));
   // desktop|mobile > native > bare for the same property (see platformRank)
   // when that platform is active (still after !important and breakpoint rank).
@@ -899,8 +1143,7 @@ export function resolveTailwind(className, width = 0, interaction) {
  * target matches that variant relative to the owner.
  */
 export function resolveRetargetedTailwind(ownerClassName, width, interaction, variantMatches) {
-  const utilities = sortUtilities(String(ownerClassName).split(/\s+/).filter(Boolean)
-    .map((token, index) => ({ ...parseToken(token), index }))
+  const utilities = sortUtilities(tokensOf(ownerClassName)
     .filter(token => {
       if (token.variants.includes("selection")) return false;
       const retarget = token.variants.filter(isRetargetingArbitraryVariant);
@@ -917,7 +1160,7 @@ const selectionCache = new Map();
 // Element construction resolves selection styles for every class change; cache
 // like resolveTailwind (results are frozen).
 export function resolveTailwindSelection(className, width = 0) {
-  const key = `${hostKind}\0${width}\0${className}`;
+  const key = `${hostKind}${osKind}${colorScheme}\0${width}\0${className}`;
   const cached = selectionCache.get(key);
   if (cached) return cached;
   const values = resolveSelectionUncached(className, width);
@@ -926,7 +1169,7 @@ export function resolveTailwindSelection(className, width = 0) {
   return values;
 }
 function resolveSelectionUncached(className, width) {
-  const utilities = String(className).split(/\s+/).filter(Boolean).map((token, index) => ({ ...parseToken(token), index }))
+  const utilities = tokensOf(className)
     .filter(token => token.variants.includes("selection")
       && active(token.variants.filter(variant => variant !== "selection"), width));
   utilities.sort((a, b) => Number(a.important) - Number(b.important)

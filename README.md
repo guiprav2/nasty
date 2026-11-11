@@ -1,8 +1,8 @@
 # Nasty
 
-Nasty is a staged Node.js rebuild of Sweet. JavaScript owns the document and frame orchestration; Rust exposes focused native services. PHP and QuickJS are outside the current work. The roadmap and measured results are in [plan.md](plan.md).
+Nasty is a staged Node.js rebuild of Sweet. JavaScript owns the document and frame orchestration; Rust exposes focused native services. The roadmap and measured results are in [plan.md](plan.md).
 
-Node.js code and examples live in `node/`; the native workspace lives in `rust/`.
+Node.js code and examples live in `node/`; the native workspace lives in `rust/`. **NastyOS** (QuickJS + Linux-derived drivers, preview under `os/`) is scaffolded separately; desktop/Android builds stay on Node and leave the `nastyos` native feature off.
 
 ## Android arm64 build
 

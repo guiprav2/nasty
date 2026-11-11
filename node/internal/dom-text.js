@@ -62,9 +62,21 @@ function inherited(element, property, fallback) {
   }
   return fallback;
 }
+function paintDeviceScaleFor(element) {
+  try {
+    const scale = Number(documentState(element.document)?.paintDeviceScale);
+    return Number.isFinite(scale) && scale > 0 ? scale : 1;
+  } catch {
+    return 1;
+  }
+}
 function fontMetrics(element) {
   const parsedFontSize = Number.parseFloat(inherited(element, 'fontSize', 16));
-  const fontSize = Number.isFinite(parsedFontSize) && parsedFontSize > 0 ? parsedFontSize : 16;
+  const cssFontSize = Number.isFinite(parsedFontSize) && parsedFontSize > 0 ? parsedFontSize : 16;
+  // During present, paintDeviceScale (DPR) sizes glyphs for the device surface.
+  // Layout measure keeps CSS px (scale 1).
+  const scale = paintDeviceScaleFor(element);
+  const fontSize = cssFontSize * scale;
   const rawLineHeight = inherited(element, 'lineHeight', 'normal');
   let lineHeight;
   if (rawLineHeight === 'normal' || rawLineHeight === undefined || rawLineHeight === null) {
@@ -74,12 +86,12 @@ function fontMetrics(element) {
     // are authored as strings like "24px" or via Tailwind leading-[24px] → 24
     // only when the value is clearly a pixel length (>= fontSize, or from px).
     // Treat small numbers as multipliers so UA `lineHeight: 1` cannot become 1px.
-    lineHeight = rawLineHeight > 0 && rawLineHeight <= 4 ? rawLineHeight * fontSize : rawLineHeight;
+    lineHeight = rawLineHeight > 0 && rawLineHeight <= 4 ? rawLineHeight * fontSize : rawLineHeight * scale;
   } else {
     const value = String(rawLineHeight).trim();
     const parsed = Number.parseFloat(value);
     if (/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(value)) lineHeight = parsed * fontSize;
-    else lineHeight = parsed;
+    else lineHeight = parsed * scale;
   }
   if (!Number.isFinite(lineHeight) || lineHeight <= 0) lineHeight = fontSize * 1.2;
   return { fontSize, lineHeight };
@@ -451,6 +463,12 @@ function textEntriesFor(entries, boxes, target, textLayers, styleFrame, hiddenMe
     if (![textOrigin.x, textOrigin.y, transformedWidth, fontSize, lineHeight].every(Number.isFinite)
         || transformedWidth < 0 || fontSize <= 0 || lineHeight <= 0) continue;
     const whiteSpace = resolvedStyle.whiteSpace;
+    // Unwrapped runs (nowrap) get no layout lines, so collapse whitespace here like
+    // layout's measure did; otherwise template indentation ("\n    −\n  ") draws the
+    // glyph lines below its laid-out box.
+    if (!textState && element.localName !== 'textarea' && !['pre', 'pre-wrap', 'pre-line'].includes(whiteSpace)) {
+      text = text.replace(/\s+/g, ' ').trim();
+    }
     if (whiteSpace === 'nowrap' && (resolvedStyle.textOverflow === 'ellipsis'
         || (placeholder && resolvedStyle.textOverflow === undefined))) {
       text = ellipsizeText(element, text, bounds.width);

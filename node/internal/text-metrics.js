@@ -1,8 +1,17 @@
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { EMOJI_FAMILY, findFontFiles, fontFamilies, systemFontFamily } from '../font-registry.js';
-import { elementState } from './dom-state.js';
+import { documentState, elementState } from './dom-state.js';
 import { nerdIcon, renderedText } from './nerd-icon.js';
 import { isInlineRoot } from './inline-text.js';
+
+function paintDeviceScaleFor(element) {
+  try {
+    const scale = Number(documentState(element.document)?.paintDeviceScale);
+    return Number.isFinite(scale) && scale > 0 ? scale : 1;
+  } catch {
+    return 1;
+  }
+}
 const loaded = new Set();
 function loadFamilies(stack) {
   for (const family of fontFamilies(stack)) {
@@ -15,6 +24,13 @@ const context = createCanvas(1, 1).getContext('2d');
 const fontBounds = new Map();
 // GlobalFonts.has is a slow native lookup; families only change by registration.
 const resolvedFamilies = new Map();
+/** Call after a Google Font lands on disk so measure/paint pick up the new face. */
+export function clearTextFontCaches(family) {
+  if (family) loaded.delete(family);
+  else loaded.clear();
+  resolvedFamilies.clear();
+  fontBounds.clear();
+}
 export function inherited(element, name, fallback) {
   for (let current = element; current; current = current.parent) {
     const value = current.style[name];
@@ -23,7 +39,8 @@ export function inherited(element, name, fallback) {
   return fallback;
 }
 export function textStyle(element) {
-  const size = parseFloat(inherited(element, 'fontSize', 16)) || 16;
+  const scale = paintDeviceScaleFor(element);
+  const size = (parseFloat(inherited(element, 'fontSize', 16)) || 16) * scale;
   const weight = inherited(element, 'fontWeight', 400);
   const requestedFamilies = fontFamilies(inherited(element, 'fontFamily', 'sans-serif'))
     .map(name => ['sans-serif', 'ui-sans-serif', 'system-ui'].includes(name) ? systemFontFamily
@@ -49,7 +66,8 @@ export function textStyle(element) {
     resolvedFamilies.set(stackKey, resolvedFamily);
   }
   const rawSpacing = inherited(element, 'letterSpacing', 0);
-  const spacing = parseFloat(rawSpacing) * (String(rawSpacing).endsWith('em') ? size : 1) || 0;
+  const spacingAmount = parseFloat(rawSpacing) || 0;
+  const spacing = String(rawSpacing).endsWith('em') ? spacingAmount * size : spacingAmount * scale;
   const rawLine = inherited(element, 'lineHeight', 'normal');
   const font = `${weight} ${size}px ${family}`;
   let bounds = fontBounds.get(font);
@@ -58,8 +76,8 @@ export function textStyle(element) {
   const line = lineValue === 'normal' ? bounds.fontBoundingBoxAscent + bounds.fontBoundingBoxDescent
     : /^-?(?:\d+\.?\d*|\.\d+)$/.test(lineValue) ? parseFloat(lineValue) * size
       : lineValue.endsWith('em') ? parseFloat(lineValue) * size
-        : lineValue.endsWith('rem') ? parseFloat(lineValue) * 16
-          : lineValue.endsWith('%') ? parseFloat(lineValue) * size / 100 : parseFloat(lineValue);
+        : lineValue.endsWith('rem') ? parseFloat(lineValue) * 16 * scale
+          : lineValue.endsWith('%') ? parseFloat(lineValue) * size / 100 : parseFloat(lineValue) * scale;
   const overflowWrap = inherited(element, 'overflowWrap', 'normal');
   return { size, spacing, line, font, family: resolvedFamily, color: inherited(element, 'color', '#000'),
     wrap: element.localName !== 'input' && !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')),

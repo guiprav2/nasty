@@ -5,7 +5,12 @@ export function registerMutationDocument(document) {
   documents.set(document, { observers: new Set(), records: [], scheduled: false });
 }
 
+// Internal listeners for every DOM mutation (e.g. re-matching :has()/ancestor-context
+// styles after the tree changes), called before observer bookkeeping.
+export const mutationHooks = new Set();
+
 export function recordMutation(record) {
+  for (const hook of mutationHooks) hook(record);
   const document = record.target?.nodeType === 9 ? record.target : record.target?.ownerDocument;
   const state = documents.get(document);
   if (!state) return;

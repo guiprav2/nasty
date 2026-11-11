@@ -109,7 +109,7 @@ let cachedWindows = [], latestProcesses = [], latestProcessSnapshot = null, wind
 const directStreams = new Set();
 const windowCaptures = new Map();
 let requestedWindowIds = new Set();
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const procEventHelper = path.join(repoRoot, 'rust', 'target', 'debug', 'nasty-proc-events');
 
 function startProcConnector() {

@@ -154,9 +154,9 @@ function color(value) {
   const cached = parsedColors.get(value);
   if (cached) return cached;
   const remember = result => { if (parsedColors.size > 4096) parsedColors.clear(); parsedColors.set(value, result); return result; };
-  let m = /^#([\da-f]{3}|[\da-f]{6}|[\da-f]{8})$/i.exec(value);
+  let m = /^#([\da-f]{3,4}|[\da-f]{6}|[\da-f]{8})$/i.exec(value);
   if (m) {
-    const hex = m[1].length === 3 ? [...m[1]].map(c => c + c).join('') : m[1];
+    const hex = m[1].length <= 4 ? [...m[1]].map(c => c + c).join('') : m[1];
     return remember([0, 2, 4].map(i => parseInt(hex.slice(i, i + 2), 16) / 255).concat(hex.length === 8 ? parseInt(hex.slice(6), 16) / 255 : 1));
   }
   m = /^rgba?\(\s*([\d.]+)[, ]+([\d.]+)[, ]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/i.exec(value);
@@ -415,7 +415,42 @@ export function resetCanvasContext(context) {
   state.path.length = 0; state.circle = null; state.gpu.path = state.path;
   state.deferred = false; state.operations = []; state.operationCursor = 0;
   state.gpu = createCanvasGpu();
+  state.imageLayers = null;
   touched(state);
+}
+// Decoded <img> and <video> pictures live only in GPU textures, so Skia cannot
+// read them. drawImage of one records a textured layer that the renderer draws
+// over the canvas's raster content inside the canvas box.
+function gpuImageTexture(source) {
+  const name = source?.localName;
+  if (name !== 'img' && name !== 'video') return null;
+  const sourceState = elementState(source);
+  const image = name === 'video' ? sourceState.video?.image : sourceState.image;
+  return image?.textureId && !image.pixels ? image : null;
+}
+function recordImageLayer(state, source, image, args) {
+  const naturalWidth = source.localName === 'video' ? (source.videoWidth || image.width) : (image.naturalWidth ?? image.width);
+  const naturalHeight = source.localName === 'video' ? (source.videoHeight || image.height) : (image.naturalHeight ?? image.height);
+  let sx = 0, sy = 0, sw = naturalWidth, sh = naturalHeight, dx, dy, dw, dh;
+  if (args.length >= 8) [sx, sy, sw, sh, dx, dy, dw, dh] = args.map(Number);
+  else if (args.length >= 4) [dx, dy, dw, dh] = args.map(Number);
+  else { [dx, dy] = args.map(Number); dw = naturalWidth; dh = naturalHeight; }
+  if (![sx, sy, sw, sh, dx, dy, dw, dh].every(Number.isFinite) || !sw || !sh || !dw || !dh || !naturalWidth || !naturalHeight) return;
+  const u0 = sx / naturalWidth, v0 = sy / naturalHeight, u1 = (sx + sw) / naturalWidth, v1 = (sy + sh) / naturalHeight;
+  const corners = [[dx, dy, u0, v0], [dx + dw, dy, u1, v0], [dx + dw, dy + dh, u1, v1], [dx, dy + dh, u0, v1]]
+    .map(([x, y, u, v]) => { const [px, py] = transformed(state, x, y); return { x: px, y: py, u, v }; });
+  (state.imageLayers ??= []).push({ source, corners });
+}
+/** Textured GPU layers recorded by drawImage of GPU-only images, in canvas pixels. */
+export function canvasImageLayers(context) {
+  const layers = contexts.get(context)?.imageLayers;
+  if (!layers?.length) return null;
+  const live = [];
+  for (const layer of layers) {
+    const image = gpuImageTexture(layer.source);
+    if (image) live.push({ source: layer.source, textureId: image.textureId, corners: layer.corners });
+  }
+  return live;
 }
 export function imageSurface(element) {
   const state = elementState(element);
@@ -441,7 +476,11 @@ export class CanvasRenderingContext2D {
       get(target, key) {
         if (key === 'canvas') return canvas;
         if (['fillStyle', 'strokeStyle', 'lineWidth'].includes(key)) return state[key];
-        if (key === 'drawImage') return (source, ...args) => { materialize(state); state.gpu.valid = false; touched(state); return state.ctx.drawImage(source?.localName ? imageSurface(source) : source, ...args); };
+        if (key === 'drawImage') return (source, ...args) => {
+          const texture = gpuImageTexture(source);
+          if (texture) { materialize(state); state.gpu.valid = false; recordImageLayer(state, source, texture, args); touched(state); return undefined; }
+          materialize(state); state.gpu.valid = false; touched(state); return state.ctx.drawImage(source?.localName ? imageSurface(source) : source, ...args);
+        };
         if (key === 'createRadialGradient') return (...args) => {
           const gradient = { native: null, args, x0: args[0], y0: args[1], r0: args[2], x1: args[3], y1: args[4], r1: args[5], stops: [], addColorStop(offset, value) {
             offset = Number(offset); value = String(value);
@@ -455,6 +494,7 @@ export class CanvasRenderingContext2D {
         if (key === 'createLinearGradient' || key === 'createPattern') return (...args) => state.ctx[key](...args);
         if (key === 'clearRect') return (x, y, w, h) => {
           if (x === 0 && y === 0 && w >= canvas.width && h >= canvas.height) {
+            state.imageLayers = null;
             state.gpu.vertices.length = 0; state.gpu.valid = state.gpu.canMirror; state.gpu.path.length = 0;
             state.gpu.circles.cursor = 0; state.gpu.operations.length = 0; state.gpu.triangleStart = 0;
             state.gpu.beziers.cursor = 0;

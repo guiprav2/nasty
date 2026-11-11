@@ -148,13 +148,20 @@ function stageNodeModules(srcModules, destModules, target) {
   mkdirSync(destModules, { recursive: true });
   for (const entry of readdirSync(srcModules)) {
     if (entry.startsWith('.')) continue;
-    if (entry === '@napi-rs') {
-      mkdirSync(join(destModules, '@napi-rs'), { recursive: true });
-      for (const pkg of readdirSync(join(srcModules, '@napi-rs'))) {
-        const keepLinux = target === 'linux-x64' && (pkg === 'canvas' || pkg === 'canvas-linux-x64-gnu');
-        const keepAndroid = target === 'android-arm64' && (pkg === 'canvas' || pkg === 'canvas-android-arm64');
+    // Native packages: the JS loader plus only the target's prebuilt binary
+    // (@napi-rs/canvas; @resvg/resvg-js rasterizes SVG images).
+    const nativeScopes = {
+      '@napi-rs': { base: 'canvas', linux: 'canvas-linux-x64-gnu', android: 'canvas-android-arm64' },
+      '@resvg': { base: 'resvg-js', linux: 'resvg-js-linux-x64-gnu', android: 'resvg-js-android-arm64' },
+    };
+    if (nativeScopes[entry]) {
+      const scope = nativeScopes[entry];
+      mkdirSync(join(destModules, entry), { recursive: true });
+      for (const pkg of readdirSync(join(srcModules, entry))) {
+        const keepLinux = target === 'linux-x64' && (pkg === scope.base || pkg === scope.linux);
+        const keepAndroid = target === 'android-arm64' && (pkg === scope.base || pkg === scope.android);
         if (!keepLinux && !keepAndroid) continue;
-        cpSync(join(srcModules, '@napi-rs', pkg), join(destModules, '@napi-rs', pkg), {
+        cpSync(join(srcModules, entry, pkg), join(destModules, entry, pkg), {
           recursive: true,
           dereference: true,
           filter: pruneNodeModulesFilter,

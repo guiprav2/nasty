@@ -9,6 +9,7 @@ import { RemoteWindow, renderWorkerEnabled } from "./internal/remote-window.js";
 import { availableParallelism, cpus, homedir } from "node:os";
 import { MediaStream, mediaDevices, readVideoTrackFrame } from "./webrtc.js";
 import { loadImage, unloadImage } from "./image-decoder.js";
+import { hostPlatform, isFullscreenHost, isNastyOS } from "./internal/platform.js";
 
 // Image decode completions are applied off the hot path: worker results only
 // enqueue here, and GPU upload + DOM load events drain with a per-turn budget
@@ -57,18 +58,36 @@ import { AnimationEvent, isAnimationControlProperty, registerKeyframes, syncCssA
 import { buildTransformedDisplayList, clearPaintSegments, displayListCanvas, displayListScrollScene, displayListTextLayers, parseColor } from "./render.js";
 import { scrollHostElement } from "./internal/scroll-quads.js";
 import { CanvasRenderingContext2D, resetCanvasContext } from "./canvas-2d.js";
-import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics } from "./internal/text-metrics.js";
+import { inherited as inheritedStyle, measureText, measureTextBoundaries, textMetrics, clearTextFontCaches } from "./internal/text-metrics.js";
+import {
+  setFontCacheDirectory,
+  requestGoogleFontsForStack,
+  onGoogleFontReady,
+  fontFamilies as splitFontFamilies,
+} from "./font-registry.js";
 import { blocksWindowDrag, elementsFromPoint as hitTestElementsFromPoint, trackClickListener } from "./internal/dom-hit-testing.js";
 import {
   classHasRetargetingArbitrary,
+  classHasSelfArbitrary,
+  classHasSpecificity,
+  classTokenActive,
+  classUtilityFlags,
   decodeArbitraryVariantInner,
+  getTailwindColorScheme,
+  resolveCascadedTailwind,
   resolveRetargetedTailwind,
+  resolveSelfArbitraryTailwind,
   resolveTailwind,
   resolveTailwindSelection,
+  setTailwindColorScheme,
 } from "./tailwind.js";
+import { adwaitaKeyframes } from "./adwaita.generated.js";
+import { materialKeyframes } from "./material.generated.js";
+import { fluentKeyframes } from "./fluent.generated.js";
+import { isRetargetingArbitraryVariant } from "./tailwind.js";
 import { decodeVideoFrame, getVideoAudioClock, hasVideoAudio, pauseVideoAudio, setVideoAudioVolume, startVideoAudio, stopVideoAudio, stopVideoStream, waitForVideoAudioReady } from "./video-decoder.js";
 import { resolveWindowDimension, validateWindowDimension } from "./internal/window-dimensions.js";
-import { MutationObserver, registerMutationDocument, recordMutation } from "./internal/mutation-observer.js";
+import { MutationObserver, registerMutationDocument, recordMutation, mutationHooks } from "./internal/mutation-observer.js";
 import { ResizeObserver, notifyResizeObservers } from "./internal/resize-observer.js";
 
 // Resize observations are broadcast in the rendering step that follows a reflow
@@ -157,6 +176,9 @@ export { TransitionEvent };
 export { AnimationEvent };
 export { MutationObserver };
 export { ResizeObserver };
+// Host-level platform theming (not DOM API): which OS variant (win:/lin:/mac:/android:)
+// applies. Auto-detected from the platform; hosts pass null to keep apps OS-neutral.
+export { getTailwindOsKind, setTailwindOsKind } from "./tailwind.js";
 export {
   MediaDeviceInfo, MediaDevices, MediaStream, MediaStreamTrack, MediaStreamTrackEvent,
   RTCDataChannel, RTCDataChannelEvent, RTCError, RTCErrorEvent, RTCIceCandidate, RTCPeerConnection,
@@ -174,6 +196,30 @@ function clipboardWindow() {
   return window;
 }
 
+// After a Google Font download lands in cachePath/fonts, restyle text that asked for it.
+onGoogleFontReady((family) => {
+  clearTextFontCaches(family);
+  for (const window of openWindows) {
+    const doc = window.document;
+    if (!doc) continue;
+    try {
+      const state = documentState(doc);
+      state.dirty = true;
+      state.textMetricsDirty = true;
+      for (const element of state.elements ?? []) {
+        const stack = element.style?.fontFamily;
+        if (!stack) continue;
+        if (!splitFontFamilies(stack).some(name => name === family)) continue;
+        element._styleChanged("fontFamily", true);
+      }
+      // Automatic presentation is already paced while a document is attached;
+      // dirty flags above are enough for the next frame to reshape text.
+    } catch (error) {
+      console.error("Nasty Google Font restyle failed:", error);
+    }
+  }
+});
+
 /** Async Clipboard API, text only. */
 export class Clipboard extends EventTarget {
   async writeText(text) { clipboardWindow().setClipboardText(String(text)); }
@@ -184,8 +230,8 @@ const sharedClipboard = new Clipboard();
 export class Navigator {
   get clipboard() { return sharedClipboard; }
   get mediaDevices() { return mediaDevices; }
-  get userAgent() { return `Mozilla/5.0 (${process.platform}) Nasty/0.1`; }
-  get platform() { return process.platform; }
+  get userAgent() { return `Mozilla/5.0 (${hostPlatform()}) Nasty/0.1`; }
+  get platform() { return hostPlatform(); }
   get language() { return this.languages[0]; }
   get languages() { return Object.freeze([Intl.DateTimeFormat().resolvedOptions().locale || "en-US"]); }
   get hardwareConcurrency() { return availableParallelism?.() ?? cpus().length; }
@@ -361,11 +407,14 @@ export class Window extends NativeWindow {
     if (!RESIZABLE_MODES.has(initialResizable)) {
       throw new TypeError('resizable must be "horizontal", "vertical", "both", or "none"');
     }
+    // NastyOS / Android: fullscreen viewport; orientation defaults to auto.
     const initialOrientation = options.orientation ?? "auto";
     if (!ORIENTATION_MODES.has(initialOrientation)) {
       throw new TypeError('orientation must be "auto", "portrait", or "landscape"');
     }
-    const initialBorderless = options.borderless ?? false;
+    const fullscreenHost = isFullscreenHost();
+    const initialBorderless = options.borderless ?? fullscreenHost;
+    const nativeResizable = fullscreenHost ? "none" : initialResizable;
     const initialDragAnywhere = options.dragAnywhere ?? false;
     const initialMaximizable = options.maximizable ?? false;
     const initialVsync = options.vsync ?? true;
@@ -399,17 +448,23 @@ export class Window extends NativeWindow {
       width: typeof initialWidth === "number" ? Math.max(1, initialWidth) : 960,
       height: typeof initialHeight === "number" ? Math.max(1, initialHeight) : 600,
       visible: false,
-      resizable: initialResizable, orientation: initialOrientation, borderless: initialBorderless,
+      resizable: nativeResizable, orientation: initialOrientation, borderless: initialBorderless,
       dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized, vsync: initialVsync });
     openWindows.add(this);
     this.#appId = appId;
     this.#userDataPath = userDataPath;
     this.#cachePath = cachePath;
+    // Google Font downloads persist under <cachePath>/fonts across restarts.
+    if (cachePath) setFontCacheDirectory(join(cachePath, 'fonts'));
     this.#width = initialWidth;
     this.#height = initialHeight;
-    this.#resizable = initialResizable;
+    this.#resizable = nativeResizable;
     this.#orientation = initialOrientation;
     this.#borderless = initialBorderless;
+    // NastyOS: always cover the viewport. Android NativeActivity already does.
+    if (isNastyOS() && typeof this.setFullscreen === "function") {
+      try { this.setFullscreen(true); } catch { /* stub may no-op */ }
+    }
     this.#dragAnywhere = initialDragAnywhere;
     this.#maximizable = initialMaximizable;
     this.#vsync = initialVsync;
@@ -732,8 +787,14 @@ export class Window extends NativeWindow {
    */
   captureFrame(path = null, { element = null, rect = null } = {}) {
     const box = rect ?? element?.getBoundingClientRect() ?? null;
-    // Layout runs in the window's physical pixels, so client coordinates are surface pixels.
-    const region = box ? { x: box.x ?? box.left, y: box.y ?? box.top, width: box.width, height: box.height } : null;
+    // Layout/DOM rects are CSS px; the GPU surface is physical. Scale the crop to device px.
+    const dpr = this.devicePixelRatio() || 1;
+    const region = box ? {
+      x: (box.x ?? box.left) * dpr,
+      y: (box.y ?? box.top) * dpr,
+      width: box.width * dpr,
+      height: box.height * dpr,
+    } : null;
     let id;
     try {
       id = super.captureFrame(path == null ? null : String(path), region);
@@ -854,12 +915,20 @@ export class Window extends NativeWindow {
       this.#dispatchWindowEvent(makeHostEvent(eventType, fields));
       return;
     }
-    const cursor = Number.isFinite(nativeEvent.x) && Number.isFinite(nativeEvent.y)
+    const cursorPhysical = Number.isFinite(nativeEvent.x) && Number.isFinite(nativeEvent.y)
       ? { x: nativeEvent.x, y: nativeEvent.y }
       : super.cursorPosition();
+    // Pointers arrive in physical px; DOM hit-testing uses CSS px (physical ÷ DPR).
+    const pointerDpr = this.devicePixelRatio() || 1;
+    const cursor = {
+      x: cursorPhysical.x / pointerDpr,
+      y: cursorPhysical.y / pointerDpr,
+    };
     const fields = {
       x: cursor.x, y: cursor.y, clientX: cursor.x, clientY: cursor.y,
-      button: nativeEvent.button ?? 0, deltaX: nativeEvent.deltaX ?? 0, deltaY: nativeEvent.deltaY ?? 0,
+      button: nativeEvent.button ?? 0,
+      deltaX: (nativeEvent.deltaX ?? 0) / pointerDpr,
+      deltaY: (nativeEvent.deltaY ?? 0) / pointerDpr,
     };
     const key = normalizeWindowKey(nativeEvent.key, nativeEvent.text);
     const modifiers = String(nativeEvent.modifiers || "");
@@ -1418,23 +1487,30 @@ export class Window extends NativeWindow {
         reconcileContentVisibility(this.#document, markGeometryDirty);
       }
       const size = this.size();
-      const boxes = documentPaintBoxes(this.#document);
-      benchmarkMark("documentBoxes");
-      const overlays = inputDecorationOverlays(this.#document);
-      benchmarkMark("overlays");
-      const list = buildTransformedDisplayList(boxes, size.width, size.height, overlays);
-      benchmarkMark("displayList");
-      syncDocumentTextForPresent(this, this.#document, displayListTextLayers(list));
-      // Rotated/scaled text is drawn upright into its own textures; one that just
-      // became drawable is repainted so the next frame maps it into place.
-      for (const element of paintTransformedText(this)) element._styleChanged("class");
-      benchmarkMark("text");
-      // Scroll-layer content is drawn into its textures only where it changed;
-      // its text was just placed in layer space above.
-      paintScrollLayers(this, this.#document);
-      documentState(this.#document).paintDirtyElements?.clear();
-      benchmarkMark("scrollLayers");
+      const dpr = this.devicePixelRatio();
+      const cssBoxes = documentPaintBoxes(this.#document);
+      // Layout is CSS px; GPU surface is physical. Scale geometry for paint/text.
+      const docState = documentState(this.#document);
+      docState.paintDeviceScale = dpr;
+      const boxes = dpr === 1 ? cssBoxes : scaleBoxesToDevice(cssBoxes, dpr);
+      docState.paintBoxesOverride = boxes;
+      let list;
       try {
+        benchmarkMark("documentBoxes");
+        const overlays = inputDecorationOverlays(this.#document);
+        benchmarkMark("overlays");
+        list = buildTransformedDisplayList(boxes, size.width, size.height, overlays);
+        benchmarkMark("displayList");
+        syncDocumentTextForPresent(this, this.#document, displayListTextLayers(list));
+        // Rotated/scaled text is drawn upright into its own textures; one that just
+        // became drawable is repainted so the next frame maps it into place.
+        for (const element of paintTransformedText(this)) element._styleChanged("class");
+        benchmarkMark("text");
+        // Scroll-layer content is drawn into its textures only where it changed;
+        // its text was just placed in layer space above.
+        paintScrollLayers(this, this.#document);
+        documentState(this.#document).paintDirtyElements?.clear();
+        benchmarkMark("scrollLayers");
         const canvas = displayListCanvas(list);
         // A window thread can scroll the layers in this list by itself (see workers/scroll-compositor.js).
         const scrollScene = displayListScrollScene(list);
@@ -1443,6 +1519,9 @@ export class Window extends NativeWindow {
       } catch (error) {
         if (super.closed) this.#stopMedia();
         throw error;
+      } finally {
+        docState.paintDeviceScale = 1;
+        docState.paintBoxesOverride = null;
       }
       benchmarkMark("nativePresent");
     }
@@ -1697,12 +1776,53 @@ function appendOrderedQuads(list, quads) {
   return Buffer.from(result.buffer);
 }
 
-export { FontRegistry } from "./font-registry.js";
+export {
+  FontRegistry,
+  ensureGoogleFont,
+  scanGfontNames,
+  downloadGoogleFonts,
+  setFontCacheDirectory,
+  fontCacheDirectory,
+  onGoogleFontReady,
+} from "./font-registry.js";
 export { buildBoxDisplayList } from "./render.js";
 export { buildImageDraws } from "./render.js";
 export { buildOrderedDisplayList } from "./render.js";
 export { buildTransformedDisplayList } from "./render.js";
 export { closeImageDecoder } from "./image-decoder.js";
+
+/** Scale layout (CSS px) boxes to device pixels for GPU paint. */
+function scaleBoxesToDevice(boxes, dpr) {
+  if (!(dpr > 0) || Math.abs(dpr - 1) < 1e-9) return boxes;
+  const scaleRect = (rect) => rect ? {
+    x: rect.x * dpr, y: rect.y * dpr, width: rect.width * dpr, height: rect.height * dpr,
+  } : null;
+  const scaleEdges = (edges) => edges ? {
+    top: edges.top * dpr, right: edges.right * dpr, bottom: edges.bottom * dpr, left: edges.left * dpr,
+  } : edges;
+  const scaled = boxes.map((box) => ({
+    ...box,
+    x: box.x * dpr,
+    y: box.y * dpr,
+    width: box.width * dpr,
+    height: box.height * dpr,
+    margin: scaleEdges(box.margin),
+    border: scaleEdges(box.border),
+    padding: scaleEdges(box.padding),
+    marginBox: scaleRect(box.marginBox),
+    borderBox: scaleRect(box.borderBox),
+    paddingBox: scaleRect(box.paddingBox),
+    contentBox: scaleRect(box.contentBox),
+    clip: scaleRect(box.clip),
+    innerClip: scaleRect(box.innerClip),
+    scrollWidth: (box.scrollWidth ?? 0) * dpr,
+    scrollHeight: (box.scrollHeight ?? 0) * dpr,
+    layerOriginX: box.layerOriginX != null ? box.layerOriginX * dpr : box.layerOriginX,
+    layerOriginY: box.layerOriginY != null ? box.layerOriginY * dpr : box.layerOriginY,
+  }));
+  if (boxes.assembled) scaled.assembled = scaleBoxesToDevice(boxes.assembled, dpr);
+  return scaled;
+}
 
 /** Surface scale factor when recorded on the viewport (for touch slop, etc.). */
 function viewportDevicePixelRatio(viewport) {
@@ -1710,11 +1830,12 @@ function viewportDevicePixelRatio(viewport) {
   return Number.isFinite(ratio) && ratio > 0 ? ratio : 1;
 }
 
-/** Width passed to resolveTailwind for breakpoints. Layout is 1 CSS px = 1 surface px. */
+/** Breakpoint width in CSS px (viewport is already CSS-sized under HiDPI). */
 function tailwindViewportWidth(viewport) {
   return viewport?.width || 0;
 }
 
+/** Resolve CSS lengths in CSS px (layout space). Paint scales CSS → device separately. */
 function resolveCssLength(value, fontSize, viewport) {
   if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
   if (typeof value !== "string") return undefined;
@@ -1848,6 +1969,10 @@ function styleForTaffy(style, fontSize = 16, viewport = { width: 0, height: 0 })
   for (const [property, value] of Object.entries(result)) {
     if (typeof value === "number" && !Number.isFinite(value)) delete result[property];
   }
+  // The native struct's `direction` is the flex direction. CSS `direction`
+  // (ltr/rtl text direction, e.g. Beer's icons and sliders) isn't a layout input
+  // there and must not leak into it ("unknown flex direction: ltr").
+  delete result.direction;
   if (result.flexDirection !== undefined) {
     result.direction = result.flexDirection;
     delete result.flexDirection;
@@ -2251,7 +2376,134 @@ function syncWindowTitleFromTitleElement(element) {
   view.title = element.textContent ?? "";
 }
 
-const SIMPLE_SELECTOR = /^(?:[a-z][\w-]*|\*)?(?:[.#][\w-]+|\[[\w-]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\]\s]+))?\]|:(?:first-child|last-child|only-child|first-of-type|last-of-type|only-of-type))*$/i;
+const STRUCTURAL_PSEUDOS = new Set(["first-child", "last-child", "only-child", "first-of-type", "last-of-type", "only-of-type"]);
+
+/** Split on `sep` outside (), [] and quotes. */
+function splitSelectorTopLevel(text, sep) {
+  const parts = [];
+  let depth = 0, quote = null, start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "(" || ch === "[") depth++;
+    else if (ch === ")" || ch === "]") depth--;
+    else if (ch === sep && depth === 0) { parts.push(text.slice(start, i)); start = i + 1; }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+// While Tailwind arbitrary variants ([&.on]:, [&_.x]:) are matched, a marker class
+// also counts as present through an active variant token (android:and-border).
+let classTokenMatcher = null;
+function withClassTokenMatcher(matcher, fn) {
+  const previous = classTokenMatcher;
+  classTokenMatcher = matcher;
+  try { return fn(); } finally { classTokenMatcher = previous; }
+}
+
+/** Parse a compound selector into its simple selectors; throws on anything unsupported. */
+const compoundCache = new Map();
+function parseCompound(pattern) {
+  let parsed = compoundCache.get(pattern);
+  if (parsed) return parsed;
+  const fail = () => { throw new DOMException(`Unsupported selector: ${pattern}`, "SyntaxError"); };
+  parsed = { tag: null, classes: [], ids: [], attrs: [], pseudos: [], nots: [] };
+  let i = 0;
+  const ident = () => {
+    const m = /^-?[A-Za-z_\u00a0-\uffff][\w\u00a0-\uffff-]*/.exec(pattern.slice(i));
+    if (!m) fail();
+    i += m[0].length;
+    return m[0];
+  };
+  const tagMatch = /^(?:[a-z][\w-]*|\*)/i.exec(pattern);
+  if (tagMatch) { parsed.tag = tagMatch[0].toLowerCase(); i = tagMatch[0].length; }
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === ".") { i++; parsed.classes.push(ident()); }
+    else if (ch === "#") { i++; parsed.ids.push(ident()); }
+    else if (ch === "[") {
+      const close = pattern.indexOf("]", i);
+      if (close < 0) fail();
+      const m = /^\[\s*([\w-]+)\s*(?:([~|^$*]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+))\s*(i)?)?\s*\]$/.exec(pattern.slice(i, close + 1));
+      if (!m) fail();
+      parsed.attrs.push({ name: m[1].toLowerCase(), op: m[2] ?? null, value: m[3] ?? m[4] ?? m[5], insensitive: !!m[6] });
+      i = close + 1;
+    } else if (ch === ":") {
+      i++;
+      const name = ident().toLowerCase();
+      if (STRUCTURAL_PSEUDOS.has(name)) { parsed.pseudos.push(name); continue; }
+      if (name === "not" && pattern[i] === "(") {
+        let depth = 0, j = i;
+        for (; j < pattern.length; j++) {
+          if (pattern[j] === "(") depth++;
+          else if (pattern[j] === ")" && --depth === 0) break;
+        }
+        if (depth !== 0) fail();
+        const inner = pattern.slice(i + 1, j);
+        // :not() takes compound selectors (a selector list); validate each eagerly.
+        const list = splitSelectorTopLevel(inner, ",").map(part => part.trim());
+        if (!list.every(Boolean) || list.some(part => /[\s>+~]/.test(part.replace(/\([^)]*\)|\[[^\]]*\]/g, "")))) fail();
+        list.forEach(parseCompound);
+        parsed.nots.push(list);
+        i = j + 1;
+        continue;
+      }
+      // :is() / :where() over compound selectors, and :has() over relative
+      // selectors that are one compound (`> x` = child, `x` = descendant).
+      // Generated theme tables (Beer CSS) use them, e.g. :has(> main) > header.fixed.
+      if ((name === "is" || name === "where" || name === "has") && pattern[i] === "(") {
+        let depth = 0, j = i;
+        for (; j < pattern.length; j++) {
+          if (pattern[j] === "(") depth++;
+          else if (pattern[j] === ")" && --depth === 0) break;
+        }
+        if (depth !== 0) fail();
+        const list = splitSelectorTopLevel(pattern.slice(i + 1, j), ",").map(part => part.trim());
+        if (!list.every(Boolean)) fail();
+        const flat = part => part.replace(/\([^)]*\)|\[[^\]]*\]/g, "");
+        if (name === "has") {
+          const rel = list.map(part => {
+            const child = part.startsWith(">");
+            const compound = child ? part.slice(1).trim() : part;
+            if (!compound || /[\s>+~]/.test(flat(compound))) fail();
+            parseCompound(compound);
+            return { child, compound };
+          });
+          (parsed.has ??= []).push(rel);
+        } else {
+          if (list.some(part => /[\s>+~]/.test(flat(part)))) fail();
+          list.forEach(parseCompound);
+          (parsed.ises ??= []).push(list);
+        }
+        i = j + 1;
+        continue;
+      }
+      fail();
+    } else fail();
+  }
+  compoundCache.set(pattern, parsed);
+  if (compoundCache.size > 32768) compoundCache.delete(compoundCache.keys().next().value);
+  return parsed;
+}
+
+function matchesAttribute(element, { name, op, value, insensitive }) {
+  if (!element.hasAttribute(name)) return false;
+  if (op === null) return true;
+  let actual = String(element.getAttribute(name) ?? "");
+  let expected = String(value);
+  if (insensitive) { actual = actual.toLowerCase(); expected = expected.toLowerCase(); }
+  switch (op) {
+    case "=": return actual === expected;
+    case "~=": return !!expected && actual.split(/\s+/).includes(expected);
+    case "|=": return actual === expected || actual.startsWith(`${expected}-`);
+    case "^=": return !!expected && actual.startsWith(expected);
+    case "$=": return !!expected && actual.endsWith(expected);
+    case "*=": return !!expected && actual.includes(expected);
+    default: return false;
+  }
+}
 
 function elementChildren(parent) {
   return [...(parent?.children ?? [])];
@@ -2278,27 +2530,30 @@ function matchesPseudoClass(element, pseudo) {
 
 function matchesSimpleSelector(element, pattern) {
   if (!pattern) return false;
-  if (!SIMPLE_SELECTOR.test(pattern)) {
-    throw new DOMException(`Unsupported selector: ${pattern}`, "SyntaxError");
+  const { tag, classes, ids, attrs, pseudos, nots, ises, has } = parseCompound(pattern);
+  if (tag && tag !== "*" && tag !== element.localName) return false;
+  for (const id of ids) if (element.id !== id) return false;
+  for (const name of classes) {
+    if (!(classTokenMatcher ? classTokenMatcher(element, name) : element.classList.contains(name))) return false;
   }
-  const tag = pattern.match(/^[a-z][\w-]*/i)?.[0];
-  if (tag && tag !== "*" && tag.toLowerCase() !== element.localName) return false;
-  for (const [, type, name] of pattern.matchAll(/([.#])([\w-]+)/g)) {
-    if (type === "#" ? element.id !== name : !element.classList.contains(name)) return false;
-  }
-  for (const match of pattern.matchAll(/\[([\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+)))?\]/g)) {
-    const attr = match[1];
-    const expected = match[2] ?? match[3] ?? match[4];
-    if (expected === undefined) {
-      if (!element.hasAttribute(attr)) return false;
-    } else if (String(element.getAttribute(attr) ?? "") !== expected) {
-      return false;
-    }
-  }
-  for (const [, pseudo] of pattern.matchAll(/:(first-child|last-child|only-child|first-of-type|last-of-type|only-of-type)/g)) {
-    if (!matchesPseudoClass(element, pseudo)) return false;
-  }
+  for (const attr of attrs) if (!matchesAttribute(element, attr)) return false;
+  for (const pseudo of pseudos) if (!matchesPseudoClass(element, pseudo)) return false;
+  for (const list of nots) if (list.some(part => matchesSimpleSelector(element, part))) return false;
+  if (ises) for (const list of ises) if (!list.some(part => matchesSimpleSelector(element, part))) return false;
+  if (has) for (const list of has) if (!list.some(rel => hasRelative(element, rel))) return false;
   return true;
+}
+
+// :has(> x) — a matching child; :has(x) — a matching descendant.
+function hasRelative(element, { child, compound }) {
+  const visit = node => {
+    for (const kid of elementChildren(node)) {
+      if (matchesSimpleSelector(kid, compound)) return true;
+      if (!child && visit(kid)) return true;
+    }
+    return false;
+  };
+  return visit(element);
 }
 
 /** Tokenize a compound selector into { compound } / { c: '>'|' ' } parts. */
@@ -2323,7 +2578,17 @@ function tokenizeCompoundSelector(selector) {
       throw new DOMException(`Unsupported selector: ${selector}`, "SyntaxError");
     }
     const start = i;
-    while (i < s.length && !/\s/.test(s[i]) && s[i] !== ">" && s[i] !== "+" && s[i] !== "~") i += 1;
+    // Spaces, '>' and quotes inside :not(…) / […] belong to the compound.
+    let depth = 0, quote = null;
+    while (i < s.length) {
+      const ch = s[i];
+      if (quote) { if (ch === quote) quote = null; i += 1; continue; }
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (ch === "(" || ch === "[") depth++;
+      else if (ch === ")" || ch === "]") depth--;
+      else if (depth === 0 && (/\s/.test(ch) || ch === ">" || ch === "+" || ch === "~")) break;
+      i += 1;
+    }
     tokens.push({ compound: s.slice(start, i) });
   }
   return tokens;
@@ -2337,22 +2602,31 @@ function parentElementLike(node) {
 
 const ARB_ROOT_ATTR = "data-tw-arb-root";
 
+// Adwaita (adw-*) and Material (and-*) @keyframes, e.g. adw-spinner-spin, to-ripple.
+// Generated data: one bad entry must not stop Nasty from loading.
+for (const [name, frames] of Object.entries({ ...adwaitaKeyframes, ...materialKeyframes, ...fluentKeyframes })) {
+  try {
+    registerKeyframes(name, frames);
+  } catch (error) {
+    console.warn(`Nasty: skipped theme keyframes "${name}":`, error?.message || error);
+  }
+}
+
 /** Whether `target` matches a Tailwind `[&…]` variant relative to `owner`. */
 function matchesAmpVariant(owner, target, variant) {
   const inner = decodeArbitraryVariantInner(variant);
   if (!inner.startsWith("&")) return false;
   const rest = inner.slice(1);
-  if (!/^\s*[>+~\s]/.test(rest)) return false;
-  const relative = rest.trimStart().startsWith(">") || rest.trimStart().startsWith("+") || rest.trimStart().startsWith("~")
-    ? rest.trimStart()
-    : rest; // leading space = descendant
+  if (!isRetargetingArbitraryVariant(variant)) return false;
   const prev = owner.getAttribute(ARB_ROOT_ATTR);
   owner.setAttribute(ARB_ROOT_ATTR, "1");
   try {
-    const absolute = `[${ARB_ROOT_ATTR}="1"]` + (relative.startsWith(">") || relative.startsWith("+") || relative.startsWith("~") || relative.startsWith(" ")
-      ? relative
-      : ` ${relative}`);
-    return target.matches(absolute);
+    // `&` is the owner: a leading combinator/space relates to it, while a leading
+    // compound (".adw-flat .x", "a .x") further constrains the owner itself.
+    const tag = /^(?:[a-z][\w-]*|\*)/i.exec(rest)?.[0] ?? "";
+    const absolute = `${tag}[${ARB_ROOT_ATTR}="1"]${rest.slice(tag.length)}`;
+    const width = tailwindViewportWidth(documentState(target.document).viewport);
+    return withClassTokenMatcher(variantClassMatcher(width), () => target.matches(absolute));
   } catch {
     return false;
   } finally {
@@ -2374,14 +2648,98 @@ function ancestorRetargetedValues(element, width, interaction) {
   return layers.length ? Object.assign({}, ...layers.reverse()) : null;
 }
 
+/** Whether `element` itself matches a self arbitrary variant ([&.on], [&[disabled]], [&:first-child]). */
+// Marker classes may be platform-scoped (android:and-border); see classTokenActive.
+function variantClassMatcher(width) {
+  return (element, name) => element.classList.contains(name) || classTokenActive(element.className, name, width);
+}
+
+function matchesSelfVariant(element, variant, width = 0) {
+  const inner = decodeArbitraryVariantInner(variant);
+  // [&.on] → ".on" on the element; context [:has(>main)>&.fixed] → the whole
+  // selector with & as the element itself (matches() walks the ancestors).
+  const selector = inner.startsWith("&") ? inner.slice(1) : inner.replace("&", "*");
+  if (!selector) return false;
+  try {
+    return withClassTokenMatcher(variantClassMatcher(width), () => element.matches(selector));
+  } catch {
+    return false;
+  }
+}
+
+// Theme tables with upstream specificity (and-*) resolve the element's own,
+// self-variant and ancestor-retargeted utilities as one cascade, as CSS does
+// (.and-field > .and-input must not beat a class on the input itself, and
+// `button` must lose to `.and-chip`). Other classes keep the layered merge.
+function cascadedTailwindValues(element, width, interaction) {
+  const sources = [];
+  const ancestors = [];
+  for (let ancestor = parentElementLike(element); ancestor; ancestor = parentElementLike(ancestor)) {
+    if (classHasRetargetingArbitrary(ancestor.className)) ancestors.push(ancestor);
+  }
+  const usesSpecificity = classHasSpecificity(element.className) || ancestors.some(a => classHasSpecificity(a.className));
+  if (!usesSpecificity) return null;
+  sources.push({ className: element.className, kind: "own", layer: 0 });
+  sources.push({ className: element.className, kind: "self", layer: 1, variantMatches: variant => matchesSelfVariant(element, variant, width) });
+  // Farther ancestors first, so nearer ones win ties.
+  ancestors.reverse().forEach((ancestor, i) => sources.push({
+    className: ancestor.className, kind: "retarget", layer: 2 + i,
+    variantMatches: variant => matchesAmpVariant(ancestor, element, variant),
+  }));
+  return resolveCascadedTailwind(sources, width, interaction);
+}
+
 function applyTailwindClassValues(element, ownValues) {
   const state = styleData.get(element.style);
   const width = tailwindViewportWidth(documentState(element.document).viewport);
   const interaction = interactionState(element, state);
+  const cascaded = cascadedTailwindValues(element, width, interaction);
+  if (cascaded) {
+    state.classValues = cascaded;
+    return cascaded;
+  }
+  const fromSelf = state.hasSelfArbitrary
+    ? resolveSelfArbitraryTailwind(element.className, width, interaction, variant => matchesSelfVariant(element, variant, width))
+    : null;
   const fromAncestors = ancestorRetargetedValues(element, width, interaction);
-  const next = fromAncestors ? { ...ownValues, ...fromAncestors } : ownValues;
+  const next = fromSelf || fromAncestors ? { ...ownValues, ...fromSelf, ...fromAncestors } : ownValues;
   state.classValues = next;
   return next;
+}
+
+// Elements whose classes use ancestor-context / :has() variants ([:has(>main)>&.fixed]).
+// Their match depends on the tree around them, so any child-list change marks them
+// stale and they re-resolve once before the next layout.
+function trackContextElement(element, uses) {
+  const doc = element.document && documentState(element.document);
+  if (!doc) return;
+  if (uses) (doc.contextElements ??= new Set()).add(element);
+  else doc.contextElements?.delete(element);
+  if (uses) doc.contextDirty = true;
+}
+
+mutationHooks.add(record => {
+  if (record.type !== "childList") return;
+  const document = record.target?.nodeType === 9 ? record.target : record.target?.document ?? record.target?.ownerDocument;
+  const doc = document && documentState(document);
+  if (doc?.contextElements?.size) doc.contextDirty = true;
+});
+
+function refreshContextStyles(document) {
+  const doc = documentState(document);
+  if (!doc.contextDirty) return;
+  doc.contextDirty = false;
+  for (const element of doc.contextElements ?? []) refreshSelfArbitraryStyles(element);
+}
+
+/** Re-resolve an element's own classes after a non-class attribute changed ([&[disabled]]:…). */
+function refreshSelfArbitraryStyles(element) {
+  const state = styleData.get(element.style);
+  if (!state?.hasSelfArbitrary) return;
+  const width = tailwindViewportWidth(documentState(element.document).viewport);
+  applyTailwindClassValues(element, resolveTailwind(element.className, width, interactionState(element, state)));
+  const changed = refreshStyleValues(state);
+  if (changed.size) element._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
 }
 
 function refreshDescendantArbitraryStyles(root) {
@@ -2406,11 +2764,36 @@ function refreshDescendantArbitraryStyles(root) {
 }
 
 
+// A selector list's trimmed parts (Element.matches / querySelector*), parsed once.
+const selectorListCache = new Map();
+function selectorListParts(selector) {
+  let parts = selectorListCache.get(selector);
+  if (parts) return parts;
+  parts = splitSelectorTopLevel(selector, ",").map(part => part.trim());
+  selectorListCache.set(selector, parts);
+  if (selectorListCache.size > 32768) selectorListCache.delete(selectorListCache.keys().next().value);
+  return parts;
+}
+
+// Selector strings repeat for every element (theme variants, querySelector loops);
+// parse each once. null = a single compound.
+const complexSelectorCache = new Map();
+function complexSelectorTokens(selector) {
+  let tokens = complexSelectorCache.get(selector);
+  if (tokens !== undefined) return tokens;
+  tokens = /[>\s]/.test(selector.replace(/\([^()]*(?:\([^()]*\)[^()]*)*\)|\[[^\]]*\]/g, ""))
+    ? tokenizeCompoundSelector(selector)
+    : null;
+  complexSelectorCache.set(selector, tokens);
+  if (complexSelectorCache.size > 32768) complexSelectorCache.delete(complexSelectorCache.keys().next().value);
+  return tokens;
+}
+
 /** Simple selectors plus descendant and child combinators (e.g. head > title). */
 function matchesComplexSelector(element, selector) {
   if (!selector) return false;
-  if (!/[>\s]/.test(selector)) return matchesSimpleSelector(element, selector);
-  const tokens = tokenizeCompoundSelector(selector);
+  const tokens = complexSelectorTokens(selector);
+  if (tokens === null) return matchesSimpleSelector(element, selector);
   if (!tokens.length || !tokens[tokens.length - 1].compound) {
     throw new DOMException(`Unsupported selector: ${selector}`, "SyntaxError");
   }
@@ -3013,7 +3396,7 @@ export class Element extends EventTarget {
     return null;
   }
   matches(selector) {
-    return String(selector).split(",").some(part => matchesComplexSelector(this, part.trim()));
+    return selectorListParts(String(selector)).some(part => matchesComplexSelector(this, part));
   }
   querySelectorAll(selector) {
     const found = [];
@@ -3122,13 +3505,22 @@ export class Element extends EventTarget {
     this.attributes.set(name, value);
     recordMutation({ type: "attributes", target: this, attributeName: name, oldValue: oldValue ?? null, addedNodes: [], removedNodes: [] });
     if (name === "class") {
+      // Adwaita dark theme on <body> (Nasty documents have no <html>): flip
+      // dark: utilities for the whole document, like html.adw-theme-dark on the web.
+      const darkScheme = this === this.document?.body && /(?:^|\s)(?:adw-(?:theme-dark|dark-theme)|and-dark|win-dark)(?:\s|$)/.test(value);
+      const schemeChanged = this === this.document?.body && darkScheme !== (getTailwindColorScheme() === "dark");
+      if (schemeChanged) setTailwindColorScheme(darkScheme ? "dark" : "light");
       const width = tailwindViewportWidth(documentState(this.document).viewport);
       const state = styleData.get(this.style);
-      state.hasResponsiveUtilities = /(?:^|\s)(?:sm|md|lg|xl|2xl):/.test(value);
-      state.hasHoverUtilities = /(?:^|\s|:)hover:/.test(value);
-      state.hasGroupHoverUtilities = /(?:^|\s|:)group-hover:/.test(value);
-      state.hasActiveUtilities = /(?:^|\s|:)active:/.test(value);
-      state.hasRetargetingArbitrary = classHasRetargetingArbitrary(value);
+      // Flags come from expanded tokens: adw-* classes carry their own hover:/active:/max-md: entries.
+      const flags = classUtilityFlags(value);
+      state.hasResponsiveUtilities = flags.responsive;
+      state.hasHoverUtilities = flags.hover;
+      state.hasGroupHoverUtilities = flags.groupHover;
+      state.hasActiveUtilities = flags.active;
+      state.hasSelfArbitrary = flags.self;
+      state.hasRetargetingArbitrary = flags.retargeting;
+      trackContextElement(this, flags.context);
       const styles = resolveTailwind(value, width, interactionState(this, state));
       applyTailwindClassValues(this, styles);
       state.selectionValues = resolveTailwindSelection(value, width);
@@ -3150,7 +3542,7 @@ export class Element extends EventTarget {
         this._styleChanged("class");
       }
       // Parent `[&>…]:` utilities paint onto matching descendants — refresh them.
-      if (state.hasRetargetingArbitrary || classHasRetargetingArbitrary(oldValue ?? "")) {
+      if (schemeChanged || state.hasRetargetingArbitrary || classHasRetargetingArbitrary(oldValue ?? "")) {
         refreshDescendantArbitraryStyles(this);
       }
     } else if (name === "hidden") this._styleChanged();
@@ -3159,6 +3551,8 @@ export class Element extends EventTarget {
       // Seed the IDL value from the content attribute (DOMParser / create-time attrs).
       this.value = value;
     }
+    // `[&[disabled]]:…` / `[&.on]:…` style entries depend on the element's attributes.
+    if (name !== "class" && name !== ARB_ROOT_ATTR) refreshSelfArbitraryStyles(this);
     if (name === "muted" && this.localName === "video") {
       updateVideoVolume(this);
     }
@@ -3185,11 +3579,15 @@ export class Element extends EventTarget {
       state.hasHoverUtilities = false;
       state.hasGroupHoverUtilities = false;
       state.hasActiveUtilities = false;
+      state.hasSelfArbitrary = false;
+      trackContextElement(this, false);
       state.classValues = {};
       const changed = refreshStyleValues(state);
       this._styleChanged([...changed].some(property => LAYOUT_STYLE_PROPERTIES.has(property)) ? undefined : "class", inheritsTextChange(changed));
     } else if (name === "hidden") this._styleChanged();
     else if ((name === "checked" || name === "type") && this.localName === "input") this._styleChanged("class");
+    // `[&[disabled]]:…` / `[&.on]:…` style entries depend on the element's attributes.
+    if (name !== "class" && name !== ARB_ROOT_ATTR) refreshSelfArbitraryStyles(this);
     if (name === "muted" && this.localName === "video") {
       updateVideoVolume(this);
     }
@@ -4038,6 +4436,11 @@ export class Element extends EventTarget {
 
   _styleChanged(property, inheritedFontChanged = false) {
     const doc = documentState(this.document);
+    // gfont-[…] / missing families: fetch Google Fonts into cachePath/fonts.
+    if (property === undefined || property === "class" || property === "fontFamily" || inheritedFontChanged) {
+      const stack = this.style?.fontFamily;
+      if (stack) requestGoogleFontsForStack(stack);
+    }
     // Scroll-texture descendants only dirty their host bake. Transform/opacity
     // class updates (carousel poses) must not throw away the scroll-scene base;
     // they stay live chrome and are reprojected until the pose settles.
@@ -4381,6 +4784,9 @@ export class Element extends EventTarget {
         }
       }
       child._styleChanged(undefined, true);
+      // A subtree assembled while detached never resolved `[&…]:` utilities from its
+      // own elements or its new ancestors onto its descendants; resolve them once now.
+      if (child instanceof Element && child.children.length) refreshDescendantArbitraryStyles(child);
       // Sibling :first-child / :last-child targets can change when a peer is inserted.
       if (styleData.get(this.style)?.hasRetargetingArbitrary) refreshDescendantArbitraryStyles(this);
     } else this.#structureChanged();
@@ -4738,6 +5144,7 @@ export class Document extends EventTarget {
   }
 
   async #layout(width, height, timings) {
+    refreshContextStyles(this);
     this.#prepareText();
     if (!Number.isFinite(width) || !Number.isFinite(height) || width < 0 || height < 0) {
       throw new RangeError("viewport must have finite nonnegative dimensions");
@@ -4784,11 +5191,15 @@ export class Document extends EventTarget {
 
   #layoutSync(timings) {
     const started = timings && performance.now();
+    refreshContextStyles(this);
     this.#prepareText();
     const size = documentState(this).defaultView?.size();
-    const width = size?.width ?? documentState(this).viewport.width;
-    const height = size?.height ?? documentState(this).viewport.height;
     const dpr = documentState(this).defaultView?.devicePixelRatio?.() ?? documentState(this).viewport.devicePixelRatio ?? 1;
+    // Browser math: layout viewport is CSS px = physical ÷ devicePixelRatio.
+    const physicalW = size?.width ?? documentState(this).viewport.width * dpr;
+    const physicalH = size?.height ?? documentState(this).viewport.height * dpr;
+    const width = dpr > 0 ? physicalW / dpr : physicalW;
+    const height = dpr > 0 ? physicalH / dpr : physicalH;
     let didReflow = false;
     if (width !== documentState(this).viewport.width || height !== documentState(this).viewport.height
       || dpr !== documentState(this).viewport.devicePixelRatio) {
