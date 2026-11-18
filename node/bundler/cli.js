@@ -5,6 +5,7 @@ import { hostTarget, parseTarget, sanitizeName } from './targets.js';
 import { packLinuxAppImage } from './pack-linux-appimage.js';
 import { packWinSea } from './pack-win-sea.js';
 import { packAndroidApk } from './pack-android-apk.js';
+import { packMetalIso } from './pack-metal-iso.js';
 
 const nodeDir = fileURLToPath(new URL('..', import.meta.url));
 
@@ -13,7 +14,7 @@ export async function runCli(argv) {
   program
     .name('nasty-bundle')
     .description('Release-build Nasty and pack the app in the current directory into a platform bundle')
-    .option('--target <target>', 'linux-x64 | win-x64 | android-arm64 (default: host)')
+    .option('--target <target>', 'linux-x64 | win-x64 | android-arm64 | metal-x64 (default: host)')
     .option('--entry <file>', 'app entry relative to cwd', 'main.js')
     .option('--name <name>', 'product / output name (default: cwd basename)')
     .option('--out <dir>', 'output directory', '.')
@@ -53,6 +54,9 @@ export async function runCli(argv) {
         return 0;
       case 'android-arm64':
         await packAndroidApk(common);
+        return 0;
+      case 'metal-x64':
+        await packMetalIso(common);
         return 0;
       default:
         throw new Error(`Unsupported target ${target}`);

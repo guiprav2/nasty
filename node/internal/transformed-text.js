@@ -91,14 +91,17 @@ export function paintTransformedText(window) {
   // Older android-arm64 addons predate createLayerTexture; skip GPU text layers.
   if (typeof window.createLayerTexture !== 'function') return ready;
   for (const [element, entry] of entries) {
-    const width = Math.max(1, Math.ceil(entry.width));
-    const height = Math.max(1, Math.ceil(entry.height));
+    const width = Math.max(1, Math.floor(entry.width));
+    const height = Math.max(1, Math.floor(entry.height));
     const signature = `${width}x${height}|${entry.signature}`;
     if (entry.rendered === signature) continue;
     if (!entry.textureId) entry.textureId = window.createLayerTexture(width, height);
-    else if (entry.textureWidth !== width || entry.textureHeight !== height) window.resizeLayerTexture(entry.textureId, width, height);
+    else if (entry.textureWidth !== width || entry.textureHeight !== height) {
+      window.resizeLayerTexture(entry.textureId, width, height);
+    }
     entry.textureWidth = width;
     entry.textureHeight = height;
+    if (!Number.isInteger(entry.textureId) || !(entry.textureId > 0)) continue;
     const runs = layerTextRunPairs(window, [element], null, true);
     window.renderLayer(entry.textureId, 0, 0, width, height, EMPTY_LIST,
       undefined, undefined, undefined, undefined, runs, entry.originX, entry.originY);

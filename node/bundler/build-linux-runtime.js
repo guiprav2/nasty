@@ -21,7 +21,7 @@ import { createHash } from 'node:crypto';
 import { ensureNativeAddon } from './build-native.js';
 import { resolveLinuxIcon } from './icons.js';
 import { bundleSharedLibs, findCanvasNative, stripTree } from './linux-libs.js';
-import { repoPaths, resetDir, stageNastyRuntime } from './layout.js';
+import { nastySourcesStamp, repoPaths, resetDir, stageNastyRuntime } from './layout.js';
 
 /**
  * Path of the cached generalized linux runtime AppImage (no app overlay).
@@ -40,7 +40,8 @@ export function linuxRuntimeStampPath() {
 
 /**
  * Ensure a high-compression, stripped runtime AppImage exists.
- * Rebuilds when native addon, Node binary, or bundler boot files change.
+ * Rebuilds when the native addon, Node binary, bundler boot files, or the
+ * staged Nasty sources (JS, dependencies, fonts) change.
  */
 export async function ensureLinuxRuntimeBase({
   nodeDir,
@@ -59,7 +60,7 @@ export async function ensureLinuxRuntimeBase({
     skipNativeBuild,
   });
 
-  const stamp = runtimeStamp({ nodeDir, addon });
+  const stamp = runtimeStamp({ nodeDir, addon, fontsDir });
   if (!rebuild && existsSync(basePath) && existsSync(stampPath) && readStamp(stampPath) === stamp) {
     console.error(`runtime base cache hit: ${basePath}`);
     return basePath;
@@ -185,8 +186,9 @@ Terminal=false
   );
 }
 
-function runtimeStamp({ nodeDir, addon }) {
+function runtimeStamp({ nodeDir, addon, fontsDir }) {
   const hash = createHash('sha256');
+  hash.update(nastySourcesStamp(nodeDir, fontsDir));
   for (const file of [
     process.execPath,
     addon,

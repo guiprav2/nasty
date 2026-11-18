@@ -10,6 +10,8 @@ def nastyApp = (findProperty('nastyApp') ?: 'tour').toString()
 def nastyApps = [
     tour: [id: 'org.nasty.tour', entry: 'node/examples/tour.js', manifest: 'src/main/AndroidManifest.xml'],
     dyndyn: [id: 'org.nasty.dyndyn', entry: 'node/examples/dyndyn/mobile.js', manifest: 'src/dyndyn/AndroidManifest.xml'],
+    // only: ship just this example (not the others, nor the tour video).
+    vitrola: [id: 'org.nasty.vitrola', entry: 'node/examples/vitrola/vitrola.js', manifest: 'src/vitrola/AndroidManifest.xml', java: 'src/vitrola/java', res: 'src/vitrola/res', ytdlp: true, only: 'vitrola'],
 ]
 def isBundle = nastyApp == 'bundle'
 def nastyAppConfig = isBundle ? null : nastyApps[nastyApp]
@@ -35,11 +37,26 @@ tasks.register('prepareNastyAssets', Sync) {
     } else {
         from(repositoryRoot.toPath().resolve('node').toFile()) {
             into 'nasty/node'
-            exclude 'native/**', 'runtime/**', 'node_modules/**', 'examples/*.svg'
+            // examples/*/data holds the developer's own app data (Vitrola's library and API key).
+            exclude 'native/**', 'runtime/**', 'node_modules/**', 'examples/*.svg', 'examples/*/data/**'
+            if (nastyAppConfig?.only) {
+                def keep = "examples/${nastyAppConfig.only}"
+                // Development-only parts of Nasty.
+                exclude 'tour.mp4', 'test/**', 'scripts/**', 'bundler/**', 'bin/**', 'package-lock.json'
+                exclude { el ->
+                    def path = el.relativePath.pathString
+                    path.startsWith('examples/') && path != keep && !path.startsWith(keep + '/')
+                }
+            }
         }
         from(repositoryRoot.toPath().resolve('node/node_modules').toFile()) {
             into 'nasty/node/node_modules'
             exclude '@napi-rs/canvas-linux-*/**'
+            if (nastyAppConfig?.only) {
+                // Dependency tests, demos and docs (as nasty-bundle prunes them).
+                exclude '**/test/**', '**/tests/**', '**/__tests__/**', '**/experiment/**', '**/example/**', '**/examples/**',
+                    '**/docs/**', '**/*.md', '**/*.map', '**/*.ts', '**/.*/**'
+            }
         }
         from(repositoryRoot.toPath().resolve('fonts').toFile()) {
             into 'nasty/fonts'
@@ -98,6 +115,8 @@ android {
                 }
             } else {
                 manifest.srcFile nastyAppConfig.manifest
+                if (nastyAppConfig.java) java.srcDir nastyAppConfig.java
+                if (nastyAppConfig.res) res.srcDir nastyAppConfig.res
             }
             jniLibs.srcDirs = ['src/main/jniLibs']
         }
@@ -106,6 +125,10 @@ android {
     packaging {
         jniLibs.useLegacyPackaging = true
     }
+}
+
+dependencies {
+    if (nastyAppConfig?.ytdlp) implementation project(':ytdlp')
 }
 
 tasks.named('preBuild').configure {

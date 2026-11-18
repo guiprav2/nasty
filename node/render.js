@@ -12,7 +12,12 @@ import { inherited as inheritedStyle } from "./internal/text-metrics.js";
 // Texture ids with this bit set sample nearest-neighbour in the native
 // renderer (CSS image-rendering: pixelated / crisp-edges). Native ids stay below it.
 const NEAREST_TEXTURE_BIT = 1 << 23;
+/** True when `textureId` is a finite integer the native display-list parser accepts. */
+export function validTextureId(textureId) {
+  return Number.isFinite(textureId) && textureId > 0 && Number.isInteger(textureId);
+}
 function sampledTextureId(element, textureId) {
+  if (!validTextureId(textureId)) return 0;
   const rendering = inheritedStyle(element, "imageRendering", "auto");
   return rendering === "pixelated" || rendering === "crisp-edges" ? textureId + NEAREST_TEXTURE_BIT : textureId;
 }
@@ -223,6 +228,12 @@ function replayLayoutMesh(mesh, matrix, opacityScale, clipRect, polygons, window
       const count = src[offset + 6];
       const header = offset;
       offset += 7;
+      const textureOk = validTextureId(textureId)
+        || (textureId > NEAREST_TEXTURE_BIT && validTextureId(textureId - NEAREST_TEXTURE_BIT));
+      if (!textureOk || !Number.isFinite(count) || count < 3 || count % 3 !== 0) {
+        offset += Math.max(0, count) * 5;
+        continue;
+      }
       if (replayImage.length < count * 3) replayImage = new Float32Array(Math.max(count * 3, replayImage.length * 2));
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       let allInside = true;
@@ -316,6 +327,12 @@ function replayLayoutMeshGeneral(mesh, matrix, opacityScale, clipRect, polygons)
       const textureId = src[offset + 1];
       const count = src[offset + 6];
       offset += 7;
+      const textureOk = validTextureId(textureId)
+        || (textureId > NEAREST_TEXTURE_BIT && validTextureId(textureId - NEAREST_TEXTURE_BIT));
+      if (!textureOk || !Number.isFinite(count) || count < 3 || count % 3 !== 0) {
+        offset += Math.max(0, count) * 5;
+        continue;
+      }
       const projected = new Array(count);
       for (let index = 0; index < count; index++) {
         const point = project(src[offset], src[offset + 1]);
@@ -337,7 +354,8 @@ function replayLayoutMeshGeneral(mesh, matrix, opacityScale, clipRect, polygons)
       }
       if (triangles.length >= 3) {
         const scissor = screenSpaceBounds(triangles, clipRect);
-        if (scissor.width > 0 && scissor.height > 0) {
+        if (scissor.width > 0 && scissor.height > 0
+          && [scissor.x, scissor.y, scissor.width, scissor.height].every(Number.isFinite)) {
           out.push(1, textureId, scissor.x, scissor.y, scissor.width, scissor.height, triangles.length);
           for (const point of triangles) out.push(point.x, point.y, point.u, point.v, point.reciprocalW);
           commands++;
@@ -349,9 +367,10 @@ function replayLayoutMeshGeneral(mesh, matrix, opacityScale, clipRect, polygons)
   return { part, commands };
 }
 
-/** Drop cached paint commands for one element after a local paint-only change. */
+/** Drop cached paint commands and layout meshes for one element after a local paint-only change. */
 export function clearPaintSegments(element) {
   paintSegments.delete(element);
+  layoutMeshCache.delete(element);
 }
 
 function translatePaintSegment(source, dx, dy) {
@@ -830,6 +849,25 @@ function parseBoxShadowLayer(piece) {
   return { inset, offsetX, offsetY, blur: Math.max(0, blur), spread, color };
 }
 
+const shadowRingCache = new Map();
+
+/**
+ * The ring a box-shadow draws when it is exactly one zero-offset, zero-blur outset layer
+ * (Tailwind ring-*), else null. A list that merely starts with such a layer (Adwaita's
+ * adw-card: "0 0 0 1px …, 0 4px 8px -2px …") is a general shadow list, not a ring.
+ */
+export function shadowRing(source) {
+  const text = String(source ?? "");
+  if (shadowRingCache.has(text)) return shadowRingCache.get(text);
+  const layers = parseBoxShadowList(text);
+  const layer = layers.length === 1 ? layers[0] : null;
+  const ring = layer && !layer.inset && !layer.offsetX && !layer.offsetY && !layer.blur && layer.spread >= 0
+    ? { spread: layer.spread, color: layer.color } : null;
+  if (shadowRingCache.size > 512) shadowRingCache.clear();
+  shadowRingCache.set(text, ring);
+  return ring;
+}
+
 /** Extent beyond the border box needed to cover all shadow layers (CSS px). */
 function boxShadowOutset(source) {
   let max = 0;
@@ -945,18 +983,37 @@ function paintStyleValue(style, property) {
   return samplesComputedStyle(style, property) ? computedStyleValue(style, property) : style[property];
 }
 
+// While presenting at a device pixel ratio, boxes are in device px (scaleBoxesToDevice) but
+// transform and perspective lengths are CSS px: scale them too, or 3D scenes flatten,
+// bunch up and skew on high-DPR screens.
+function boxPaintScale(box) {
+  const document = box.element?.document ?? box.element?.ownerDocument;
+  const scale = document ? documentState(document).paintDeviceScale : 1;
+  return scale > 0 ? scale : 1;
+}
+
+// The CSS-px matrix in device px: S·M·S⁻¹ for a uniform scale S.
+function scaleMatrixToDevice(matrix, scale) {
+  if (scale === 1) return matrix;
+  const scaled = matrix.map((row) => row.slice());
+  for (let row = 0; row < 3; row += 1) scaled[row][3] *= scale;
+  for (let column = 0; column < 3; column += 1) scaled[3][column] /= scale;
+  return scaled;
+}
+
 function boxTransformMatrix(box) {
   const style = box.element.style;
   const source = samplesComputedStyle(style, "transform")
     ? computedStyleValue(style, "transform")
     : style.transform;
   if (!source || source === "none") return IDENTITY_MATRIX;
+  const scale = boxPaintScale(box);
   const origin = transformOrigin(
     samplesComputedStyle(style, "transformOrigin") ? computedStyleValue(style, "transformOrigin") : style.transformOrigin,
-    box.width,
-    box.height,
-  );
-  const matrix = parseTransform(source, box.width, box.height);
+    box.width / scale,
+    box.height / scale,
+  ).map((value) => value * scale);
+  const matrix = scaleMatrixToDevice(parseTransform(source, box.width / scale, box.height / scale), scale);
   return multiply4(
     multiply4(
       multiply4(
@@ -975,13 +1032,14 @@ function childPerspectiveMatrix(box) {
     ? computedStyleValue(style, "perspective")
     : style.perspective;
   if (!source || source === "none") return IDENTITY_MATRIX;
-  const distance = lengthValue(String(source));
+  const scale = boxPaintScale(box);
+  const distance = lengthValue(String(source)) * scale;
   if (distance <= 0) throw new TypeError("perspective must be positive");
   const originSource = samplesComputedStyle(style, "perspectiveOrigin")
     ? computedStyleValue(style, "perspectiveOrigin")
     : style.perspectiveOrigin;
   const parts = String(originSource ?? "50% 50%").trim().split(/\s+/);
-  const origin = [lengthValue(parts[0] ?? "50%", box.width), lengthValue(parts[1] ?? "50%", box.height)];
+  const origin = [lengthValue(parts[0] ?? "50%", box.width / scale) * scale, lengthValue(parts[1] ?? "50%", box.height / scale) * scale];
   const perspective = identity4();
   perspective[3][2] = -1 / distance;
   return multiply4(
@@ -1311,10 +1369,10 @@ function buildFastRecipe(element) {
   const shadow = String(paintStyleValue(style, "boxShadow") ?? "");
   let ring = null;
   if (shadow && shadow !== "none") {
-    const match = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(shadow);
+    const match = shadowRing(shadow);
     // Ring shadows stay on the fast after-pass. Soft/hard shadows still allow a
     // fast bg+border recipe; the general after-pass paints those separately.
-    if (match) ring = { spread: Number(match[1]), color: parseColor(match[2]) };
+    if (match) ring = { spread: match.spread, color: parseColor(match.color) };
   }
   const borderActive = SIDES.map((side) => {
     const borderStyle = style[`border${side}Style`] ?? style.borderStyle ?? "none";
@@ -1912,8 +1970,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     const box = boxesByElement.get(owner);
     if (!box) return false;
     const shadow = String(paintStyleValue(owner.style, "boxShadow") ?? "");
-    const ring = /^0 0 0 (\d+(?:\.\d+)?)px/.exec(shadow);
-    const spread = !shadow || shadow === "none" ? 0 : ring ? Number(ring[1]) : boxShadowOutset(shadow);
+    const ring = shadowRing(shadow);
+    const spread = !shadow || shadow === "none" ? 0 : ring ? ring.spread : boxShadowOutset(shadow);
     const rect = windowRectOf(box, { x: box.borderBox.x - spread, y: box.borderBox.y - spread,
       width: box.borderBox.width + spread * 2, height: box.borderBox.height + spread * 2 });
     if (!rectsOverlap(rect, layerTextBounds)) return false;
@@ -2204,6 +2262,9 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   };
   // One textured GPU instance (display-list tag 8) for an image texture.
   const pushImageBox = (textureId, rect, uv, corners, clips, imageOpacity) => {
+    if (!validTextureId(textureId) && !(textureId > NEAREST_TEXTURE_BIT && validTextureId(textureId - NEAREST_TEXTURE_BIT))) return;
+    if (![rect.x, rect.y, rect.width, rect.height, ...uv].every(Number.isFinite)) return;
+    if (!(rect.width > 0) || !(rect.height > 0)) return;
     const similarity = clips.similarity ?? IDENTITY_SIMILARITY;
     if (similarity !== IDENTITY_SIMILARITY) {
       rect = mapRect(similarity, rect);
@@ -2291,7 +2352,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       const dest = { x: content.x + layout.x, y: content.y + layout.y, width: layout.width, height: layout.height };
       // Crop to the content box and adjust UVs, so overflow never draws.
       const shown = intersection(dest, content);
-      if (shown.width > 0 && shown.height > 0 && dest.width > 0 && dest.height > 0) {
+      if (shown.width > 0 && shown.height > 0 && dest.width > 0 && dest.height > 0 && validTextureId(image.textureId)) {
         const u = (x) => layout.u0 + (x - dest.x) / dest.width * (layout.u1 - layout.u0);
         const v = (y) => layout.v0 + (y - dest.y) / dest.height * (layout.v1 - layout.v0);
         pushImageBox(sampledTextureId(element, image.textureId), shown, [u(shown.x), v(shown.y), u(shown.x + shown.width), v(shown.y + shown.height)],
@@ -2331,8 +2392,8 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
   };
   const clipSignature = (box) => {
     const shadow = String(paintStyleValue(box.element.style, "boxShadow") ?? "");
-    const ring = /^0 0 0 (\d+(?:\.\d+)?)px/.exec(shadow);
-    const spread = !shadow || shadow === "none" ? 0 : ring ? Number(ring[1]) : boxShadowOutset(shadow);
+    const ring = shadowRing(shadow);
+    const spread = !shadow || shadow === "none" ? 0 : ring ? ring.spread : boxShadowOutset(shadow);
     const left = box.x - spread, top = box.y - spread;
     const right = box.x + box.width + spread, bottom = box.y + box.height + spread;
     const inside = (rect, radius) => insideClip(rect, radius, left, top, right, bottom);
@@ -2657,10 +2718,10 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       };
       const { x, y, width: boxWidth, height: boxHeight } = box.borderBox;
       const corners = cornerRadiiFor(box.element.style, boxWidth, boxHeight);
-      const ring = /^0 0 0 (\d+(?:\.\d+)?)px (.+)$/.exec(shadowText);
+      const ring = shadowRing(shadowText);
       if (ring) {
-        const spread = Number(ring[1]);
-        const color = withOpacity(parseColor(ring[2]), opacity);
+        const spread = ring.spread;
+        const color = withOpacity(parseColor(ring.color), opacity);
         const ringRect = { x: x - spread, y: y - spread, width: boxWidth + spread * 2, height: boxHeight + spread * 2 };
         const ringClips = !paintMode.capture
           ? gpuBoxClips(element, ringRect.x, ringRect.y, ringRect.x + ringRect.width, ringRect.y + ringRect.height) : null;
@@ -2778,7 +2839,7 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     // Hard offset shadows under fill+border (CSS order). Soft glows stay on after.
     {
       const shadowText = String(paintStyleValue(style, "boxShadow") ?? "");
-      if (shadowText && shadowText !== "none" && !/^0 0 0 \d/.test(shadowText)) {
+      if (shadowText && shadowText !== "none" && !shadowRing(shadowText)) {
         paintBoxShadows(box, shadowText, opacity, borderCorners, project, pushGpuBox, gpuBoxClips, element, paintMode, "hard");
       }
     }
@@ -3026,9 +3087,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
     // Projects layout-space textured corners, clips them like the element's
     // content, and draws them as one textured GPU polygon.
     const pushTexturedPolygon = (textureId, points) => {
+      if (!validTextureId(textureId) && !(textureId > NEAREST_TEXTURE_BIT && validTextureId(textureId - NEAREST_TEXTURE_BIT))) return;
       const corners = points.map(({ x, y, u, v }) => {
         const point = projectPoint(box, x, y);
-        return Number.isFinite(point.x) && Number.isFinite(point.y) ? { ...point, u, v } : null;
+        return Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(u) && Number.isFinite(v)
+          && Number.isFinite(point.reciprocalW) && point.reciprocalW > 0
+          ? { ...point, u, v } : null;
       });
       if (!corners.every(Boolean)) return;
       let clipped = paintMode.capture ? corners : clipTexturedPolygon(corners, viewport);
@@ -3057,10 +3121,12 @@ export function buildTransformedDisplayList(boxes, width, height, overlays = [],
       const { u0, v0, u1, v1 } = layout;
       // Corners are projected to screen space (including CSS transforms) and
       // clipped there: viewport first, then overflow/window regions.
-      pushTexturedPolygon(sampledTextureId(box.element, image.textureId), [
-        { x: imageRect.x, y: imageRect.y, u: u0, v: v0 }, { x: imageRect.x + imageRect.width, y: imageRect.y, u: u1, v: v0 },
-        { x: imageRect.x + imageRect.width, y: imageRect.y + imageRect.height, u: u1, v: v1 }, { x: imageRect.x, y: imageRect.y + imageRect.height, u: u0, v: v1 },
-      ]);
+      if (validTextureId(image.textureId)) {
+        pushTexturedPolygon(sampledTextureId(box.element, image.textureId), [
+          { x: imageRect.x, y: imageRect.y, u: u0, v: v0 }, { x: imageRect.x + imageRect.width, y: imageRect.y, u: u1, v: v0 },
+          { x: imageRect.x + imageRect.width, y: imageRect.y + imageRect.height, u: u1, v: v1 }, { x: imageRect.x, y: imageRect.y + imageRect.height, u: u0, v: v1 },
+        ]);
+      }
     }
     // drawImage of GPU-only pictures: textured layers above the canvas raster,
     // mapped from canvas pixels into the content box and clipped to it.

@@ -353,11 +353,15 @@ function grownEdge(previous, need) {
 }
 
 function tileSpans(previous, extent, limit) {
-  const count = Math.max(1, Math.ceil(extent / limit));
+  const edgeLimit = Math.max(1, Math.floor(limit));
+  const count = Math.max(1, Math.ceil(extent / edgeLimit));
   const spans = [];
   for (let index = 0; index < count; index++) {
-    const need = index < count - 1 ? limit : extent - index * limit;
-    spans.push(index < count - 1 ? limit : Math.max(previous[index] ?? 0, grownEdge(previous[index], need)));
+    const need = index < count - 1 ? edgeLimit : extent - index * edgeLimit;
+    const span = index < count - 1
+      ? edgeLimit
+      : Math.max(previous[index] ?? 0, grownEdge(previous[index], need));
+    spans.push(Math.max(1, Math.floor(span)));
   }
   return spans;
 }
@@ -435,10 +439,14 @@ function allocateTiles(window, layer, hostBox, width, height, geometry, banded) 
         continue;
       } else {
         keep.add(key);
-        if (tile.width !== wanted.width || tile.height !== wanted.height) {
-          window.resizeLayerTexture(tile.id, wanted.width, wanted.height);
-          tile.width = wanted.width;
-          tile.height = wanted.height;
+        // Match createLayerTexture: native u32 truncates floats, so JS must store
+        // the same integer size the GPU texture actually has.
+        const width = Math.max(1, Math.floor(wanted.width));
+        const height = Math.max(1, Math.floor(wanted.height));
+        if (tile.width !== width || tile.height !== height) {
+          window.resizeLayerTexture(tile.id, width, height);
+          tile.width = width;
+          tile.height = height;
         }
       }
     }
@@ -447,8 +455,18 @@ function allocateTiles(window, layer, hostBox, width, height, geometry, banded) 
   // Older android-arm64 addons predate createLayerTexture; leave tiles unallocated.
   if (typeof window.createLayerTexture !== 'function') return fresh;
   for (const { key, wanted } of missing) {
-    layer.tiles.set(key, { id: window.createLayerTexture(wanted.width, wanted.height), ...wanted });
-    fresh.push(wanted);
+    const width = Math.max(1, Math.floor(wanted.width));
+    const height = Math.max(1, Math.floor(wanted.height));
+    const id = window.createLayerTexture(width, height);
+    if (!Number.isInteger(id) || !(id > 0)) continue;
+    layer.tiles.set(key, {
+      id,
+      x: Math.floor(wanted.x),
+      y: Math.floor(wanted.y),
+      width,
+      height,
+    });
+    fresh.push({ x: Math.floor(wanted.x), y: Math.floor(wanted.y), width, height });
   }
   for (const [key, tile] of layer.tiles) {
     if (keep.has(key)) continue;
@@ -688,8 +706,21 @@ function layerIndexFor(layer) {
 function paintRegion(window, document, layer, byElement, nested, rect) {
   const index = layerIndexFor(layer);
   for (const tile of layer.tiles.values()) {
-    const region = intersect(rect, { x: tile.x, y: tile.y, width: tile.width, height: tile.height });
-    if (region.width <= 0 || region.height <= 0) continue;
+    const tileW = Math.max(0, Math.floor(tile.width));
+    const tileH = Math.max(0, Math.floor(tile.height));
+    if (!(tileW > 0) || !(tileH > 0) || !Number.isInteger(tile.id) || !(tile.id > 0)) continue;
+    const hit = intersect(rect, { x: tile.x, y: tile.y, width: tileW, height: tileH });
+    if (hit.width <= 0 || hit.height <= 0) continue;
+    // renderLayer takes u32 texel coords. Snap to integers inside the tile so
+    // float dirty rects never report a region outside the texture.
+    const localX = Math.max(0, Math.min(tileW, Math.floor(hit.x - tile.x)));
+    const localY = Math.max(0, Math.min(tileH, Math.floor(hit.y - tile.y)));
+    const localRight = Math.max(localX, Math.min(tileW, Math.ceil(hit.x - tile.x + hit.width)));
+    const localBottom = Math.max(localY, Math.min(tileH, Math.ceil(hit.y - tile.y + hit.height)));
+    const localW = localRight - localX;
+    const localH = localBottom - localY;
+    if (!(localW > 0) || !(localH > 0)) continue;
+    const region = { x: tile.x + localX, y: tile.y + localY, width: localW, height: localH };
     const picked = new Map();
     const consider = ([element, entry]) => {
       if (picked.has(element) || layer.bounds.get(element) !== entry) return;
@@ -715,13 +746,13 @@ function paintRegion(window, document, layer, byElement, nested, rect) {
       if (inner) nestedLayers.set(box.element, layerInfo(inner, box));
     }
     const list = boxes.length
-      ? buildTransformedDisplayList(boxes, region.width, region.height, [], {
+      ? buildTransformedDisplayList(boxes, localW, localH, [], {
         layerPaint: true, scrollLayerState: { layers: nestedLayers, covered: new Set() } })
       : Buffer.from(new Float32Array([5, 0]).buffer);
     const canvas = boxes.length ? displayListCanvas(list) : null;
     const textLayers = boxes.length ? displayListTextLayers(list) : null;
     const runs = layerTextRunPairs(window, boxes.map((box) => box.element), textLayers);
-    window.renderLayer(tile.id, region.x - tile.x, region.y - tile.y, region.width, region.height, list,
+    window.renderLayer(tile.id, localX, localY, localW, localH, list,
       canvas?.triangles, canvas?.circles, canvas?.beziers, canvas?.operations, runs, region.x, region.y);
   }
 }

@@ -1,8 +1,8 @@
 import { arch, platform } from 'node:os';
 
-/** @typedef {'linux-x64' | 'win-x64' | 'android-arm64'} BundleTarget */
+/** @typedef {'linux-x64' | 'win-x64' | 'android-arm64' | 'metal-x64'} BundleTarget */
 
-const TARGETS = /** @type {const} */ (['linux-x64', 'win-x64', 'android-arm64']);
+const TARGETS = /** @type {const} */ (['linux-x64', 'win-x64', 'android-arm64', 'metal-x64']);
 
 export function supportedTargets() {
   return [...TARGETS];
@@ -34,6 +34,8 @@ export function artifactName(target, name) {
       return `${name}.exe`;
     case 'android-arm64':
       return `${name}.apk`;
+    case 'metal-x64':
+      return `${name}-x86_64.iso`;
     default:
       throw new Error(`Unknown target ${target}`);
   }

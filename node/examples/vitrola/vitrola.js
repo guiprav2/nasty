@@ -11,6 +11,7 @@ import { bindVideoStream } from "../../index.js";
 import * as youtube from "./youtube.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
+const isAndroid = process.platform === "android";
 process.env.NASTY_FONT_DIR ??= here;
 const { Document, Window } = await import("../../index.js");
 const { dominant } = await import("../../dominant.js");
@@ -28,47 +29,42 @@ const cancelAnimationFrame = clearTimeout;
 let windowMaximized = false;
 function updateBodyFrame(maximized = windowMaximized) {
   windowMaximized = maximized;
-  const open = process.env.SWEET_ANDROID_APK || maximized || doc.fullscreenElement;
+  const open = isAndroid || maximized || doc.fullscreenElement;
   const frame = open ? "" : "rounded-2xl border border-zinc-600/25 ";
   doc.body.className = `h-screen w-full overflow-hidden ${frame}bg-[#070709] text-white font-[Inter]`;
 }
 updateBodyFrame();
 
-const art = {
-  WNcsUNKlAKw: join(here, "covers/WNcsUNKlAKw.jpg"),
-  "S-Xm7s9eGxU": join(here, "covers/S-Xm7s9eGxU.jpg"),
-  "9E6b3swbnWg": join(here, "covers/9E6b3swbnWg.jpg"),
-  "7maJOI3QMu0": join(here, "covers/7maJOI3QMu0.jpg"),
-  eUDVUZZyA0M: join(here, "covers/eUDVUZZyA0M.jpg"),
-  "5NV6Rdv1a3I": join(here, "covers/5NV6Rdv1a3I.jpg"),
-  "fWNaR-rxAic": join(here, "covers/fWNaR-rxAic.jpg"),
-};
 
+// Open movies (Blender Foundation / Blender Studio, Creative Commons) for a fresh library.
 const seedPlaylists = [
   {
-    id: "rain-glass",
-    name: "Rain Glass",
-    mood: "soothing ambient",
+    id: "open-movies",
+    name: "Open Movies",
+    mood: "Blender Foundation shorts",
     tracks: [
-      { videoId: "WNcsUNKlAKw", title: "Debussy - Clair de Lune", channel: "Rousseau", duration: 314 },
-      { videoId: "S-Xm7s9eGxU", title: "Satie - Gymnopedie No.1", channel: "DistantMirrors", duration: 217 },
-      { videoId: "9E6b3swbnWg", title: "Chopin - Nocturne op.9 No.2", channel: "andrea romano", duration: 269 },
-      { videoId: "7maJOI3QMu0", title: "Yiruma - River Flows in You", channel: "Yiruma", duration: 210 },
-      { videoId: "eUDVUZZyA0M", title: "Ludovico Einaudi - Experience", channel: "Ludovico Einaudi", duration: 383 },
+      { videoId: "aqz-KE-bpKQ", title: "Big Buck Bunny", channel: "Blender", duration: 635 },
+      { videoId: "eRsGyueVLvQ", title: "Sintel", channel: "Blender", duration: 888 },
+      { videoId: "R6MlUcmOul8", title: "Tears of Steel", channel: "Blender", duration: 734 },
+      { videoId: "TLkA0RELQ1g", title: "Elephants Dream", channel: "Blender", duration: 654 },
     ],
   },
   {
-    id: "night-drive",
-    name: "Night Drive",
-    mood: "tense electronic",
+    id: "studio-shorts",
+    name: "Studio Shorts",
+    mood: "newer Blender Studio films",
     tracks: [
-      { videoId: "5NV6Rdv1a3I", title: "Daft Punk - Get Lucky", channel: "Daft Punk", duration: 249 },
-      { videoId: "fWNaR-rxAic", title: "Carly Rae Jepsen - Call Me Maybe", channel: "Carly Rae Jepsen", duration: 200 },
+      { videoId: "WhWc3b3KhnY", title: "Spring", channel: "Blender Studio", duration: 464 },
+      { videoId: "mN0zPOpADL4", title: "Agent 327: Operation Barbershop", channel: "Blender Studio", duration: 232 },
+      { videoId: "Y-rmzh0PI3c", title: "Cosmos Laundromat", channel: "Blender", duration: 731 },
     ],
   },
 ];
 
-const dataDir = process.env.VITROLA_DATA_DIR || join(here, "data");
+// On Android, Nasty re-extracts the app (files/nasty/) from the APK on every launch, so data
+// lives beside it in files/vitrola-data/ to survive restarts.
+const dataDir = process.env.VITROLA_DATA_DIR
+  || (isAndroid ? join(here, "..", "..", "..", "..", "vitrola-data") : join(here, "data"));
 const windowSizeFile = join(dataDir, "window-size.json");
 let initialWindowSize = { width: 1440, height: 900 };
 try {
@@ -127,6 +123,8 @@ const state = {
   keyError: "",
   keyBusy: false,
   entered: !!savedKey,
+  // Without a key the player works and chat is off; the chat input then takes a key.
+  hasKey: !!savedKey,
   forget: false,
   draft: "",
   busy: false,
@@ -139,7 +137,6 @@ const state = {
   drawerOpen: false,
   inspector: false,
   inspectedNode: null,
-  lift: null,
   cookiePrompt: null,
   playlists: restored.playlists,
   player: restored.player,
@@ -374,19 +371,20 @@ function traceCarousel(event, details = {}) {
   console.error(`[vitrola-carousel ${new Date().toISOString()}] ${event}`, details);
 }
 
+async function enterPlayer() {
+  state.keyError = "";
+  state.entered = true;
+  applyState(await library.publicState(), { forcePaused: true });
+  if (!state.player.track && state.playlists[0]?.tracks.length) {
+    state.player = playerFor(state.playlists[0], 0, "paused");
+  }
+  syncCarouselMedia();
+  d.updateSync();
+}
+
 async function unlock() {
   if (state.keyBusy) return;
-  if (process.env.VITROLA_UI_ONLY) {
-    state.keyError = "";
-    state.entered = true;
-    applyState(await library.publicState(), { forcePaused: true });
-    if (!state.player.track && state.playlists[0]?.tracks.length) {
-      state.player = playerFor(state.playlists[0], 0, "paused");
-    }
-    syncCarouselMedia();
-    d.updateSync();
-    return;
-  }
+  if (process.env.VITROLA_UI_ONLY) return enterPlayer();
   const key = state.apiKey.trim();
   if (key.length < 20) {
     state.keyError = "Enter a Grok API key.";
@@ -400,13 +398,8 @@ async function unlock() {
     const checked = await verifyKey(key);
     await library.setApiKey(checked);
     state.apiKey = "";
-    state.entered = true;
-    applyState(await library.publicState(), { forcePaused: true });
-    if (!state.player.track && state.playlists[0]?.tracks.length) {
-      state.player = playerFor(state.playlists[0], 0, "paused");
-    }
-    syncCarouselMedia();
-    d.updateSync();
+    state.hasKey = true;
+    await enterPlayer();
   } catch (error) {
     state.keyError = error.message || "That key did not work.";
   } finally {
@@ -416,7 +409,7 @@ async function unlock() {
 }
 
 function imageFor(track) {
-  return art[track?.videoId] || track?.thumbnail || "";
+  return track?.thumbnail || "";
 }
 
 function carouselCenter() {
@@ -458,7 +451,8 @@ function rotateCarousel(center) {
 
 function pose(offset, narrow) {
   const abs = Math.abs(offset);
-  const shifts = narrow ? [0, 112, 150, 178, 198, 214] : [0, 228, 292, 348, 396, 436];
+  // Narrow: cards are 72vw wide on phones, so neighbors sit proportionally further out.
+  const shifts = narrow ? [0, 150, 202, 240, 267, 289] : [0, 228, 292, 348, 396, 436];
   if (abs > 5.05) return "pointer-events-none opacity-0";
   const depths = [90, -20, -64, -104, -140, -172];
   const sizes = [1, 0.98, 0.94, 0.9, 0.86, 0.82];
@@ -481,7 +475,10 @@ function pose(offset, narrow) {
 function cardImage(index, reflection = false) {
   let entry;
   const image = d.el("img", {
-    class: `h-full w-full object-cover ${reflection ? "object-bottom [transform:scaleY(-1)]" : ""}`,
+    // In fullscreen the poster letterboxes like the video, so the sides stay black.
+    class: reflection
+      ? "h-full w-full object-cover object-bottom [transform:scaleY(-1)]"
+      : ["h-full w-full", () => isFullscreenCard(index) ? "object-contain" : "object-cover"],
     onattach: (node) => {
       if (!carouselImages.includes(entry)) carouselImages.push(entry);
       const src = imageFor(state.player.tracks[index]);
@@ -500,8 +497,9 @@ function videoFor(index) {
   let entry;
   const video = d.el("video", {
     class: [
-      "pointer-events-none absolute inset-0 h-full w-full object-cover",
+      "pointer-events-none absolute inset-0 h-full w-full",
       () => Number(index) === state.player.index ? "opacity-100" : "opacity-0",
+      () => isFullscreenCard(index) ? "object-contain" : "object-cover",
     ],
     onattach: () => {
       if (!carouselVideos.includes(entry)) carouselVideos.push(entry);
@@ -582,7 +580,11 @@ function syncCarouselMedia() {
     for (const { video } of carouselVideos) {
       const next = video === active ? src : "";
       if ((video.getAttribute("src") || "") !== next) {
-        if (next) video.setAttribute("src", next);
+        if (next) {
+          video.setAttribute("src", next);
+          // Separate audio stream (Android): bind it before play() starts audio from src.
+          if (separateAudio?.src === next) bindVideoStream(video, { mediaUrl: next, audioUrl: separateAudio.audioUrl });
+        }
         else {
           video.pause();
           video.removeAttribute("src");
@@ -648,6 +650,7 @@ function syncCarouselMedia() {
     }
     resolvedMediaKey = key;
     resolvedMediaSrc = src;
+    separateAudio = result.mode === "cdn" && result.audioUrl && result.audioUrl !== src ? { src, audioUrl: result.audioUrl } : null;
     state.mediaError = "";
     apply(src, generation);
   }).catch((error) => {
@@ -661,59 +664,46 @@ function syncCarouselMedia() {
 }
 
 const coverCards = [];
+/** { src, audioUrl } when the resolved video has its audio in another stream (Android). */
+let separateAudio = null;
 
 function px(value) {
   return `${Math.round(Number(value) * 10) / 10}px`;
 }
 
-function orientationsDiffer(rect) {
+function videoIsLandscape() {
   const video = currentVideo();
-  const videoWidth = Number(video?.videoWidth) || rect.width;
-  const videoHeight = Number(video?.videoHeight) || rect.height;
-  if (videoWidth < 2 || videoHeight < 2 || viewportWidth < 2 || viewportHeight < 2) return false;
-  return (videoWidth >= videoHeight) !== (viewportWidth >= viewportHeight);
+  const width = Number(video?.videoWidth) || 16;
+  const height = Number(video?.videoHeight) || 9;
+  return width >= height;
 }
 
-function liftClass(lift) {
-  // duration-0 keeps the card a GPU layer at the measured rect. Dropping
-  // `transition` for that frame puts the card into the static base, and the
-  // window keeps drawing the previous base until that upload finishes.
-  const start = `group fixed z-[80] overflow-hidden origin-center transition duration-0 top-[${px(lift.rect.top)}] left-[${px(lift.rect.left)}] w-[${px(lift.rect.width)}] h-[${px(lift.rect.height)}]`;
-  if (lift.phase !== "to") return start;
-  const box = lift.rotate
-    ? {
-        left: (viewportWidth - viewportHeight) / 2,
-        top: (viewportHeight - viewportWidth) / 2,
-        width: viewportHeight,
-        height: viewportWidth,
-      }
-    : { left: 0, top: 0, width: viewportWidth, height: viewportHeight };
-  const spin = lift.rotate ? " [transform:rotate(90deg)]" : "";
-  return `group fixed z-[80] overflow-hidden origin-center transition duration-500 ease-out top-[${px(box.top)}] left-[${px(box.left)}] w-[${px(box.width)}] h-[${px(box.height)}]${spin}`;
+/** True for the frame after leaving fullscreen, so the card snaps back into its pose. */
+let snapCards = false;
+
+function isFullscreenCard(index) {
+  return !!doc.fullscreenElement && doc.fullscreenElement === coverCards[Number(index)];
 }
 
+// Fullscreen switches instantly (a grow animation can't hand over cleanly to Android's
+// rotation or to a window going fullscreen). Android goes edge to edge, then rotates to the
+// video's orientation once the card is fullscreen; back leaves it.
 function beginCardFullscreen(index) {
-  if (state.lift) return;
   const card = coverCards[Number(index)];
-  if (!card) return;
-  const rect = card.getBoundingClientRect();
-  if (rect.width < 2 || rect.height < 2) return;
-  state.lift = { index: Number(index), rect, phase: "from", rotate: orientationsDiffer(rect) };
-  d.updateSync();
-  requestAnimationFrame(() => {
-    if (!state.lift || state.lift.index !== Number(index)) return;
-    const finish = (event) => {
-      // The button's opacity fade is reported as a transform and bubbles here.
-      // once would treat that as the end of the grow and snap fullscreen early.
-      const property = event?.propertyName;
-      if (property !== "left" && property !== "top" && property !== "width" && property !== "height") return;
-      card.removeEventListener("transitionend", finish);
-      card.requestFullscreen()?.catch((error) => console.error(error));
-    };
-    card.addEventListener("transitionend", finish);
-    state.lift.phase = "to";
-    d.updateSync();
-  });
+  if (!card || doc.fullscreenElement) return;
+  if (isAndroid) win.safeArea = "none";
+  Promise.resolve(card.requestFullscreen())
+    .then(() => { if (isAndroid && doc.fullscreenElement === card) win.orientation = videoIsLandscape() ? "landscape" : "portrait"; })
+    .catch((error) => {
+      console.error(error);
+      endCardFullscreen();
+    });
+}
+
+function endCardFullscreen() {
+  if (!isAndroid) return;
+  win.safeArea = "both";
+  win.orientation = "auto";
 }
 
 function coverCard(index) {
@@ -721,33 +711,23 @@ function coverCard(index) {
     "div",
     {
       class: () => {
-        if (state.lift && Number(state.lift.index) === Number(index)) return liftClass(state.lift);
+        // Fullscreen applies instantly: no carousel transition from the 3D pose.
+        if (isFullscreenCard(index)) return "group absolute inset-0 origin-center";
         const hidden = index >= state.player.tracks.length;
-        const motion = carouselPointer ? "duration-0" : "duration-700";
+        const motion = carouselPointer || snapCards ? "duration-0" : "duration-700";
         const placed = hidden ? "pointer-events-none opacity-0" : pose(index - carouselCenter(), viewportWidth < 1024);
         return `group absolute inset-0 origin-center cursor-pointer transition-all ease-out ${motion} ${placed}`;
       },
       onattach: () => { coverCards[Number(index)] = card; },
       ondetach: () => { if (coverCards[Number(index)] === card) coverCards[Number(index)] = null; },
-      onclick: (event) => {
-        let node = event?.target;
-        while (node) {
-          if (node._fullscreenButton) return;
-          node = node.parentNode;
-        }
-        if (state.lift) return;
-        if (Date.now() < carouselSuppressClickUntil) return;
-        if (Number(index) >= state.player.tracks.length) return;
-        cancelCarouselReset();
-        carouselPointer = null;
-        carouselCenterPreview = null;
-        void playAt(state.player.playlistId, Number(index));
-      },
     },
     d.el(
       "div",
       {
-        class: ["absolute inset-0 overflow-hidden rounded-xl bg-zinc-900", () => Math.abs(index - carouselCenter()) < 0.35 ? "ring-2 ring-white/85" : "ring-1 ring-white/10"],
+        class: ["absolute inset-0 overflow-hidden", () => {
+          if (isFullscreenCard(index)) return "bg-black";
+          return `rounded-xl bg-zinc-900 ${Math.abs(index - carouselCenter()) < 0.35 ? "ring-2 ring-white/85" : "ring-1 ring-white/10"}`;
+        }],
         onattach: (node) => { videoFrames[Number(index)] = node; },
         ondetach: (node) => { if (videoFrames[Number(index)] === node) videoFrames[Number(index)] = null; },
       },
@@ -756,7 +736,8 @@ function coverCard(index) {
       d.el("button", {
         class: () => {
           const active = Number(index) === state.player.index && state.player.track;
-          if (!active) return "hidden";
+          // Android leaves fullscreen with its back button; the corner sits under the status bar.
+          if (!active || (isAndroid && doc.fullscreenElement === card)) return "hidden";
           return "absolute right-2 top-2 z-30 flex items-center justify-center h-8 w-8 rounded-full border border-zinc-500/20 bg-black/75 text-lg text-white cursor-pointer opacity-0 transition duration-200 ease-out group-hover:opacity-100";
         },
         "aria-label": "Full screen",
@@ -778,10 +759,19 @@ function coverCard(index) {
   return card;
 }
 
+// The cover card containing node, or -1.
+function cardIndexAt(node) {
+  for (; node; node = node.parentNode) {
+    const index = coverCards.indexOf(node);
+    if (index >= 0) return index;
+  }
+  return -1;
+}
+
 function coverStage() {
   let gestureStart = null;
   let wheelGestureTimer = null;
-  const spacing = () => viewportWidth < 1024 ? 112 : 228;
+  const spacing = () => viewportWidth < 1024 ? 150 : 228;
   const showVolume = (value) => {
     const video = currentVideo();
     if (!video) return;
@@ -798,6 +788,9 @@ function coverStage() {
     d.updateSync();
   };
   const onPointerDown = (event) => {
+    // The fullscreen button handles its own press: capturing the pointer here would retarget
+    // its click to the stage.
+    for (let node = event.target; node; node = node.parentNode) if (node._fullscreenButton) return;
     if (wheelGestureTimer !== null) clearTimeout(wheelGestureTimer);
     wheelGestureTimer = null;
     carouselSuppressClickUntil = 0;
@@ -807,6 +800,7 @@ function coverStage() {
     // a child makes release/click target the wrong track after a swipe.
     (event.currentTarget ?? event.target)?.setPointerCapture?.(event.pointerId);
     gestureStart = {
+      target: event.target,
       x: event.clientX ?? event.x,
       y: event.clientY ?? event.y,
       center: carouselCenter(),
@@ -842,12 +836,23 @@ function coverStage() {
     }
   };
   const onPointerUp = () => {
+    const start = gestureStart;
     const moved = !!gestureStart?.moved;
     const axis = gestureStart?.axis;
     const preview = gestureStart?.preview;
     gestureStart = null;
     if (!moved) {
       carouselPointer = null;
+      // A tap plays the card it landed on (unless it is already the one playing). The stage
+      // captures the pointer, so this is where taps are seen: clicks target the stage.
+      const tapped = start ? cardIndexAt(start.target) : -1;
+      const playing = tapped === state.player.index && state.player.status === "playing";
+      if (tapped >= 0 && tapped < state.player.tracks.length && !playing && !doc.fullscreenElement) {
+        cancelCarouselReset();
+        carouselCenterPreview = null;
+        void playAt(state.player.playlistId, tapped);
+        return;
+      }
       scheduleCarouselRender();
       if (carouselCenterPreview !== null) resetCarouselAfterPause();
       return;
@@ -921,7 +926,7 @@ function coverStage() {
           },
           d.el(
             "div",
-            { class: "relative aspect-video w-[min(52vw,22rem)] max-w-[88vw]" },
+            { class: "relative aspect-video w-[min(72vw,22rem)] max-w-[88vw]" },
             d.map(() => state.player.tracks, (_track, cursor) => coverCard(cursor)),
           ),
         ),
@@ -1037,7 +1042,7 @@ function header() {
       d.el("div", { class: "text-sm font-semibold" }, "Vitrola"),
       d.el("div", { class: "text-[11px] text-white/40" }, "Grok 4.3"),
     ),
-    d.el("button", { class: "shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-xs text-white/45 hover:bg-white/10 hover:text-white cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API key"),
+    d.if(() => state.hasKey, d.el("button", { class: "shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-xs text-white/45 hover:bg-white/10 hover:text-white cursor-pointer", onclick: () => { state.forget = true; d.updateSync(); } }, "Forget API key")),
   );
 }
 
@@ -1053,7 +1058,27 @@ function chatMessage(message) {
   );
 }
 
+// Without a key, the chat input takes one: checked like the title screen's, then chat turns on.
+async function addKeyFromChat() {
+  const key = state.draft.trim();
+  if (!key || state.busy) return;
+  state.busy = true;
+  state.error = "";
+  d.updateSync();
+  try {
+    await library.setApiKey(await verifyKey(key));
+    state.draft = "";
+    state.hasKey = true;
+  } catch (error) {
+    state.error = error.message || "That key did not work.";
+  } finally {
+    state.busy = false;
+    d.updateSync();
+  }
+}
+
 async function sendMessage() {
+  if (!state.hasKey) return addKeyFromChat();
   const text = state.draft.trim();
   if (!text || state.busy) return;
   state.draft = "";
@@ -1121,7 +1146,8 @@ async function sendMessage() {
 
 function chatPanel() {
   const chatScroller = d.el("div", { class: () => `w-full shrink-0 overflow-x-hidden overflow-y-auto overflow-anchor-edge-auto overflow-anchor-margin-auto rounded-t-2xl border border-zinc-600/25 bg-[#101012]/95 px-3 py-2 backdrop-blur transition-[height,opacity] duration-300 ${state.chatOpen ? "h-[30vh] opacity-100" : "h-0 border-0 p-0 opacity-0"} md:h-auto md:flex-1 md:rounded-none md:border-0 md:bg-black/30 md:p-3 md:opacity-100 md:backdrop-blur-none`, onscroll: onChatScroll, onwheel: onChatScroll },
-    d.if(() => state.messages.length === 0, d.el("div", { class: "mt-6 text-center text-sm text-white/35" }, "Ask Vitrola to find a video or set a mood.")),
+    d.if(() => state.hasKey && state.messages.length === 0, d.el("div", { class: "mt-6 text-center text-sm text-white/35" }, "Ask Vitrola to find a video or set a mood.")),
+    d.if(() => !state.hasKey, d.el("div", { class: "mt-6 px-4 text-center text-sm text-white/35" }, "Chat needs an xAI (Grok) API key. Enter one below to ask Vitrola for videos and playlists; it stays on this device.")),
     d.map(() => state.messages, chatMessage),
   );
   return d.el(
@@ -1133,13 +1159,13 @@ function chatPanel() {
     d.el("div", { class: "relative z-40 shrink-0 border-t border-zinc-600/25 bg-[#09090b]/95 p-3 md:bg-black/30" },
       d.el("div", { class: "flex w-full items-stretch overflow-hidden rounded-2xl border border-zinc-600/25 bg-black/40" },
       d.el("input", {
-        type: "text",
+        type: () => state.hasKey ? "text" : "password",
         class: "min-h-0 min-w-0 flex-1 rounded-l-2xl rounded-r-none bg-transparent px-3 py-2 text-sm text-white focus:border-rose-300/60",
-        placeholder: "Play a more soothing playlist…",
+        placeholder: () => state.hasKey ? "Play a more soothing playlist…" : "Enter your xAI key…",
         value: d.binding({ get: () => state.draft, set: (value) => { state.draft = value; } }),
         onkeydown: (event) => { if (event.key === "Enter") { event.preventDefault?.(); sendButton?.click(); } },
       }),
-      d.el("button", { class: "flex shrink-0 justify-center rounded-l-none rounded-r-2xl bg-white px-4 py-2 text-sm font-semibold text-black cursor-pointer hover:bg-zinc-200 disabled:opacity-40", disabled: () => state.busy, onattach: (node) => { sendButton = node; }, onclick: sendMessage }, "Send"),
+      d.el("button", { class: "flex shrink-0 justify-center rounded-l-none rounded-r-2xl bg-white px-4 py-2 text-sm font-semibold text-black cursor-pointer hover:bg-zinc-200 disabled:opacity-40", disabled: () => state.busy, onattach: (node) => { sendButton = node; }, onclick: sendMessage }, d.text(() => state.hasKey ? "Send" : "Save key")),
       ),
     ),
   );
@@ -1331,6 +1357,7 @@ async function forgetKey() {
   await library.transport("stop");
   await library.clearApiKey();
   state.entered = false;
+  state.hasKey = false;
   state.forget = false;
   state.apiKey = "";
   state.error = "";
@@ -1439,7 +1466,7 @@ function titleScreen() {
         ),
       ),
       d.el("div", { class: "mt-7 text-3xl font-semibold" }, "Vitrola"),
-      d.el("div", { class: "mt-2 w-full text-center text-sm text-white/55" }, "A Grok API key opens the player. It stays on this machine until you forget it."),
+      d.el("div", { class: "mt-2 w-full max-w-full text-center text-sm text-white/55 whitespace-normal [overflow-wrap:anywhere]" }, "A Grok (xAI) API key turns on the chat assistant. It stays on this device until you forget it."),
       d.el("div", { class: "mt-7 w-full text-left text-[11px] font-medium text-white/40" }, "GROK API KEY"),
       d.el("input", {
         type: "password", placeholder: "xai-…",
@@ -1449,12 +1476,13 @@ function titleScreen() {
       }),
       d.if(() => !!state.keyError, d.el("div", { class: "mt-3 w-full text-sm text-rose-300" }, d.text(() => state.keyError))),
       d.el("button", { class: "mt-5 whitespace-nowrap rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black cursor-pointer disabled:opacity-50", disabled: () => state.keyBusy, onattach: (node) => { startButton = node; }, onclick: unlock }, d.text(() => state.keyBusy ? "Checking…" : "Start")),
+      d.el("button", { class: "mt-3 whitespace-nowrap rounded-full px-5 py-2 text-sm text-white/60 hover:bg-white/10 hover:text-white cursor-pointer disabled:opacity-50", disabled: () => state.keyBusy, onclick: enterPlayer }, "I don't have a key"),
     ),
   );
 }
 
 function windowControls(position = "fixed right-2 top-2 z-50") {
-  if (process.env.SWEET_ANDROID_APK) return d.el("div", { class: "hidden" });
+  if (isAndroid) return d.el("div", { class: "hidden" });
   const control = (label, iconClass, action, hover = "hover:bg-white/15") => d.el("button", {
     class: () => `flex items-center justify-center h-8 w-9 rounded-lg text-sm text-white/65 ${hover} cursor-pointer`,
     "aria-label": label,
@@ -1487,9 +1515,10 @@ if (state.entered) {
 const win = new Window({
   appId: "vitrola",
   title: "Vitrola",
+  icon: join(here, "logo.png"),
   width: initialWindowSize.width,
   height: initialWindowSize.height,
-  borderless: !process.env.SWEET_ANDROID_APK,
+  borderless: !isAndroid,
   dragAnywhere: true,
   maximizable: true,
   opacity: 1,
@@ -1498,7 +1527,12 @@ const win = new Window({
 win.document = doc;
 const closed = new Promise(resolve => win.addEventListener("close", resolve, { once: true }));
 doc.addEventListener("fullscreenchange", () => {
-  if (!doc.fullscreenElement) state.lift = null;
+  // Fullscreen video uses the whole screen; otherwise keep clear of Android's system bars.
+  if (!doc.fullscreenElement) {
+    endCardFullscreen();
+    snapCards = true;
+    requestAnimationFrame(() => { snapCards = false; d.updateSync(); });
+  }
   updateBodyFrame();
   d.updateSync();
 });
@@ -1507,7 +1541,7 @@ win.addEventListener("keydown", (event) => {
     doc.exitFullscreen();
     return;
   }
-  if (!process.env.SWEET_ANDROID_APK && event.ctrlKey && event.key?.toLowerCase() === "i") {
+  if (!isAndroid && event.ctrlKey && event.key?.toLowerCase() === "i") {
     if (!state.inspector) startInspector();
     else saveButton?.click();
   } else if (state.inspector && event.key === "Enter") {

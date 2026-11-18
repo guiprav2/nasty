@@ -1,5 +1,7 @@
 #include <android/native_activity.h>
 #include <dlfcn.h>
+#include <cstdlib>
+#include <cstring>
 #include <jni.h>
 #include <node.h>
 
@@ -45,6 +47,119 @@ extern "C" int nasty_set_requested_orientation(int orientation) {
   if (attached) g_vm->DetachCurrentThread();
   return failed ? -4 : 0;
 }
+
+// Fullscreen on Android: NastyActivity.nastySetImmersive hides (or restores) the system bars.
+// Returns 1 when the activity has no such method (a plain NativeActivity).
+extern "C" int nasty_set_immersive(int immersive) {
+  if (g_vm == nullptr || g_activity == nullptr) return -1;
+  JNIEnv *env = nullptr;
+  bool attached = false;
+  const jint status = g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+  if (status == JNI_EDETACHED) {
+    if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return -2;
+    attached = true;
+  } else if (status != JNI_OK) {
+    return -3;
+  }
+  int result = 0;
+  jclass activity_class = env->GetObjectClass(g_activity);
+  jmethodID method = activity_class == nullptr ? nullptr : env->GetMethodID(activity_class, "nastySetImmersive", "(Z)V");
+  if (method == nullptr) {
+    env->ExceptionClear();
+    result = 1;
+  } else {
+    env->CallVoidMethod(g_activity, method, static_cast<jboolean>(immersive != 0));
+    if (env->ExceptionCheck()) { env->ExceptionClear(); result = -4; }
+  }
+  if (activity_class != nullptr) env->DeleteLocalRef(activity_class);
+  if (attached) g_vm->DetachCurrentThread();
+  return result;
+}
+
+// Android's default for an unhandled back press: send the app to the background
+// (Activity.moveTaskToBack), keeping it running like other apps do.
+extern "C" int nasty_move_task_to_back() {
+  if (g_vm == nullptr || g_activity == nullptr) return -1;
+  JNIEnv *env = nullptr;
+  bool attached = false;
+  const jint status = g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+  if (status == JNI_EDETACHED) {
+    if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return -2;
+    attached = true;
+  } else if (status != JNI_OK) {
+    return -3;
+  }
+  jclass activity_class = env->GetObjectClass(g_activity);
+  jmethodID move = activity_class == nullptr ? nullptr : env->GetMethodID(activity_class, "moveTaskToBack", "(Z)Z");
+  if (move != nullptr) env->CallBooleanMethod(g_activity, move, JNI_TRUE);
+  const bool failed = move == nullptr || env->ExceptionCheck();
+  if (failed) env->ExceptionClear();
+  if (activity_class != nullptr) env->DeleteLocalRef(activity_class);
+  if (attached) g_vm->DetachCurrentThread();
+  return failed ? -4 : 0;
+}
+
+// Vitrola's APK embeds yt-dlp in a Python runtime; its activity exposes
+// String nastyYtdlpExtractInfo(String source, boolean flat). Returns a malloc'd
+// UTF-8 string: the info JSON with *ok = 1, or an error message with *ok = 0.
+// Free it with nasty_free_string.
+extern "C" char *nasty_ytdlp_extract(const char *source, int flat, int *ok) {
+  *ok = 0;
+  if (g_vm == nullptr || g_activity == nullptr) return strdup("yt-dlp: Android activity not initialized");
+  JNIEnv *env = nullptr;
+  bool attached = false;
+  const jint status = g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+  if (status == JNI_EDETACHED) {
+    if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return strdup("yt-dlp: couldn't attach to the JVM");
+    attached = true;
+  } else if (status != JNI_OK) {
+    return strdup("yt-dlp: no JNI environment");
+  }
+
+  char *result = nullptr;
+  jclass activity_class = env->GetObjectClass(g_activity);
+  jmethodID extract = activity_class == nullptr
+      ? nullptr
+      : env->GetMethodID(activity_class, "nastyYtdlpExtractInfo", "(Ljava/lang/String;Z)Ljava/lang/String;");
+  if (extract == nullptr) {
+    env->ExceptionClear();
+    result = strdup("yt-dlp isn't bundled in this APK");
+  } else {
+    jstring jsource = env->NewStringUTF(source);
+    auto value = static_cast<jstring>(env->CallObjectMethod(g_activity, extract, jsource, static_cast<jboolean>(flat != 0)));
+    if (jthrowable error = env->ExceptionOccurred()) {
+      env->ExceptionClear();
+      jclass throwable = env->FindClass("java/lang/Throwable");
+      jmethodID to_string = env->GetMethodID(throwable, "toString", "()Ljava/lang/String;");
+      auto message = static_cast<jstring>(env->CallObjectMethod(error, to_string));
+      if (env->ExceptionCheck() || message == nullptr) {
+        env->ExceptionClear();
+        result = strdup("yt-dlp failed");
+      } else {
+        const char *chars = env->GetStringUTFChars(message, nullptr);
+        result = strdup(chars);
+        env->ReleaseStringUTFChars(message, chars);
+        env->DeleteLocalRef(message);
+      }
+      env->DeleteLocalRef(throwable);
+      env->DeleteLocalRef(error);
+    } else if (value == nullptr) {
+      result = strdup("yt-dlp returned nothing");
+    } else {
+      const char *chars = env->GetStringUTFChars(value, nullptr);
+      result = strdup(chars);
+      env->ReleaseStringUTFChars(value, chars);
+      *ok = 1;
+    }
+    if (value != nullptr) env->DeleteLocalRef(value);
+    env->DeleteLocalRef(jsource);
+  }
+  if (activity_class != nullptr) env->DeleteLocalRef(activity_class);
+  if (attached) g_vm->DetachCurrentThread();
+  return result;
+}
+
+extern "C" void nasty_free_string(char *value) { free(value); }
 
 namespace {
 bool g_camera_requested = false;

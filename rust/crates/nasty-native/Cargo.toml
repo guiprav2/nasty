@@ -48,6 +48,8 @@ libloading = "0.8"
 # Image clipboard for captureFrame (already in the tree through egui-winit).
 arboard = { version = "3.6", default-features = false, features = ["image-data"] }
 rfd = "0.15"
+# ensureYtDlp: fetches the latest standalone yt-dlp release (Android APKs embed a Python runtime instead).
+yt-dlp = "2.10"
 
 [build-dependencies]
 napi-build = "2"

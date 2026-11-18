@@ -82,11 +82,16 @@ function hasBrightCaret(image, x, rect) {
   }
   return best >= 10;
 }
+// Selection highlight is rgba(59, 130, 246, ~0.42) over #202430 → a clear blue.
+// Dark glyph AA on that background can look faintly blue under gamma; require a
+// stronger blue so those edges are not mistaken for the selection.
+function isSelectionBlue([r, g, b]) {
+  return b > 110 && b > r * 1.5 && b > g * 1.3;
+}
 function selectionLeft(image, rect) {
   for (let x = Math.floor(rect.x + 8); x < rect.x + rect.width - 8; x++) {
     for (let y = Math.floor(rect.y + 4); y < rect.y + rect.height - 4; y++) {
-      const [r, g, b] = pixel(image, x, y);
-      if (b > r * 1.2 && b > g * 1.1 && b > 80) return x;
+      if (isSelectionBlue(pixel(image, x, y))) return x;
     }
   }
   return null;
@@ -94,8 +99,7 @@ function selectionLeft(image, rect) {
 function selectionRight(image, rect) {
   for (let x = Math.floor(rect.x + rect.width - 8); x > rect.x + 8; x--) {
     for (let y = Math.floor(rect.y + 4); y < rect.y + rect.height - 4; y++) {
-      const [r, g, b] = pixel(image, x, y);
-      if (b > r * 1.2 && b > g * 1.1 && b > 80) return x + 1;
+      if (isSelectionBlue(pixel(image, x, y))) return x + 1;
     }
   }
   return null;
@@ -131,13 +135,13 @@ function brightestPixel(image, rect) {
   }
   return best;
 }
-function estimatedLinearOpacity(pixel, background = [32, 36, 48]) {
-  const linear = value => {
-    const v = value / 255;
-    return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
-  };
-  return pixel.slice(0, 3).reduce((sum, value, index) => sum +
-    (linear(value) - linear(background[index])) / (1 - linear(background[index])), 0) / 3;
+// Nasty blends glyph color in sRGB (same as a typical GPU blend). Estimate the
+// authored alpha from that, not from a linear-light un-blend.
+function estimatedLinearOpacity(sample, background = [32, 36, 48]) {
+  return sample.slice(0, 3).reduce((sum, value, index) => {
+    const denom = 255 - background[index];
+    return sum + (denom === 0 ? 0 : (value - background[index]) / denom);
+  }, 0) / 3;
 }
 async function startFixture() {
   await mkdir(artifactDir, { recursive: true });
@@ -151,10 +155,25 @@ async function startFixture() {
   app.stderr.on('data', chunk => { output += chunk; });
   const windowId = await waitFor(async () => {
     if (app.exitCode !== null) return { fatal: `fixture exited early (${app.exitCode}): ${output}` };
-    return { id: run('xdotool', ['search', '--name', `^${title}$`]).split('\n')[0] };
+    // Prefer the newest match; a previous fixture may still be tearing down.
+    const ids = run('xdotool', ['search', '--name', `^${title}$`]).split('\n').filter(Boolean);
+    return { id: ids.at(-1) };
   }, value => Boolean(value?.id)).then(value => value.id);
   await waitFor(state, value => value.input.rect.width > 600);
-  await delay(400);
+  // Wait until the first GPU frame is actually on screen (layout can report
+  // before present, and ImageMagick then saves an empty black window).
+  await waitFor(async () => {
+    try {
+      const frame = await capture(windowId, 'boot');
+      const input = (await state()).input.rect;
+      const ink = countPixels(frame, { x: input.x + 12, y: input.y + 7, width: 120, height: 24 },
+        p => Math.max(p[0], p[1], p[2]) > 90);
+      return { ink };
+    } catch (error) {
+      return { ink: 0, error: String(error) };
+    }
+  }, value => value.ink > 5, 8000);
+  await delay(200);
   return { app, windowId };
 }
 async function click(windowId, rect, x = 40, y = null) {

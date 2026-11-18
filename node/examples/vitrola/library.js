@@ -90,7 +90,9 @@ export async function createLibrary(file, seedPlaylists = []) {
       theme: playlist.theme || "",
       tracks: playlist.tracks.map((track, index) => cleanTrack(track, playlist.id, index)),
     })),
-    player: { playlistId: null, index: 0, status: "idle", oneOff: null },
+    // A fresh library starts with the first seed playlist queued (an idle player left the
+    // footer on "Nothing playing" once a track started).
+    player: { playlistId: seedPlaylists[0]?.id ?? null, index: 0, status: seedPlaylists.length ? "paused" : "idle", oneOff: null },
     messages: [],
     logs: [],
     apiKey: "",

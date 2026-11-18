@@ -3,9 +3,9 @@ import { Document, Window } from '../node/index.js';
 
 const reportPath = process.env.NASTY_INPUT_TEST_REPORT;
 if (!reportPath) throw new Error('NASTY_INPUT_TEST_REPORT is required');
-const win = new Window({ title: 'Nasty input visual regression', width: 820, height: 620, resizable: 'none' });
+const win = new Window({ title: 'Nasty input visual regression', width: 820, height: 760, resizable: 'none' });
 const doc = new Document();
-doc.body.className = 'flex flex-col gap-3 w-[820px] h-[620px] p-6 bg-[#080a10] text-white font-[DejaVu_Sans]';
+doc.body.className = 'flex flex-col gap-3 w-[820px] h-[760px] p-6 bg-[#080a10] text-white font-[DejaVu_Sans]';
 
 const heading = doc.createElement('div');
 heading.className = 'h-6 shrink-0 text-base font-semibold';
@@ -24,10 +24,10 @@ overflowTextarea.className = 'w-[240px] h-20 shrink-0 rounded-md bg-[#202430] px
 overflowTextarea.value = 'W'.repeat(80);
 const chat = doc.createElement('div');
 chat.id = 'chat-bubble';
-chat.className = 'w-[300px] rounded-xl bg-[#30343d] px-3 py-2 text-sm text-white whitespace-pre-wrap [overflow-wrap:anywhere]';
+chat.className = 'w-[300px] shrink-0 rounded-xl bg-[#30343d] px-3 py-2 text-sm text-white whitespace-pre-wrap [overflow-wrap:anywhere]';
 chat.textContent = 'W'.repeat(220);
 const shortChatRow = doc.createElement('div');
-shortChatRow.className = 'flex w-full justify-start';
+shortChatRow.className = 'flex w-full shrink-0 justify-start';
 const shortChat = doc.createElement('div');
 shortChat.id = 'short-chat-bubble';
 shortChat.className = 'max-w-[92%] rounded-2xl bg-[#30343d] px-3 py-2 text-sm text-white whitespace-pre-wrap [overflow-wrap:anywhere]';
@@ -35,7 +35,9 @@ shortChat.textContent = 'Playlist created.';
 shortChatRow.appendChild(shortChat);
 const composer = doc.createElement('div');
 composer.id = 'vitrola-composer';
-composer.className = 'flex w-[320px] items-stretch overflow-hidden rounded-2xl border border-white/10 bg-black/40';
+// shrink-0 keeps the composer tall enough to type into when the chat bubble
+// above it eats the remaining column height.
+composer.className = 'flex w-[320px] shrink-0 items-stretch overflow-hidden rounded-2xl border border-white/10 bg-black/40';
 const composerInput = doc.createElement('input');
 composerInput.id = 'vitrola-input';
 composerInput.className = 'min-h-0 min-w-0 flex-1 rounded-l-2xl rounded-r-none bg-transparent px-3 py-2 text-sm text-white [transform:translateX(0px)]';

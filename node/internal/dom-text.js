@@ -729,11 +729,15 @@ export function layerTextRunPairs(window, elements, textLayers = null, onlyTrans
     const parts = state.slotOf.get(element);
     if (!parts) continue;
     const layer = textLayers?.get(element) ?? 0;
+    const layerIndex = Number(layer);
+    if (!Number.isFinite(layerIndex) || layerIndex < 0 || !Number.isInteger(layerIndex)) continue;
     for (const slot of parts) {
       if (slot === undefined) continue;
+      const runIndex = Number(slot);
+      if (!Number.isFinite(runIndex) || runIndex < 0 || !Number.isInteger(runIndex)) continue;
       // Transformed text has its own texture (transformed-text.js), never a tile's.
-      if ((state.slots[slot]?.target === TRANSFORMED_TEXT_TARGET) !== onlyTransformed) continue;
-      pairs.push(slot, layer);
+      if ((state.slots[runIndex]?.target === TRANSFORMED_TEXT_TARGET) !== onlyTransformed) continue;
+      pairs.push(runIndex, layerIndex);
     }
   }
   return pairs;

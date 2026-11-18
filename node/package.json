@@ -13,6 +13,7 @@
     "build:debug": "cargo build --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js",
     "build:release": "cargo build --release --manifest-path ../rust/Cargo.toml -p nasty-native && node scripts/copy-native.js --release",
     "build:android-arm64": "bash scripts/build-android-arm64.sh",
+    "build:vitrola-apk": "bash scripts/build-vitrola-apk.sh",
     "build:tour-apk": "bash scripts/build-tour-apk.sh",
     "build:dyndyn-apk": "bash scripts/build-dyndyn-apk.sh",
     "build:treva-appimage": "bash scripts/build-treva-appimage.sh"

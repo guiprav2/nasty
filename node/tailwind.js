@@ -311,6 +311,16 @@ function utilityStyle(utility) {
     if (amount === undefined) return null;
     return [["width", amount], ["height", amount]];
   }
+  // Arbitrary aspect ratio: aspect-[3/4] → aspect-ratio: 3 / 4 (not a spacing %).
+  const aspectArbitrary = /^aspect-\[(.+)\]$/.exec(utility);
+  if (aspectArbitrary) {
+    const raw = aspectArbitrary[1].replace(/\\_/g, "\0").replaceAll("_", " ").replaceAll("\0", "_").trim();
+    if (!raw) return null;
+    if (raw === "auto") return ["aspectRatio", "auto"];
+    const fraction = /^(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)$/.exec(raw);
+    if (fraction) return ["aspectRatio", `${fraction[1]} / ${fraction[2]}`];
+    return ["aspectRatio", raw];
+  }
   // tailwindcss-animated longhand utilities. Like that plugin's stylesheet, they
   // win over the matching part of an animate-* shorthand in any class order.
   const animatedTime = /^animate-(duration|delay)-(.+)$/.exec(utility);

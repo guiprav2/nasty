@@ -8,6 +8,7 @@
 import { open, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { elementState } from "./internal/dom-state.js";
+import { clearPaintSegments } from "./render.js";
 
 const DEFAULT_MAX_EDGE = 8192;
 
@@ -43,12 +44,19 @@ function ensureWindowHook(window) {
     const id = Number(event.deltaX);
     const map = pendingMap(window);
     const request = map.get(id);
+    const textureOk = Number.isFinite(textureId) && textureId > 0 && Number.isInteger(textureId)
+      && Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0;
     if (!request) {
       // Late/stray event — drop texture to avoid GPU leak.
-      try { if (Number.isFinite(textureId)) window.deleteImageTexture?.(textureId); } catch { /* ignore */ }
+      try { if (textureOk) window.deleteImageTexture?.(textureId); } catch { /* ignore */ }
       return;
     }
     map.delete(id);
+    if (!textureOk) {
+      request.reject(new Error("image-ready event missing a valid texture id"));
+      try { if (Number.isFinite(textureId) && textureId > 0) window.deleteImageTexture?.(textureId); } catch { /* ignore */ }
+      return;
+    }
     request.resolve({
       textureId,
       width,
@@ -197,5 +205,7 @@ export function unloadImage(element, window) {
   if (!state.image) return false;
   const released = window.deleteImageTexture(state.image.textureId);
   state.image = null;
+  // Drop cached display-list commands that still reference the deleted texture.
+  clearPaintSegments(element);
   return released;
 }

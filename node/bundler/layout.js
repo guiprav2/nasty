@@ -9,6 +9,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
 /**
@@ -128,6 +129,45 @@ export function stageAndroidNastyPayload({ nodeDir, fontsDir, payloadRoot, canva
   }
 
   return { destPkg, destFonts };
+}
+
+/**
+ * Cache key over the Nasty sources the runtime stages (stageNastyRuntime /
+ * stageAndroidNastyPayload): every non-skipped top-level JS file and directory,
+ * package.json, the installed dependencies, and fonts. Path, size and mtime per
+ * file, like the bundlers' other stamp inputs. The native addon is left to the
+ * callers, which stamp the one they ship.
+ *
+ * @param {string} nodeDir
+ * @param {string} fontsDir
+ */
+export function nastySourcesStamp(nodeDir, fontsDir) {
+  const hash = createHash('sha256');
+  const add = path => {
+    const st = statSync(path);
+    hash.update(`${path}:${st.size}:${st.mtimeMs}\n`);
+  };
+  const walk = dir => {
+    for (const name of readdirSync(dir).sort()) {
+      const path = join(dir, name);
+      const st = statSync(path);
+      if (st.isDirectory()) walk(path);
+      else if (st.isFile()) add(path);
+    }
+  };
+  for (const name of readdirSync(nodeDir).sort()) {
+    if (shouldSkipNastyTopLevel(name) || name === 'native') continue;
+    const path = join(nodeDir, name);
+    const st = statSync(path);
+    if (name === 'node_modules') {
+      // npm rewrites this on every install/update; walking the tree would be slow.
+      const lock = join(path, '.package-lock.json');
+      if (existsSync(lock)) add(lock);
+    } else if (st.isDirectory()) walk(path);
+    else if (st.isFile() && (name.endsWith('.js') || name === 'package.json')) add(path);
+  }
+  if (existsSync(fontsDir)) walk(fontsDir);
+  return hash.digest('hex');
 }
 
 function shouldSkipNastyTopLevel(name) {

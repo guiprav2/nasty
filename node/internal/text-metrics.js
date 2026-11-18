@@ -79,7 +79,8 @@ export function textStyle(element) {
         : lineValue.endsWith('rem') ? parseFloat(lineValue) * 16 * scale
           : lineValue.endsWith('%') ? parseFloat(lineValue) * size / 100 : parseFloat(lineValue) * scale;
   const overflowWrap = inherited(element, 'overflowWrap', 'normal');
-  return { size, spacing, line, font, family: resolvedFamily, color: inherited(element, 'color', '#000'),
+  // scale: the paint device scale these sizes were taken at (1 during layout, the DPR during present).
+  return { size, spacing, line, font, scale, family: resolvedFamily, color: inherited(element, 'color', '#000'),
     wrap: element.localName !== 'input' && !['nowrap', 'pre'].includes(inherited(element, 'whiteSpace', 'normal')),
     breakWords: element.localName === 'textarea' || overflowWrap === 'anywhere' || overflowWrap === 'break-word' };
 }
@@ -193,6 +194,8 @@ export function textMetrics(element) {
 export function inlineTextLines(element, width) {
   const metrics = elementState(element).textMetrics ?? textMetrics(element);
   if (!metrics.inline) return null;
+  // Same unit conversion as layoutTextLines: paint widths are device px, metrics CSS px.
+  width = width * (metrics.style.scale ?? 1) / paintDeviceScaleFor(element);
   // Each line is a list of { word, text } fragments so a single long word can
   // split across lines under overflow-wrap, matching layout-engine measure.
   const lines = [];
@@ -243,7 +246,9 @@ export function layoutTextLines(element, width) {
   if (!style.wrap) return null;
   const state = elementState(element);
   if (state.textLines?.metrics === metrics && state.textLines.width === width) return state.textLines.lines;
-  const limit = width;
+  // Paint passes device-px widths (DPR-scaled boxes) while these metrics are usually layout's
+  // CSS px: compare in the metrics' units, or high-DPI screens never wrap.
+  const limit = width * (style.scale ?? 1) / paintDeviceScaleFor(element);
   const lines = [];
   let line = '', lineWidth = 0;
   const flush = () => { lines.push(line); line = ''; lineWidth = 0; };

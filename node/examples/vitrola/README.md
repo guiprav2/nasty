@@ -10,4 +10,4 @@ Run from `node/` with:
 node examples/vitrola/title.js
 ```
 
-Install `yt-dlp` (or `youtube-dl`) on `PATH` for YouTube search and playback. Add a Grok API key in the app to enable the assistant. Player and library data are stored in `examples/vitrola/data/` by default; set `VITROLA_DATA_DIR` to choose another directory. Set `VITROLA_YTDL` to use a specific yt-dlp executable.
+Search and playback use yt-dlp, never the system's. On desktop, Nasty's `ensureYtDlp()` downloads the latest standalone release into `~/.cache/nasty/yt-dlp/` on first use and checks for a newer one each launch. The Android APK (`npm run build:vitrola-apk`) embeds Python with yt-dlp, and on first use each launch downloads the newest yt-dlp release into app storage and imports it in place of the bundled one. Add a Grok API key in the app to enable the assistant. Player and library data are stored in `examples/vitrola/data/` by default; set `VITROLA_DATA_DIR` to choose another directory.

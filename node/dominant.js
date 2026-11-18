@@ -59,6 +59,9 @@ function bindText(document, getter) {
     if (node.data !== value) node.data = value;
   } };
   addBinding(node, binding);
+  // Seed before append so the first layout measures real text (empty createTextNode
+  // otherwise lays out 0-width labels until a later update pass).
+  binding.update();
   return node;
 }
 
@@ -76,7 +79,8 @@ function boundDescendants(node) {
   const walk = (current) => {
     out.push(current);
     if (current.nodeType !== 1) return;
-    for (const child of current.children || []) walk(child);
+    // childNodes, not children: d.text bindings are Text nodes.
+    for (const child of current.childNodes || []) walk(child);
   };
   walk(node);
   return out;

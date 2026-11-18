@@ -50,6 +50,16 @@ icons/
 
 `win-x64` is a stub. `android-arm64` packs a debug-signed APK (`assets/nasty/{entry,files.list,…}`); signed APKs cannot use a trailing overlay, so Webfoundry export injects assets and resigns.
 
+### metal-x64: Limine ISO (NastyOS / KVM)
+
+```bash
+cd os/examples/webfoundry-landing
+nasty-bundle --target metal-x64 --entry guest-main.js --name webfoundry-landing --out ./dist
+NASTYOS_ISO=./dist/webfoundry-landing-x86_64.iso DISPLAY=:0 os/scripts/run-kvm.sh
+```
+
+Packs app JS into the freestanding guest VFS (`/app/…`), rebuilds the Limine ISO, and copies `${name}-x86_64.iso` to `--out`. Guest boot loads `/app/guest-main.js` (must export `bootGuestLanding`); when only `--entry` exists, the packer synthesizes a bridge. There is no guest ISO9660/file loader yet — modules are embedded in the kernel (`pack-guest-js.mjs`). Optional disk: `os/scripts/mk-ext4-image.sh` then `NASTYOS_EXT4_IMAGE=… run-kvm.sh`.
+
 ### android-arm64: runtime APK + Webfoundry export
 
 1. **Toolchain Node**: `NODE_MOBILE_ROOT` (default `~/prog/nasty-nodejs-mobile`) must provide **Capawesome 18.20.4 full-icu** `bin/arm64-v8a/libnode.so` (~97 MiB) plus a `VERSION` note. Stock janeasystems small-icu (~60 MiB) is rejected: Unicode property escapes (`\p{…}`) used by `font-registry` and CDN `marked` fail at parse time.

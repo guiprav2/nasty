@@ -12,7 +12,7 @@
 import { documentLiveLookup, documentState, elementState } from "./dom-state.js";
 import { insideSkippedContent } from "./content-visibility.js";
 import { clipsOverflow } from "./overflow.js";
-import { createBoxProjector } from "../render.js";
+import { clearPaintSegments, createBoxProjector } from "../render.js";
 
 const DEFAULT_POOL = 48;
 const DEFAULT_KEEP_FOLD = 2;
@@ -255,6 +255,9 @@ function unloadAwayImage(element, window) {
     try { window.deleteImageTexture(state.image.textureId); } catch { /* ignore */ }
   }
   state.image = null;
+  // Soft eviction used to leave paintSegments / layout meshes pointing at the
+  // deleted GPU texture; the next present then failed with invalid image headers.
+  clearPaintSegments(element);
   state.currentSrc = "";
   state.imageLoadState = "pending";
   state.imageAwaySince = null;

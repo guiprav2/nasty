@@ -1,5 +1,8 @@
 fn main() {
     napi_build::setup();
+    // Shared modules (layout_shared.rs) derive napi objects only in this crate.
+    println!("cargo::rustc-check-cfg=cfg(nasty_napi)");
+    println!("cargo:rustc-cfg=nasty_napi");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         link_ffmpeg();
     }

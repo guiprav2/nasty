@@ -1,0 +1,28 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="28" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:hasCode="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="Vitrola"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <!-- A NativeActivity subclass, so Nasty's ytdlpExtract() can reach the embedded yt-dlp. -->
+        <activity
+            android:name="org.nasty.vitrola.VitrolaActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:exported="true"
+            android:label="Vitrola"
+            android:screenOrientation="unspecified"
+            android:windowSoftInputMode="adjustResize|stateUnchanged">
+            <meta-data android:name="android.app.lib_name" android:value="nasty_native" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

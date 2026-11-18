@@ -3110,6 +3110,7 @@ doc.body.appendChild(shell());
 d.updateSync();
 
 win = new Window({
+  icon: join(here, "logo.png"),
   appId: "treva",
   title: "Treva",
   width: 1100,

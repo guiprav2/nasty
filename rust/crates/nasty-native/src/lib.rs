@@ -1,8 +1,10 @@
 //! Small Node binding for Taffy. The document and frame clock live in JavaScript.
 
-use glyphon::cosmic_text::{Align, Weight, Wrap};
+mod text_shared;
+use text_shared::*;
+use glyphon::cosmic_text::Wrap;
 use glyphon::{
-    Attrs, Buffer as TextBuffer, Cache as TextCache, Color as TextColor, Edit, Editor, Family,
+    Attrs, Buffer as TextBuffer, Cache as TextCache, Color as TextColor, Edit, Editor,
     FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
     TextRenderer, Viewport,
 };
@@ -14,6 +16,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use taffy::prelude::*;
@@ -31,8 +34,11 @@ mod video_stream;
 mod image_decode_pool;
 mod webrtc_bridge;
 mod frame_recorder;
+mod ytdlp;
 #[cfg(target_os = "android")]
 mod android_camera;
+#[cfg(target_os = "android")]
+mod android_media;
 use image_decode_pool::{ImageDecodePool, ImageJobOutcome};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -50,100 +56,7 @@ pub struct RecordingInfo {
     pub height: u32,
 }
 
-/// CSS font matching within one family: the requested weight when the family has
-/// it, else its nearest face (heavier first above 500, lighter first below 400).
-/// cosmic-text only takes exact weights from a named family and otherwise falls
-/// through to unrelated fonts, which then disagree with layout's measurements.
-fn nearest_weight(db: &glyphon::fontdb::Database, family: Family<'_>, requested: u16) -> Weight {
-    let Family::Name(name) = family else { return Weight(requested) };
-    let weights: Vec<u16> = db.faces()
-        .filter(|face| face.style == glyphon::fontdb::Style::Normal && face.families.iter().any(|(each, _)| each.eq_ignore_ascii_case(name)))
-        .map(|face| face.weight.0)
-        .collect();
-    if weights.is_empty() || weights.contains(&requested) { return Weight(requested); }
-    let pick = |candidates: &mut dyn Iterator<Item = u16>, heavier: bool| {
-        if heavier { candidates.min() } else { candidates.max() }
-    };
-    let above = |weights: &[u16]| pick(&mut weights.iter().copied().filter(|weight| *weight > requested), true);
-    let below = |weights: &[u16]| pick(&mut weights.iter().copied().filter(|weight| *weight < requested), false);
-    let chosen = if requested > 500 { above(&weights).or_else(|| below(&weights)) }
-        else if requested < 400 { below(&weights).or_else(|| above(&weights)) }
-        else {
-            // 400 tries 500 first and 500 tries 400 first, then lighter, then heavier.
-            let partner = if requested == 400 { 500 } else { 400 };
-            weights.contains(&partner).then_some(partner).or_else(|| below(&weights)).or_else(|| above(&weights))
-        };
-    Weight(chosen.unwrap_or(requested))
-}
 
-#[napi(object)]
-#[derive(Default)]
-pub struct LayoutStyle {
-    pub display: Option<String>,
-    pub position: Option<String>,
-    pub top: Option<f64>,
-    pub right: Option<f64>,
-    pub bottom: Option<f64>,
-    pub left: Option<f64>,
-    pub top_percent: Option<f64>,
-    pub right_percent: Option<f64>,
-    pub bottom_percent: Option<f64>,
-    pub left_percent: Option<f64>,
-    pub direction: Option<String>,
-    pub width: Option<f64>,
-    pub height: Option<f64>,
-    pub width_percent: Option<f64>,
-    pub height_percent: Option<f64>,
-    pub aspect_ratio: Option<f64>,
-    pub min_width: Option<f64>,
-    pub min_height: Option<f64>,
-    pub max_width: Option<f64>,
-    pub max_height: Option<f64>,
-    pub min_width_percent: Option<f64>,
-    pub min_height_percent: Option<f64>,
-    pub max_width_percent: Option<f64>,
-    pub max_height_percent: Option<f64>,
-    pub flex_wrap: Option<String>,
-    pub padding: Option<f64>,
-    pub padding_top: Option<f64>,
-    pub padding_right: Option<f64>,
-    pub padding_bottom: Option<f64>,
-    pub padding_left: Option<f64>,
-    pub margin: Option<f64>,
-    pub margin_top: Option<f64>,
-    pub margin_right: Option<f64>,
-    pub margin_bottom: Option<f64>,
-    pub margin_left: Option<f64>,
-    pub margin_top_auto: Option<bool>,
-    pub margin_right_auto: Option<bool>,
-    pub margin_bottom_auto: Option<bool>,
-    pub margin_left_auto: Option<bool>,
-    pub border_width: Option<f64>,
-    pub border_top_width: Option<f64>,
-    pub border_right_width: Option<f64>,
-    pub border_bottom_width: Option<f64>,
-    pub border_left_width: Option<f64>,
-    pub gap: Option<f64>,
-    pub flex_grow: Option<f64>,
-    pub flex_shrink: Option<f64>,
-    pub flex_basis: Option<f64>,
-    pub flex_basis_percent: Option<f64>,
-    pub align_items: Option<String>,
-    pub justify_content: Option<String>,
-    /// CSS `grid-template-columns` track list, e.g. `repeat(3, minmax(0px, 1fr))`.
-    pub grid_template_columns: Option<String>,
-    /// CSS `grid-template-rows` track list.
-    pub grid_template_rows: Option<String>,
-    pub grid_auto_flow: Option<String>,
-    pub grid_auto_columns: Option<String>,
-    pub grid_auto_rows: Option<String>,
-    pub grid_column: Option<String>,
-    pub grid_row: Option<String>,
-    pub row_gap: Option<f64>,
-    pub column_gap: Option<f64>,
-}
-
-/// One file-type choice in the file picker, e.g. "Images" with ["png", "jpg"].
 #[napi(object)]
 pub struct FilePickerFilter {
     pub name: String,
@@ -170,533 +83,16 @@ pub struct LayoutBox {
     pub padding_left: f64,
 }
 
-fn finite_nonnegative(value: f64, name: &str) -> Result<f32> {
-    if !value.is_finite() || value < 0.0 || value > f32::MAX as f64 {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!("{name} must be a finite nonnegative number"),
-        ));
-    }
-    Ok(value as f32)
-}
+mod layout_shared;
+mod backdrop_shared;
+use backdrop_shared::BackdropResources;
+pub use layout_shared::LayoutStyle;
+use layout_shared::{convert_style, finite_nonnegative};
 
-fn finite_signed(value: f64, name: &str) -> Result<f32> {
-    if !value.is_finite() || value.abs() > f32::MAX as f64 {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!("{name} must be finite and within the supported numeric range"),
-        ));
+impl From<layout_shared::LayoutError> for Error {
+    fn from(e: layout_shared::LayoutError) -> Self {
+        Error::new(Status::InvalidArg, e.0)
     }
-    Ok(value as f32)
-}
-
-
-fn parse_css_length_px(s: &str) -> Result<f32> {
-    let s = s.trim();
-    if let Some(px) = s.strip_suffix("px") {
-        let n: f64 = px.trim().parse().map_err(|_| {
-            Error::new(Status::InvalidArg, format!("invalid length: {s}"))
-        })?;
-        return finite_nonnegative(n, "length");
-    }
-    if let Some(pct) = s.strip_suffix('%') {
-        let n: f64 = pct.trim().parse().map_err(|_| {
-            Error::new(Status::InvalidArg, format!("invalid percent length: {s}"))
-        })?;
-        // Percent tracks are resolved by Taffy against the grid container; store as length 0
-        // is wrong. Prefer explicit px for bridge simplicity — reject bare %.
-        let _ = n;
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!("percent track sizes are not supported yet: {s}"),
-        ));
-    }
-    let n: f64 = s.parse().map_err(|_| {
-        Error::new(Status::InvalidArg, format!("invalid length: {s}"))
-    })?;
-    finite_nonnegative(n, "length")
-}
-
-fn split_top_level_comma(s: &str) -> Option<(&str, &str)> {
-    let mut depth = 0i32;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn split_top_level_tokens(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ' ' | '\t' | '\n' | '\r' if depth == 0 => {
-                if i > start {
-                    let piece = s[start..i].trim();
-                    if !piece.is_empty() {
-                        out.push(piece.to_string());
-                    }
-                }
-                start = i + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    if start < s.len() {
-        let tail = s[start..].trim();
-        if !tail.is_empty() {
-            out.push(tail.to_string());
-        }
-    }
-    out
-}
-
-fn parse_min_track_sizing(s: &str) -> Result<MinTrackSizingFunction> {
-    let s = s.trim();
-    if s == "auto" {
-        return Ok(MinTrackSizingFunction::auto());
-    }
-    if s == "min-content" {
-        return Ok(MinTrackSizingFunction::min_content());
-    }
-    if s == "max-content" {
-        return Ok(MinTrackSizingFunction::max_content());
-    }
-    if s.ends_with("fr") {
-        return Ok(MinTrackSizingFunction::auto());
-    }
-    let len = parse_css_length_px(s)?;
-    Ok(MinTrackSizingFunction::from(LengthPercentage::length(len)))
-}
-
-fn parse_max_track_sizing(s: &str) -> Result<MaxTrackSizingFunction> {
-    let s = s.trim();
-    if s == "auto" {
-        return Ok(MaxTrackSizingFunction::auto());
-    }
-    if s == "min-content" {
-        return Ok(MaxTrackSizingFunction::min_content());
-    }
-    if s == "max-content" {
-        return Ok(MaxTrackSizingFunction::max_content());
-    }
-    if let Some(fr) = s.strip_suffix("fr") {
-        let n: f32 = fr.trim().parse().map_err(|_| {
-            Error::new(Status::InvalidArg, format!("invalid fr max track: {s}"))
-        })?;
-        if !n.is_finite() || n < 0.0 {
-            return Err(Error::new(Status::InvalidArg, format!("invalid fr max track: {s}")));
-        }
-        return Ok(MaxTrackSizingFunction::fr(n));
-    }
-    let len = parse_css_length_px(s)?;
-    Ok(MaxTrackSizingFunction::from(LengthPercentage::length(len)))
-}
-
-fn parse_track_sizing_function(raw: &str) -> Result<TrackSizingFunction> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return Err(Error::new(Status::InvalidArg, "empty grid track"));
-    }
-    if let Some(inner) = s.strip_prefix("minmax(").and_then(|rest| rest.strip_suffix(')')) {
-        let (min_raw, max_raw) = split_top_level_comma(inner).ok_or_else(|| {
-            Error::new(Status::InvalidArg, format!("invalid minmax track: {s}"))
-        })?;
-        let min = parse_min_track_sizing(min_raw.trim())?;
-        let max = parse_max_track_sizing(max_raw.trim())?;
-        return Ok(minmax(min, max));
-    }
-    if s == "auto" {
-        return Ok(TrackSizingFunction::AUTO);
-    }
-    if s == "min-content" {
-        return Ok(TrackSizingFunction::MIN_CONTENT);
-    }
-    if s == "max-content" {
-        return Ok(TrackSizingFunction::MAX_CONTENT);
-    }
-    if let Some(fr) = s.strip_suffix("fr") {
-        let n: f32 = fr.trim().parse().map_err(|_| {
-            Error::new(Status::InvalidArg, format!("invalid fr track: {s}"))
-        })?;
-        if !n.is_finite() || n < 0.0 {
-            return Err(Error::new(Status::InvalidArg, format!("invalid fr track: {s}")));
-        }
-        return Ok(flex(n));
-    }
-    let len = parse_css_length_px(s)?;
-    Ok(TrackSizingFunction::from(LengthPercentage::length(len)))
-}
-
-fn parse_grid_template_tracks(raw: &str) -> Result<Vec<GridTemplateComponent<String>>> {
-    let tokens = split_top_level_tokens(raw.trim());
-    let mut tracks = Vec::new();
-    for token in tokens {
-        let t = token.trim();
-        if t.is_empty() {
-            continue;
-        }
-        if let Some(inner) = t.strip_prefix("repeat(").and_then(|rest| rest.strip_suffix(')')) {
-            let (count_raw, list_raw) = split_top_level_comma(inner).ok_or_else(|| {
-                Error::new(Status::InvalidArg, format!("invalid repeat(): {t}"))
-            })?;
-            let count_raw = count_raw.trim();
-            let mut repeated = Vec::new();
-            for part in split_top_level_tokens(list_raw.trim()) {
-                if part.trim().is_empty() {
-                    continue;
-                }
-                repeated.push(parse_track_sizing_function(&part)?);
-            }
-            if count_raw == "auto-fill" {
-                tracks.push(repeat(RepetitionCount::AutoFill, repeated));
-            } else if count_raw == "auto-fit" {
-                tracks.push(repeat(RepetitionCount::AutoFit, repeated));
-            } else {
-                let count: u16 = count_raw.parse().map_err(|_| {
-                    Error::new(Status::InvalidArg, format!("invalid repeat count: {count_raw}"))
-                })?;
-                tracks.push(repeat(count, repeated));
-            }
-        } else {
-            let sizing = parse_track_sizing_function(t)?;
-            tracks.push(GridTemplateComponent::Single(sizing));
-        }
-    }
-    Ok(tracks)
-}
-
-fn parse_grid_auto_tracks(raw: &str) -> Result<Vec<TrackSizingFunction>> {
-    let mut tracks = Vec::new();
-    for token in split_top_level_tokens(raw.trim()) {
-        if token.trim().is_empty() {
-            continue;
-        }
-        tracks.push(parse_track_sizing_function(&token)?);
-    }
-    Ok(tracks)
-}
-
-fn parse_grid_placement_line(raw: &str) -> Result<Line<GridPlacement>> {
-    let s = raw.trim();
-    if s == "auto" {
-        return Ok(Line {
-            start: GridPlacement::Auto,
-            end: GridPlacement::Auto,
-        });
-    }
-    let parts: Vec<&str> = s.split('/').map(|p| p.trim()).collect();
-    let parse_one = |part: &str| -> Result<GridPlacement> {
-        let part = part.trim();
-        if part == "auto" || part.is_empty() {
-            return Ok(GridPlacement::Auto);
-        }
-        if let Some(n) = part.strip_prefix("span ") {
-            let n: u16 = n.trim().parse().map_err(|_| {
-                Error::new(Status::InvalidArg, format!("invalid grid span: {part}"))
-            })?;
-            return Ok(span(n));
-        }
-        let n: i16 = part.parse().map_err(|_| {
-            Error::new(Status::InvalidArg, format!("invalid grid line: {part}"))
-        })?;
-        Ok(line(n))
-    };
-    if parts.len() == 1 {
-        Ok(Line {
-            start: parse_one(parts[0])?,
-            end: GridPlacement::Auto,
-        })
-    } else if parts.len() == 2 {
-        Ok(Line {
-            start: parse_one(parts[0])?,
-            end: parse_one(parts[1])?,
-        })
-    } else {
-        Err(Error::new(
-            Status::InvalidArg,
-            format!("invalid grid placement: {raw}"),
-        ))
-    }
-}
-
-fn convert_style(input: LayoutStyle) -> Result<Style> {
-    let mut style = Style::default();
-    // Nasty uses reset-style border-box sizing. There is no public boxSizing option.
-    style.box_sizing = BoxSizing::BorderBox;
-    if let Some(ratio) = input.aspect_ratio {
-        if !ratio.is_finite() || ratio <= 0.0 || ratio > f32::MAX as f64 {
-            return Err(Error::new(Status::InvalidArg, "aspectRatio must be finite and positive"));
-        }
-        style.aspect_ratio = Some(ratio as f32);
-    }
-    if let Some(position) = input.position.as_deref() {
-        style.position = match position {
-            "static" | "relative" => Position::Relative,
-            "absolute" | "fixed" => Position::Absolute,
-            _ => return Err(Error::new(Status::InvalidArg, format!("unknown position: {position}"))),
-        };
-    }
-    for (name, value, target) in [
-        ("top", input.top, &mut style.inset.top),
-        ("right", input.right, &mut style.inset.right),
-        ("bottom", input.bottom, &mut style.inset.bottom),
-        ("left", input.left, &mut style.inset.left),
-    ] {
-        if let Some(value) = value {
-            *target = LengthPercentageAuto::length(finite_signed(value, name)?);
-        }
-    }
-    for (name, value, target) in [
-        ("topPercent", input.top_percent, &mut style.inset.top),
-        ("rightPercent", input.right_percent, &mut style.inset.right),
-        ("bottomPercent", input.bottom_percent, &mut style.inset.bottom),
-        ("leftPercent", input.left_percent, &mut style.inset.left),
-    ] {
-        if let Some(value) = value {
-            *target = LengthPercentageAuto::percent(finite_signed(value, name)?);
-        }
-    }
-    if let Some(display) = input.display.as_deref() {
-        style.display = match display {
-            "block" => Display::Block,
-            "flex" => Display::Flex,
-            "grid" => Display::Grid,
-            "none" => Display::None,
-            _ => {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!("unknown display: {display}"),
-                ))
-            }
-        };
-    }
-    if let Some(direction) = input.direction.as_deref() {
-        style.flex_direction = match direction {
-            "row" => FlexDirection::Row,
-            "column" => FlexDirection::Column,
-            "row-reverse" => FlexDirection::RowReverse,
-            "column-reverse" => FlexDirection::ColumnReverse,
-            _ => {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!("unknown flex direction: {direction}"),
-                ))
-            }
-        };
-    }
-    for (name, px, percent, target) in [
-        (
-            "width",
-            input.width,
-            input.width_percent,
-            &mut style.size.width,
-        ),
-        (
-            "height",
-            input.height,
-            input.height_percent,
-            &mut style.size.height,
-        ),
-    ] {
-        if px.is_some() && percent.is_some() {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!("{name} cannot be both pixels and percent"),
-            ));
-        }
-        if let Some(px) = px {
-            *target = Dimension::length(finite_nonnegative(px, name)?);
-        }
-        if let Some(percent) = percent {
-            *target = Dimension::percent(finite_nonnegative(percent, name)?);
-        }
-    }
-    for (name, px, percent, target) in [
-        ("minWidth", input.min_width, input.min_width_percent, &mut style.min_size.width),
-        ("minHeight", input.min_height, input.min_height_percent, &mut style.min_size.height),
-        ("maxWidth", input.max_width, input.max_width_percent, &mut style.max_size.width),
-        ("maxHeight", input.max_height, input.max_height_percent, &mut style.max_size.height),
-    ] {
-        if px.is_some() && percent.is_some() {
-            return Err(Error::new(Status::InvalidArg, format!("{name} cannot be both pixels and percent")));
-        }
-        if let Some(value) = px {
-            *target = LengthPercentageAuto::length(finite_nonnegative(value, name)?);
-        }
-        if let Some(value) = percent {
-            *target = LengthPercentageAuto::percent(finite_nonnegative(value, name)?);
-        }
-    }
-    style.flex_wrap = match input.flex_wrap.as_deref() {
-        Some("wrap") => FlexWrap::Wrap,
-        Some("wrap-reverse") => FlexWrap::WrapReverse,
-        _ => FlexWrap::NoWrap,
-    };
-    let padding = input.padding.unwrap_or(0.0);
-    style.padding = Rect {
-        top: LengthPercentage::length(finite_nonnegative(
-            input.padding_top.unwrap_or(padding),
-            "paddingTop",
-        )?),
-        right: LengthPercentage::length(finite_nonnegative(
-            input.padding_right.unwrap_or(padding),
-            "paddingRight",
-        )?),
-        bottom: LengthPercentage::length(finite_nonnegative(
-            input.padding_bottom.unwrap_or(padding),
-            "paddingBottom",
-        )?),
-        left: LengthPercentage::length(finite_nonnegative(
-            input.padding_left.unwrap_or(padding),
-            "paddingLeft",
-        )?),
-    };
-    let margin = input.margin.unwrap_or(0.0);
-    let margin_edge =
-        |value: Option<f64>, auto: Option<bool>, name: &str| -> Result<LengthPercentageAuto> {
-            if auto.unwrap_or(false) {
-                Ok(LengthPercentageAuto::auto())
-            } else {
-                Ok(LengthPercentageAuto::length(finite_signed(
-                    value.unwrap_or(margin),
-                    name,
-                )?))
-            }
-        };
-    style.margin = Rect {
-        top: margin_edge(input.margin_top, input.margin_top_auto, "marginTop")?,
-        right: margin_edge(input.margin_right, input.margin_right_auto, "marginRight")?,
-        bottom: margin_edge(
-            input.margin_bottom,
-            input.margin_bottom_auto,
-            "marginBottom",
-        )?,
-        left: margin_edge(input.margin_left, input.margin_left_auto, "marginLeft")?,
-    };
-    let border = input.border_width.unwrap_or(0.0);
-    style.border = Rect {
-        top: LengthPercentage::length(finite_nonnegative(
-            input.border_top_width.unwrap_or(border),
-            "borderTopWidth",
-        )?),
-        right: LengthPercentage::length(finite_nonnegative(
-            input.border_right_width.unwrap_or(border),
-            "borderRightWidth",
-        )?),
-        bottom: LengthPercentage::length(finite_nonnegative(
-            input.border_bottom_width.unwrap_or(border),
-            "borderBottomWidth",
-        )?),
-        left: LengthPercentage::length(finite_nonnegative(
-            input.border_left_width.unwrap_or(border),
-            "borderLeftWidth",
-        )?),
-    };
-    if let Some(value) = input.gap {
-        let value = LengthPercentage::length(finite_nonnegative(value, "gap")?);
-        style.gap = Size {
-            width: value,
-            height: value,
-        };
-    }
-    if let Some(value) = input.row_gap {
-        style.gap.height = LengthPercentage::length(finite_nonnegative(value, "rowGap")?);
-    }
-    if let Some(value) = input.column_gap {
-        style.gap.width = LengthPercentage::length(finite_nonnegative(value, "columnGap")?);
-    }
-    if let Some(ref raw) = input.grid_template_columns {
-        style.grid_template_columns = parse_grid_template_tracks(raw)?;
-    }
-    if let Some(ref raw) = input.grid_template_rows {
-        style.grid_template_rows = parse_grid_template_tracks(raw)?;
-    }
-    if let Some(ref raw) = input.grid_auto_columns {
-        style.grid_auto_columns = parse_grid_auto_tracks(raw)?;
-    }
-    if let Some(ref raw) = input.grid_auto_rows {
-        style.grid_auto_rows = parse_grid_auto_tracks(raw)?;
-    }
-    if let Some(value) = input.grid_auto_flow.as_deref() {
-        style.grid_auto_flow = match value {
-            "row" => GridAutoFlow::Row,
-            "column" => GridAutoFlow::Column,
-            "row dense" | "dense" => GridAutoFlow::RowDense,
-            "column dense" => GridAutoFlow::ColumnDense,
-            _ => {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!("unknown gridAutoFlow: {value}"),
-                ))
-            }
-        };
-    }
-    if let Some(ref raw) = input.grid_column {
-        style.grid_column = parse_grid_placement_line(raw)?;
-    }
-    if let Some(ref raw) = input.grid_row {
-        style.grid_row = parse_grid_placement_line(raw)?;
-    }
-    if let Some(value) = input.flex_grow {
-        style.flex_grow = finite_nonnegative(value, "flexGrow")?;
-    }
-    if let Some(value) = input.flex_shrink {
-        style.flex_shrink = finite_nonnegative(value, "flexShrink")?;
-    }
-    if input.flex_basis.is_some() && input.flex_basis_percent.is_some() {
-        return Err(Error::new(
-            Status::InvalidArg,
-            "flexBasis cannot be both pixels and percent",
-        ));
-    }
-    if let Some(value) = input.flex_basis {
-        style.flex_basis = Dimension::length(finite_nonnegative(value, "flexBasis")?);
-    }
-    if let Some(value) = input.flex_basis_percent {
-        style.flex_basis = Dimension::percent(finite_nonnegative(value, "flexBasisPercent")?);
-    }
-    if let Some(value) = input.align_items.as_deref() {
-        style.align_items = Some(match value {
-            "start" | "flex-start" => AlignItems::START,
-            "end" | "flex-end" => AlignItems::END,
-            "center" | "unsafe center" => AlignItems::CENTER,
-            "safe center" => AlignItems::SAFE_CENTER,
-            "stretch" => AlignItems::STRETCH,
-            _ => {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!("unknown alignItems: {value}"),
-                ))
-            }
-        });
-    }
-    if let Some(value) = input.justify_content.as_deref() {
-        style.justify_content = Some(match value {
-            "start" | "flex-start" => JustifyContent::START,
-            "end" | "flex-end" => JustifyContent::END,
-            "center" | "unsafe center" => JustifyContent::CENTER,
-            "safe center" => JustifyContent::SAFE_CENTER,
-            "space-between" => JustifyContent::SPACE_BETWEEN,
-            "space-around" => JustifyContent::SPACE_AROUND,
-            "space-evenly" => JustifyContent::SPACE_EVENLY,
-            _ => {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!("unknown justifyContent: {value}"),
-                ))
-            }
-        });
-    }
-    Ok(style)
 }
 
 fn taffy_error(error: TaffyError) -> Error {
@@ -850,6 +246,44 @@ impl LayoutTree {
     }
 }
 
+/// System bar insets in physical px, top << 32 | bottom: reported by NastyActivity on Android,
+/// or NASTY_SAFE_INSETS="top,bottom" (for trying safe areas on desktop).
+static SAFE_INSETS_RAW: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Window#safeArea edges: bit 0 top, bit 1 bottom.
+static SAFE_AREA_EDGES: AtomicU8 = AtomicU8::new(0);
+
+fn raw_safe_insets() -> (u32, u32) {
+    let mut raw = SAFE_INSETS_RAW.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        let (top, bottom) = std::env::var("NASTY_SAFE_INSETS").ok()
+            .and_then(|value| { let (t, b) = value.split_once(',')?; Some((t.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?)) })
+            .unwrap_or((0, 0));
+        raw = (top as u64) << 32 | bottom as u64;
+        let _ = SAFE_INSETS_RAW.compare_exchange(u64::MAX, raw, Ordering::AcqRel, Ordering::Acquire);
+        raw = SAFE_INSETS_RAW.load(Ordering::Acquire);
+    }
+    ((raw >> 32) as u32, raw as u32)
+}
+
+/// The insets the window keeps clear, given its safeArea mode.
+fn effective_safe_insets() -> (u32, u32) {
+    let edges = SAFE_AREA_EDGES.load(Ordering::Acquire);
+    let (top, bottom) = raw_safe_insets();
+    (if edges & 1 != 0 { top } else { 0 }, if edges & 2 != 0 { bottom } else { 0 })
+}
+
+/// NastyActivity reports the status/navigation bar sizes (physical px) whenever they change.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_org_nasty_NastyActivity_nastyInsetsChanged(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    top: i32,
+    bottom: i32,
+) {
+    SAFE_INSETS_RAW.store((top.max(0) as u64) << 32 | bottom.max(0) as u64, Ordering::Release);
+}
+
 #[cfg(target_os = "android")]
 static ANDROID_APP: OnceLock<winit::platform::android::activity::AndroidApp> = OnceLock::new();
 
@@ -860,6 +294,8 @@ extern "C" {
         activity: *mut std::ffi::c_void,
     );
     fn nasty_set_requested_orientation(orientation: i32) -> i32;
+    fn nasty_move_task_to_back() -> i32;
+    fn nasty_set_immersive(immersive: i32) -> i32;
     fn nasty_node_start(script_path: *const std::ffi::c_char) -> i32;
     fn nasty_native_library_path() -> *const std::ffi::c_char;
 }
@@ -1077,193 +513,20 @@ enum CanvasCommand {
     Beziers(std::ops::Range<u32>),
 }
 
-struct BackdropResources {
-    source: wgpu::Texture,
-    small: wgpu::Texture,
-    horizontal: wgpu::Texture,
-    blurred: wgpu::Texture,
-    downsample_bind: wgpu::BindGroup,
-    horizontal_bind: wgpu::BindGroup,
-    vertical_bind: wgpu::BindGroup,
-    composite_bind: wgpu::BindGroup,
-    horizontal_params: wgpu::Buffer,
-    vertical_params: wgpu::Buffer,
-    composite_params: wgpu::Buffer,
-    downsample_pipeline: wgpu::RenderPipeline,
-    blur_pipeline: wgpu::RenderPipeline,
-    composite_pipeline: wgpu::RenderPipeline,
-    small_width: u32,
-    small_height: u32,
-}
 
-impl BackdropResources {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> Self {
-        let small_width = (width / 4).max(1);
-        let small_height = (height / 4).max(1);
-        let make_texture = |label, width, height, usage| device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage,
-            view_formats: &[],
-        });
-        let sampled_target = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let source = make_texture("Nasty backdrop source", width, height,
-            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING);
-        let small = make_texture("Nasty backdrop downsample", small_width, small_height, sampled_target);
-        let horizontal = make_texture("Nasty backdrop horizontal blur", small_width, small_height, sampled_target);
-        let blurred = make_texture("Nasty backdrop vertical blur", small_width, small_height, sampled_target);
-        let source_view = source.create_view(&Default::default());
-        let small_view = small.create_view(&Default::default());
-        let horizontal_view = horizontal.create_view(&Default::default());
-        let blurred_view = blurred.create_view(&Default::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Nasty backdrop sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Nasty backdrop bindings"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            ],
-        });
-        let make_params = |x: f32, y: f32| device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Nasty backdrop blur direction"),
-            contents: bytemuck::cast_slice(&[x, y, 1.0, 0.0]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let horizontal_params = make_params(1.0, 0.0);
-        let vertical_params = make_params(0.0, 1.0);
-        let composite_params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Nasty backdrop composite masks"), size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
-        });
-        let make_bind = |view: &wgpu::TextureView, params: Option<&wgpu::Buffer>| {
-            let mut entries = vec![
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ];
-            if let Some(params) = params { entries.push(wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() }); }
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Nasty backdrop bind group"), layout: &layout, entries: &entries })
-        };
-        let simple_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Nasty backdrop sampling bindings"), entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-            ],
-        });
-        let make_simple_bind = |view: &wgpu::TextureView| device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Nasty backdrop sampling bind"), layout: &simple_layout, entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-        });
-        let shader_source = r#"
-            struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
-            @vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
-                var p = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
-                var o: Out; o.position = vec4(p[i],0.0,1.0); o.uv = vec2((p[i].x+1.0)*0.5, (1.0-p[i].y)*0.5); return o;
-            }
-        "#;
-        let make_pipeline = |label: &'static str, fragment: String, bind_layout: &wgpu::BindGroupLayout, blend: Option<wgpu::BlendState>| {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(fragment.into()) });
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bind_layout], push_constant_ranges: &[] });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label), layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
-                primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })] }),
-                multiview: None, cache: None,
-            })
-        };
-        // One axis of a Gaussian with standard deviation params.z (in texels of the
-        // downsampled copy), sampled densely out to 3σ. Each tap pair of adjacent
-        // texels is read with one bilinear fetch at their weighted midpoint.
-        let blur_shader = format!("{shader_source}
-            @group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler;
-            @group(0) @binding(2) var<uniform> params: vec4<f32>;
-            @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{
-                let texel = params.xy / vec2<f32>(textureDimensions(tex));
-                let sigma = max(params.z, 0.5);
-                let reach = min(i32(ceil(sigma * 3.0)), 192);
-                let falloff = -0.5 / (sigma * sigma);
-                var sum = textureSampleLevel(tex, samp, i.uv, 0.0);
-                var total = 1.0;
-                for (var k = 1; k <= reach; k = k + 2) {{
-                    let a = f32(k);
-                    let b = a + 1.0;
-                    let wa = exp(a * a * falloff);
-                    let wb = exp(b * b * falloff);
-                    let w = wa + wb;
-                    let offset = texel * ((a * wa + b * wb) / w);
-                    sum += (textureSampleLevel(tex, samp, i.uv + offset, 0.0) + textureSampleLevel(tex, samp, i.uv - offset, 0.0)) * w;
-                    total += 2.0 * w;
-                }}
-                return sum / total;
-            }}");
-        // 4×4 box average: four bilinear fetches, each the mean of a 2×2 block.
-        let downsample_shader = format!("{shader_source}
-            @group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler;
-            @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{
-                let t = 1.0 / vec2<f32>(textureDimensions(tex));
-                return 0.25 * (textureSampleLevel(tex, samp, i.uv + t * vec2(-1.0, -1.0), 0.0)
-                    + textureSampleLevel(tex, samp, i.uv + t * vec2(1.0, -1.0), 0.0)
-                    + textureSampleLevel(tex, samp, i.uv + t * vec2(-1.0, 1.0), 0.0)
-                    + textureSampleLevel(tex, samp, i.uv + t * vec2(1.0, 1.0), 0.0));
-            }}");
-        // The blurred backdrop, limited to the rounded-rect masks with antialiased
-        // edges. Samples are premultiplied, so dividing by alpha leaves only real
-        // content: transparent pixels beyond the window's own corners are not
-        // averaged in as dark, see-through haze. The result is opaque where the
-        // masks cover it and blends in by their coverage at the edges.
-        let composite_shader = format!("{shader_source}
-            @group(0) @binding(0) var tex: texture_2d<f32>; @group(0) @binding(1) var samp: sampler;
-            struct Masks {{ a: vec4<f32>, a_radius: vec4<f32>, b: vec4<f32>, b_radius: vec4<f32> }};
-            @group(0) @binding(2) var<uniform> masks: Masks;
-            fn coverage(p: vec2<f32>, rect: vec4<f32>, radius: f32) -> f32 {{
-                if (rect.z <= 0.0) {{ return 1.0; }}
-                let half = rect.zw * 0.5;
-                let r = min(radius, min(half.x, half.y));
-                let q = abs(p - (rect.xy + half)) - (half - vec2(r));
-                let d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
-                return clamp(0.5 - d, 0.0, 1.0);
-            }}
-            @fragment fn fs(i: Out) -> @location(0) vec4<f32> {{
-                let c = textureSample(tex, samp, i.uv);
-                let cover = coverage(i.position.xy, masks.a, masks.a_radius.x) * coverage(i.position.xy, masks.b, masks.b_radius.x);
-                return vec4(c.rgb / max(c.a, 0.0001), cover);
-            }}");
-        let composite_blend = wgpu::BlendState {
-            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
-            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
-        };
-        let downsample_pipeline = make_pipeline("Nasty backdrop downsample pipeline", downsample_shader, &simple_layout, None);
-        let composite_pipeline = make_pipeline("Nasty backdrop composite pipeline", composite_shader, &layout, Some(composite_blend));
-        let blur_pipeline = make_pipeline("Nasty backdrop blur pipeline", blur_shader, &layout, None);
-        Self { source, small, horizontal, blurred,
-            downsample_bind: make_simple_bind(&source_view),
-            horizontal_bind: make_bind(&small_view, Some(&horizontal_params)),
-            vertical_bind: make_bind(&horizontal_view, Some(&vertical_params)),
-            composite_bind: make_bind(&blurred_view, Some(&composite_params)), horizontal_params, vertical_params, composite_params,
-            downsample_pipeline, blur_pipeline, composite_pipeline, small_width, small_height }
-    }
+/// Loads a PNG for the window icon; a bad path only warns, since the window still works without it.
+fn load_window_icon(path: &str) -> Option<winit::window::Icon> {
+    let image = match image::open(path) {
+        Ok(image) => image.into_rgba8(),
+        Err(error) => {
+            eprintln!("Nasty: could not load window icon {path}: {error}");
+            return None;
+        }
+    };
+    let (width, height) = image.dimensions();
+    winit::window::Icon::from_rgba(image.into_raw(), width, height)
+        .map_err(|error| eprintln!("Nasty: invalid window icon {path}: {error}"))
+        .ok()
 }
 
 #[napi(object)]
@@ -1282,6 +545,15 @@ pub struct WindowOptions {
     pub maximizable: Option<bool>,
     pub maximized: Option<bool>,
     pub vsync: Option<bool>,
+    /// PNG shown as the window's icon (taskbar, alt-tab) on desktop; ignored on Android.
+    pub icon: Option<String>,
+    /// Linux: with the title, names the window's class (X11 WM_CLASS, Wayland app id), which
+    /// desktops show as the app's name instead of the process ("node").
+    #[napi(js_name = "appId")]
+    pub app_id: Option<String>,
+    /// Android: keep content clear of the system bars ("none", "top", "bottom" or "both").
+    #[napi(js_name = "safeArea")]
+    pub safe_area: Option<String>,
 }
 
 #[napi(object)]
@@ -1328,190 +600,8 @@ fn decode_image_rgba(
     decode_image_rgba_natural(encoded, max_edge).map(|(width, height, pixels, _)| (width, height, pixels))
 }
 
-/// Like `decode_image_rgba`, plus the source's intrinsic (pre-downscale) size,
-/// which `HTMLImageElement.naturalWidth/naturalHeight` report.
-pub(crate) fn decode_image_rgba_natural(
-    encoded: &[u8],
-    max_edge: u32,
-) -> std::result::Result<(u32, u32, Vec<u8>, (u32, u32)), String> {
-    let max_edge = max_edge.max(1);
-    // Never call imageops::resize (rayon) from pool workers — nested deadlock.
-    if let Ok(img) = try_decode_jpeg_scaled(encoded, max_edge) {
-        return Ok(img);
-    }
-    let image = image::load_from_memory(encoded)
-        .map_err(|error| format!("decode image: {error}"))?
-        .into_rgba8();
-    let (width, height) = image.dimensions();
-    if width == 0 || height == 0 {
-        return Err("decoded image has no dimensions".into());
-    }
-    let longest = width.max(height);
-    if longest <= max_edge {
-        return Ok((width, height, image.into_raw(), (width, height)));
-    }
-    let scale = f64::from(max_edge) / f64::from(longest);
-    let next_width = ((f64::from(width) * scale).round() as u32).max(1);
-    let next_height = ((f64::from(height) * scale).round() as u32).max(1);
-    let resized = resize_rgba_nearest(&image, next_width, next_height);
-    Ok((next_width, next_height, resized, (width, height)))
-}
-
-fn try_decode_jpeg_scaled(
-    encoded: &[u8],
-    max_edge: u32,
-) -> std::result::Result<(u32, u32, Vec<u8>, (u32, u32)), String> {
-    if encoded.len() < 3 || encoded[0] != 0xFF || encoded[1] != 0xD8 {
-        return Err("not jpeg".into());
-    }
-    // Single decoder: read_info → scale(requested) → decode. jpeg-decoder picks
-    // IDCT 1/1,1/2,1/4,1/8 from the requested size.
-    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(encoded));
-    decoder.read_info().map_err(|e| format!("jpeg info: {e}"))?;
-    let info = decoder
-        .info()
-        .ok_or_else(|| "jpeg missing info".to_string())?;
-    let full_w = u32::from(info.width);
-    let full_h = u32::from(info.height);
-    if full_w == 0 || full_h == 0 {
-        return Err("jpeg has no dimensions".into());
-    }
-    let longest = full_w.max(full_h);
-    let (req_w, req_h) = if longest <= max_edge {
-        (
-            full_w.min(u32::from(u16::MAX)) as u16,
-            full_h.min(u32::from(u16::MAX)) as u16,
-        )
-    } else {
-        let s = f64::from(max_edge) / f64::from(longest);
-        (
-            ((f64::from(full_w) * s).round() as u32)
-                .max(1)
-                .min(u32::from(u16::MAX)) as u16,
-            ((f64::from(full_h) * s).round() as u32)
-                .max(1)
-                .min(u32::from(u16::MAX)) as u16,
-        )
-    };
-    decoder
-        .scale(req_w, req_h)
-        .map_err(|e| format!("jpeg scale: {e}"))?;
-    let pixels = decoder.decode().map_err(|e| format!("jpeg decode: {e}"))?;
-    let info = decoder
-        .info()
-        .ok_or_else(|| "jpeg missing info after decode".to_string())?;
-    let width = u32::from(info.width);
-    let height = u32::from(info.height);
-    let rgba = jpeg_pixels_to_rgba(&pixels, info.pixel_format, width, height)?;
-    let longest = width.max(height);
-    if longest <= max_edge {
-        return Ok((width, height, rgba, (full_w, full_h)));
-    }
-    let img = image::RgbaImage::from_raw(width, height, rgba)
-        .ok_or_else(|| "rgba buffer size mismatch".to_string())?;
-    let s = f64::from(max_edge) / f64::from(longest);
-    let nw = ((f64::from(width) * s).round() as u32).max(1);
-    let nh = ((f64::from(height) * s).round() as u32).max(1);
-    Ok((nw, nh, resize_rgba_nearest(&img, nw, nh), (full_w, full_h)))
-}
-
-fn jpeg_pixels_to_rgba(
-    pixels: &[u8],
-    format: jpeg_decoder::PixelFormat,
-    width: u32,
-    height: u32,
-) -> std::result::Result<Vec<u8>, String> {
-    let n = (width as usize).saturating_mul(height as usize);
-    match format {
-        jpeg_decoder::PixelFormat::L16 => {
-            if pixels.len() < n * 2 {
-                return Err("jpeg L16 underrun".into());
-            }
-            let mut out = vec![0u8; n * 4];
-            for i in 0..n {
-                // Take high byte.
-                let g = pixels[i * 2];
-                let o = i * 4;
-                out[o] = g;
-                out[o + 1] = g;
-                out[o + 2] = g;
-                out[o + 3] = 255;
-            }
-            Ok(out)
-        }
-        jpeg_decoder::PixelFormat::L8 => {
-            if pixels.len() < n {
-                return Err("jpeg L8 underrun".into());
-            }
-            let mut out = vec![0u8; n * 4];
-            for i in 0..n {
-                let g = pixels[i];
-                let o = i * 4;
-                out[o] = g;
-                out[o + 1] = g;
-                out[o + 2] = g;
-                out[o + 3] = 255;
-            }
-            Ok(out)
-        }
-        jpeg_decoder::PixelFormat::RGB24 => {
-            if pixels.len() < n * 3 {
-                return Err("jpeg RGB underrun".into());
-            }
-            let mut out = vec![0u8; n * 4];
-            for i in 0..n {
-                let s = i * 3;
-                let o = i * 4;
-                out[o] = pixels[s];
-                out[o + 1] = pixels[s + 1];
-                out[o + 2] = pixels[s + 2];
-                out[o + 3] = 255;
-            }
-            Ok(out)
-        }
-        jpeg_decoder::PixelFormat::CMYK32 => {
-            if pixels.len() < n * 4 {
-                return Err("jpeg CMYK underrun".into());
-            }
-            let mut out = vec![0u8; n * 4];
-            for i in 0..n {
-                let s = i * 4;
-                let c = u16::from(pixels[s]);
-                let m = u16::from(pixels[s + 1]);
-                let y = u16::from(pixels[s + 2]);
-                let k = u16::from(pixels[s + 3]);
-                let o = i * 4;
-                out[o] = (((255 - c) * (255 - k)) / 255) as u8;
-                out[o + 1] = (((255 - m) * (255 - k)) / 255) as u8;
-                out[o + 2] = (((255 - y) * (255 - k)) / 255) as u8;
-                out[o + 3] = 255;
-            }
-            Ok(out)
-        }
-    }
-}
-
-fn resize_rgba_nearest(
-    src: &image::RgbaImage,
-    next_width: u32,
-    next_height: u32,
-) -> Vec<u8> {
-    let (sw, sh) = src.dimensions();
-    let mut out = vec![0u8; (next_width as usize) * (next_height as usize) * 4];
-    if sw == 0 || sh == 0 || next_width == 0 || next_height == 0 {
-        return out;
-    }
-    for y in 0..next_height {
-        let sy = (u64::from(y) * u64::from(sh)) / u64::from(next_height);
-        for x in 0..next_width {
-            let sx = (u64::from(x) * u64::from(sw)) / u64::from(next_width);
-            let p = src.get_pixel(sx as u32, sy as u32).0;
-            let i = ((y as usize) * (next_width as usize) + (x as usize)) * 4;
-            out[i..i + 4].copy_from_slice(&p);
-        }
-    }
-    out
-}
+mod image_shared;
+pub(crate) use image_shared::decode_image_rgba_natural;
 
 /// CPU-only decode for worker threads. Does not touch the GPU.
 #[napi(js_name = "decodeImageRgba")]
@@ -1923,15 +1013,6 @@ fn layer_text_bounds(run: &TextRunOptions, origin_x: f64, origin_y: f64, width: 
     }
 }
 
-fn text_run_align(value: Option<&str>) -> Option<Align> {
-    match value {
-        Some("right") => Some(Align::Right),
-        Some("center") => Some(Align::Center),
-        Some("justify") => Some(Align::Justified),
-        Some("end") => Some(Align::End),
-        _ => None,
-    }
-}
 
 // A family can have several files (regular, medium, bold, italic). Loading only
 // the first file leaves the other faces unavailable to the font matcher.
@@ -1942,51 +1023,7 @@ fn custom_font_key(family: &str, data: &[u8]) -> (String, u64) {
     (family.to_owned(), hash.finish())
 }
 
-fn generic_text_family(name: &str) -> Option<Family<'static>> {
-    match name.to_ascii_lowercase().as_str() {
-        "serif" | "ui-serif" | "fangsong" => Some(Family::Serif),
-        "sans-serif" | "system-ui" | "ui-sans-serif" | "ui-rounded" => Some(Family::SansSerif),
-        "monospace" | "ui-monospace" => Some(Family::Monospace),
-        "cursive" => Some(Family::Cursive),
-        "fantasy" => Some(Family::Fantasy),
-        _ => None,
-    }
-}
 
-/// Resolves a CSS font-family stack ("Fraunces, ui-serif, Georgia, serif") to
-/// the first entry the font database can satisfy, like a browser's font
-/// matching. Results are cached per stack until the database gains faces.
-fn text_family<'a>(family: Option<&'a str>, db: &glyphon::fontdb::Database) -> Family<'a> {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static RESOLVED: Mutex<Option<(usize, HashMap<String, Option<usize>>)>> = Mutex::new(None);
-    let Some(stack) = family else {
-        return Family::SansSerif;
-    };
-    let entries: Vec<&'a str> = stack
-        .split(',')
-        .map(|entry| entry.trim().trim_matches(|c| c == '\'' || c == '"').trim())
-        .filter(|entry| !entry.is_empty())
-        .collect();
-    let face_count = db.len();
-    let index = {
-        let mut cache = RESOLVED.lock().expect("font family cache lock");
-        if cache.as_ref().map_or(true, |(count, _)| *count != face_count) {
-            *cache = Some((face_count, HashMap::new()));
-        }
-        let map = &mut cache.as_mut().unwrap().1;
-        *map.entry(stack.to_owned()).or_insert_with(|| {
-            entries.iter().position(|entry| {
-                generic_text_family(entry).is_some()
-                    || db.faces().any(|face| face.families.iter().any(|(name, _)| name.eq_ignore_ascii_case(entry)))
-            })
-        })
-    };
-    match index.map(|index| entries[index]) {
-        Some(entry) => generic_text_family(entry).unwrap_or(Family::Name(entry)),
-        None => Family::SansSerif,
-    }
-}
 
 #[napi(object)]
 pub struct TextFontData {
@@ -2028,7 +1065,9 @@ struct RenderTimings {
 }
 
 struct Renderer {
-    surface: wgpu::Surface<'static>,
+    /// None while Android has the app in the background (its native window is gone).
+    surface: Option<wgpu::Surface<'static>>,
+    instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -2080,6 +1119,15 @@ struct Renderer {
     supported_present_modes: Vec<wgpu::PresentMode>,
     backdrop: HashMap<(u32, u32), BackdropResources>,
     surface_copy_src: bool,
+    /// Real surface height; `config.height` is the frame height (surface minus safe insets).
+    surface_height: u32,
+    safe_top: u32,
+    safe_bottom: u32,
+    /// With safe insets, frames render here and are drawn onto the surface at `safe_top`.
+    safe_frame: Option<wgpu::Texture>,
+    safe_blit_pipeline: wgpu::RenderPipeline,
+    safe_blit_sampler: wgpu::Sampler,
+    safe_blit_bind_group: Option<wgpu::BindGroup>,
     /// Captures waiting for the next presented window frame (see `captureFrame`).
     pending_captures: Vec<FrameCapture>,
     /// Finished captures, reported by `drainEvents` (PNG writes finish off-thread).
@@ -3103,30 +2151,7 @@ impl Renderer {
         } else {
             "input.color.rgb"
         };
-        let quad_shader_source = r#"
-                struct VertexInput {
-                    @location(0) position: vec2<f32>,
-                    @location(1) color: vec4<f32>,
-                };
-                struct VertexOutput {
-                    @builtin(position) position: vec4<f32>,
-                    @location(0) color: vec4<f32>,
-                };
-                fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
-                    let low = value / vec3<f32>(12.92);
-                    let high = pow((value + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
-                    return select(high, low, value <= vec3<f32>(0.04045));
-                }
-                @vertex fn vs_main(input: VertexInput) -> VertexOutput {
-                    var output: VertexOutput;
-                    output.position = vec4<f32>(input.position, 0.0, 1.0);
-                    output.color = input.color;
-                    return output;
-                }
-                @fragment fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-                    return vec4<f32>(__OUTPUT_RGB__, input.color.a);
-                }
-                "#
+        let quad_shader_source = include_str!("shaders/quad.wgsl")
             .replace("__OUTPUT_RGB__", quad_color_output);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Nasty quad shader"),
@@ -3164,6 +2189,38 @@ impl Renderer {
             }),
             multiview: None,
             cache: None,
+        });
+        let safe_blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nasty safe-area blit shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/safe_blit.wgsl").into()),
+        });
+        let safe_blit_targets = [Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })];
+        let safe_blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Nasty safe-area blit pipeline"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &safe_blit_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &safe_blit_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &safe_blit_targets,
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let safe_blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Nasty safe-area blit sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
         });
         // Replaces (no blend) so a scroll-layer region can be reset to
         // transparent before it is repainted.
@@ -3387,100 +2444,7 @@ impl Renderer {
             cache: None,
         });
         let box_color_output = if format.is_srgb() { "srgb_to_linear(rgb)" } else { "rgb" };
-        let box_shader_source = r#"
-                struct Viewport { size: vec2<f32> };
-                @group(0) @binding(0) var<uniform> viewport: Viewport;
-                struct BoxInput {
-                    @location(0) rect: vec4<f32>, @location(1) radii: vec4<f32>,
-                    @location(2) c0: vec4<f32>, @location(3) c1: vec4<f32>,
-                    @location(4) c2: vec4<f32>, @location(5) c3: vec4<f32>,
-                    @location(6) stops: vec4<f32>, @location(7) line: vec4<f32>,
-                    @location(8) border: vec4<f32>, @location(9) border_color: vec4<f32>,
-                    @location(10) clip0: vec4<f32>, @location(11) clip1: vec4<f32>,
-                    @location(12) extra: vec4<f32>,
-                };
-                struct BoxOutput {
-                    @builtin(position) position: vec4<f32>,
-                    @location(0) point: vec2<f32>,
-                    @location(1) @interpolate(flat) rect: vec4<f32>, @location(2) @interpolate(flat) radii: vec4<f32>,
-                    @location(3) @interpolate(flat) c0: vec4<f32>, @location(4) @interpolate(flat) c1: vec4<f32>,
-                    @location(5) @interpolate(flat) c2: vec4<f32>, @location(6) @interpolate(flat) c3: vec4<f32>,
-                    @location(7) @interpolate(flat) stops: vec4<f32>, @location(8) @interpolate(flat) line: vec4<f32>,
-                    @location(9) @interpolate(flat) border: vec4<f32>, @location(10) @interpolate(flat) border_color: vec4<f32>,
-                    @location(11) @interpolate(flat) clip0: vec4<f32>, @location(12) @interpolate(flat) clip1: vec4<f32>,
-                    @location(13) @interpolate(flat) extra: vec4<f32>,
-                };
-                fn srgb_to_linear(value: vec3<f32>) -> vec3<f32> {
-                    let low = value / vec3<f32>(12.92);
-                    let high = pow((value + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
-                    return select(high, low, value <= vec3<f32>(0.04045));
-                }
-                // Signed distance to a rounded rect with per-corner radii (y down).
-                fn sd_round_rect(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
-                    let half = rect.zw * 0.5;
-                    let q = p - (rect.xy + half);
-                    var r = select(radii.x, radii.y, q.x > 0.0);
-                    if (q.y > 0.0) { r = select(radii.w, radii.z, q.x > 0.0); }
-                    r = min(r, min(half.x, half.y));
-                    let d = abs(q) - half + vec2<f32>(r);
-                    return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - r;
-                }
-                fn coverage(d: f32) -> f32 { return clamp(0.5 - d, 0.0, 1.0); }
-                fn clip_coverage(p: vec2<f32>, clip: vec4<f32>, radius: f32) -> f32 {
-                    if (clip.z <= 0.0 || clip.w <= 0.0) { return select(1.0, 0.0, clip.z < 0.0); }
-                    return coverage(sd_round_rect(p, clip, vec4<f32>(radius)));
-                }
-                @vertex fn vs_main(input: BoxInput, @builtin(vertex_index) vertex_index: u32) -> BoxOutput {
-                    let corners = array<vec2<f32>, 6>(
-                        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-                        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));
-                    // One pixel of slack on every side for antialiased edges.
-                    let point = input.rect.xy - vec2<f32>(1.0) + corners[vertex_index] * (input.rect.zw + vec2<f32>(2.0));
-                    var output: BoxOutput;
-                    output.position = vec4<f32>(point.x / viewport.size.x * 2.0 - 1.0, 1.0 - point.y / viewport.size.y * 2.0, 0.0, 1.0);
-                    output.point = point;
-                    output.rect = input.rect; output.radii = input.radii;
-                    output.c0 = input.c0; output.c1 = input.c1; output.c2 = input.c2; output.c3 = input.c3;
-                    output.stops = input.stops; output.line = input.line;
-                    output.border = input.border; output.border_color = input.border_color;
-                    output.clip0 = input.clip0; output.clip1 = input.clip1; output.extra = input.extra;
-                    return output;
-                }
-                fn premultiplied(color: vec4<f32>) -> vec4<f32> { return vec4<f32>(color.rgb * color.a, color.a); }
-                fn segment(a: vec4<f32>, b: vec4<f32>, lo: f32, hi: f32, t: f32) -> vec4<f32> {
-                    return mix(premultiplied(a), premultiplied(b), clamp((t - lo) / max(hi - lo, 1e-6), 0.0, 1.0));
-                }
-                fn fill_color(input: BoxOutput) -> vec4<f32> {
-                    let count = input.extra.z;
-                    if (count < 1.5) { return premultiplied(input.c0); }
-                    let direction = input.line.zw - input.line.xy;
-                    let t = clamp(dot(input.point - input.line.xy, direction) / max(dot(direction, direction), 1e-6), 0.0, 1.0);
-                    let s = input.stops;
-                    if (t <= s.x) { return premultiplied(input.c0); }
-                    if (t <= s.y || count < 2.5) { return segment(input.c0, input.c1, s.x, s.y, t); }
-                    if (t <= s.z || count < 3.5) { return segment(input.c1, input.c2, s.y, s.z, t); }
-                    return segment(input.c2, input.c3, s.z, s.w, t);
-                }
-                @fragment fn fs_main(input: BoxOutput) -> @location(0) vec4<f32> {
-                    let outer = coverage(sd_round_rect(input.point, input.rect, input.radii));
-                    var inner = outer;
-                    let border = input.border;
-                    if (any(border > vec4<f32>(0.0))) {
-                        let inner_rect = vec4<f32>(input.rect.x + border.w, input.rect.y + border.x,
-                            input.rect.z - border.y - border.w, input.rect.w - border.x - border.z);
-                        let inner_radii = max(input.radii - vec4<f32>(max(border.x, border.w), max(border.x, border.y),
-                            max(border.z, border.y), max(border.z, border.w)), vec4<f32>(0.0));
-                        inner = select(0.0, min(outer, coverage(sd_round_rect(input.point, inner_rect, inner_radii))),
-                            inner_rect.z > 0.0 && inner_rect.w > 0.0);
-                    }
-                    var color = fill_color(input) * inner + premultiplied(input.border_color) * (outer - inner);
-                    color = color * clip_coverage(input.point, input.clip0, input.extra.x)
-                        * clip_coverage(input.point, input.clip1, input.extra.y);
-                    if (color.a <= 0.0) { discard; }
-                    let rgb = color.rgb / color.a;
-                    return vec4<f32>(__OUTPUT_RGB__, color.a);
-                }
-            "#
+        let box_shader_source = include_str!("shaders/box.wgsl")
             .replace("__OUTPUT_RGB__", box_color_output);
         let box_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Nasty box shader"),
@@ -3623,28 +2587,7 @@ impl Renderer {
             });
         let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Nasty image shader"),
-            source: wgpu::ShaderSource::Wgsl(r#"
-                struct VertexInput {
-                    @location(0) position: vec2<f32>,
-                    @location(1) uv: vec2<f32>,
-                    @location(2) reciprocal_w: f32,
-                };
-                struct VertexOutput {
-                    @builtin(position) position: vec4<f32>,
-                    @location(0) uv: vec2<f32>,
-                };
-                @vertex fn vs_main(input: VertexInput) -> VertexOutput {
-                    var output: VertexOutput;
-                    output.position = vec4<f32>(input.position * input.reciprocal_w, 0.0, input.reciprocal_w);
-                    output.uv = input.uv;
-                    return output;
-                }
-                @group(0) @binding(0) var image_texture: texture_2d<f32>;
-                @group(0) @binding(1) var image_sampler: sampler;
-                @fragment fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-                    return textureSample(image_texture, image_sampler, input.uv);
-                }
-            "#.into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/image.wgsl").into()),
         });
         const IMAGE_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
             wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32];
@@ -3702,61 +2645,7 @@ impl Renderer {
         });
         let image_box_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Nasty image box shader"),
-            source: wgpu::ShaderSource::Wgsl(r#"
-                struct Viewport { size: vec2<f32> };
-                @group(1) @binding(0) var<uniform> viewport: Viewport;
-                @group(0) @binding(0) var image_texture: texture_2d<f32>;
-                @group(0) @binding(1) var image_sampler: sampler;
-                struct ImageBoxInput {
-                    @location(0) rect: vec4<f32>, @location(1) uv: vec4<f32>, @location(2) radii: vec4<f32>,
-                    @location(3) clip0: vec4<f32>, @location(4) clip1: vec4<f32>, @location(5) extra: vec4<f32>,
-                };
-                struct ImageBoxOutput {
-                    @builtin(position) position: vec4<f32>,
-                    @location(0) point: vec2<f32>,
-                    @location(1) uv: vec2<f32>,
-                    @location(2) @interpolate(flat) rect: vec4<f32>, @location(3) @interpolate(flat) radii: vec4<f32>,
-                    @location(4) @interpolate(flat) clip0: vec4<f32>, @location(5) @interpolate(flat) clip1: vec4<f32>,
-                    @location(6) @interpolate(flat) extra: vec4<f32>,
-                };
-                fn sd_round_rect(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
-                    let half = rect.zw * 0.5;
-                    let q = p - (rect.xy + half);
-                    var r = select(radii.x, radii.y, q.x > 0.0);
-                    if (q.y > 0.0) { r = select(radii.w, radii.z, q.x > 0.0); }
-                    r = min(r, min(half.x, half.y));
-                    let d = abs(q) - half + vec2<f32>(r);
-                    return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - r;
-                }
-                fn coverage(d: f32) -> f32 { return clamp(0.5 - d, 0.0, 1.0); }
-                fn clip_coverage(p: vec2<f32>, clip: vec4<f32>, radius: f32) -> f32 {
-                    if (clip.z <= 0.0 || clip.w <= 0.0) { return select(1.0, 0.0, clip.z < 0.0); }
-                    return coverage(sd_round_rect(p, clip, vec4<f32>(radius)));
-                }
-                @vertex fn vs_main(input: ImageBoxInput, @builtin(vertex_index) vertex_index: u32) -> ImageBoxOutput {
-                    let corners = array<vec2<f32>, 6>(
-                        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
-                        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));
-                    let corner = corners[vertex_index];
-                    let point = input.rect.xy + corner * input.rect.zw;
-                    var output: ImageBoxOutput;
-                    output.position = vec4<f32>(point.x / viewport.size.x * 2.0 - 1.0, 1.0 - point.y / viewport.size.y * 2.0, 0.0, 1.0);
-                    output.point = point;
-                    output.uv = mix(input.uv.xy, input.uv.zw, corner);
-                    output.rect = input.rect; output.radii = input.radii;
-                    output.clip0 = input.clip0; output.clip1 = input.clip1; output.extra = input.extra;
-                    return output;
-                }
-                @fragment fn fs_main(input: ImageBoxOutput) -> @location(0) vec4<f32> {
-                    let color = textureSample(image_texture, image_sampler, input.uv);
-                    var cover = input.extra.z;
-                    if (any(input.radii > vec4<f32>(0.0))) { cover = cover * coverage(sd_round_rect(input.point, input.rect, input.radii)); }
-                    cover = cover * clip_coverage(input.point, input.clip0, input.extra.x)
-                        * clip_coverage(input.point, input.clip1, input.extra.y);
-                    if (cover <= 0.0) { discard; }
-                    return vec4<f32>(color.rgb, color.a * cover);
-                }
-            "#.into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/image_box.wgsl").into()),
         });
         let image_box_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Nasty image box pipeline layout"),
@@ -3880,7 +2769,8 @@ impl Renderer {
             .map_err(|error| format!("start text worker: {error}"))?;
 
         Ok(Self {
-            surface,
+            surface: Some(surface),
+            instance,
             device,
             queue,
             config,
@@ -3931,6 +2821,13 @@ impl Renderer {
             supported_present_modes,
             backdrop: HashMap::new(),
             surface_copy_src,
+            surface_height: size.height.max(1),
+            safe_top: 0,
+            safe_bottom: 0,
+            safe_frame: None,
+            safe_blit_pipeline,
+            safe_blit_sampler,
+            safe_blit_bind_group: None,
             pending_captures: Vec::new(),
             capture_results: std::sync::mpsc::channel(),
             recorder: None,
@@ -3943,7 +2840,7 @@ impl Renderer {
         if present_mode == self.config.present_mode { return Ok(()); }
         self.config.present_mode = present_mode;
         self.config.desired_maximum_frame_latency = if present_mode == wgpu::PresentMode::Mailbox { 1 } else { 2 };
-        self.surface.configure(&self.device, &self.config);
+        self.configure_surface();
         self.present_mode_name = format!("{present_mode:?}");
         Ok(())
     }
@@ -4093,15 +2990,66 @@ impl Renderer {
         Ok(())
     }
 
-    fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
+    /// Android destroys the native window when the app goes to the background.
+    fn suspend_surface(&mut self) {
+        self.surface = None;
+    }
+
+    /// A new native window after resume: same device, textures and frame, new surface.
+    fn resume_surface(&mut self, window: Arc<OsWindow>) -> std::result::Result<(), String> {
+        let size = window.inner_size();
+        self.surface = Some(self.instance.create_surface(window).map_err(|error| format!("recreate GPU surface: {error}"))?);
+        self.resize(size.width.max(1), size.height.max(1));
+        Ok(())
+    }
+
+    /// The swapchain uses the real surface height; `config` holds the frame size.
+    fn configure_surface(&self) {
+        let mut config = self.config.clone();
+        config.height = self.surface_height;
+        if let Some(surface) = self.surface.as_ref() { surface.configure(&self.device, &config); }
+    }
+
+    /// Keeps frames clear of `top` / `bottom` physical px of the surface (system bars).
+    fn set_safe_insets(&mut self, top: u32, bottom: u32) {
+        if (top, bottom) == (self.safe_top, self.safe_bottom) { return; }
+        self.safe_top = top;
+        self.safe_bottom = bottom;
+        self.resize(self.config.width, self.surface_height);
+    }
+
+    fn resize(&mut self, width: u32, surface_height: u32) {
+        if width == 0 || surface_height == 0 {
             return;
         }
+        let height = surface_height.saturating_sub(self.safe_top + self.safe_bottom).max(1);
+        self.surface_height = surface_height;
         self.config.width = width;
         self.config.height = height;
+        self.safe_frame = (self.safe_top + self.safe_bottom > 0).then(|| self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Nasty safe-area frame"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }));
+        self.safe_blit_bind_group = self.safe_frame.as_ref().map(|texture| {
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Nasty safe-area blit"),
+                layout: &self.safe_blit_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.safe_blit_sampler) },
+                ],
+            })
+        });
         self.queue.write_buffer(&self.canvas_viewport_buffer, 0,
             bytemuck::cast_slice(&[width as f32, height as f32]));
-        self.surface.configure(&self.device, &self.config);
+        self.configure_surface();
         self.backdrop.clear();
         if let Some(runtime) = self.text_runtime.as_mut() {
             runtime
@@ -4117,7 +3065,7 @@ impl Renderer {
         {
             self.config.alpha_mode = mode;
             self.transparent = transparent;
-            self.surface.configure(&self.device, &self.config);
+            self.configure_surface();
             window.request_redraw();
         }
     }
@@ -4452,11 +3400,14 @@ impl Renderer {
         let frame = if layer_target.is_some() {
             None
         } else {
-            Some(match self.surface.get_current_texture() {
+            let Some(acquired) = self.surface.as_ref().map(|surface| surface.get_current_texture()) else {
+                return Ok(RenderTimings::default());
+            };
+            Some(match acquired {
                 Ok(frame) => frame,
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                     self.resize(window.inner_size().width, window.inner_size().height);
-                    self.surface
+                    self.surface.as_ref().ok_or_else(|| "GPU surface is suspended".to_string())?
                         .get_current_texture()
                         .map_err(|error| format!("acquire GPU frame after resize: {error}"))?
                 }
@@ -4464,8 +3415,10 @@ impl Renderer {
             })
         };
         let acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
-        let view = match (&frame, layer_target) {
-            (Some(frame), _) => frame.texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        // The texture this frame draws into: the surface, or the safe-area frame placed on it below.
+        let frame_texture = frame.as_ref().map(|frame| self.safe_frame.clone().unwrap_or_else(|| frame.texture.clone()));
+        let view = match (&frame_texture, layer_target) {
+            (Some(texture), _) => texture.create_view(&wgpu::TextureViewDescriptor::default()),
             (None, Some(target)) => self
                 .images
                 .get(&target.texture_id)
@@ -4502,7 +3455,7 @@ impl Renderer {
                         segment_start += 1;
                         continue;
                     }
-                    self.encode_backdrop_blur(&mut encoder, &frame.as_ref().expect("window frame").texture, *x, *y, *width, *height, *radius, masks)?;
+                    self.encode_backdrop_blur(&mut encoder, frame_texture.as_ref().expect("window frame"), *x, *y, *width, *height, *radius, masks)?;
                     segment_start += 1;
                     continue;
                 }
@@ -4745,7 +3698,7 @@ impl Renderer {
         }
         // Captures wait for a real window frame (not a layer texture render).
         let mut readbacks = Vec::new();
-        if let Some(frame) = frame.as_ref().filter(|_| self.surface_copy_src && !self.pending_captures.is_empty()) {
+        if let Some(frame_texture) = frame_texture.as_ref().filter(|_| self.surface_copy_src && !self.pending_captures.is_empty()) {
             let (surface_width, surface_height) = (self.config.width, self.config.height);
             for capture in std::mem::take(&mut self.pending_captures) {
                 let (x, y, width, height) = capture.region.unwrap_or((0, 0, surface_width, surface_height));
@@ -4756,12 +3709,26 @@ impl Renderer {
                     let _ = self.capture_results.0.send(CaptureOutcome::Done { id: capture.id, error: Some("the capture region is outside the window".into()) });
                     continue;
                 }
-                let readback = self.encode_readback(&mut encoder, &frame.texture, (x, y, width, height));
+                let readback = self.encode_readback(&mut encoder, frame_texture, (x, y, width, height));
                 readbacks.push((capture, readback));
             }
         }
-        if let (Some(frame), Some(recorder)) = (&frame, self.recorder.as_mut()) {
-            recorder.capture(&self.device, &mut encoder, &frame.texture);
+        if let (Some(frame_texture), Some(recorder)) = (&frame_texture, self.recorder.as_mut()) {
+            recorder.capture(&self.device, &mut encoder, frame_texture);
+        }
+        if let (Some(frame), Some(safe), Some(bind_group)) = (&frame, self.safe_frame.as_ref(), self.safe_blit_bind_group.as_ref()) {
+            // Black behind the system bars, the frame drawn into the band between them.
+            let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let attachments = [Some(wgpu::RenderPassColorAttachment { view: &surface_view, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty safe-area blit"),
+                color_attachments: &attachments, depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+            let size = safe.size();
+            pass.set_viewport(0.0, self.safe_top as f32, size.width as f32, size.height as f32, 0.0, 1.0);
+            pass.set_scissor_rect(0, self.safe_top, size.width, size.height);
+            pass.set_pipeline(&self.safe_blit_pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.draw(0..3, 0..1);
         }
         let submit_started = Instant::now();
         self.queue.submit(Some(encoder.finish()));
@@ -4863,62 +3830,8 @@ impl Renderer {
         radius: f32,
         masks: &[f32; 10],
     ) -> std::result::Result<(), String> {
-        if width <= 0.0 || height <= 0.0 { return Ok(()); }
-        let left = x.floor().clamp(0.0, self.config.width as f32) as u32;
-        let top = y.floor().clamp(0.0, self.config.height as f32) as u32;
-        let right = (x + width).ceil().clamp(0.0, self.config.width as f32) as u32;
-        let bottom = (y + height).ceil().clamp(0.0, self.config.height as f32) as u32;
-        if right <= left || bottom <= top { return Ok(()); }
-        // The Gaussian reaches 3σ past the rect; copy that much context around it.
-        let margin = (radius.max(0.0) * 3.0).ceil() as u32 + 4;
-        let source_left = left.saturating_sub(margin);
-        let source_top = top.saturating_sub(margin);
-        let source_right = right.saturating_add(margin).min(self.config.width);
-        let source_bottom = bottom.saturating_add(margin).min(self.config.height);
-        let source_width = source_right - source_left;
-        let source_height = source_bottom - source_top;
-        let key = (source_width, source_height);
-        if !self.backdrop.contains_key(&key) {
-            self.backdrop.insert(key, BackdropResources::new(&self.device, self.config.format, source_width, source_height));
-        }
-        let resources = self.backdrop.get(&key).expect("backdrop resources were just cached");
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo { texture: surface, mip_level: 0, origin: wgpu::Origin3d { x: source_left, y: source_top, z: 0 }, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyTextureInfo { texture: &resources.source, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::Extent3d { width: source_width, height: source_height, depth_or_array_layers: 1 },
-        );
-        // CSS blur(r) is a Gaussian with standard deviation r; the copy is at 1/4 scale.
-        let sigma = (radius.max(0.0) / 4.0).max(0.5);
-        self.queue.write_buffer(&resources.horizontal_params, 0, bytemuck::cast_slice(&[1.0_f32, 0.0, sigma, 0.0]));
-        self.queue.write_buffer(&resources.vertical_params, 0, bytemuck::cast_slice(&[0.0_f32, 1.0, sigma, 0.0]));
-        self.queue.write_buffer(&resources.composite_params, 0, bytemuck::cast_slice(&[
-            masks[0], masks[1], masks[2], masks[3], masks[4], 0.0, 0.0, 0.0,
-            masks[5], masks[6], masks[7], masks[8], masks[9], 0.0, 0.0, 0.0,
-        ]));
-        for (label, texture, pipeline, bind_group, w, h) in [
-            ("Nasty backdrop downsample", &resources.small, &resources.downsample_pipeline, &resources.downsample_bind, resources.small_width, resources.small_height),
-            ("Nasty backdrop horizontal", &resources.horizontal, &resources.blur_pipeline, &resources.horizontal_bind, resources.small_width, resources.small_height),
-            ("Nasty backdrop vertical", &resources.blurred, &resources.blur_pipeline, &resources.vertical_bind, resources.small_width, resources.small_height),
-        ] {
-            let target = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let attachments = [Some(wgpu::RenderPassColorAttachment { view: &target, resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some(label), color_attachments: &attachments,
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
-            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
-            pass.set_pipeline(pipeline); pass.set_bind_group(0, bind_group, &[]); pass.draw(0..3, 0..1);
-        }
-        if right > left && bottom > top {
-            let surface_view = surface.create_view(&wgpu::TextureViewDescriptor::default());
-            let attachments = [Some(wgpu::RenderPassColorAttachment { view: &surface_view, resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("Nasty backdrop composite"), color_attachments: &attachments,
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
-            pass.set_viewport(source_left as f32, source_top as f32, source_width as f32, source_height as f32, 0.0, 1.0);
-            pass.set_scissor_rect(left, top, right-left, bottom-top);
-            pass.set_pipeline(&resources.composite_pipeline); pass.set_bind_group(0, &resources.composite_bind, &[]); pass.draw(0..3, 0..1);
-        }
-        Ok(())
+        backdrop_shared::encode_backdrop_blur(&mut self.backdrop, &self.device, &self.queue, self.config.format,
+            self.config.width, self.config.height, encoder, surface, x, y, width, height, radius, masks)
     }
 
     fn request_text_runs(
@@ -5605,7 +4518,12 @@ impl Renderer {
         caret_index: u32,
     ) -> Option<(f64, f64, f64, Vec<TextSelectionRect>, f64, f64)> {
         let runtime = self.text_runtime.as_ref()?;
+        // Spare slots from JS are parked at (-100000, -100000) with empty text.
+        // Matching those for an empty input parks the caret off-screen.
         let positioned = runtime.text_buffers.iter().find(|positioned| {
+            if positioned.x <= -50_000.0 || positioned.y <= -50_000.0 {
+                return false;
+            }
             positioned
                 .buffer
                 .lines
@@ -5669,25 +4587,13 @@ impl Renderer {
     }
 }
 
-fn parse_text_color(value: &str) -> Option<TextColor> {
-    let hex = value.strip_prefix('#').unwrap_or(value);
-    if hex.len() != 6 && hex.len() != 8 {
-        return None;
-    }
-    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
-    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
-    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
-    let alpha = if hex.len() == 8 {
-        u8::from_str_radix(&hex[6..8], 16).ok()?
-    } else {
-        255
-    };
-    Some(TextColor::rgba(red, green, blue, alpha))
-}
 
 #[derive(Default)]
 struct WindowApp {
     title: String,
+    icon: Option<winit::window::Icon>,
+    app_id: Option<String>,
+    safe_area: String,
     width: f64,
     height: f64,
     min_width: Option<f64>,
@@ -5726,6 +4632,10 @@ struct WindowApp {
     /// Last known inner size from Resized events. Querying the window
     /// (an X11 round trip) on every layout cost ~1 ms under load.
     cached_inner_size: Option<winit::dpi::PhysicalSize<u32>>,
+    /// Safe-area insets (physical px) the renderer currently keeps clear; see sync_safe_insets.
+    safe_insets: (u32, u32),
+    /// Last setFullscreen request (Android reports no window fullscreen of its own).
+    fullscreen: bool,
     image_draws: Vec<ImageDraw>,
     draw_order: Vec<DrawOrder>,
     render_pending: bool,
@@ -5842,6 +4752,34 @@ impl WindowApp {
     /// Drain worker results and upload on the GPU/window thread. Emits
     /// `image-ready` (texture id in `x`, width `y`, height as `deltaY`, job id as `deltaX`)
     /// or `image-error` (message in `key`, job id as `deltaX`). No pixel buffers enter JS.
+    /// Applies a safeArea or system bar change: the renderer resizes its frame and JS gets a
+    /// resize event with the new layout size.
+    fn sync_safe_insets(&mut self) {
+        let wanted = effective_safe_insets();
+        if wanted == self.safe_insets { return; }
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        renderer.set_safe_insets(wanted.0, wanted.1);
+        let applied = (renderer.safe_top, renderer.safe_bottom);
+        if applied == self.safe_insets { return; }
+        self.safe_insets = applied;
+        self.render_pending = false;
+        let (width, height) = (renderer.config.width, renderer.config.height);
+        self.events.push(NativeEvent {
+            kind: "resize".into(),
+            x: width as f64,
+            y: height as f64,
+            key: None,
+            button: None,
+            text: None,
+            modifiers: None,
+            drag_requested: None,
+            delta_x: None,
+            delta_y: None,
+            pointer_type: None,
+            pointer_id: None,
+        });
+    }
+
     fn drain_image_decode_uploads(&mut self, limit: usize) {
         let Some(pool) = self.image_decode_pool.clone() else {
             return;
@@ -5917,8 +4855,30 @@ impl WindowApp {
 }
 
 impl ApplicationHandler for WindowApp {
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(renderer) = self.renderer.as_mut() { renderer.suspend_surface(); }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() || self.closed {
+        if self.closed {
+            return;
+        }
+        // Back from the background (Android): redraw the last frame on a new surface.
+        if let Some(window) = self.window.clone() {
+            if let Some(renderer) = self.renderer.as_mut().filter(|renderer| renderer.surface.is_none()) {
+                match renderer.resume_surface(window.clone()) {
+                    Ok(()) => {
+                        let size = window.inner_size();
+                        self.cached_inner_size = Some(size);
+                        self.render_pending = true;
+                        window.request_redraw();
+                    }
+                    Err(error) => {
+                        eprintln!("Nasty: {error}");
+                        self.error = Some(error);
+                    }
+                }
+            }
             return;
         }
         // NastyOS builds: fullscreen, undecorated, non-resizable — do not change
@@ -5941,7 +4901,15 @@ impl ApplicationHandler for WindowApp {
             .with_decorations(!self.borderless)
             .with_transparent(self.borderless || self.body_transparent)
             .with_maximized(self.maximized)
+            .with_window_icon(self.icon.clone())
             .with_inner_size(LogicalSize::new(self.width, self.height));
+        // The class desktops show as the app name: the title, with the app id as X11's instance.
+        #[cfg(all(target_os = "linux", not(feature = "nastyos")))]
+        let attributes = {
+            let instance = self.app_id.clone().unwrap_or_else(|| self.title.to_lowercase());
+            let attributes = winit::platform::x11::WindowAttributesExtX11::with_name(attributes, self.title.clone(), instance.clone());
+            winit::platform::wayland::WindowAttributesExtWayland::with_name(attributes, self.title.clone(), instance)
+        };
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
@@ -6013,10 +4981,11 @@ impl ApplicationHandler for WindowApp {
                 // Keep displaying the last submitted frame until JS submits
                 // its resized frame, rather than rendering stale image IDs.
                 self.render_pending = false;
+                let (top, bottom) = self.safe_insets;
                 self.events.push(NativeEvent {
                     kind: "resize".into(),
                     x: size.width as f64,
-                    y: size.height as f64,
+                    y: size.height.saturating_sub(top + bottom) as f64,
                     key: None,
                     button: None,
                     text: None,
@@ -6057,7 +5026,7 @@ impl ApplicationHandler for WindowApp {
                 // Keep pointer coordinates in that same surface space.
                 let scale = self.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0).max(0.01);
                 let x = position.x;
-                let y = position.y;
+                let y = position.y - self.safe_insets.0 as f64;
                 self.cursor = (x, y);
                 if let Some(window) = self.window.as_ref() {
                     let logical_size = window.inner_size().to_logical::<f64>(scale);
@@ -6194,7 +5163,7 @@ impl ApplicationHandler for WindowApp {
             // in physical surface pixels to match Window.size() layout space.
             OsWindowEvent::Touch(touch) => {
                 let x = touch.location.x;
-                let y = touch.location.y;
+                let y = touch.location.y - self.safe_insets.0 as f64;
                 self.cursor = (x, y);
                 let pointer_id = Some(touch.id as u32);
                 let pointer_type = Some("touch".into());
@@ -6604,6 +5573,9 @@ impl Window {
             maximizable: options.maximizable.unwrap_or(false),
             maximized: options.maximized.unwrap_or(false),
             vsync: options.vsync.unwrap_or(true),
+            icon: options.icon.as_deref().and_then(load_window_icon),
+            app_id: options.app_id,
+            safe_area: options.safe_area.unwrap_or_else(|| "none".into()),
             ..Default::default()
         };
         if !app.width.is_finite() || !app.height.is_finite() || app.width < 1.0 || app.height < 1.0
@@ -6613,8 +5585,12 @@ impl Window {
                 "window width and height must be positive finite numbers",
             ));
         }
+        if !matches!(app.safe_area.as_str(), "none" | "top" | "bottom" | "both") {
+            return Err(Error::new(Status::InvalidArg, "safeArea must be none, top, bottom, or both"));
+        }
         let mut window = Self { event_loop, app };
         window.apply_orientation()?;
+        window.apply_safe_area();
         window.pump(Duration::ZERO)?;
         // Warm the decode pool so the first folder open does not pay thread spawn.
         let _ = window.app.ensure_image_pool();
@@ -6755,13 +5731,18 @@ impl Window {
     #[napi(js_name = "setFullscreen")]
     pub fn set_fullscreen(&mut self, value: bool) -> Result<()> {
         let window = self.app.window.as_ref().ok_or_else(|| Error::new(Status::GenericFailure, "native window is unavailable"))?;
+        // Android has no window fullscreen (winit ignores it): hide the system bars instead.
+        #[cfg(target_os = "android")]
+        unsafe { nasty_set_immersive(value as i32); }
         window.set_fullscreen(value.then_some(winit::window::Fullscreen::Borderless(None)));
+        self.app.fullscreen = value;
         self.app.render_pending = true;
         Ok(())
     }
 
     #[napi(js_name = "isFullscreen")]
     pub fn is_fullscreen(&self) -> bool {
+        if cfg!(target_os = "android") { return self.app.fullscreen; }
         self.app.window.as_ref().is_some_and(|window| window.fullscreen().is_some())
     }
 
@@ -6952,6 +5933,35 @@ impl Window {
         Ok(())
     }
 
+    // Window#safeArea: frames render into the band between the requested system bars (see
+    // Renderer::set_safe_insets); layout size and pointer coordinates shrink to match.
+    fn apply_safe_area(&self) {
+        let edges = match self.app.safe_area.as_str() {
+            "top" => 1,
+            "bottom" => 2,
+            "both" => 3,
+            _ => 0,
+        };
+        SAFE_AREA_EDGES.store(edges, Ordering::Release);
+    }
+
+    #[napi(js_name = "setSafeAreaMode")]
+    pub fn set_safe_area_mode(&mut self, mode: String) -> Result<()> {
+        if !matches!(mode.as_str(), "none" | "top" | "bottom" | "both") {
+            return Err(Error::new(Status::InvalidArg, "safeArea must be none, top, bottom, or both"));
+        }
+        self.app.safe_area = mode;
+        self.apply_safe_area();
+        Ok(())
+    }
+
+    /// Android: send the app to the background, as an unhandled back press does. No-op elsewhere.
+    #[napi(js_name = "moveToBackground")]
+    pub fn move_to_background(&self) {
+        #[cfg(target_os = "android")]
+        unsafe { nasty_move_task_to_back(); }
+    }
+
     #[napi(js_name = "setOrientationMode")]
     pub fn set_orientation_mode(&mut self, mode: String) -> Result<()> {
         if !matches!(mode.as_str(), "auto" | "portrait" | "landscape") {
@@ -6976,9 +5986,10 @@ impl Window {
             (_, Some(window)) => window.inner_size(),
             _ => Default::default(),
         };
+        let (top, bottom) = self.app.safe_insets;
         WindowSize {
             width: size.width,
-            height: size.height,
+            height: size.height.saturating_sub(top + bottom),
         }
     }
 
@@ -7332,6 +6343,7 @@ impl Window {
         // expensive or infrequent presentation also throttles keyboard input.
         if !self.app.closed {
             self.pump(Duration::ZERO)?;
+            self.app.sync_safe_insets();
             // Upload a bounded batch of decoded images each poll so GPU work
             // stays off the JS heap and cannot monopolize a single turn.
             self.app.drain_image_decode_uploads(32);
@@ -7530,10 +6542,15 @@ impl Window {
             .ok_or_else(|| Error::new(Status::GenericFailure, "GPU renderer is unavailable"))?;
         let layer = renderer.images.get(&texture_id).filter(|image| image.premultiplied)
             .ok_or_else(|| Error::new(Status::InvalidArg, "unknown layer texture"))?;
-        if width == 0 || height == 0 || x.checked_add(width).is_none_or(|right| right > layer.width)
-            || y.checked_add(height).is_none_or(|bottom| bottom > layer.height)
-        {
-            return Err(Error::new(Status::InvalidArg, "layer region is outside the texture"));
+        // Clamp to the live texture. Fire-and-forget paints can land after a
+        // resize shrunk the tile; erroring poisoned the window-host log and
+        // skipped the frame instead of painting the overlap that still fits.
+        let x = x.min(layer.width);
+        let y = y.min(layer.height);
+        let width = width.min(layer.width.saturating_sub(x));
+        let height = height.min(layer.height.saturating_sub(y));
+        if width == 0 || height == 0 {
+            return Ok(());
         }
         if let Some(runtime) = renderer.text_runtime.as_mut() {
             runtime

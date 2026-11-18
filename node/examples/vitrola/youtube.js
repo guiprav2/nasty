@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process';
+import { ensureYtDlp, ytdlpExtract } from '../../index.js';
 import { browsersWithYouTubeCookies, cookiesFromBrowserError } from './browser-cookies.js';
 
-// yt-dlp implements the youtube-dl command line. Prefer it, then youtube-dl.
+// Desktop: Nasty keeps the latest standalone yt-dlp release (checked once per launch); the
+// system's yt-dlp is never used. Android: the APK's embedded Python runtime (ytdlpExtract).
+let android = process.platform === 'android';
 let binPromise = null;
 let cookieBrowser = '';
 let cookiePrompt = null;
@@ -24,29 +27,14 @@ export function thumbnailFor(videoId) {
   return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 }
 
-function which(name) {
-  return new Promise((resolve) => {
-    let child = spawn('which', [name], { stdio: ['ignore', 'pipe', 'ignore'] });
-    let out = '';
-    child.stdout.on('data', (chunk) => { out += chunk; });
-    child.on('error', () => resolve(''));
-    child.on('close', (code) => resolve(code === 0 ? out.trim() : ''));
-  });
-}
-
 export function ytdlBin() {
-  if (!binPromise) {
-    binPromise = (async () => {
-      if (process.env.VITROLA_YTDL) return process.env.VITROLA_YTDL;
-      if (await which('yt-dlp')) return 'yt-dlp';
-      if (await which('youtube-dl')) return 'youtube-dl';
-      throw new Error('yt-dlp or youtube-dl is required. Install yt-dlp and ensure it is on PATH.');
-    })();
-  }
+  // A failed first download (e.g. offline) is retried on the next request.
+  binPromise ??= ensureYtDlp().catch((error) => { binPromise = null; throw error; });
   return binPromise;
 }
 
 export async function videoInfo(url) {
+  if (android) return JSON.parse(await ytdlpExtract(String(url), false));
   let bin = await ytdlBin();
   // Default client (not android): android often only exposes muxed 360p (fmt 18),
   // which blocks full-res DASH progressive MP4s the stream demuxer needs.
@@ -61,7 +49,39 @@ export async function videoInfo(url) {
   return JSON.parse(raw);
 }
 
+// Android's embedded yt-dlp returns info JSON only, so pick formats here. A muxed H.264 MP4
+// (video and sound in one file) is best, but the clients it uses often offer none; then pair
+// an H.264 video-only MP4 (decoded in hardware on phones; AV1/VP9 fall back to slow software
+// decoders) with the best AAC audio. Plain https only (no HLS/DASH manifests).
+function pickPlayback(info) {
+  let formats = (info.formats || []).filter((f) => /^https?:\/\//i.test(f.url || '') && /^https?$/i.test(f.protocol || ''));
+  let hasVideo = (f) => f.vcodec && f.vcodec !== 'none';
+  let hasAudio = (f) => f.acodec && f.acodec !== 'none';
+  let h264 = (f) => /^(avc1|h264)/i.test(f.vcodec || '');
+  let best = (list, rank) => list.sort((a, b) => rank(a) - rank(b)).at(-1);
+  let byHeight = (f) => (f.height || 0) * 1e6 + (f.tbr || 0);
+  let muxed = best(formats.filter((f) => hasVideo(f) && hasAudio(f) && f.ext === 'mp4' && h264(f)), byHeight);
+  if (muxed) return { video: muxed.url, audio: muxed.url };
+  // Up to 720p at up to 30 fps: phones keep up with every frame (60 fps streams dropped
+  // frames unevenly, which looked choppier than a steady 30).
+  let phoneFriendly = (f) => hasVideo(f) && !hasAudio(f) && f.ext === 'mp4' && h264(f) && (f.height || 0) <= 720;
+  let video = best(formats.filter((f) => phoneFriendly(f) && (f.fps || 30) <= 30), byHeight)
+    ?? best(formats.filter(phoneFriendly), byHeight);
+  let audio = best(formats.filter((f) => hasAudio(f) && !hasVideo(f) && /^mp4a/i.test(f.acodec || '') && !/drc/i.test(f.format_id || '')), (f) => f.abr || f.tbr || 0);
+  if (video && audio) return { video: video.url, audio: audio.url };
+  let anyMuxed = best(formats.filter((f) => hasVideo(f) && hasAudio(f)), byHeight);
+  return anyMuxed ? { video: anyMuxed.url, audio: anyMuxed.url } : null;
+}
+
+/** Android: { video, audio } URLs to play (the same URL when the format is muxed). */
+export async function playbackUrls(url) {
+  const picked = pickPlayback(await videoInfo(url));
+  if (!picked) throw new Error('yt-dlp did not return a playable media URL');
+  return picked;
+}
+
 export async function playbackUrl(url) {
+  if (android) return (await playbackUrls(url)).video;
   const bin = await ytdlBin();
   // Always prefer the highest progressive muxed stream. Fullscreen will need
   // high-res later; switching formats mid-playback interrupts, so start high.
@@ -154,6 +174,10 @@ export async function search(query, limit = 5) {
   let q = cleanQuery(query);
   if (!q) return [];
   let n = Math.min(8, Math.max(1, Math.floor(Number(limit) || 5)));
+  if (android) {
+    let data = JSON.parse(await ytdlpExtract(`ytsearch${n}:${q}`, true));
+    return (data.entries || []).map((entry) => normalizeEntry(entry, q)).filter(Boolean);
+  }
   let bin = await ytdlBin();
   let raw = await runChecked(bin, [
     '--flat-playlist',

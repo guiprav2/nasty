@@ -1,6 +1,6 @@
 import { VideoStreamPlayer } from "../../index.js";
 import { createYoutubeVideoStream, isYoutubeSource } from "./mp4-stream.js";
-import { playbackUrl } from "./youtube.js";
+import { playbackUrl, playbackUrls } from "./youtube.js";
 
 /**
  * Resolve YouTube (or other) playback without touching a DOM node.
@@ -11,7 +11,15 @@ import { playbackUrl } from "./youtube.js";
 export async function resolveTrackPlayback(pageUrl, { isCurrent = () => true } = {}) {
   if (!pageUrl) throw new Error("page URL required");
 
-  if (!isYoutubeSource(pageUrl)) {
+  // The demuxed stream player is desktop-only (Android's native module has no
+  // VideoStreamPlayer); there, YouTube plays through its progressive MP4 URL.
+  if (process.platform === "android") {
+    // Video and audio may be separate streams there (see playbackUrls).
+    const { video, audio } = await playbackUrls(pageUrl);
+    if (!isCurrent()) throw new Error("track changed during resolve");
+    return { mode: "cdn", mediaUrl: video, audioUrl: audio, height: 0 };
+  }
+  if (!isYoutubeSource(pageUrl) || typeof VideoStreamPlayer !== "function") {
     const mediaUrl = await playbackUrl(pageUrl);
     if (!isCurrent()) throw new Error("track changed during resolve");
     return { mode: "cdn", mediaUrl, audioUrl: mediaUrl, height: 0 };

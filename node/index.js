@@ -176,6 +176,7 @@ export { TransitionEvent };
 export { AnimationEvent };
 export { MutationObserver };
 export { ResizeObserver };
+export { ensureYtDlp, ytdlpExtract } from "./ytdlp.js";
 // Host-level platform theming (not DOM API): which OS variant (win:/lin:/mac:/android:)
 // applies. Auto-detected from the platform; hosts pass null to keep apps OS-neutral.
 export { getTailwindOsKind, setTailwindOsKind } from "./tailwind.js";
@@ -351,6 +352,7 @@ export class Window extends NativeWindow {
   #height;
   #resizable;
   #orientation;
+  #safeArea;
   #borderless;
   #dragAnywhere;
   #maximizable;
@@ -449,7 +451,9 @@ export class Window extends NativeWindow {
       height: typeof initialHeight === "number" ? Math.max(1, initialHeight) : 600,
       visible: false,
       resizable: nativeResizable, orientation: initialOrientation, borderless: initialBorderless,
-      dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized, vsync: initialVsync });
+      dragAnywhere: initialDragAnywhere, maximizable: initialMaximizable, maximized: initialMaximized, vsync: initialVsync,
+      // Names the window's class on Linux, so desktops show the app rather than "node".
+      ...(appId ? { appId } : {}) });
     openWindows.add(this);
     this.#appId = appId;
     this.#userDataPath = userDataPath;
@@ -460,6 +464,7 @@ export class Window extends NativeWindow {
     this.#height = initialHeight;
     this.#resizable = nativeResizable;
     this.#orientation = initialOrientation;
+    this.#safeArea = options.safeArea ?? "none";
     this.#borderless = initialBorderless;
     // NastyOS: always cover the viewport. Android NativeActivity already does.
     if (isNastyOS() && typeof this.setFullscreen === "function") {
@@ -582,6 +587,16 @@ export class Window extends NativeWindow {
     }
     super.setOrientationMode(mode);
     this.#orientation = mode;
+  }
+
+  // Android: "top", "bottom" or "both" keep the window clear of those system bars (the surface,
+  // layout and touch coordinates shrink to the area between them); "none" draws edge to edge,
+  // e.g. for fullscreen video. No effect on desktop.
+  get safeArea() { return this.#safeArea; }
+  set safeArea(mode) {
+    if (!SAFE_AREA_MODES.has(mode)) throw new TypeError('safeArea must be "none", "top", "bottom", or "both"');
+    super.setSafeAreaMode(mode);
+    this.#safeArea = mode;
   }
 
   get borderless() { return this.#borderless; }
@@ -834,7 +849,16 @@ export class Window extends NativeWindow {
 
   #dispatchWindowEvent(event) {
     Object.defineProperty(event, "target", { configurable: true, value: this });
-    return this.#eventTarget.dispatchEvent(event);
+    const previousGlobalEvent = globalThis.event;
+    globalThis.event = event;
+    const previousViewEvent = this.event;
+    this.event = event;
+    try {
+      return this.#eventTarget.dispatchEvent(event);
+    } finally {
+      globalThis.event = previousGlobalEvent;
+      this.event = previousViewEvent;
+    }
   }
 
   #flushNativeEvents() {
@@ -940,8 +964,9 @@ export class Window extends NativeWindow {
       shiftKey: /SHIFT/i.test(modifiers), altKey: /ALT/i.test(modifiers), metaKey: /SUPER|META|LOGO/i.test(modifiers),
       pointerId, pointerType, isPrimary: pointerType === "mouse" ? pointerId === 1 : true,
     });
-    // Like a browser, Escape leaves fullscreen and is not delivered to the page.
-    if (nativeEvent.type === "keydown" && key === "Escape" && this.#document?.fullscreenElement) {
+    // Like a browser, Escape (and Android's back button) leaves fullscreen and is not
+    // delivered to the page.
+    if (nativeEvent.type === "keydown" && (key === "Escape" || key === "BrowserBack") && this.#document?.fullscreenElement) {
       this.#document.exitFullscreen().catch(() => {});
       return;
     }
@@ -1006,6 +1031,8 @@ export class Window extends NativeWindow {
       const previousPressed = this.#pressedElement;
       this.#pressedElement = target;
       documentState(document).pointerPressed = true;
+      // The pressed pointer, which setPointerCapture accepts: id 1 for the mouse, the touch's id on Android.
+      documentState(document).pressedPointerId = pointerId;
       updatePressedChain(previousPressed, target);
       this.#pointerGesture = {
         pointerId, pointerType,
@@ -1095,8 +1122,9 @@ export class Window extends NativeWindow {
     }
     if (nativeEvent.type === "keydown" || nativeEvent.type === "keyup") {
       const active = document.activeElement;
+      let prevented = event.defaultPrevented;
       if (active) {
-        const prevented = dispatchDomEvent(active, nativeEvent.type, fields);
+        prevented = dispatchDomEvent(active, nativeEvent.type, fields) || prevented;
         if (!prevented && nativeEvent.type === "keydown" && fields.key === " ") {
           const toggled = activateCheckableInput(active);
           if (toggled) {
@@ -1104,6 +1132,10 @@ export class Window extends NativeWindow {
             toggled.dispatchEvent(new Event("change", { bubbles: true }));
           }
         }
+      }
+      // Android's back button: unless the app handled it, background the app like others do.
+      if (!prevented && nativeEvent.type === "keydown" && key === "BrowserBack" && process.platform === "android") {
+        super.moveToBackground?.();
       }
     }
   }
@@ -1165,6 +1197,7 @@ export class Window extends NativeWindow {
       };
     });
     const states = super.updateTextAreas(controls);
+    if (!Array.isArray(states)) return states;
     for (let index = 0; index < controls.length; index++) {
       const element = elements[index];
       if (!element) continue;
@@ -1173,6 +1206,9 @@ export class Window extends NativeWindow {
       const previousRenderTextOriginX = elementStateValue.renderTextOriginX;
       const previousRenderCaretX = elementStateValue.renderCaretX;
       const next = states[index];
+      // Native can return a shorter list when the window thread is recovering
+      // from a failed present; skip rather than crash on selectionRects.
+      if (!next) continue;
       if (element.localName === "input") {
         const value = renderedInputValue(element, next.displayText ?? next.value);
         const characters = Array.from(value);
@@ -1211,7 +1247,7 @@ export class Window extends NativeWindow {
         );
         if (next.selectionEnd > next.selectionStart) {
           const shift = elementStateValue.renderTextOriginX - previousTextOriginX;
-          elementStateValue.renderSelectionRects = next.renderedGeometry && next.selectionRects.length
+          elementStateValue.renderSelectionRects = next.renderedGeometry && next.selectionRects?.length
             ? next.selectionRects.map(rect => ({ ...rect, x: rect.x + shift }))
             : [{
               x: elementStateValue.renderTextOriginX + (boundaries[next.selectionStart] ?? 0),
@@ -1225,7 +1261,7 @@ export class Window extends NativeWindow {
       } else {
         elementStateValue.renderTextOriginX = null;
         elementStateValue.renderCaretX = null;
-        elementStateValue.renderSelectionRects = next.selectionRects;
+        elementStateValue.renderSelectionRects = next.selectionRects ?? [];
       }
       if (element.value !== next.value) {
         element.value = next.value;
@@ -1709,6 +1745,7 @@ export class Window extends NativeWindow {
 }
 
 const RESIZABLE_MODES = new Set(["horizontal", "vertical", "both", "none"]);
+const SAFE_AREA_MODES = new Set(["none", "top", "bottom", "both"]);
 const ORIENTATION_MODES = new Set(["auto", "portrait", "landscape"]);
 
 function inputDecorationQuads(document, width, height) {
@@ -1736,10 +1773,36 @@ function inputDecorationQuads(document, width, height) {
     for (const rect of state.renderSelectionRects ?? editor.selectionRects ?? []) push(rect, selectionColor, clip);
     if (Math.floor(performance.now() / 500) % 2 === 0) {
       const caretColor = parseColor(element.style.caretColor ?? "#ffffff");
-      push({ x: state.renderCaretX ?? editor.caretX, y: editor.caretY, width: Math.max(1, box.contentBox.width > 0 ? 1.5 : 1), height: editor.caretHeight }, caretColor, clip);
+      const caret = caretOverlayRect(state, editor, box);
+      if (caret) push(caret, caretColor, clip);
     }
   }
   return values;
+}
+
+/** Caret rect in layout space; ignores native sentinel coords from parked text runs. */
+function caretOverlayRect(state, editor, box) {
+  const height = editor.caretHeight;
+  if (!(height > 0)) return null;
+  const x = state.renderCaretX ?? editor.caretX;
+  const y = editor.caretY;
+  // Parked glyphon buffers live at (-100000, -100000); fall back to the content box
+  // or the editor text origin from egui.
+  if (!(Number.isFinite(x) && x > -50_000) || !(Number.isFinite(y) && y > -50_000)) {
+    const originY = Number.isFinite(editor.textOriginY) && editor.textOriginY > -50_000
+      ? editor.textOriginY
+      : box?.contentBox
+        ? box.contentBox.y + Math.max(0, (box.contentBox.height - height) / 2)
+        : null;
+    const originX = Number.isFinite(x) && x > -50_000
+      ? x
+      : (Number.isFinite(editor.textOriginX) && editor.textOriginX > -50_000
+        ? editor.textOriginX
+        : box?.contentBox?.x);
+    if (originX == null || originY == null) return null;
+    return { x: originX, y: originY, width: 1.5, height };
+  }
+  return { x, y, width: 1.5, height };
 }
 
 function inputDecorationOverlays(document) {
@@ -1753,12 +1816,8 @@ function inputDecorationOverlays(document) {
     }
     if (Math.floor(performance.now() / 500) % 2 === 0) {
       const color = parseColor(element.style.caretColor ?? "#ffffff");
-      if (color) overlays.push({ element, color, rect: {
-        x: state.renderCaretX ?? editor.caretX,
-        y: editor.caretY,
-        width: 1.5,
-        height: editor.caretHeight,
-      } });
+      const caret = caretOverlayRect(state, editor, null);
+      if (color && caret) overlays.push({ element, color, rect: caret });
     }
   }
   return overlays;
@@ -3443,10 +3502,10 @@ export class Element extends EventTarget {
 
   append(...children) { for (const child of children) this.appendChild(child); }
   replaceChildren(...children) { for (const child of [...this.#childNodes]) this.removeChild(child); this.append(...children); }
-  // The mouse is the only pointer, with id 1 (as on pointer events).
+  // One pointer at a time: the mouse (id 1, as on pointer events) or the pressed touch.
   setPointerCapture(id) {
     const state = documentState(this.document);
-    if (id !== 1) throw new DOMException("No active pointer with the given id is found.", "NotFoundError");
+    if (id !== 1 && id !== state.pressedPointerId) throw new DOMException("No active pointer with the given id is found.", "NotFoundError");
     if (!this.isConnected) throw new DOMException("The element is not connected.", "InvalidStateError");
     if (!state.pointerPressed) throw new DOMException("The pointer has no buttons pressed.", "InvalidStateError");
     const captures = state.pointerCapture ??= new Map();
@@ -3457,7 +3516,7 @@ export class Element extends EventTarget {
     dispatchPointerCaptureEvent(this, "gotpointercapture", id);
   }
   releasePointerCapture(id) {
-    if (id !== 1) throw new DOMException("No active pointer with the given id is found.", "NotFoundError");
+    if (id !== 1 && id !== documentState(this.document).pressedPointerId) throw new DOMException("No active pointer with the given id is found.", "NotFoundError");
     if (documentState(this.document).pointerCapture?.get(id) === this) releaseCapturedPointer(this.document, id);
   }
   hasPointerCapture(id) { return documentState(this.document).pointerCapture?.get(id) === this; }
@@ -3475,9 +3534,25 @@ export class Element extends EventTarget {
     return Promise.resolve();
   }
   dispatchEvent(event) {
-    const result = super.dispatchEvent(event);
-    this[`on${event.type}`]?.call(this, event);
-    return result;
+    // Browsers expose the current DOM event as window.event (and as a free
+    // `event` identifier via the global object). Webfoundry wf-on* handlers
+    // rely on that; keep the same binding for the duration of dispatch.
+    const previousGlobalEvent = globalThis.event;
+    globalThis.event = event;
+    const view = this.document?.defaultView;
+    let previousViewEvent;
+    if (view) {
+      previousViewEvent = view.event;
+      view.event = event;
+    }
+    try {
+      const result = super.dispatchEvent(event);
+      this[`on${event.type}`]?.call(this, event);
+      return result;
+    } finally {
+      globalThis.event = previousGlobalEvent;
+      if (view) view.event = previousViewEvent;
+    }
   }
 
   getAttribute(name) {
@@ -4454,10 +4529,10 @@ export class Element extends EventTarget {
     } else if (noteScrollLayerPaintChange(this) !== "content") {
       doc.pendingScrollSceneInvalidation = true;
     }
-    // Image decode completion clears only that img's paint segment. Bumping
+    // Image decode / soft-eviction clears only that img's paint segment. Bumping
     // sceneGeneration per cover would rebuild the whole transformed chrome and
     // starve sidebar text during boot — keep image loads paint-local.
-    if (property === "class") clearPaintSegmentSubtree(this);
+    if (property === "class" || property === "image") clearPaintSegmentSubtree(this);
     if (property !== "value" && property !== "image") {
       doc.sceneGeneration = (doc.sceneGeneration ?? 0) + 1;
       if (property === undefined || inheritedFontChanged || LAYOUT_STYLE_PROPERTIES.has(property)) {
@@ -5069,9 +5144,22 @@ export class Document extends EventTarget {
   }
 
   dispatchEvent(event) {
-    const result = super.dispatchEvent(event);
-    this[`on${event.type}`]?.call(this, event);
-    return result;
+    const previousGlobalEvent = globalThis.event;
+    globalThis.event = event;
+    const view = this.defaultView;
+    let previousViewEvent;
+    if (view) {
+      previousViewEvent = view.event;
+      view.event = event;
+    }
+    try {
+      const result = super.dispatchEvent(event);
+      this[`on${event.type}`]?.call(this, event);
+      return result;
+    } finally {
+      globalThis.event = previousGlobalEvent;
+      if (view) view.event = previousViewEvent;
+    }
   }
 
   createElement(name) {

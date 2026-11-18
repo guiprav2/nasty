@@ -17,7 +17,7 @@ import { spawnSync } from 'node:child_process';
 import { collectAppFiles } from './collect-app.js';
 import { assertAndroidToolchain, resolveAndroidEnv } from './android-env.js';
 import { resolveAndroidIconSource, writeAndroidLauncherMipmaps } from './icons.js';
-import { repoPaths, resetDir, stageAndroidNastyPayload } from './layout.js';
+import { nastySourcesStamp, repoPaths, resetDir, stageAndroidNastyPayload } from './layout.js';
 import { artifactName } from './targets.js';
 
 const ORIENTATIONS = new Set(['auto', 'portrait', 'landscape']);
@@ -202,7 +202,7 @@ export async function ensureAndroidRuntimeBase({
 
   ensureAndroidNative({ nodeDir, repoRoot, env, skipNativeBuild });
 
-  const stamp = androidRuntimeStamp({ nodeDir, env });
+  const stamp = androidRuntimeStamp({ nodeDir, env, fontsDir });
 
   if (!rebuild && existsSync(basePath) && existsSync(stampPath) && readFileSync(stampPath, 'utf8') === stamp) {
     console.error(`android runtime cache hit: ${basePath}`);
@@ -332,23 +332,20 @@ function ensureAndroidNative({ nodeDir, repoRoot, env, skipNativeBuild }) {
 
 /**
  * Cache key for the Webfoundry-hosted android runtime APK.
- * Includes Capawesome libnode and JS that WF keeps when injecting an app.
+ * Includes Capawesome libnode, the Android addon, and every staged Nasty source
+ * (JS, dependencies, fonts), so any runtime change rebuilds the cached APK.
  */
-function androidRuntimeStamp({ nodeDir, env }) {
+function androidRuntimeStamp({ nodeDir, env, fontsDir }) {
   const paths = [
     env.libnodePath,
     env.libnodeVersionPath,
     join(nodeDir, 'native/android-arm64/nasty.node'),
-    join(nodeDir, 'index.js'),
-    join(nodeDir, 'render.js'),
-    join(nodeDir, 'tailwind.js'),
-    join(nodeDir, 'font-registry.js'),
-    join(nodeDir, 'internal/transformed-text.js'),
-    join(nodeDir, 'internal/gpu-scroll-layers.js'),
+    join(nodeDir, 'bundler/layout.js'),
     join(nodeDir, 'bundler/pack-android-apk.js'),
   ];
   return [
-    'android-runtime-v3',
+    'android-runtime-v4',
+    `sources:${nastySourcesStamp(nodeDir, fontsDir)}`,
     ...paths.map(path => fileStamp(path)),
   ].join('\n');
 }
